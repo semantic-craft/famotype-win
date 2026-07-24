@@ -42,7 +42,7 @@ public sealed class AboutPageParityContractTests
         Assert.Contains("软件更新", page);
         Assert.Contains("检查更新", page);
         Assert.Contains("ReleasesUrl", page);
-        Assert.Contains("semantic-craft/famoime-win-releases/releases/latest", page);
+        Assert.Contains("semantic-craft/famotype-win/releases/latest", page);
         Assert.Contains("已打开法墨发布页", page);
         Assert.DoesNotContain("已是最新版本", page);
         Assert.Contains("tray menu must keep update checks in the About page", menuTest);

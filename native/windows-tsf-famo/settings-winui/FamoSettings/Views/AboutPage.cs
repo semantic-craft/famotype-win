@@ -11,7 +11,7 @@ namespace Famo.Settings.Views;
 /// <summary>关于（关）—— 版本 + 开源许可。</summary>
 public sealed class AboutPage : UserControl
 {
-    private const string ReleasesUrl = "https://github.com/semantic-craft/famoime-win-releases/releases/latest";
+    private const string ReleasesUrl = "https://github.com/semantic-craft/famotype-win/releases/latest";
 
     public AboutPage()
     {

@@ -3,9 +3,9 @@
 本仓库是法墨输入法的独立 Windows 源码仓，只包含 Windows TSF、WinUI 设置面板、安装器源码、测试与 Windows CI。
 
 - Windows 源码：`native/windows-tsf-famo/`
-- Windows 安装包：[famoime-win-releases](https://github.com/semantic-craft/famoime-win-releases/releases/latest)
-- macOS 源码：[famoime-mac](https://github.com/semantic-craft/famoime-mac)
-- macOS 安装包：[famo-releases](https://github.com/semantic-craft/famo-releases/releases/latest)
+- Windows 安装包：[本仓 Releases](https://github.com/semantic-craft/famotype-win/releases/latest)
+- macOS 源码：[famotype-macos](https://github.com/semantic-craft/famotype-macos)
+- macOS 安装包：[famotype-macos releases](https://github.com/semantic-craft/famotype-macos/releases/latest)
 
 Windows 与 macOS 的代码、tag、Latest Release 和发布资产相互独立，不得交叉上传。
 
