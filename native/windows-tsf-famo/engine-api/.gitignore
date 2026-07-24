@@ -1,0 +1,3 @@
+# CMake build trees and runtime smoke fixtures
+build*/
+tests/rime_smoke_data/

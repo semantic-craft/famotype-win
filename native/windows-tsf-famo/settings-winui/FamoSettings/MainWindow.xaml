@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="Famo.Settings.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Grid x:Name="Root" Background="{StaticResource Famo.Card2}">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="208" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- 侧栏 = card 面 -->
+        <Border Grid.Column="0" Background="{StaticResource Famo.Card}"
+                BorderBrush="{StaticResource Famo.Line}" BorderThickness="0,0,1,0">
+            <Grid Padding="16,22,16,16">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <StackPanel Grid.Row="0" Margin="2,0,0,16">
+                    <TextBlock Text="法墨输入法" FontSize="18" FontWeight="SemiBold" Foreground="{StaticResource Famo.Ink}" />
+                    <TextBlock Text="Famo" FontFamily="{StaticResource Famo.Serif}" FontSize="12"
+                               Foreground="{StaticResource Famo.Ink3}" Margin="0,2,0,0" />
+                </StackPanel>
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Hidden" Margin="0,4,0,0">
+                    <StackPanel x:Name="NavHost" Spacing="22" />
+                </ScrollViewer>
+                <Border Grid.Row="2" BorderBrush="{StaticResource Famo.Line2}" BorderThickness="0,1,0,0"
+                        Padding="2,8,0,0" Margin="0,8,0,0">
+                    <TextBlock Text="librime · v0.1.0" FontFamily="{StaticResource Famo.Mono}" FontSize="12"
+                               Foreground="{StaticResource Famo.Ink3}" />
+                </Border>
+            </Grid>
+        </Border>
+
+        <!-- 详情 = card2 面，卡片浮起。单列自上而下，内容宽度上限 980（规范建议 1000–1100）；
+             超宽时居中留对称边距。见 design/DECISIONS-2026-07-19.md §九。 -->
+        <ScrollViewer Grid.Column="1" x:Name="ContentScroller">
+            <Grid Padding="40,32,40,56" HorizontalAlignment="Stretch">
+                <ContentControl x:Name="PageHost" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch"
+                                MaxWidth="980" />
+            </Grid>
+        </ScrollViewer>
+    </Grid>
+</Window>

@@ -1,0 +1,210 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "Famo-Windows-1.4.8",
+  "documentNamespace": "https://github.com/semantic-craft/famoime-win/spdx/famo-windows-1.4.8",
+  "creationInfo": {
+    "created": "2026-07-20T13:00:00Z",
+    "creators": [
+      "Organization: semantic-craft"
+    ]
+  },
+  "documentDescribes": [
+    "SPDXRef-Package-Famo-Windows"
+  ],
+  "packages": [
+    {
+      "name": "Famo Windows",
+      "SPDXID": "SPDXRef-Package-Famo-Windows",
+      "versionInfo": "1.4.8",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "GPL-3.0-only",
+      "licenseDeclared": "GPL-3.0-only",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "librime",
+      "SPDXID": "SPDXRef-Package-librime",
+      "versionInfo": "1.17.0",
+      "downloadLocation": "https://github.com/rime/librime",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "OpenCC",
+      "SPDXID": "SPDXRef-Package-OpenCC",
+      "downloadLocation": "https://github.com/BYVoid/OpenCC",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "google-glog",
+      "SPDXID": "SPDXRef-Package-glog",
+      "downloadLocation": "https://github.com/google/glog",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "LevelDB",
+      "SPDXID": "SPDXRef-Package-LevelDB",
+      "downloadLocation": "https://github.com/google/leveldb",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-3-Clause",
+      "licenseDeclared": "BSD-3-Clause",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "marisa-trie",
+      "SPDXID": "SPDXRef-Package-marisa-trie",
+      "versionInfo": "0.2.6",
+      "downloadLocation": "https://github.com/s-yata/marisa-trie",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-2-Clause OR LGPL-2.1-only",
+      "licenseDeclared": "BSD-2-Clause OR LGPL-2.1-only",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "yaml-cpp",
+      "SPDXID": "SPDXRef-Package-yaml-cpp",
+      "downloadLocation": "https://github.com/jbeder/yaml-cpp",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "Boost",
+      "SPDXID": "SPDXRef-Package-Boost",
+      "downloadLocation": "https://www.boost.org/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSL-1.0",
+      "licenseDeclared": "BSL-1.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "Lua",
+      "SPDXID": "SPDXRef-Package-Lua",
+      "versionInfo": "5.4.8",
+      "downloadLocation": "https://www.lua.org/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "Copyright Lua.org, PUC-Rio"
+    },
+    {
+      "name": "rime-ice",
+      "SPDXID": "SPDXRef-Package-rime-ice",
+      "versionInfo": "846e5fcae56f0e3f4dcd8570319ffaf377e15471",
+      "downloadLocation": "git+https://github.com/iDvel/rime-ice.git@846e5fcae56f0e3f4dcd8570319ffaf377e15471",
+      "filesAnalyzed": false,
+      "licenseConcluded": "GPL-3.0-only",
+      "licenseDeclared": "GPL-3.0-only",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "rime-wubi86-jidian",
+      "SPDXID": "SPDXRef-Package-rime-wubi86-jidian",
+      "versionInfo": "a194fb8b3ec41ef9dcf079d3a67876fa75f79135",
+      "downloadLocation": "git+https://github.com/KyleBing/rime-wubi86-jidian.git@a194fb8b3ec41ef9dcf079d3a67876fa75f79135",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "copyrightText": "NOASSERTION"
+    },
+    {
+      "name": "Microsoft .NET Runtime",
+      "SPDXID": "SPDXRef-Package-dotnet-runtime",
+      "versionInfo": "10.0.9",
+      "downloadLocation": "https://github.com/dotnet/runtime",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "Copyright Microsoft Corporation"
+    },
+    {
+      "name": "Windows App SDK",
+      "SPDXID": "SPDXRef-Package-Windows-App-SDK",
+      "versionInfo": "1.8.260529003",
+      "downloadLocation": "https://github.com/microsoft/WindowsAppSDK",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "Copyright Microsoft Corporation"
+    }
+  ],
+  "relationships": [
+    {
+      "spdxElementId": "SPDXRef-DOCUMENT",
+      "relationshipType": "DESCRIBES",
+      "relatedSpdxElement": "SPDXRef-Package-Famo-Windows"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-Famo-Windows",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-librime"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-Famo-Windows",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-rime-ice"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-Famo-Windows",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-rime-wubi86-jidian"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-Famo-Windows",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-dotnet-runtime"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-Famo-Windows",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-Windows-App-SDK"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-librime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-OpenCC"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-librime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-glog"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-librime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-LevelDB"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-librime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-marisa-trie"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-librime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-yaml-cpp"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-librime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-Boost"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-librime",
+      "relationshipType": "DEPENDS_ON",
+      "relatedSpdxElement": "SPDXRef-Package-Lua"
+    }
+  ]
+}

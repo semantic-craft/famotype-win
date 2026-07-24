@@ -1,0 +1,183 @@
+# weasel.custom.yaml — 法墨 Windows (Famo) 品牌皮肤 + 候选窗外观
+# 落 %LOCALAPPDATA%\Famo\。本文件 = 「即时桶」落点(皮肤/明暗/字体/排版/几何)，
+# 设置面板改这些 → 前端轻量 reload 候选窗重绘，不走重部署。出处对照见 CONFIG-MAPPING.md §②③。
+#
+# 色值单一真相源 = shared/skins/colors.md。Windows 前端颜色为 BGR：6 位 0xBBGGRR=不透明，
+# 8 位 0xAABBGGRR 才带透明度——纯色值与 macOS Squirrel 完全一致，只是键名不同。
+# 当前默认皮肤 = 荔园红（shenda / shenda_dark，深大红品牌色），明暗跟随系统。
+# 键名对照(Windows←Squirrel)：candidate_back_color←back_color；candidate_border_color←border_color；
+#   hilited_label_color←hilited_candidate_label_color。
+
+patch:
+  style:
+    color_scheme: shenda              # 即时桶：appearance.skin（亮）
+    color_scheme_dark: shenda_dark    # 即时桶：appearance.appearanceMode（暗跟随）
+    font_face: "微软雅黑"             # 即时桶：appearance.fontFace
+    font_point: 19                    # 即时桶：appearance.fontPoint（对齐 Mac 1.3.3 中档）
+    label_format: "%s."               # 即时桶：appearance.candidateFormat（标签格式；空=隐藏标签）
+    label_font_point: 13.7            # 即时桶：主字号 × 0.72（0=隐藏标签）
+    comment_font_point: 15.2          # 即时桶：主字号 × 0.8（0=隐藏注释）
+    horizontal: true                  # 即时桶：appearance.orientation（true=横排）
+    inline_preedit: false             # 即时桶：appearance.inlinePreedit
+    preedit_type: composition         # 即时桶：appearance.inlineCandidatePreview（composition=原样/preview=候选预览）
+    layout:
+      corner_radius: 13               # 即时桶：appearance.layout.cornerRadius
+      border_width: 1                 # 即时桶：appearance.layout.borderWidth
+      round_corner: 9                 # 选中高亮圆角（比面板小 4）
+      hilite_padding_x: 8             # 高亮左右内边距
+      hilite_padding_y: 7             # 高亮上下内边距
+      hilite_spacing: 5               # 序号与候选词间距
+      spacing: 6                      # 候选间距
+      shadow_radius: 16               # 即时桶：appearance.layout.shadowRadius
+      shadow_offset_x: 0
+      shadow_offset_y: 7
+      margin_x: 8                     # 即时桶：appearance.layout.margin
+      margin_y: 8                     # 即时桶：appearance.layout.margin
+
+  # ── 深大红 / Shenda（默认 · 荔园红 · 深圳大学）─────────────────
+  preset_color_schemes/shenda:
+    name: "深大红 / 法墨"
+    author: "法墨输入法"
+    back_color: 0xF5F9FB
+    candidate_back_color: 0xF5F9FB
+    border_color: 0xE2E2E2
+    text_color: 0x646A6B
+    hilited_text_color: 0x532CA8
+    hilited_back_color: 0xE7EFF3
+    candidate_text_color: 0x22262A
+    label_color: 0x87939A
+    comment_text_color: 0x87939A
+    hilited_candidate_text_color: 0xF5F9FB
+    hilited_candidate_back_color: 0x532CA8
+    hilited_candidate_border_color: 0x532CA8
+    hilited_label_color: 0xF5F9FB
+    hilited_comment_text_color: 0xF5F9FB
+
+  preset_color_schemes/shenda_dark:
+    name: "深大红·暗 / 法墨"
+    author: "法墨输入法"
+    back_color: 0x212326
+    candidate_back_color: 0x212326
+    border_color: 0x3A3A3A
+    text_color: 0x909EA8
+    hilited_text_color: 0x8E6AE0
+    hilited_back_color: 0x1C1E21
+    candidate_text_color: 0xD8E4EC
+    label_color: 0x626D76
+    comment_text_color: 0x626D76
+    hilited_candidate_text_color: 0x16181A
+    hilited_candidate_back_color: 0x8E6AE0
+    hilited_candidate_border_color: 0x8E6AE0
+    hilited_label_color: 0x16181A
+    hilited_comment_text_color: 0x16181A
+
+  # ── 胡佛红 / Stanford（斯坦福大学）─────────────────────────
+  preset_color_schemes/stanford:
+    name: "斯坦福 / Stanford"
+    author: "法墨输入法"
+    back_color: 0xFCFBFB
+    candidate_back_color: 0xFCFBFB
+    border_color: 0xE2E2E2
+    text_color: 0x5A5653
+    hilited_text_color: 0x15158C
+    hilited_back_color: 0xF4F2F1
+    candidate_text_color: 0x292D2E
+    label_color: 0x908D8A
+    comment_text_color: 0x908D8A
+    hilited_candidate_text_color: 0xFCFBFB
+    hilited_candidate_back_color: 0x15158C
+    hilited_candidate_border_color: 0x15158C
+    hilited_label_color: 0xFCFBFB
+    hilited_comment_text_color: 0xFCFBFB
+
+  preset_color_schemes/stanford_dark:
+    name: "斯坦福·暗 / Stanford"
+    author: "法墨输入法"
+    back_color: 0x2C2826
+    candidate_back_color: 0x2C2826
+    border_color: 0x3A3A3A
+    text_color: 0xA6A19D
+    hilited_text_color: 0x4B3AB8
+    hilited_back_color: 0x272321
+    candidate_text_color: 0xEDEAE8
+    label_color: 0x75706C
+    comment_text_color: 0x75706C
+    hilited_candidate_text_color: 0xF0F2F2
+    hilited_candidate_back_color: 0x4B3AB8
+    hilited_candidate_border_color: 0x4B3AB8
+    hilited_label_color: 0xF0F2F2
+    hilited_comment_text_color: 0xF0F2F2
+
+  # ── 珞珈青 / Wuda（武汉大学）───────────────────────────────
+  preset_color_schemes/wuda:
+    name: "武大绿 / Wuda"
+    author: "法墨输入法"
+    back_color: 0xF9FBF8
+    candidate_back_color: 0xF9FBF8
+    border_color: 0xE2E2E2
+    text_color: 0x5A5F56
+    hilited_text_color: 0x67832A
+    hilited_back_color: 0xEEF2EF
+    candidate_text_color: 0x2A2D28
+    label_color: 0x8E938A
+    comment_text_color: 0x8E938A
+    hilited_candidate_text_color: 0xF8FAF9
+    hilited_candidate_back_color: 0x67832A
+    hilited_candidate_border_color: 0x67832A
+    hilited_label_color: 0xF8FAF9
+    hilited_comment_text_color: 0xF8FAF9
+
+  preset_color_schemes/wuda_dark:
+    name: "武大绿·暗 / Wuda"
+    author: "法墨输入法"
+    back_color: 0x232421
+    candidate_back_color: 0x232421
+    border_color: 0x3A3A3A
+    text_color: 0x9CA198
+    hilited_text_color: 0x81A03C
+    hilited_back_color: 0x1D1E1C
+    candidate_text_color: 0xE7EAE5
+    label_color: 0x6B7066
+    comment_text_color: 0x6B7066
+    hilited_candidate_text_color: 0x131412
+    hilited_candidate_back_color: 0x81A03C
+    hilited_candidate_border_color: 0x81A03C
+    hilited_label_color: 0x131412
+    hilited_comment_text_color: 0x131412
+
+  # ── 嘉庚蓝 / Xiada（厦门大学）─────────────────────────────
+  preset_color_schemes/xiada:
+    name: "厦大蓝 / Xiada"
+    author: "法墨输入法"
+    back_color: 0xFCFAF8
+    candidate_back_color: 0xFCFAF8
+    border_color: 0xE2E2E2
+    text_color: 0x816A5C
+    hilited_text_color: 0x8C4A1D
+    hilited_back_color: 0xF7F2EF
+    candidate_text_color: 0x362A24
+    label_color: 0xAF9888
+    comment_text_color: 0xAF9888
+    hilited_candidate_text_color: 0xFCFAF8
+    hilited_candidate_back_color: 0x8C4A1D
+    hilited_candidate_border_color: 0x8C4A1D
+    hilited_label_color: 0xFCFAF8
+    hilited_comment_text_color: 0xFCFAF8
+
+  preset_color_schemes/xiada_dark:
+    name: "厦大蓝·暗 / Xiada"
+    author: "法墨输入法"
+    back_color: 0x292421
+    candidate_back_color: 0x292421
+    border_color: 0x3A3A3A
+    text_color: 0xB8A498
+    hilited_text_color: 0xC57948
+    hilited_back_color: 0x221E1B
+    candidate_text_color: 0xF0EAE6
+    label_color: 0x8A7566
+    comment_text_color: 0x8A7566
+    hilited_candidate_text_color: 0x1C140F
+    hilited_candidate_back_color: 0xC57948
+    hilited_candidate_border_color: 0xC57948
+    hilited_label_color: 0x1C140F
+    hilited_comment_text_color: 0x1C140F

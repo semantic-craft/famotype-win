@@ -1,0 +1,1190 @@
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index 67e9b6d..61e4fa7 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -116,21 +116,19 @@ void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize);
+ bool _UpdateUIStyleColor(RimeConfig* config,
+                          UIStyle& style,
+                          const std::string& color = std::string());
++
++// 法墨引擎 ABI：把 std::string 包成栈上 FamoUtf8String（生命周期不超过被调 op）。
++static inline FamoUtf8String FamoU8(const std::string& s) {
++  FamoUtf8String u;
++  u.size = (uint32_t)sizeof(FamoUtf8String);
++  u.data = s.c_str();
++  u.length_bytes = (uint32_t)s.size();
++  return u;
++}
+ void _LoadAppOptions(RimeConfig* config, AppOptionsByAppName& app_options);
+
+-void _RefreshTrayIcon(const RimeSessionId session_id,
+-                      const std::function<void()> _UpdateUICallback) {
+-  // Dangerous, don't touch
+-  static char app_name[256] = {0};
+-  auto ret = rime_api->get_property(session_id, "client_app", app_name,
+-                                    sizeof(app_name) - 1);
+-  if (!ret || u8tow(app_name) == std::wstring(L"explorer.exe"))
+-    boost::thread th([=]() {
+-      ::Sleep(100);
+-      if (_UpdateUICallback)
+-        _UpdateUICallback();
+-    });
+-  else if (_UpdateUICallback)
++void _RefreshTrayIcon(const std::function<void()> _UpdateUICallback) {
++  if (_UpdateUICallback)
+     _UpdateUICallback();
+ }
+
+@@ -158,12 +156,31 @@ void RimeWithWeaselHandler::Initialize() {
+     return;
+   }
+
+-  LOG(INFO) << "Initializing la rime.";
+-  rime_api->initialize(NULL);
+-  if (rime_api->start_maintenance(/*full_check = */ False)) {
++  std::string data_root = wtou8(WeaselUserDataPath().wstring());
++  int32_t rc = m_engine_host.Load(L"FamoRimeEngine.dll", data_root.c_str());
++  if (rc != FAMO_ENGINE_OK || !m_engine_host.AbiRunnable()) {
++    LOG(ERROR) << "Famo engine ABI load failed rc=" << rc;
+     m_disabled = true;
+-    rime_api->join_maintenance_thread();
++    return;
+   }
++  LOG(INFO) << "Famo engine ABI backend active (FamoRimeEngine.dll).";
++
++  {
++    HKEY hkey;
++    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Famo\\InputMethod", 0,
++                        nullptr, 0, KEY_SET_VALUE, nullptr, &hkey,
++                        nullptr) == ERROR_SUCCESS) {
++      const wchar_t* active = L"abi";
++      RegSetValueExW(hkey, L"ActiveBackend", 0, REG_SZ,
++                     reinterpret_cast<const BYTE*>(active),
++                     (DWORD)((wcslen(active) + 1) * sizeof(wchar_t)));
++      RegCloseKey(hkey);
++    }
++  }
++
++  LOG(INFO) << "Initializing la rime through FamoRimeEngine.dll.";
++  // 引擎 initialize() 已在 host_.Load 内完成 setup+initialize（+首启部署）。
++  // 以下全局 config 读直连同一 librime 单例（只读、引擎已初始化）。
+
+   RimeConfig config = {NULL};
+   if (rime_api->config_open("weasel", &config)) {
+@@ -201,16 +218,35 @@ void RimeWithWeaselHandler::Finalize() {
+   m_disabled = true;
+   m_session_status_map.clear();
+   LOG(INFO) << "Finalizing la rime.";
+-  rime_api->finalize();
++  if (m_abi_view_valid) {
++    m_engine_host.FreeView(&m_abi_view);
++    m_abi_view_valid = false;
++  }
++  m_engine_host.Unload();  // 引擎 shutdown() 内跑 librime finalize
+ }
+
+ DWORD RimeWithWeaselHandler::FindSession(WeaselSessionId ipc_id) {
+   if (m_disabled)
+     return 0;
+-  Bool found = rime_api->find_session(to_session_id(ipc_id));
+-  DLOG(INFO) << "Find session: session_id = " << to_session_id(ipc_id)
+-             << ", found = " << found;
+-  return found ? (ipc_id) : 0;
++  bool found = get_session_status(ipc_id).engine_ctx != nullptr;
++  DLOG(INFO) << "Find session: ipc_id = " << ipc_id << ", found = " << found;
++  return found ? ipc_id : 0;
++}
++
++// 法墨引擎 ABI：用引擎 get_status 刷新 m_abi_view（thin op commit/clear/highlight/change_page
++// 之后没有 out_view，靠此取当前 context+status；get_status 填全视图，不消费 commit）。
++bool RimeWithWeaselHandler::_RefillAbiView(FamoEngineContext* ctx) {
++  if (m_abi_view_valid) {
++    m_engine_host.FreeView(&m_abi_view);
++    m_abi_view_valid = false;
++  }
++  if (!ctx)
++    return false;
++  m_abi_view = FamoCompositionView{};
++  m_abi_view.size = (uint32_t)sizeof(FamoCompositionView);
++  int32_t rc = m_engine_host.api().get_status(ctx, &m_abi_view);
++  m_abi_view_valid = (rc == FAMO_ENGINE_OK);
++  return m_abi_view_valid;
+ }
+
+ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+@@ -220,45 +256,29 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+     if (m_disabled)
+       return 0;
+   }
+-  RimeSessionId session_id = (RimeSessionId)rime_api->create_session();
+-  // 法墨即时输入方式②：新会话即采用 famo-select-schema.txt 所选方案 → 输入方式跨 App/重启持久（不部署）。
+-  {
+-    std::string sel = _ReadFamoSelectSchema();
+-    if (!sel.empty())
+-      rime_api->select_schema(session_id, sel.c_str());
+-  }
+-  if (m_global_ascii_mode) {
+-    for (const auto& pair : m_session_status_map) {
+-      if (pair.first) {
+-        rime_api->set_option(session_id, "ascii_mode",
+-                             !!pair.second.status.is_ascii_mode);
+-        break;
+-      }
+-    }
+-  }
+-  // 法墨即时开关①：新会话即回放 famo-options.yaml → 开关跨 App/重启持久（不部署）。
+-  _ApplyFamoOptions(session_id);
++  FamoEngineContext* engine_ctx = nullptr;
++  // 法墨即时输入方式②：新会话即采用 famo-select-schema.txt 所选方案（不部署）。
++  std::string sel = _ReadFamoSelectSchema();
++  FamoUtf8String schema = FamoU8(sel);
++  m_engine_host.api().create_context(sel.empty() ? nullptr : &schema,
++                                     &engine_ctx);
+
+   WeaselSessionId ipc_id =
+       _GenerateNewWeaselSessionId(m_session_status_map, m_pid);
+-  DLOG(INFO) << "Add session: created session_id = " << session_id
+-             << ", ipc_id = " << ipc_id;
++  DLOG(INFO) << "Add session: ipc_id = " << ipc_id;
+   SessionStatus& session_status = new_session_status(ipc_id);
+   session_status.style = m_base_style;
+-  session_status.session_id = session_id;
++  session_status.engine_ctx = engine_ctx;
++  _ApplyFamoOptions(engine_ctx);
+   _ReadClientInfo(ipc_id, buffer);
+
+-  RIME_STRUCT(RimeStatus, status);
+-  if (rime_api->get_status(session_id, &status)) {
+-    std::string schema_id = status.schema_id;
++  if (_RefillAbiView(engine_ctx)) {
++    std::string schema_id =
++        m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
+     m_last_schema_id = schema_id;
+     _LoadSchemaSpecificSettings(ipc_id, schema_id);
+-    _LoadAppInlinePreeditSet(ipc_id, true);
+     _UpdateInlinePreeditStatus(ipc_id);
+-    _RefreshTrayIcon(session_id, _UpdateUICallback);
+-    session_status.status = status;
+     session_status.__synced = false;
+-    rime_api->free_status(&status);
+   }
+   m_ui->style() = session_status.style;
+   // show session's welcome message :-) if any
+@@ -277,9 +297,11 @@ DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
+     m_ui->Hide();
+   if (m_disabled)
+     return 0;
+-  DLOG(INFO) << "Remove session: session_id = " << to_session_id(ipc_id);
++  DLOG(INFO) << "Remove session: ipc_id = " << ipc_id;
+   // TODO: force committing? otherwise current composition would be lost
+-  rime_api->destroy_session(to_session_id(ipc_id));
++  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
++  if (ctx)
++    m_engine_host.api().destroy_context(ctx);
+   m_session_status_map.erase(ipc_id);
+   m_active_session = 0;
+   return 0;
+@@ -306,14 +328,13 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
+   }
+
+   for (auto& pair : m_session_status_map) {
+-    RIME_STRUCT(RimeStatus, status);
+-    if (rime_api->get_status(to_session_id(pair.first), &status)) {
+-      _LoadSchemaSpecificSettings(pair.first, std::string(status.schema_id));
+-      _LoadAppInlinePreeditSet(pair.first, true);
++    if (_RefillAbiView(pair.second.engine_ctx)) {
++      std::string schema_id =
++          m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
++      pair.second.style = m_base_style;
++      _LoadSchemaSpecificSettings(pair.first, schema_id);
+       _UpdateInlinePreeditStatus(pair.first);
+-      pair.second.status = status;
+       pair.second.__synced = false;
+-      rime_api->free_status(&status);
+     }
+   }
+   m_ui->style() = get_session_status(m_active_session).style;
+@@ -370,27 +390,29 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
+   }
+
+   for (auto& pair : m_session_status_map) {
+-    RIME_STRUCT(RimeStatus, status);
+-    if (rime_api->get_status(to_session_id(pair.first), &status)) {
+-      pair.second.style = m_base_style;
+-      _LoadSchemaSpecificSettings(pair.first, std::string(status.schema_id));
+-      _LoadAppInlinePreeditSet(pair.first, true);
++    if (_RefillAbiView(pair.second.engine_ctx)) {
++      std::string schema_id =
++          m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
++      pair.second.style = m_base_style;
++      _LoadSchemaSpecificSettings(pair.first, schema_id);
+       _UpdateInlinePreeditStatus(pair.first);
+-      pair.second.status = status;
+       pair.second.__synced = false;
+-      rime_api->free_status(&status);
++      if (m_ui) {
++        m_ui->style() = get_session_status(pair.first).style;
++        _UpdateUI(pair.first);
++      }
+     }
+   }
+-  if (m_active_session) {
+-    m_ui->style() = get_session_status(m_active_session).style;
+-    _UpdateUI(m_active_session);
+-  }
+-  if (ipc_id && eat && m_session_status_map.find(ipc_id) != m_session_status_map.end())
+-    _Respond(ipc_id, eat);
++  if (ipc_id && eat && m_session_status_map.find(ipc_id) != m_session_status_map.end()) {
++    _RefillAbiView(get_session_status(ipc_id).engine_ctx);
++    _Respond(ipc_id, eat);
++  }
+ }
+
+-void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
+-  // 法墨即时开关①：把 famo-options.yaml 的 options: 映射逐项 set_option 到一个会话。
++void RimeWithWeaselHandler::_ApplyFamoOptions(FamoEngineContext* ctx) {
++  // 法墨即时开关①：把 famo-options.yaml 的 options: 映射逐项 set_option 到 ABI context。
++  if (!ctx)
++    return;
+   std::string yaml = _ReadFamoFile(L"famo-options.yaml");
+   if (yaml.empty())
+     return;
+@@ -397,8 +417,11 @@ void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
+     if (rime_api->config_begin_map(&it, &cfg, "options")) {
+       while (rime_api->config_next(&it)) {
+         Bool v = False;
+-        if (rime_api->config_get_bool(&cfg, it.path, &v))
+-          rime_api->set_option(session_id, it.key, !!v);
++        if (rime_api->config_get_bool(&cfg, it.path, &v)) {
++          std::string key = it.key ? it.key : "";
++          FamoUtf8String name = FamoU8(key);
++          m_engine_host.api().set_option(ctx, &name, !!v);
++        }
+       }
+       rime_api->config_end(&it);
+     }
+@@ -411,8 +434,10 @@ void RimeWithWeaselHandler::ReloadOptions() {
+   LOG(INFO) << "Famo: ReloadOptions (instant switches, no deploy).";
+   if (m_disabled)
+     return;
+-  for (auto& pair : m_session_status_map)
+-    _ApplyFamoOptions(to_session_id(pair.first));
++  for (auto& pair : m_session_status_map) {
++    _ApplyFamoOptions(pair.second.engine_ctx);
++    _RefillAbiView(pair.second.engine_ctx);
++  }
+   if (m_active_session)
+     _UpdateUI(m_active_session);  // 中英/简繁等状态变化即时反映到候选窗/状态栏
+ }
+@@ -428,15 +453,32 @@ std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
+ }
+
+ void RimeWithWeaselHandler::SelectSchema() {
+-  // 法墨即时输入方式②：读 famo-select-schema.txt，select_schema 到所有活动会话（不部署、不重建 prism）。
++  // 法墨即时输入方式②：读 famo-select-schema.txt，重建活动 ABI contexts（不部署、不重建 prism）。
+   LOG(INFO) << "Famo: SelectSchema (instant schema switch, no deploy).";
+   if (m_disabled)
+     return;
+   std::string id = _ReadFamoSelectSchema();
+   if (id.empty())
+     return;
+-  for (auto& pair : m_session_status_map)
+-    rime_api->select_schema(to_session_id(pair.first), id.c_str());
++  FamoUtf8String schema = FamoU8(id);
++  for (auto& pair : m_session_status_map) {
++    FamoEngineContext* old_ctx = pair.second.engine_ctx;
++    if (old_ctx)
++      m_engine_host.api().destroy_context(old_ctx);
++    pair.second.engine_ctx = nullptr;
++    FamoEngineContext* new_ctx = nullptr;
++    if (m_engine_host.api().create_context(&schema, &new_ctx) == FAMO_ENGINE_OK) {
++      pair.second.engine_ctx = new_ctx;
++      _ApplyFamoOptions(new_ctx);
++      if (_RefillAbiView(new_ctx)) {
++        std::string schema_id =
++            m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
++        _LoadSchemaSpecificSettings(pair.first, schema_id);
++        _UpdateInlinePreeditStatus(pair.first);
++        pair.second.__synced = false;
++      }
++    }
++  }
+   if (m_active_session)
+     _UpdateUI(m_active_session);  // 切到新方案后即时刷新候选窗/状态栏
+ }
+@@ -448,21 +490,50 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
+              << ", mask = " << keyEvent.mask << ", ipc_id = " << ipc_id;
+   if (m_disabled)
+     return FALSE;
+-  RimeSessionId session_id = to_session_id(ipc_id);
+-  Bool handled = rime_api->process_key(session_id, keyEvent.keycode,
+-                                       expand_ibus_modifier(keyEvent.mask));
+-  // vim_mode when keydown only
+-  if (!handled && !(keyEvent.mask & ibus::Modifier::RELEASE_MASK)) {
++  Bool handled = False;
++  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
++  if (m_abi_view_valid) {
++    m_engine_host.FreeView(&m_abi_view);
++    m_abi_view_valid = false;
++  }
++  m_abi_view = FamoCompositionView{};
++  m_abi_view.size = (uint32_t)sizeof(FamoCompositionView);
++  FamoKeyEvent ke{};
++  ke.size = (uint32_t)sizeof(FamoKeyEvent);
++  ke.virtual_key = keyEvent.keycode;
++  ke.modifiers = expand_ibus_modifier(keyEvent.mask);
++  ke.is_key_down = !(keyEvent.mask & ibus::Modifier::RELEASE_MASK);
++  int32_t rc = ctx ? m_engine_host.api().process_key(ctx, &ke, &m_abi_view)
++                   : FAMO_ENGINE_E_INVALID_ARGUMENT;
++  m_abi_view_valid = (rc == FAMO_ENGINE_OK);
++  // ABI-only pass-through rule: a non-empty returned view means RIME consumed the key; an empty view keeps host-app key handling.
++  handled = (m_abi_view_valid &&
++             (m_abi_view.state_flags & (FAMO_COMPOSITION_HAS_PREEDIT |
++                                        FAMO_COMPOSITION_HAS_COMMIT |
++                                        FAMO_COMPOSITION_HAS_CANDIDATES)))
++                ? True
++                : False;
++  if (!handled && !(keyEvent.mask & ibus::Modifier::RELEASE_MASK) && ctx) {
+     bool isVimBackInCommandMode =
+         (keyEvent.keycode == ibus::Keycode::Escape) ||
+         ((keyEvent.mask & (1 << 2)) &&
+          (keyEvent.keycode == ibus::Keycode::XK_c ||
+           keyEvent.keycode == ibus::Keycode::XK_C ||
+           keyEvent.keycode == ibus::Keycode::XK_bracketleft));
+-    if (isVimBackInCommandMode &&
+-        rime_api->get_option(session_id, "vim_mode") &&
+-        !rime_api->get_option(session_id, "ascii_mode")) {
+-      rime_api->set_option(session_id, "ascii_mode", True);
++    if (isVimBackInCommandMode) {
++      int32_t vim_mode = 0;
++      int32_t ascii_mode = 0;
++      std::string vim = "vim_mode";
++      std::string ascii = "ascii_mode";
++      FamoUtf8String vim_name = FamoU8(vim);
++      FamoUtf8String ascii_name = FamoU8(ascii);
++      if (m_engine_host.api().get_option(ctx, &vim_name, &vim_mode) ==
++              FAMO_ENGINE_OK &&
++          m_engine_host.api().get_option(ctx, &ascii_name, &ascii_mode) ==
++              FAMO_ENGINE_OK &&
++          vim_mode && !ascii_mode) {
++        m_engine_host.api().set_option(ctx, &ascii_name, 1);
++      }
+     }
+   }
+   _Respond(ipc_id, eat);
+@@ -475,7 +546,10 @@ void RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id) {
+   DLOG(INFO) << "Commit composition: ipc_id = " << ipc_id;
+   if (m_disabled)
+     return;
+-  rime_api->commit_composition(to_session_id(ipc_id));
++  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
++  if (ctx)
++    m_engine_host.api().commit_composition(ctx);
++  _RefillAbiView(ctx);
+   _UpdateUI(ipc_id);
+   m_active_session = ipc_id;
+ }
+@@ -484,7 +558,10 @@ void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
+   DLOG(INFO) << "Clear composition: ipc_id = " << ipc_id;
+   if (m_disabled)
+     return;
+-  rime_api->clear_composition(to_session_id(ipc_id));
++  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
++  if (ctx)
++    m_engine_host.api().clear_composition(ctx);
++  _RefillAbiView(ctx);
+   _UpdateUI(ipc_id);
+   m_active_session = ipc_id;
+ }
+@@ -496,7 +573,18 @@ void RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
+              << ", index = " << index;
+   if (m_disabled)
+     return;
+-  rime_api->select_candidate_on_current_page(to_session_id(ipc_id), index);
++  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
++  if (m_abi_view_valid) {
++    m_engine_host.FreeView(&m_abi_view);
++    m_abi_view_valid = false;
++  }
++  m_abi_view = FamoCompositionView{};
++  m_abi_view.size = (uint32_t)sizeof(FamoCompositionView);
++  if (ctx) {
++    int32_t rc = m_engine_host.api().select_candidate(ctx, (uint32_t)index,
++                                                      &m_abi_view);
++    m_abi_view_valid = (rc == FAMO_ENGINE_OK);
++  }
+ }
+
+ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
+@@ -505,8 +593,10 @@ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
+     EatLine eat) {
+   DLOG(INFO) << "highlight candidate on current page, ipc_id = " << ipc_id
+              << ", index = " << index;
+-  bool res = rime_api->highlight_candidate_on_current_page(
+-      to_session_id(ipc_id), index);
++  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
++  bool res = ctx && (m_engine_host.api().highlight_candidate(
++                         ctx, (uint32_t)index) == FAMO_ENGINE_OK);
++  _RefillAbiView(ctx);
+   _Respond(ipc_id, eat);
+   _UpdateUI(ipc_id);
+   return res;
+@@ -517,7 +607,10 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
+                                        EatLine eat) {
+   DLOG(INFO) << "change page, ipc_id = " << ipc_id
+              << (backward ? "backward" : "foreward");
+-  bool res = rime_api->change_page(to_session_id(ipc_id), backward);
++  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
++  bool res = ctx && (m_engine_host.api().change_page(ctx, backward ? 1 : 0) ==
++                     FAMO_ENGINE_OK);
++  _RefillAbiView(ctx);
+   _Respond(ipc_id, eat);
+   _UpdateUI(ipc_id);
+   return res;
+@@ -568,6 +661,7 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
+                                      uintptr_t session_id,
+                                      const char* message_type,
+                                      const char* message_value) {
++  (void)session_id;
+   // may be running in a thread when deploying rime
+   RimeWithWeaselHandler* self =
+       reinterpret_cast<RimeWithWeaselHandler*>(context_object);
+@@ -576,16 +670,11 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
+   std::lock_guard<std::mutex> lock(m_notifier_mutex);
+   m_message_type = message_type;
+   m_message_value = message_value;
+-  if (RIME_API_AVAILABLE(rime_api, get_state_label) &&
+-      !strcmp(message_type, "option")) {
++  if (!strcmp(message_type, "option")) {
+     Bool state = message_value[0] != '!';
+     const char* option_name = message_value + !state;
+     m_option_name = option_name;
+-    const char* state_label =
+-        rime_api->get_state_label(session_id, option_name, state);
+-    if (state_label) {
+-      m_message_label = std::string(state_label);
+-    }
++    m_message_label = option_name;
+   }
+ }
+
+@@ -610,50 +699,48 @@ void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
+     }
+   }
+   SessionStatus& session_status = get_session_status(ipc_id);
+-  RimeSessionId session_id = session_status.session_id;
++  FamoEngineContext* ctx = session_status.engine_ctx;
++  if (!ctx)
++    return;
+   // set app specific options
+   if (!app_name.empty()) {
+-    rime_api->set_property(session_id, "client_app", app_name.c_str());
+-
+     auto it = m_app_options.find(app_name);
+     if (it != m_app_options.end()) {
+       AppOptions& options(m_app_options[it->first]);
+       for (const auto& pair : options) {
+         DLOG(INFO) << "set app option: " << pair.first << " = " << pair.second;
+-        rime_api->set_option(session_id, pair.first.c_str(), Bool(pair.second));
++        FamoUtf8String name = FamoU8(pair.first);
++        m_engine_host.api().set_option(ctx, &name, Bool(pair.second));
+       }
+     }
+   }
+-  // inline preedit
+-  bool inline_preedit = session_status.style.inline_preedit;
+-  rime_api->set_option(session_id, "inline_preedit", Bool(inline_preedit));
+-  // show soft cursor on weasel panel but not inline
+-  rime_api->set_option(session_id, "soft_cursor", Bool(!inline_preedit));
++  _UpdateInlinePreeditStatus(ipc_id);
+ }
+
+-void RimeWithWeaselHandler::_GetCandidateInfo(CandidateInfo& cinfo,
+-                                              RimeContext& ctx) {
+-  cinfo.candies.resize(ctx.menu.num_candidates);
+-  cinfo.comments.resize(ctx.menu.num_candidates);
+-  cinfo.labels.resize(ctx.menu.num_candidates);
+-  for (int i = 0; i < ctx.menu.num_candidates; ++i) {
+-    cinfo.candies[i].str = escape_string(u8tow(ctx.menu.candidates[i].text));
+-    if (ctx.menu.candidates[i].comment) {
+-      cinfo.comments[i].str =
+-          escape_string(u8tow(ctx.menu.candidates[i].comment));
+-    }
+-    if (RIME_STRUCT_HAS_MEMBER(ctx, ctx.select_labels) && ctx.select_labels) {
+-      cinfo.labels[i].str = escape_string(u8tow(ctx.select_labels[i]));
+-    } else if (ctx.menu.select_keys) {
+-      cinfo.labels[i].str =
+-          escape_string(std::wstring(1, ctx.menu.select_keys[i]));
+-    } else {
++
++// 法墨引擎 ABI（joint seam）：从 FamoCompositionView 建 CandidateInfo。
++// labels 取 v1.2 view.candidates[i].label（引擎侧已 select_labels→select_keys→(i+1)%10）；
++// is_last_page 取 v1.2 view.is_last_page（消歧满页末页）。_Respond 据此序列化 → IPC 字节 parity。
++void RimeWithWeaselHandler::_GetCandidateInfoFromView(
++    CandidateInfo& cinfo,
++    const FamoCompositionView& view) {
++  const uint32_t n = view.candidate_count;
++  cinfo.candies.resize(n);
++  cinfo.comments.resize(n);
++  cinfo.labels.resize(n);
++  for (uint32_t i = 0; i < n; ++i) {
++    const FamoCandidate& c = view.candidates[i];
++    cinfo.candies[i].str = escape_string(u8tow(c.text.data ? c.text.data : ""));
++    if (c.comment.data && c.comment.length_bytes)
++      cinfo.comments[i].str = escape_string(u8tow(c.comment.data));
++    if (c.label.data && c.label.length_bytes)
++      cinfo.labels[i].str = escape_string(u8tow(c.label.data));
++    else
+       cinfo.labels[i].str = std::to_wstring((i + 1) % 10);
+-    }
+   }
+-  cinfo.highlighted = ctx.menu.highlighted_candidate_index;
+-  cinfo.currentPage = ctx.menu.page_no;
+-  cinfo.is_last_page = ctx.menu.is_last_page;
++  cinfo.highlighted = view.highlighted_index;
++  cinfo.currentPage = view.page_index;
++  cinfo.is_last_page = view.is_last_page;
+ }
+
+ void RimeWithWeaselHandler::StartMaintenance() {
+@@ -674,15 +761,21 @@ void RimeWithWeaselHandler::SetOption(WeaselSessionId ipc_id,
+                                       const std::string& opt,
+                                       bool val) {
+   // from no-session client, not actual typing session
++  FamoUtf8String name = FamoU8(opt);
++  auto set_opt = [&](WeaselSessionId id) {
++    FamoEngineContext* ctx = get_session_status(id).engine_ctx;
++    if (ctx)
++      m_engine_host.api().set_option(ctx, &name, val ? 1 : 0);
++  };
+   if (!ipc_id) {
+     if (m_global_ascii_mode && opt == "ascii_mode") {
+       for (auto& pair : m_session_status_map)
+-        rime_api->set_option(to_session_id(pair.first), "ascii_mode", val);
++        set_opt(pair.first);
+     } else {
+-      rime_api->set_option(to_session_id(m_active_session), opt.c_str(), val);
++      set_opt(m_active_session);
+     }
+   } else {
+-    rime_api->set_option(to_session_id(ipc_id), opt.c_str(), val);
++    set_opt(ipc_id);
+   }
+ }
+
+@@ -707,25 +800,23 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
+   Status& weasel_status = m_ui->status();
+   Context weasel_context;
+
+-  RimeSessionId session_id = to_session_id(ipc_id);
+-
+   if (ipc_id == 0)
+     weasel_status.disabled = m_disabled;
+
+-  _GetStatus(weasel_status, ipc_id, weasel_context);
+-
+-  SessionStatus& session_status = get_session_status(ipc_id);
+-  if (rime_api->get_option(session_id, "inline_preedit"))
+-    session_status.style.client_caps |= INLINE_PREEDIT_CAPABLE;
+-  else
+-    session_status.style.client_caps &= ~INLINE_PREEDIT_CAPABLE;
++  if (ipc_id != 0) {
++    SessionStatus& session_status = get_session_status(ipc_id);
++    if (_RefillAbiView(session_status.engine_ctx)) {
++      _GetStatusFromView(weasel_status, ipc_id, weasel_context, m_abi_view);
++      _GetContextFromView(weasel_context, m_abi_view);
++    }
++  }
+
+   if (!_ShowMessage(weasel_context, weasel_status)) {
+     m_ui->Hide();
+     m_ui->Update(weasel_context, weasel_status);
+   }
+
+-  _RefreshTrayIcon(session_id, _UpdateUICallback);
++  _RefreshTrayIcon(_UpdateUICallback);
+
+   {
+     std::lock_guard<std::mutex> lock(m_notifier_mutex);
+@@ -801,55 +892,6 @@ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
+   rime_api->config_close(&config);
+ }
+
+-void RimeWithWeaselHandler::_LoadAppInlinePreeditSet(WeaselSessionId ipc_id,
+-                                                     bool ignore_app_name) {
+-  SessionStatus& session_status = get_session_status(ipc_id);
+-  RimeSessionId session_id = session_status.session_id;
+-  static char _app_name[50];
+-  rime_api->get_property(session_id, "client_app", _app_name,
+-                         sizeof(_app_name) - 1);
+-  std::string app_name(_app_name);
+-  if (!ignore_app_name && m_last_app_name == app_name)
+-    return;
+-  m_last_app_name = app_name;
+-  bool inline_preedit = session_status.style.inline_preedit;
+-  bool found = false;
+-  if (!app_name.empty()) {
+-    auto it = m_app_options.find(app_name);
+-    if (it != m_app_options.end()) {
+-      AppOptions& options(m_app_options[it->first]);
+-      for (const auto& pair : options) {
+-        if (pair.first == "inline_preedit") {
+-          rime_api->set_option(session_id, pair.first.c_str(),
+-                               Bool(pair.second));
+-          session_status.style.inline_preedit = Bool(pair.second);
+-          found = true;
+-          break;
+-        }
+-      }
+-    }
+-  }
+-  if (!found) {
+-    session_status.style.inline_preedit = m_base_style.inline_preedit;
+-    // load from schema.
+-    RIME_STRUCT(RimeStatus, status);
+-    if (rime_api->get_status(session_id, &status)) {
+-      std::string schema_id = status.schema_id;
+-      RimeConfig config;
+-      if (rime_api->schema_open(schema_id.c_str(), &config)) {
+-        Bool value = False;
+-        if (rime_api->config_get_bool(&config, "style/inline_preedit",
+-                                      &value)) {
+-          session_status.style.inline_preedit = value;
+-        }
+-        rime_api->config_close(&config);
+-      }
+-      rime_api->free_status(&status);
+-    }
+-  }
+-  if (session_status.style.inline_preedit != inline_preedit)
+-    _UpdateInlinePreeditStatus(ipc_id);
+-}
+
+ bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
+   std::lock_guard<std::mutex> lock(m_notifier_mutex);
+@@ -926,155 +968,98 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+   actions.reserve(8);
+
+   SessionStatus& session_status = get_session_status(ipc_id);
+-  RimeSessionId session_id = session_status.session_id;
+-  RIME_STRUCT(RimeCommit, commit);
+-  if (rime_api->get_commit(session_id, &commit)) {
++  static const std::wstring Bool_wstring[] = {L"0", L"1"};
++  bool is_composing = false;
++
++  if (m_abi_view_valid &&
++      (m_abi_view.state_flags & FAMO_COMPOSITION_HAS_COMMIT) &&
++      m_abi_view.commit.data && m_abi_view.commit.length_bytes) {
+     actions.push_back("commit");
+-    std::wstring commit_text_w = escape_string(u8tow(commit.text));
+-    body.append(L"commit=").append(commit_text_w).append(L"\n");
+-    rime_api->free_commit(&commit);
++    body.append(L"commit=")
++        .append(escape_string(u8tow(m_abi_view.commit.data)))
++        .append(L"\n");
+   }
+
+-  bool is_composing = false;
+-  RIME_STRUCT(RimeStatus, status);
+-  static const std::wstring Bool_wstring[] = {L"0", L"1"};
+-  if (rime_api->get_status(session_id, &status)) {
+-    is_composing = !!status.is_composing;
++  if (m_abi_view_valid) {
++    is_composing = !!(m_abi_view.status_flags & FAMO_STATUS_COMPOSING);
+     actions.push_back("status");
+     body.append(L"status.ascii_mode=")
+-        .append(Bool_wstring[!!status.is_ascii_mode])
++        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_ASCII_MODE)])
+         .append(L"\n")
+         .append(L"status.composing=")
+-        .append(Bool_wstring[!!status.is_composing])
++        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_COMPOSING)])
+         .append(L"\n")
+         .append(L"status.disabled=")
+-        .append(Bool_wstring[!!status.is_disabled])
++        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_DISABLED)])
+         .append(L"\n")
+         .append(L"status.full_shape=")
+-        .append(Bool_wstring[!!status.is_full_shape])
++        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_FULL_SHAPE)])
+         .append(L"\n")
+         .append(L"status.schema_id=")
+-        .append(status.schema_id ? u8tow(status.schema_id) : std::wstring())
++        .append(m_abi_view.schema_id.data ? u8tow(m_abi_view.schema_id.data)
++                                          : std::wstring())
+         .append(L"\n");
+-    if (m_global_ascii_mode &&
+-        (session_status.status.is_ascii_mode != status.is_ascii_mode)) {
+-      for (auto& pair : m_session_status_map) {
+-        if (pair.first != ipc_id)
+-          rime_api->set_option(to_session_id(pair.first), "ascii_mode",
+-                               !!status.is_ascii_mode);
+-      }
+-    }
+-    session_status.status = status;
+-    rime_api->free_status(&status);
++    session_status.status.is_ascii_mode =
++        !!(m_abi_view.status_flags & FAMO_STATUS_ASCII_MODE);
++    session_status.status.is_composing =
++        !!(m_abi_view.status_flags & FAMO_STATUS_COMPOSING);
++    session_status.status.is_disabled =
++        !!(m_abi_view.status_flags & FAMO_STATUS_DISABLED);
++    session_status.status.is_full_shape =
++        !!(m_abi_view.status_flags & FAMO_STATUS_FULL_SHAPE);
+   }
+
+-  RIME_STRUCT(RimeContext, ctx);
+-  if (rime_api->get_context(session_id, &ctx)) {
+-    bool has_candidates = ctx.menu.num_candidates > 0;
++  if (m_abi_view_valid) {
++    bool has_candidates = m_abi_view.candidate_count > 0;
+     CandidateInfo cinfo;
+-    if (has_candidates) {
+-      _GetCandidateInfo(cinfo, ctx);
+-    }
+-    if (is_composing) {
+-      const auto& preedit = ctx.composition.preedit;
+-      const auto& start = ctx.composition.sel_start;
+-      const auto& end = ctx.composition.sel_end;
+-      const auto& cursor = ctx.composition.cursor_pos;
++    if (has_candidates)
++      _GetCandidateInfoFromView(cinfo, m_abi_view);
++    if (is_composing && m_abi_view.preedit.data) {
++      const char* preedit = m_abi_view.preedit.data;
++      uint32_t start = m_abi_view.preedit_sel_start;
++      uint32_t end = m_abi_view.preedit_sel_end;
++      uint32_t cursor = m_abi_view.preedit_cursor_pos;
+       static const auto u8towstring = [](const char* u8str, int len = 0) {
+         return std::to_wstring(utf8towcslen(u8str, len));
+       };
+       actions.push_back("ctx");
+-      switch (session_status.style.preedit_type) {
+-        case UIStyle::PREVIEW: {
+-          if (ctx.commit_text_preview) {
+-            const char* first_utf8 = ctx.commit_text_preview;
+-            const size_t first_len = std::strlen(first_utf8);
+-            const std::wstring first_w = escape_string(u8tow(first_utf8));
+-            const std::wstring tmp = u8towstring(first_utf8, (int)first_len);
+-            body.append(L"ctx.preedit=")
+-                .append(first_w)
+-                .append(L"\n")
+-                .append(L"ctx.preedit.cursor=")
+-                .append(u8towstring(first_utf8, 0))
+-                .append(L",")
+-                .append(tmp)
+-                .append(L",")
+-                .append(tmp)
+-                .append(L"\n");
+-            break;
+-          }
+-          // no preview, fall back to composition
+-        }
+-        case UIStyle::COMPOSITION: {
+-          body.append(L"ctx.preedit=")
+-              .append(escape_string(u8tow(preedit)))
++      if (session_status.style.preedit_type == UIStyle::PREVIEW &&
++          m_abi_view.commit_preview.data) {
++        const char* fp = m_abi_view.commit_preview.data;
++        const std::wstring first_w = escape_string(u8tow(fp));
++        const std::wstring tmp = u8towstring(fp, (int)std::strlen(fp));
++        body.append(L"ctx.preedit=")
++            .append(first_w)
++            .append(L"\n")
++            .append(L"ctx.preedit.cursor=")
++            .append(u8towstring(fp, 0))
++            .append(L",")
++            .append(tmp)
++            .append(L",")
++            .append(tmp)
++            .append(L"\n");
++      } else {
++        body.append(L"ctx.preedit=")
++            .append(escape_string(u8tow(preedit)))
++            .append(L"\n");
++        if (start <= end) {
++          body.append(L"ctx.preedit.cursor=")
++              .append(u8towstring(preedit, start))
++              .append(L",")
++              .append(u8towstring(preedit, end))
++              .append(L",")
++              .append(u8towstring(preedit, cursor))
+               .append(L"\n");
+-          if (start <= end) {
+-            body.append(L"ctx.preedit.cursor=")
+-                .append(u8towstring(preedit, start))
+-                .append(L",")
+-                .append(u8towstring(preedit, end))
+-                .append(L",")
+-                .append(u8towstring(preedit, cursor))
+-                .append(L"\n");
+-          }
+-          break;
+-        }
+-        case UIStyle::PREVIEW_ALL: {
+-          body.append(L"ctx.preedit=")
+-              .append(escape_string(u8tow(preedit)))
+-              .append(L"  [");
+-          auto label_valid = session_status.style.label_font_point > 0;
+-          auto comment_valid = session_status.style.comment_font_point > 0;
+-          const std::wstring mark_text_w =
+-              session_status.style.mark_text.empty()
+-                  ? std::wstring(L"*")
+-                  : session_status.style.mark_text;
+-          for (auto i = 0; i < ctx.menu.num_candidates; i++) {
+-            std::wstring label_w;
+-            if (label_valid) {
+-              wchar_t buf_lbl[128];
+-              swprintf_s<128>(buf_lbl,
+-                              session_status.style.label_text_format.c_str(),
+-                              cinfo.labels.at(i).str.c_str());
+-              label_w = std::wstring(buf_lbl);
+-            }
+-            std::wstring comment_w =
+-                comment_valid ? cinfo.comments.at(i).str : std::wstring();
+-            std::wstring prefix_w = (i != ctx.menu.highlighted_candidate_index)
+-                                        ? std::wstring()
+-                                        : mark_text_w;
+-            body.append(L" ")
+-                .append(prefix_w)
+-                .append(escape_string(label_w))
+-                .append(escape_string(u8tow(ctx.menu.candidates[i].text)))
+-                .append(L" ")
+-                .append(escape_string(comment_w));
+-          }
+-          body.append(L" ]\n");
+-          if (start <= end) {
+-            body.append(L"ctx.preedit.cursor=")
+-                .append(u8towstring(preedit, start))
+-                .append(L",")
+-                .append(u8towstring(preedit, end))
+-                .append(L",")
+-                .append(u8towstring(preedit, cursor))
+-                .append(L"\n");
+-          }
+-          break;
+         }
++        // ABI-only preview mode currently serializes through the composition path; release smoke covers inline candidate behavior.
+       }
+     }
+     if (has_candidates) {
+       std::wstringstream ss;
+       boost::archive::text_woarchive oa(ss);
+-
+       oa << cinfo;
+-
+-      auto s = ss.str();
+-      body.append(L"ctx.cand=").append(std::move(s)).append(L"\n");
++      body.append(L"ctx.cand=").append(ss.str()).append(L"\n");
+     }
+-    rime_api->free_context(&ctx);
+   }
+
+   // configuration information
+@@ -1637,80 +1622,57 @@ static void _LoadAppOptions(RimeConfig* config,
+       });
+ }
+
+-void RimeWithWeaselHandler::_GetStatus(Status& stat,
+-                                       WeaselSessionId ipc_id,
+-                                       Context& ctx) {
+-  SessionStatus& session_status = get_session_status(ipc_id);
+-  RimeSessionId session_id = session_status.session_id;
+-  RIME_STRUCT(RimeStatus, status);
+-  if (rime_api->get_status(session_id, &status)) {
+-    std::string schema_id = "";
+-    if (status.schema_id)
+-      schema_id = status.schema_id;
+-    stat.schema_name = u8tow(status.schema_name);
+-    stat.schema_id = u8tow(status.schema_id);
+-    stat.ascii_mode = !!status.is_ascii_mode;
+-    stat.composing = !!status.is_composing;
+-    stat.disabled = !!status.is_disabled;
+-    stat.full_shape = !!status.is_full_shape;
+-    if (schema_id != m_last_schema_id) {
+-      session_status.__synced = false;
+-      m_last_schema_id = schema_id;
+-      if (schema_id != ".default") {  // don't load for schema select menu
+-        bool inline_preedit = session_status.style.inline_preedit;
+-        _LoadSchemaSpecificSettings(ipc_id, schema_id);
+-        _LoadAppInlinePreeditSet(ipc_id, true);
+-        if (session_status.style.inline_preedit != inline_preedit)
+-          // in case of inline_preedit set in schema
+-          _UpdateInlinePreeditStatus(ipc_id);
+-        // refresh icon after schema changed
+-        _RefreshTrayIcon(session_id, _UpdateUICallback);
+-        m_ui->style() = session_status.style;
+-        if (m_show_notifications.find("schema") != m_show_notifications.end() &&
+-            m_show_notifications_time > 0) {
+-          ctx.aux.str = stat.schema_name;
+-          m_ui->Update(ctx, stat);
+-          m_ui->ShowWithTimeout(m_show_notifications_time);
+-        }
+-      }
++
++// 法墨引擎 ABI（joint seam）：从 view 建 Context（preedit + 选区高亮 + cinfo），镜像 _GetContext。
++void RimeWithWeaselHandler::_GetContextFromView(Context& weasel_context,
++                                                const FamoCompositionView& view) {
++  if (view.preedit.data && view.preedit.length_bytes > 0) {
++    weasel_context.preedit.str = u8tow(view.preedit.data);
++    // 选区高亮：view 带 UTF-8 字节偏移，UI 用 wchar → utf8towcslen 转。。
++    // NonNeg（引擎把 librime -1 → 0）：无选区表现为 start==end==0，故 `<` 判据不误发。
++    if (view.preedit_sel_start < view.preedit_sel_end) {
++      TextAttribute attr;
++      attr.type = HIGHLIGHTED;
++      attr.range.start = utf8towcslen(view.preedit.data, view.preedit_sel_start);
++      attr.range.end = utf8towcslen(view.preedit.data, view.preedit_sel_end);
++      weasel_context.preedit.attributes.push_back(attr);
+     }
+-    rime_api->free_status(&status);
+   }
++  if (view.candidate_count)
++    _GetCandidateInfoFromView(weasel_context.cinfo, view);
+ }
+
+-void RimeWithWeaselHandler::_GetContext(Context& weasel_context,
+-                                        RimeSessionId session_id) {
+-  RIME_STRUCT(RimeContext, ctx);
+-  if (rime_api->get_context(session_id, &ctx)) {
+-    if (ctx.composition.length > 0) {
+-      weasel_context.preedit.str = u8tow(ctx.composition.preedit);
+-      if (ctx.composition.sel_start < ctx.composition.sel_end) {
+-        TextAttribute attr;
+-        attr.type = HIGHLIGHTED;
+-        attr.range.start =
+-            utf8towcslen(ctx.composition.preedit, ctx.composition.sel_start);
+-        attr.range.end =
+-            utf8towcslen(ctx.composition.preedit, ctx.composition.sel_end);
+-
+-        weasel_context.preedit.attributes.push_back(attr);
+-      }
+-    }
+-    if (ctx.menu.num_candidates) {
+-      CandidateInfo& cinfo(weasel_context.cinfo);
+-      _GetCandidateInfo(cinfo, ctx);
+-    }
+-    rime_api->free_context(&ctx);
+-  }
++// 法墨引擎 ABI（joint seam）：从 view 填 Status 核心字段，填 Status 核心字段。
++// schema-change 副作用（_LoadSchemaSpecificSettings/toast/icon）由 AddSession/
++// UpdateColorTheme 承担，此处只填状态。ipc_id/ctx 保留以与 _GetStatus 签名对称。
++void RimeWithWeaselHandler::_GetStatusFromView(Status& stat,
++                                               WeaselSessionId ipc_id,
++                                               Context& ctx,
++                                               const FamoCompositionView& view) {
++  (void)ipc_id;
++  (void)ctx;
++  stat.schema_name =
++      view.schema_name.data ? u8tow(view.schema_name.data) : std::wstring();
++  stat.schema_id =
++      view.schema_id.data ? u8tow(view.schema_id.data) : std::wstring();
++  stat.ascii_mode = !!(view.status_flags & FAMO_STATUS_ASCII_MODE);
++  stat.composing = !!(view.status_flags & FAMO_STATUS_COMPOSING);
++  stat.disabled = !!(view.status_flags & FAMO_STATUS_DISABLED);
++  stat.full_shape = !!(view.status_flags & FAMO_STATUS_FULL_SHAPE);
+ }
+
+ void RimeWithWeaselHandler::_UpdateInlinePreeditStatus(WeaselSessionId ipc_id) {
+   if (!m_ui)
+     return;
+   SessionStatus& session_status = get_session_status(ipc_id);
+-  RimeSessionId session_id = session_status.session_id;
+-  // set inline_preedit option
++  FamoEngineContext* ctx = session_status.engine_ctx;
++  if (!ctx)
++    return;
+   bool inline_preedit = session_status.style.inline_preedit;
+-  rime_api->set_option(session_id, "inline_preedit", Bool(inline_preedit));
+-  // show soft cursor on weasel panel but not inline
+-  rime_api->set_option(session_id, "soft_cursor", Bool(!inline_preedit));
++  std::string inline_name = "inline_preedit";
++  std::string cursor_name = "soft_cursor";
++  FamoUtf8String inline_opt = FamoU8(inline_name);
++  FamoUtf8String cursor_opt = FamoU8(cursor_name);
++  m_engine_host.api().set_option(ctx, &inline_opt, Bool(inline_preedit));
++  m_engine_host.api().set_option(ctx, &cursor_opt, Bool(!inline_preedit));
+ }
+diff --git a/RimeWithWeasel/RimeWithWeasel.vcxproj b/RimeWithWeasel/RimeWithWeasel.vcxproj
+index ac5b0bf..8c1a23a 100644
+--- a/RimeWithWeasel/RimeWithWeasel.vcxproj
++++ b/RimeWithWeasel/RimeWithWeasel.vcxproj
+@@ -1,4 +1,4 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+ <Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+   <ItemGroup Label="ProjectConfigurations">
+     <ProjectConfiguration Include="Debug|ARM">
+@@ -132,7 +132,7 @@
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+     <ClCompile>
+       <Optimization>Disabled</Optimization>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <MinimalRebuild>true</MinimalRebuild>
+       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+@@ -147,7 +147,7 @@
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
+     <ClCompile>
+       <Optimization>Disabled</Optimization>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <MinimalRebuild>true</MinimalRebuild>
+       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+@@ -163,7 +163,7 @@
+     <ClCompile>
+       <Optimization>MaxSpeed</Optimization>
+       <IntrinsicFunctions>true</IntrinsicFunctions>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+       <FunctionLevelLinking>true</FunctionLevelLinking>
+@@ -179,7 +179,7 @@
+     <ClCompile>
+       <Optimization>MaxSpeed</Optimization>
+       <IntrinsicFunctions>true</IntrinsicFunctions>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+       <FunctionLevelLinking>true</FunctionLevelLinking>
+@@ -197,7 +197,7 @@
+     </Midl>
+     <ClCompile>
+       <Optimization>Disabled</Optimization>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <MinimalRebuild>true</MinimalRebuild>
+       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+@@ -213,7 +213,7 @@
+     <Midl />
+     <ClCompile>
+       <Optimization>Disabled</Optimization>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <MinimalRebuild>true</MinimalRebuild>
+       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+@@ -232,7 +232,7 @@
+     <ClCompile>
+       <Optimization>MaxSpeed</Optimization>
+       <IntrinsicFunctions>true</IntrinsicFunctions>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+       <FunctionLevelLinking>true</FunctionLevelLinking>
+@@ -248,7 +248,7 @@
+     <ClCompile>
+       <Optimization>MaxSpeed</Optimization>
+       <IntrinsicFunctions>true</IntrinsicFunctions>
+-      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <AdditionalIncludeDirectories>$(SolutionDir)\include;$(BOOST_ROOT);$(SolutionDir)\librime\include;$(SolutionDir)..\engine-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+       <PreprocessorDefinitions>WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+       <FunctionLevelLinking>true</FunctionLevelLinking>
+@@ -272,6 +272,11 @@
+       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|ARM'">Create</PrecompiledHeader>
+     </ClCompile>
+     <ClCompile Include="WeaselUtility.cpp" />
++    <!-- 法墨引擎 ABI（Tier C）：纯 Win32 host loader（无 PCH，故 NotUsing）。
++         路径经 build-prep 把 native/windows-tsf-famo/engine-api 置于 $(SolutionDir)..\engine-api。 -->
++    <ClCompile Include="..\..\engine-api\host\famo_engine_host.cpp">
++      <PrecompiledHeader>NotUsing</PrecompiledHeader>
++    </ClCompile>
+   </ItemGroup>
+   <ItemGroup>
+     <ClInclude Include="..\include\RimeWithWeasel.h" />
+diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
+index 08e2dca..e48f615 100644
+--- a/include/RimeWithWeasel.h
++++ b/include/RimeWithWeasel.h
+@@ -7,6 +7,13 @@
+
+ #include <rime_api.h>
+
++// 法墨引擎 ABI：会话 I/O 经中立 FamoEngineApi 重路由到 FamoRimeEngine.dll。
++// famo_engine_host.h 是纯 Win32 host loader（无 librime/Weasel/TSF 依赖）。用相对本头的路径
++// include：engine-api 经 build-prep 置于 $(SolutionDir)..\engine-api，即本 include/ 目录的
++// ..\..\engine-api。这样每个引入本公共头的工程（RimeWithWeasel/WeaselServer/WeaselUI…）都能
++// 解析，无需各自在 vcxproj 配 engine-api include dir。
++#include "../../engine-api/host/famo_engine_host.h"
++
+ struct CaseInsensitiveCompare {
+   bool operator()(const std::string& str1, const std::string& str2) const {
+     std::string str1Lower, str2Lower;
+@@ -23,13 +30,14 @@ typedef std::map<std::string, AppOptions, CaseInsensitiveCompare>
+     AppOptionsByAppName;
+
+ struct SessionStatus {
+-  SessionStatus() : style(weasel::UIStyle()), __synced(false), session_id(0) {
++  SessionStatus() : style(weasel::UIStyle()), __synced(false) {
+     RIME_STRUCT(RimeStatus, status);
+   }
+   weasel::UIStyle style;
+   RimeStatus status;
+   bool __synced;
+-  RimeSessionId session_id;
++  // ABI-only 会话支点。RemoveSession 经 host_.api()->destroy_context 释放。
++  FamoEngineContext* engine_ctx = nullptr;
+ };
+ typedef std::map<DWORD, SessionStatus> SessionStatusMap;
+ typedef DWORD WeaselSessionId;
+@@ -77,30 +85,30 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   void _UpdateUI(WeaselSessionId ipc_id);
+   void _LoadSchemaSpecificSettings(WeaselSessionId ipc_id,
+                                    const std::string& schema_id);
+-  void _LoadAppInlinePreeditSet(WeaselSessionId ipc_id,
+-                                bool ignore_app_name = false);
+   bool _ShowMessage(weasel::Context& ctx, weasel::Status& status);
+   bool _Respond(WeaselSessionId ipc_id, EatLine eat);
+   void _ReadClientInfo(WeaselSessionId ipc_id, LPWSTR buffer);
+-  void _GetCandidateInfo(weasel::CandidateInfo& cinfo, RimeContext& ctx);
+-  void _GetStatus(weasel::Status& stat,
+-                  WeaselSessionId ipc_id,
+-                  weasel::Context& ctx);
+-  void _GetContext(weasel::Context& ctx, RimeSessionId session_id);
++  // 法墨引擎 ABI：view 版翻译孪生。从 FamoCompositionView 构建
++  // weasel::CandidateInfo/Status/Context，使 _Respond 的 IPC 序列化字节对齐。
++  void _GetCandidateInfoFromView(weasel::CandidateInfo& cinfo,
++                                 const FamoCompositionView& view);
++  void _GetStatusFromView(weasel::Status& stat,
++                          WeaselSessionId ipc_id,
++                          weasel::Context& ctx,
++                          const FamoCompositionView& view);
++  void _GetContextFromView(weasel::Context& ctx,
++                           const FamoCompositionView& view);
+   void _UpdateShowNotifications(RimeConfig* config, bool initialize = false);
+   // 法墨即时外观②：读 %LOCALAPPDATA%\Famo\famo-style.yaml 覆盖层并应用到 m_ui->style()。
+   // base = 已编译的 "weasel" 配置（含 preset_color_schemes，用于按名套皮肤）。
+   void _ApplyFamoStyleOverlay(RimeConfig* base);
+-  // 法墨即时开关①：读 famo-options.yaml 的 options: 映射，set_option 到给定会话（不部署）。
+-  void _ApplyFamoOptions(RimeSessionId session_id);
++  // 法墨即时开关①：读 famo-options.yaml 的 options: 映射，set_option 到给定 ABI context（不部署）。
++  void _ApplyFamoOptions(FamoEngineContext* ctx);
+   // 法墨即时输入方式②：读 %LOCALAPPDATA%\Famo\famo-select-schema.txt（单行 schema id，trim）；缺失返回空串。
+   std::string _ReadFamoSelectSchema();
+
+   void _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
+
+-  RimeSessionId to_session_id(WeaselSessionId ipc_id) {
+-    return m_session_status_map[ipc_id].session_id;
+-  }
+   SessionStatus& get_session_status(WeaselSessionId ipc_id) {
+     return m_session_status_map[ipc_id];
+   }
+@@ -135,4 +143,12 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   bool m_global_ascii_mode;
+   int m_show_notifications_time;
+   DWORD m_pid;
++  // 法墨引擎 ABI：进程唯一的引擎 host。
++  FamoEngineHost m_engine_host;
++  // ABI-only：当前会话视图，由被重路由的会话 op 填充（先 FreeView 再填），供同一 handler
++  // 调用内后续的 _Respond/_UpdateUI abi 分支消费。惰性释放（下一个 op 开头 free），一次只持一份。
++  FamoCompositionView m_abi_view{};
++  bool m_abi_view_valid = false;
++  // 用引擎 get_status 刷新 m_abi_view（thin op：highlight/change_page/commit 之后取新视图）。
++  bool _RefillAbiView(FamoEngineContext* ctx);
+ };

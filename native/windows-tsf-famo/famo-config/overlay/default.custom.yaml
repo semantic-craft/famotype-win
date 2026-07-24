@@ -1,0 +1,43 @@
+# default.custom.yaml — 法墨 Windows (Famo) 共享默认配置 · rime-ice 底座
+# 以「打补丁」方式覆盖 rime-ice 的 default.yaml。落 %LOCALAPPDATA%\Famo\，
+# 在法墨设置面板「重新部署」或 FamoDeploy /deploy 生效。引擎无关。
+#
+# 底座 = iDvel/rime-ice（雾凇拼音全套）+ KyleBing/rime-wubi86-jidian（极点五笔86 四变体）。
+# 不含任何法学层(已整体放弃，见 UPSTREAM-SYNC)。
+#
+# 出处对照：store 字段 → 本文件键 见同目录 CONFIG-MAPPING.md §①。
+# 法墨拍板：雾凇拼音优先（首项 rime_ice = 开机默认方案）。pinyin_simp 不在列表（仅作五笔反查词典存在）。
+#
+# 切片③「无方案概念」：去掉 IME 内 F4/Ctrl+` 方案选单（switcher/hotkeys 置空）。schema_list 仍保留全套，
+# 但**不再是用户可见的方案菜单**，仅作两用途：①首项=开机默认；②供切片② select_schema 的可切目标
+# （所有 prism 首启编译，秒切前提）。用户切输入方式只在 WinUI 设置面板「输入方式」页（拼音/双拼/五笔）。
+
+patch:
+  # 去 F4 / Ctrl+` 方案选单：清空 switcher 热键，IME 内不再弹「方案选单」。
+  # 注：仅去菜单，不动 switcher/save_options（中英/简繁等选项仍跨重启持久）。切换由 WinUI + select_schema 承担。
+  switcher/hotkeys: []
+
+  # schema_list：select_schema 的可切目标 + 编译目标（非用户可见菜单）。首项 rime_ice = 开机默认。
+  #   雾凇全拼（默认）→ 极点五笔86 → 小鹤双拼 → 九键 → 五笔三变体 → 其余双拼变体。
+  schema_list:
+    - schema: rime_ice                  # 雾凇拼音·全拼（默认，主力）
+    - schema: wubi86_jidian             # 极点五笔86（KyleBing）
+    - schema: double_pinyin_flypy       # 小鹤双拼（最流行的双拼布局）
+    - schema: t9                        # 中文九键
+    - schema: wubi86_jidian_pinyin      # 极点五笔·拼音混输
+    - schema: wubi86_jidian_trad        # 极点五笔·简入繁出
+    - schema: wubi86_jidian_trad_pinyin # 极点五笔·拼音混输·简入繁出
+    - schema: double_pinyin             # 自然码双拼
+    - schema: double_pinyin_mspy        # 微软双拼
+    - schema: double_pinyin_sogou       # 搜狗双拼
+    - schema: double_pinyin_abc         # 智能 ABC 双拼
+    - schema: double_pinyin_ziguang     # 紫光双拼
+    - schema: double_pinyin_jiajia      # 拼音加加双拼
+
+  # 候选词个数：rime-ice 默认 5；法墨调为 8，更接近主流输入法一屏候选量。
+  # 注：若某 schema 自带 menu/page_size 会就近覆盖此全局值。
+  menu/page_size: 8
+
+  # 左右 Shift 都切中英：rime-ice 默认只给 Shift_L 绑 commit_code、Shift_R=noop（右 Shift 失效）。
+  # 法墨对齐主流输入法（搜狗/微信），让 Shift_R 同 Shift_L → 左右 Shift 都能切换中/英文。
+  ascii_composer/switch_key/Shift_R: commit_code

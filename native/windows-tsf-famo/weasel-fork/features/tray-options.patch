@@ -1,0 +1,130 @@
+diff --git a/WeaselServer/WeaselServerApp.cpp b/WeaselServer/WeaselServerApp.cpp
+index 29281bf..54abad2 100644
+--- a/WeaselServer/WeaselServerApp.cpp
++++ b/WeaselServer/WeaselServerApp.cpp
+@@ -53,6 +53,9 @@ int WeaselServerApp::Run() {
+   m_status_bar.Bind([this](const std::string& opt, bool val) {
+     m_handler->SetOption(0, opt, val);
+   });
++  // 法墨：托盘右键菜单的开关勾选态读 FamoStatusBar 影子态（与悬浮状态栏同一真相源）。
++  tray_icon.SetOptionQuery(
++      [this](const std::string& opt) { return m_status_bar.QueryOption(opt); });
+   // 拖动位置持久化：%LOCALAPPDATA%\Famo\famo-statusbar.txt（跨会话记住）。
+   m_status_bar.SetStatePath((WeaselUserDataPath() / L"famo-statusbar.txt").wstring());
+   if (m_status_bar.CreateBar(m_server.GetHWnd()))
+@@ -184,6 +187,25 @@ void WeaselServerApp::SetupMenuHandlers() {
+                           std::bind(explore, WeaselUserDataPath()));
+   m_server.AddMenuHandler(ID_WEASELTRAY_LOGDIR,
+                           std::bind(explore, WeaselLogPath()));
++
++  // 法墨：托盘右键菜单「中英文 / 中英标点 / 简繁 / 全半角」即时开关 —— 经 FamoStatusBar::ToggleOption
++  // 翻转并直达 RimeWithWeaselHandler::SetOption（零部署即时生效，与悬浮状态栏共用单一真相源）。
++  auto toggle = [this](const char* opt) {
++    m_status_bar.ToggleOption(opt);
++    return true;
++  };
++  m_server.AddMenuHandler(ID_WEASELTRAY_OPT_ASCII_MODE,
++                          [toggle] { return toggle("ascii_mode"); });
++  m_server.AddMenuHandler(ID_WEASELTRAY_OPT_ASCII_PUNCT,
++                          [toggle] { return toggle("ascii_punct"); });
++  m_server.AddMenuHandler(ID_WEASELTRAY_OPT_TRADITIONALIZE,
++                          [toggle] { return toggle("traditionalization"); });
++  m_server.AddMenuHandler(ID_WEASELTRAY_OPT_FULL_SHAPE,
++                          [toggle] { return toggle("full_shape"); });
++  m_server.AddMenuHandler(ID_WEASELTRAY_FAMO_STATUS_BAR, [this] {
++    m_status_bar.ShowOnFocus();
++    return true;
++  });
+ }
+ 
+ void WeaselServerApp::ensure_deployed() {
+diff --git a/WeaselServer/WeaselTrayIcon.cpp b/WeaselServer/WeaselTrayIcon.cpp
+index 119111a..e710db2 100644
+--- a/WeaselServer/WeaselTrayIcon.cpp
++++ b/WeaselServer/WeaselTrayIcon.cpp
+@@ -17,7 +17,41 @@ WeaselTrayIcon::WeaselTrayIcon(weasel::UI& ui)
+       m_schema_ascii_icon(),
+       m_disabled(false) {}
+ 
+-void WeaselTrayIcon::CustomizeMenu(HMENU hMenu) {}
++void WeaselTrayIcon::CustomizeMenu(HMENU hMenu) {
++  // 法墨：在右键菜单顶部追加 macOS 输入法菜单核心项。4 个即时开关用动作型标题
++  //（「切换至...」「使用...」）反映点击后的结果，而不是显示 Windows 状态型勾选项。
++  // 点击经 WeaselServerApp 的 handler 直达 FamoStatusBar::ToggleOption →
++  // RimeWithWeaselHandler::SetOption（零部署即时生效）。未注入查询时按关闭态生成菜单，
++  // 仍不得回退到上游 Weasel 资源菜单。
++  // 上游资源菜单包含词典、同步、帮助、检查更新等旧 Weasel 项；法墨托盘菜单
++  // 必须从空菜单重建，避免出现已移除/未实现的可点击项。
++  while (::GetMenuItemCount(hMenu) > 0)
++    ::DeleteMenu(hMenu, 0, MF_BYPOSITION);
++  int pos = 0;
++  auto add_toggle = [&](UINT id, const char* opt, const wchar_t* off_text,
++                        const wchar_t* on_text) {
++    const bool enabled = m_option_query ? m_option_query(opt) : false;
++    const wchar_t* text = enabled ? on_text : off_text;
++    ::InsertMenuW(hMenu, pos++, MF_BYPOSITION | MF_STRING, id, text);
++  };
++  auto add_action = [&](UINT id, const wchar_t* text) {
++    ::InsertMenuW(hMenu, pos++, MF_BYPOSITION | MF_STRING, id, text);
++  };
++  add_toggle(ID_WEASELTRAY_OPT_ASCII_MODE, "ascii_mode", L"切换至英文输入",
++             L"切换至中文输入");
++  add_toggle(ID_WEASELTRAY_OPT_TRADITIONALIZE, "traditionalization",
++             L"切换至繁体输入", L"切换至简体输入");
++  add_toggle(ID_WEASELTRAY_OPT_ASCII_PUNCT, "ascii_punct",
++             L"使用英文标点符号", L"使用中文标点符号");
++  add_toggle(ID_WEASELTRAY_OPT_FULL_SHAPE, "full_shape", L"使用全角输入",
++             L"使用半角输入");
++  ::InsertMenuW(hMenu, pos++, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
++  add_action(ID_WEASELTRAY_SETTINGS, L"设置…");
++  add_action(ID_WEASELTRAY_FAMO_STATUS_BAR, L"显示悬浮状态条");
++  ::InsertMenuW(hMenu, pos++, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr);
++  add_action(ID_WEASELTRAY_DEPLOY, L"刷新配置");
++  add_action(ID_WEASELTRAY_QUIT, L"退出");
++}
+ 
+ BOOL WeaselTrayIcon::Create(HWND hTargetWnd) {
+   HMODULE hModule = GetModuleHandle(NULL);
+diff --git a/WeaselServer/WeaselTrayIcon.h b/WeaselServer/WeaselTrayIcon.h
+index 42d407a..6204144 100644
+--- a/WeaselServer/WeaselTrayIcon.h
++++ b/WeaselServer/WeaselTrayIcon.h
+@@ -2,9 +2,18 @@
+ #include <WeaselUI.h>
+ #include <WeaselIPC.h>
+ #include "SystemTraySDK.h"
++#include <functional>
++#include <string>
+ 
+ #define WM_WEASEL_TRAY_NOTIFY (WEASEL_IPC_LAST_COMMAND + 100)
++
++// 法墨：运行时插入的托盘菜单 command ID；不是 .rc 静态资源项。
++#define ID_WEASELTRAY_OPT_ASCII_MODE        40020
++#define ID_WEASELTRAY_OPT_ASCII_PUNCT       40021
++#define ID_WEASELTRAY_OPT_TRADITIONALIZE    40022
++#define ID_WEASELTRAY_OPT_FULL_SHAPE        40023
++#define ID_WEASELTRAY_FAMO_STATUS_BAR       40027
+ 
+ class WeaselTrayIcon : public CSystemTray {
+  public:
+   enum WeaselTrayMode {
+@@ -19,6 +31,12 @@ class WeaselTrayIcon : public CSystemTray {
+   BOOL Create(HWND hTargetWnd);
+   void Refresh();
+ 
++  // 法墨：注入「即时开关查询」（读 FamoStatusBar 影子态），供右键菜单显示动态动作标题。
++  // 未注入时右键菜单仍按关闭态生成开关项，避免回退到上游 Weasel 资源菜单。
++  void SetOptionQuery(std::function<bool(const std::string&)> query) {
++    m_option_query = std::move(query);
++  }
++
+  protected:
+   virtual void CustomizeMenu(HMENU hMenu);
+ 
+@@ -28,4 +46,6 @@ class WeaselTrayIcon : public CSystemTray {
+   std::wstring m_schema_zhung_icon;
+   std::wstring m_schema_ascii_icon;
+   bool m_disabled;
++  // 法墨：即时开关查询回调（opt 名 -> 当前是否开）。由 WeaselServerApp 注入。
++  std::function<bool(const std::string&)> m_option_query;
+ };

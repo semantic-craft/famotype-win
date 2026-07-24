@@ -1,0 +1,208 @@
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index 12d401f..834e2ba 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -223,6 +223,12 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+       return 0;
+   }
+   RimeSessionId session_id = (RimeSessionId)rime_api->create_session();
++  // 法墨即时输入方式②：新会话即采用 famo-select-schema.txt 所选方案 → 输入方式跨 App/重启持久（不部署）。
++  {
++    std::string sel = _ReadFamoSelectSchema();
++    if (!sel.empty())
++      rime_api->select_schema(session_id, sel.c_str());
++  }
+   if (m_global_ascii_mode) {
+     for (const auto& pair : m_session_status_map) {
+       if (pair.first) {
+@@ -411,6 +417,30 @@ void RimeWithWeaselHandler::ReloadOptions() {
+     _UpdateUI(m_active_session);  // 中英/简繁等状态变化即时反映到候选窗/状态栏
+ }
+ 
++std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
++  // 读 famo-select-schema.txt（单行 schema id），trim 前后空白/换行；缺失或空返回空串。
++  std::string s = _ReadFamoFile(L"famo-select-schema.txt");
++  size_t b = s.find_first_not_of(" \t\r\n");
++  if (b == std::string::npos)
++    return std::string();
++  size_t e = s.find_last_not_of(" \t\r\n");
++  return s.substr(b, e - b + 1);
++}
++
++void RimeWithWeaselHandler::SelectSchema() {
++  // 法墨即时输入方式②：读 famo-select-schema.txt，select_schema 到所有活动会话（不部署、不重建 prism）。
++  LOG(INFO) << "Famo: SelectSchema (instant schema switch, no deploy).";
++  if (m_disabled)
++    return;
++  std::string id = _ReadFamoSelectSchema();
++  if (id.empty())
++    return;
++  for (auto& pair : m_session_status_map)
++    rime_api->select_schema(to_session_id(pair.first), id.c_str());
++  if (m_active_session)
++    _UpdateUI(m_active_session);  // 切到新方案后即时刷新候选窗/状态栏
++}
++
+ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
+                                             WeaselSessionId ipc_id,
+                                             EatLine eat) {
+diff --git a/WeaselDeployer/WeaselDeployer.cpp b/WeaselDeployer/WeaselDeployer.cpp
+index daefe0c..a8c04bd 100644
+--- a/WeaselDeployer/WeaselDeployer.cpp
++++ b/WeaselDeployer/WeaselDeployer.cpp
+@@ -75,6 +75,7 @@ static int Run(LPTSTR lpCmdLine) {
+                  L"/deploy		- Update Workspace\n"
+                  L"/reloadstyle	- Reload famo-style.yaml overlay (no deploy)\n"
+                  L"/reloadoptions	- Reload famo-options.yaml switches (no deploy)\n"
++                 L"/selectschema	- Select schema from famo-select-schema.txt (no deploy)\n"
+                  L"/dict		- Manage dictionary\n"
+                  L"/sync		- Sync user data\n"
+                  L"/install		- Install Weasel (Initial deployment)",
+@@ -102,6 +103,15 @@ static int Run(LPTSTR lpCmdLine) {
+     return 0;
+   }
+ 
++  // 法墨即时输入方式②：仅通知运行中的 server 读 famo-select-schema.txt 并 select_schema（不部署）。
++  bool select_schema = !wcscmp(L"/selectschema", lpCmdLine);
++  if (select_schema) {
++    weasel::Client client;
++    if (client.Connect())
++      client.SelectSchema();
++    return 0;
++  }
++
+   bool deployment_scheduled = !wcscmp(L"/deploy", lpCmdLine);
+   if (deployment_scheduled) {
+     return configurator.UpdateWorkspace();
+diff --git a/WeaselIPC/WeaselClientImpl.cpp b/WeaselIPC/WeaselClientImpl.cpp
+index 9da3aca..d1f1178 100644
+--- a/WeaselIPC/WeaselClientImpl.cpp
++++ b/WeaselIPC/WeaselClientImpl.cpp
+@@ -176,6 +176,11 @@ void ClientImpl::ReloadOptions() {
+   _SendMessage(WEASEL_IPC_RELOAD_OPTIONS, 0, 0);
+ }
+ 
++void ClientImpl::SelectSchema() {
++  // 无会话命令：令 server 读 famo-select-schema.txt 并 select_schema 到各会话（不部署）。
++  _SendMessage(WEASEL_IPC_SELECT_SCHEMA, 0, 0);
++}
++
+ bool ClientImpl::Echo() {
+   if (!_Active())
+     return false;
+@@ -290,6 +295,10 @@ void Client::ReloadOptions() {
+   m_pImpl->ReloadOptions();
+ }
+ 
++void Client::SelectSchema() {
++  m_pImpl->SelectSchema();
++}
++
+ void Client::TrayCommand(UINT menuId) {
+   m_pImpl->TrayCommand(menuId);
+ }
+diff --git a/WeaselIPC/WeaselClientImpl.h b/WeaselIPC/WeaselClientImpl.h
+index c0d1f44..f316db9 100644
+--- a/WeaselIPC/WeaselClientImpl.h
++++ b/WeaselIPC/WeaselClientImpl.h
+@@ -18,6 +18,7 @@ class ClientImpl {
+   void EndMaintenance();
+   void ReloadStyle();
+   void ReloadOptions();
++  void SelectSchema();
+   bool Echo();
+   bool ProcessKeyEvent(KeyEvent const& keyEvent);
+   bool CommitComposition();
+diff --git a/WeaselIPCServer/WeaselServerImpl.cpp b/WeaselIPCServer/WeaselServerImpl.cpp
+index 0e35a18..16fd4d0 100644
+--- a/WeaselIPCServer/WeaselServerImpl.cpp
++++ b/WeaselIPCServer/WeaselServerImpl.cpp
+@@ -376,6 +376,15 @@ DWORD ServerImpl::OnReloadOptions(WEASEL_IPC_COMMAND uMsg,
+   return 0;
+ }
+ 
++DWORD ServerImpl::OnSelectSchema(WEASEL_IPC_COMMAND uMsg,
++                                 DWORD wParam,
++                                 DWORD lParam) {
++  // 法墨即时输入方式②：读 famo-select-schema.txt 并 select_schema 到各会话（不部署）。
++  if (m_pRequestHandler)
++    m_pRequestHandler->SelectSchema();
++  return 0;
++}
++
+ #define MAP_PIPE_MSG_HANDLE(__msg, __wParam, __lParam) \
+   {                                                    \
+     auto lParam = __lParam;                            \
+@@ -416,6 +425,7 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
+   PIPE_MSG_HANDLE(WEASEL_IPC_CHANGE_PAGE, OnChangePage);
+   PIPE_MSG_HANDLE(WEASEL_IPC_RELOAD_STYLE, OnReloadStyle);
+   PIPE_MSG_HANDLE(WEASEL_IPC_RELOAD_OPTIONS, OnReloadOptions);
++  PIPE_MSG_HANDLE(WEASEL_IPC_SELECT_SCHEMA, OnSelectSchema);
+   PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
+   END_MAP_PIPE_MSG_HANDLE(result);
+ 
+diff --git a/WeaselIPCServer/WeaselServerImpl.h b/WeaselIPCServer/WeaselServerImpl.h
+index 8f78191..45c5d83 100644
+--- a/WeaselIPCServer/WeaselServerImpl.h
++++ b/WeaselIPCServer/WeaselServerImpl.h
+@@ -72,6 +72,7 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   DWORD OnChangePage(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnReloadStyle(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnReloadOptions(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
++  DWORD OnSelectSchema(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+ 
+  public:
+   ServerImpl();
+diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
+index bc8950d..8051dd1 100644
+--- a/include/RimeWithWeasel.h
++++ b/include/RimeWithWeasel.h
+@@ -64,6 +64,7 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   virtual void UpdateColorTheme(BOOL darkMode);
+   virtual void ReloadStyleOverlay(WeaselSessionId ipc_id = 0, EatLine eat = 0);
++  virtual void SelectSchema();
+   virtual void ReloadOptions();
+ 
+   void OnUpdateUI(std::function<void()> const& cb);
+ 
+@@ -89,6 +90,8 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   void _ApplyFamoStyleOverlay(RimeConfig* base);
+   // 法墨即时开关①：读 famo-options.yaml 的 options: 映射，set_option 到给定会话（不部署）。
+   void _ApplyFamoOptions(RimeSessionId session_id);
++  // 法墨即时输入方式②：读 %LOCALAPPDATA%\Famo\famo-select-schema.txt（单行 schema id，trim）；缺失返回空串。
++  std::string _ReadFamoSelectSchema();
+ 
+   void _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
+ 
+diff --git a/include/WeaselIPC.h b/include/WeaselIPC.h
+index fe67d7e..e88e1be 100644
+--- a/include/WeaselIPC.h
++++ b/include/WeaselIPC.h
+@@ -38,6 +38,9 @@ enum WEASEL_IPC_COMMAND {
+   // 法墨即时开关①：令 server 重读 famo-options.yaml 并 set_option 到各会话（简繁/中英标点/emoji…），
+   // 无需 deploy。与 ② 对称，无字符串载荷。
+   WEASEL_IPC_RELOAD_OPTIONS,
++  // 法墨即时输入方式②：令 server 读 famo-select-schema.txt 并 rime_api->select_schema 到各会话
++  //（拼音/双拼/五笔秒切），无需 deploy / 重建 prism。无字符串载荷（schema id 经文件传递）。
++  WEASEL_IPC_SELECT_SCHEMA,
+   WEASEL_IPC_LAST_COMMAND
+ };
+ 
+@@ -91,6 +94,8 @@ struct RequestHandler {
+   virtual void ReloadStyleOverlay(DWORD session_id = 0, EatLine eat = 0) {}
+   // 法墨即时开关①：重读 famo-options.yaml，set_option 到各会话（不部署）。
+   virtual void ReloadOptions() {}
++  // 法墨即时输入方式②：读 famo-select-schema.txt，select_schema 到各会话（不部署）。
++  virtual void SelectSchema() {}
+ };
+ 
+ // 處理server端回應之物件
+@@ -132,6 +137,8 @@ class Client {
+   void ReloadStyle();
+   // 法墨即时开关①：通知 server 重读 famo-options.yaml 并 set_option 到各会话（不部署）。
+   void ReloadOptions();
++  // 法墨即时输入方式②：通知 server 读 famo-select-schema.txt 并 select_schema 到各会话（不部署）。
++  void SelectSchema();
+   // 测试连接
+   bool Echo();
+   // 请求服务处理按键消息

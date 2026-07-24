@@ -1,0 +1,238 @@
+diff --git a/WeaselIPC/PipeChannel.cpp b/WeaselIPC/PipeChannel.cpp
+index 8687e87..6c45597 100644
+--- a/WeaselIPC/PipeChannel.cpp
++++ b/WeaselIPC/PipeChannel.cpp
+@@ -15,6 +15,82 @@ using namespace boost;
+       throw err;                         \
+   }
+ 
++namespace {
++const DWORD kFamoPipeConnectBudgetMs = 1500;
++const DWORD kFamoPipeIoBudgetMs = 1500;
++
++struct ScopedEvent {
++  ScopedEvent() : handle(::CreateEvent(NULL, TRUE, FALSE, NULL)) {
++    if (!handle) {
++      _ThrowLastError;
++    }
++  }
++
++  ~ScopedEvent() {
++    if (handle) {
++      ::CloseHandle(handle);
++    }
++  }
++
++  HANDLE handle;
++};
++
++DWORD FamoFinishPipeIo(HANDLE pipe, OVERLAPPED& overlapped, BOOL issued) {
++  if (!issued) {
++    DWORD err = ::GetLastError();
++    if (err != ERROR_IO_PENDING) {
++      _ThrowCode(err);
++    }
++
++    DWORD wait = ::WaitForSingleObject(overlapped.hEvent, kFamoPipeIoBudgetMs);
++    if (wait == WAIT_TIMEOUT) {
++      ::CancelIo(pipe);
++      _ThrowCode(ERROR_SEM_TIMEOUT);
++    }
++    if (wait != WAIT_OBJECT_0) {
++      _ThrowLastError;
++    }
++  }
++
++  DWORD transferred = 0;
++  if (!::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE)) {
++    _ThrowLastError;
++  }
++  return transferred;
++}
++
++DWORD FamoReadPipeBounded(HANDLE pipe, LPVOID msg, DWORD rec_len, DWORD& error) {
++  ScopedEvent event;
++  OVERLAPPED overlapped = {};
++  overlapped.hEvent = event.handle;
++
++  BOOL issued = ::ReadFile(pipe, msg, rec_len, NULL, &overlapped);
++  if (!issued) {
++    error = ::GetLastError();
++    if (error != ERROR_IO_PENDING) {
++      return error == ERROR_MORE_DATA ? rec_len : 0;
++    }
++
++    DWORD wait = ::WaitForSingleObject(overlapped.hEvent, kFamoPipeIoBudgetMs);
++    if (wait == WAIT_TIMEOUT) {
++      ::CancelIo(pipe);
++      _ThrowCode(ERROR_SEM_TIMEOUT);
++    }
++    if (wait != WAIT_OBJECT_0) {
++      _ThrowLastError;
++    }
++  }
++
++  DWORD transferred = 0;
++  if (!::GetOverlappedResult(pipe, &overlapped, &transferred, FALSE)) {
++    error = ::GetLastError();
++    return error == ERROR_MORE_DATA ? rec_len : 0;
++  }
++  error = ERROR_SUCCESS;
++  return transferred;
++}
++}  // namespace
++
+ PipeChannelBase::PipeChannelBase(std::wstring&& pn_cmd,
+                                  size_t bs = 4 * 1024,
+                                  SECURITY_ATTRIBUTES* s = NULL)
+@@ -40,8 +116,19 @@ bool PipeChannelBase::_Ensure() {
+ 
+ HANDLE PipeChannelBase::_Connect(const wchar_t* name) {
+   HANDLE pipe = INVALID_HANDLE_VALUE;
+-  while (_Invalid(pipe = _TryConnect()))
+-    ::WaitNamedPipe(name, 500);
++  const DWORD started = ::GetTickCount();
++  while (_Invalid(pipe = _TryConnect())) {
++    const DWORD elapsed = ::GetTickCount() - started;
++    if (elapsed >= kFamoPipeConnectBudgetMs) {
++      _ThrowCode(ERROR_SEM_TIMEOUT);
++    }
++    const DWORD wait_ms = min(static_cast<DWORD>(100),
++                              kFamoPipeConnectBudgetMs - elapsed);
++    if (!::WaitNamedPipe(name, wait_ms) &&
++        ::GetLastError() != ERROR_SEM_TIMEOUT) {
++      _ThrowLastError;
++    }
++  }
+   DWORD mode = PIPE_READMODE_MESSAGE;
+   if (!SetNamedPipeHandleState(pipe, &mode, NULL, NULL)) {
+     _ThrowLastError;
+@@ -57,7 +144,7 @@ void PipeChannelBase::_Reconnect() {
+ 
+ HANDLE PipeChannelBase::_TryConnect() {
+   auto pipe = ::CreateFile(pname.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL,
+-                           OPEN_EXISTING, 0, NULL);
++                           OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+   if (!_Invalid(pipe)) {
+     // connected to the pipe
+     return pipe;
+@@ -69,11 +156,20 @@ HANDLE PipeChannelBase::_TryConnect() {
+ }
+ 
+ size_t PipeChannelBase::_WritePipe(HANDLE pipe, size_t s, char* b) {
+-  DWORD lwritten;
+-  if (!::WriteFile(pipe, b, s, &lwritten, NULL) || lwritten <= 0) {
+-    _ThrowLastError;
++  if (s == 0 || s > 0xffffffffu) {
++    _ThrowCode(ERROR_INVALID_PARAMETER);
+   }
+-  ::FlushFileBuffers(pipe);
++
++  ScopedEvent event;
++  OVERLAPPED overlapped = {};
++  overlapped.hEvent = event.handle;
++  DWORD lwritten = FamoFinishPipeIo(
++      pipe, overlapped,
++      ::WriteFile(pipe, b, static_cast<DWORD>(s), NULL, &overlapped));
++  if (lwritten != s) {
++    _ThrowCode(ERROR_WRITE_FAULT);
++  }
++
+   return lwritten;
+ }
+ 
+@@ -86,28 +182,60 @@ void PipeChannelBase::_FinalizePipe(HANDLE& p) {
+ }
+ 
+ void PipeChannelBase::_Receive(HANDLE pipe, LPVOID msg, size_t rec_len) {
+-  DWORD lread;
+-  BOOL success = ::ReadFile(pipe, msg, rec_len, &lread, NULL);
+-  if (!success) {
+-    _ThrowIfNot(ERROR_MORE_DATA);
++  if (rec_len == 0 || rec_len > 0xffffffffu) {
++    _ThrowCode(ERROR_INVALID_PARAMETER);
++  }
++
++  DWORD read_error = ERROR_SUCCESS;
++  DWORD lread =
++      FamoReadPipeBounded(pipe, msg, static_cast<DWORD>(rec_len), read_error);
++  if (read_error != ERROR_SUCCESS && read_error != ERROR_MORE_DATA) {
++    _ThrowCode(read_error);
++  }
++  if (lread < rec_len) {
++    _ThrowCode(ERROR_INVALID_DATA);
++  }
+ 
++  if (read_error == ERROR_MORE_DATA) {
+     auto ctx = _GetContext();
+     memset(ctx->buffer.get(), 0, buff_size);
+-    success = ::ReadFile(pipe, ctx->buffer.get(), buff_size, &lread, NULL);
+-    if (!success) {
+-      _ThrowLastError;
++
++    DWORD body_error = ERROR_SUCCESS;
++    FamoReadPipeBounded(pipe, ctx->buffer.get(), static_cast<DWORD>(buff_size),
++                        body_error);
++    if (body_error != ERROR_SUCCESS) {
++      _ThrowCode(body_error == ERROR_MORE_DATA ? ERROR_INVALID_DATA
++                                               : body_error);
+     }
+   }
+   _GetContext()->has_body = false;
+ }
+ 
+ HANDLE PipeChannelBase::_ConnectServerPipe(std::wstring& pn) {
+-  HANDLE pipe =
+-      CreateNamedPipe(pn.c_str(), PIPE_ACCESS_DUPLEX,
+-                      PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+-                      PIPE_UNLIMITED_INSTANCES, buff_size, buff_size, 0, sa);
+-  if (pipe == INVALID_HANDLE_VALUE || !::ConnectNamedPipe(pipe, NULL)) {
++  HANDLE pipe = CreateNamedPipe(
++      pn.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
++      PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
++      PIPE_UNLIMITED_INSTANCES, buff_size, buff_size, 0, sa);
++  if (pipe == INVALID_HANDLE_VALUE) {
+     _ThrowLastError;
+   }
++
++  ScopedEvent event;
++  OVERLAPPED overlapped = {};
++  overlapped.hEvent = event.handle;
++  if (!::ConnectNamedPipe(pipe, &overlapped)) {
++    DWORD err = ::GetLastError();
++    if (err == ERROR_IO_PENDING) {
++      if (::WaitForSingleObject(overlapped.hEvent, INFINITE) != WAIT_OBJECT_0) {
++        _ThrowLastError;
++      }
++      DWORD ignored = 0;
++      if (!::GetOverlappedResult(pipe, &overlapped, &ignored, FALSE)) {
++        _ThrowLastError;
++      }
++    } else if (err != ERROR_PIPE_CONNECTED) {
++      _ThrowCode(err);
++    }
++  }
+   return pipe;
+ }
+diff --git a/include/PipeChannel.h b/include/PipeChannel.h
+index b747a49..ab346b6 100644
+--- a/include/PipeChannel.h
++++ b/include/PipeChannel.h
+@@ -167,9 +167,16 @@ class PipeChannel : public PipeChannelBase {
+ 
+     try {
+       _WritePipe(pipe, data_sz, pbuff);
+-    } catch (...) {
++    } catch (DWORD ex) {
++      if (ex == ERROR_SEM_TIMEOUT) {
++        ClearBufferStream();
++        throw;
++      }
+       _Reconnect();
+       _WritePipe(pipe, data_sz, pbuff);
++    } catch (...) {
++      ClearBufferStream();
++      throw;
+     }
+     ClearBufferStream();
+   }

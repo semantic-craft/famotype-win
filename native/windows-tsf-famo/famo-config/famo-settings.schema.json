@@ -1,0 +1,478 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://famo.app/schemas/famo-settings.schema.json",
+  "title": "Famo Windows IME Settings Store",
+  "description": "法墨 Windows 设置 store。落点 %LOCALAPPDATA%\\Famo\\famo-settings.json。WinUI 3 设置面板写，FamoRuntime 读即时覆盖层；appearance 写 famo-style.yaml 后轻量重载，engine 写 RIME yaml 后异步部署。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "appearance", "engine"],
+  "properties": {
+    "version": {
+      "description": "store schema 版本，便于后续迁移。",
+      "type": "integer",
+      "const": 3
+    },
+
+    "appearance": {
+      "description": "即时桶(instant)。改动写 famo-style.yaml，触发 FamoRuntime 候选窗轻量 reload，不走 RIME 重部署。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "skin", "appearanceMode", "fontFace", "fontPoint", "candidateFormat",
+        "orientation", "inlinePreedit", "inlineCandidatePreview", "layout"
+      ],
+      "properties": {
+        "skin": {
+          "description": "学院皮肤。映射 famo-style.yaml style/color_scheme。荔园红=shenda(默认,深大红品牌色) / 胡佛红=stanford / 珞珈青=wuda / 嘉庚蓝=xiada。",
+          "type": "string",
+          "enum": ["shenda", "stanford", "wuda", "xiada"],
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/color_scheme" },
+          "x-famo-skin-labels": {
+            "shenda": "荔园红 · 深圳大学",
+            "stanford": "胡佛红 · 斯坦福大学",
+            "wuda": "珞珈青 · 武汉大学",
+            "xiada": "嘉庚蓝 · 厦门大学"
+          }
+        },
+        "appearanceMode": {
+          "description": "明暗模式。system=跟随系统(由 color_scheme 亮 ↔ color_scheme_dark 暗自动切换)；light 固定用 <skin>；dark 固定用 <skin>_dark。映射 style/color_scheme ↔ style/color_scheme_dark。",
+          "type": "string",
+          "enum": ["system", "light", "dark"],
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/color_scheme ↔ style/color_scheme_dark" }
+        },
+        "fontFace": {
+          "description": "候选窗字体。映射 style/font_face(同时驱动 label_font_face / comment_font_face，留空=继承 font_face)。",
+          "type": "string",
+          "minLength": 1,
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/font_face" }
+        },
+        "fontPoint": {
+          "description": "候选窗字号(pt)。映射 style/font_point。设计稿滑块范围 11–22。",
+          "type": "number",
+          "minimum": 11,
+          "maximum": 22,
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/font_point" }
+        },
+        "candidateFormat": {
+          "description": "候选格式。full=标签+候选+注释；no_comment=标签+候选；candidate_only=仅候选。映射 style/label_format + style/label_font_point + style/comment_font_point。",
+          "type": "string",
+          "enum": ["full", "no_comment", "candidate_only"],
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/label_format + style/label_font_point + style/comment_font_point" }
+        },
+        "orientation": {
+          "description": "候选排列。horizontal=横排 / vertical=竖排。映射 style/horizontal(true=横排,false=竖排)。",
+          "type": "string",
+          "enum": ["horizontal", "vertical"],
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/horizontal" }
+        },
+        "inlinePreedit": {
+          "description": "内嵌预编辑：拼音直接显示在输入处。映射 famo-style.yaml style/inline_preedit，由 native TSF host 消费。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/inline_preedit" }
+        },
+        "inlineCandidatePreview": {
+          "description": "内嵌候选预览：光标处显示当前候选词的实际文字。映射 famo-style.yaml style/preedit_type。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/preedit_type" }
+        },
+        "layout": {
+          "description": "候选窗几何样式，全部即时。映射 style/layout/*。",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cornerRadius", "borderWidth", "shadowRadius", "margin"],
+          "properties": {
+            "cornerRadius": {
+              "description": "圆角半径(px)。映射 style/layout/corner_radius。设计稿 0–16。",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 16,
+              "x-famo-bucket": "instant",
+              "x-famo-target": { "file": "famo-style.yaml", "key": "style/corner_radius" }
+            },
+            "borderWidth": {
+              "description": "边框粗细(px)。映射 style/layout/border_width。设计稿 0–3。",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3,
+              "x-famo-bucket": "instant",
+              "x-famo-target": { "file": "famo-style.yaml", "key": "style/border_width" }
+            },
+            "shadowRadius": {
+              "description": "阴影半径(px)。映射 style/layout/shadow_radius。设计稿 0–16。",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 16,
+              "x-famo-bucket": "instant",
+              "x-famo-target": { "file": "famo-style.yaml", "key": "style/shadow_radius" }
+            },
+            "margin": {
+              "description": "内边距(px)，同时写 margin_x / margin_y。映射 style/layout/margin_x + style/layout/margin_y。设计稿 4–24。",
+              "type": "integer",
+              "minimum": 4,
+              "maximum": 24,
+              "x-famo-bucket": "instant",
+              "x-famo-target": { "file": "famo-style.yaml", "key": "style/margin_x + style/margin_y" }
+            }
+          }
+        }
+      }
+    },
+
+    "engine": {
+      "description": "部署桶(deploy)。改动写 RIME yaml(default.custom.yaml / rime_ice.custom.yaml) 后由 FamoRuntime 异步部署生效。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaList", "pageSize", "fuzzyPinyin", "emojiEnabled"],
+      "properties": {
+        "schemaList": {
+          "description": "启用的输入方案、顺序与默认。数组顺序=优先级，第一个 enabled=true 的即默认方案。映射 default.custom.yaml/schema_list(只把 enabled=true 的按序写入)。底座=iDvel/rime-ice(雾凇)全套 + KyleBing 极点五笔：rime_ice(雾凇全拼，默认) / wubi86_jidian(极点五笔86) / double_pinyin_flypy(小鹤双拼) / t9(中文九键) / wubi86_jidian_pinyin(拼音混输) / wubi86_jidian_trad(简入繁出) / wubi86_jidian_trad_pinyin(拼音混输简入繁出) / double_pinyin(自然码双拼) / double_pinyin_mspy(微软双拼) / double_pinyin_sogou(搜狗双拼) / double_pinyin_abc(智能ABC双拼) / double_pinyin_ziguang(紫光双拼) / double_pinyin_jiajia(拼音加加双拼)。",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "schema_list" },
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "enabled"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "enum": ["rime_ice", "wubi86_jidian", "double_pinyin_flypy", "t9", "wubi86_jidian_pinyin", "wubi86_jidian_trad", "wubi86_jidian_trad_pinyin", "double_pinyin", "double_pinyin_mspy", "double_pinyin_sogou", "double_pinyin_abc", "double_pinyin_ziguang", "double_pinyin_jiajia"]
+              },
+              "enabled": { "type": "boolean" }
+            }
+          }
+        },
+        "pageSize": {
+          "description": "一屏候选词个数。映射 default.custom.yaml/menu/page_size(出厂 8；rime-ice 上游默认 5)。注意：若某方案 schema 自带 menu/page_size 会就近覆盖本全局值。",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30,
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "menu/page_size" }
+        },
+        "fuzzyPinyin": {
+          "description": "模糊音规则开关。9 个独立对，逐字段镜像 macOS FamoFuzzyPreferences；各对单独 gated 追加 rime_ice.custom.yaml 的 speller/algebra/+ derive(锚定 ^/$；n_l、f_h、an_ang、en_eng、in_ing 双向发两条)。旧 3 组合(zh_ch_sh / an_en_in / l_n_f_h_r_l)由 SettingsStore.Load 迁移到这 9 项。双拼方案 algebra 与全拼不同，不能套全拼——双拼模糊音需各自 *.custom.yaml(暂不展开)。",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["zh_z", "ch_c", "sh_s", "n_l", "r_l", "f_h", "an_ang", "en_eng", "in_ing"],
+          "properties": {
+            "zh_z": {
+              "description": "zh = z（翘舌）。derive/^zh/z/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "ch_c": {
+              "description": "ch = c（翘舌）。derive/^ch/c/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "sh_s": {
+              "description": "sh = s（翘舌）。derive/^sh/s/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "n_l": {
+              "description": "n = l（声母，双向）。derive/^n/l/ + derive/^l/n/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "r_l": {
+              "description": "r = l（声母）。derive/^r/l/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "f_h": {
+              "description": "f = h（声母，双向）。derive/^f/h/ + derive/^h/f/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "an_ang": {
+              "description": "an = ang（韵母，双向）。derive/an$/ang/ + derive/ang$/an/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "en_eng": {
+              "description": "en = eng（韵母，双向）。derive/en$/eng/ + derive/eng$/en/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            },
+            "in_ing": {
+              "description": "in = ing（韵母，双向）。derive/in$/ing/ + derive/ing$/in/",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "speller/algebra/+" }
+            }
+          }
+        },
+        "emojiEnabled": {
+          "description": "Emoji 候选。出厂关。映射 rime_ice.custom.yaml 的 switches 中 emoji/reset(出厂 0；rime-ice 上游默认 1)，并同步写 famo-options.yaml options/emoji 供即时 set_option。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "rime_ice.custom.yaml", "key": "switches[emoji]/reset" }
+        },
+        "wubi": {
+          "description": "五笔专属设置（仅 wubi86_jidian 方案生效，对位 macOS FamoKeyboardPreferences 五笔项）。写 wubi86_jidian.custom.yaml(部署桶)。可选(向后兼容旧 store)。",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["codeHint", "autoClear", "candidateMode", "zReverseLookup"],
+          "properties": {
+            "codeHint": {
+              "description": "候选编码提示：true=显示原始编码(translator/comment_format:[])，false=抹掉注释(xform/.+//)。出厂关。",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "wubi86_jidian.custom.yaml", "key": "translator/comment_format" }
+            },
+            "autoClear": {
+              "description": "空码自动清码：true=speller/auto_clear:max_length，false=\"\"。出厂关。",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "wubi86_jidian.custom.yaml", "key": "speller/auto_clear" }
+            },
+            "candidateMode": {
+              "description": "单字候选：normal(默认)/single_first(单字优先)/single_only(纯单字)。非 normal 向 engine/filters/+ 追 lua_filter(依赖随包 wubi86_jidian_single_char_*.lua)。",
+              "type": "string",
+              "enum": ["normal", "single_first", "single_only"],
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "wubi86_jidian.custom.yaml", "key": "engine/filters/+" }
+            },
+            "zReverseLookup": {
+              "description": "z 临时拼音反查：true(默认,保留 schema 反查)/false(清 recognizer/patterns/reverse_lookup)。",
+              "type": "boolean",
+              "x-famo-bucket": "deploy",
+              "x-famo-target": { "file": "wubi86_jidian.custom.yaml", "key": "recognizer/patterns/reverse_lookup" }
+            }
+          }
+        }
+      }
+    },
+
+    "switches": {
+      "description": "即时开关桶(①)。改动写 famo-options.yaml 后调 FamoRuntime --control reload-options，由独立控制队列 set_option 到各会话，零部署即时生效。仅含 set_option 可切的 RIME option（emoji 另在 engine 桶，有部署 reset 兜底）。可选(向后兼容旧 store)。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asciiPunct", "fullShape"],
+      "properties": {
+        "asciiMode": {
+          "description": "中/英文输入默认态：false=中文输入(默认)，true=英文直接输入。映射 RIME option ascii_mode(famo-options.yaml options/ascii_mode)；经 AddSession 回放 = 每个新会话默认输入态(对位 macOS 默认状态·中英文)。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-options.yaml", "key": "options/ascii_mode" }
+        },
+        "asciiPunct": {
+          "description": "中/英标点：false=中文标点(默认)，true=英文标点。映射 RIME option ascii_punct(famo-options.yaml options/ascii_punct)。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-options.yaml", "key": "options/ascii_punct" }
+        },
+        "fullShape": {
+          "description": "全/半角：false=半角(默认)，true=全角。映射 RIME option full_shape(famo-options.yaml options/full_shape)。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-options.yaml", "key": "options/full_shape" }
+        },
+        "traditionalization": {
+          "description": "简/繁：false=简体(默认)，true=繁体。映射 RIME option：rime-ice(全拼/双拼) 用 traditionalization、五笔用 zh_trad —— famo-options.yaml 同时写两者，繁体默认覆盖各方案(对位 macOS 简繁多 option 集)。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-options.yaml", "key": "options/traditionalization" }
+        }
+      }
+    },
+
+    "inputMethod": {
+      "description": "输入方式(搜狗式快切)。改动写 famo-select-schema.txt 后调 FamoRuntime --control select-schema，runtime 原子替换活动 engine contexts，零部署即时秒切；新 session 回放 ⇒ 重启保持。与 engine.schemaList(部署式全量管理)分两层。可选(向后兼容旧 store)。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "doublePinyinLayout"],
+      "properties": {
+        "method": {
+          "description": "输入方式：pinyin(全拼,默认)→rime_ice / double_pinyin(双拼)→double_pinyin_<layout> / wubi(五笔)→wubi86_jidian。",
+          "type": "string",
+          "enum": ["pinyin", "double_pinyin", "wubi"],
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-select-schema.txt", "key": "schema_id" }
+        },
+        "doublePinyinLayout": {
+          "description": "双拼键位布局(仅 method=double_pinyin 生效)：flypy(小鹤,默认)/natural(自然码)/mspy(微软)/sogou(搜狗)/abc(智能ABC)/ziguang(紫光)/jiajia(拼音加加)。",
+          "type": "string",
+          "enum": ["flypy", "natural", "mspy", "sogou", "abc", "ziguang", "jiajia"],
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-select-schema.txt", "key": "schema_id" }
+        },
+        "wubiScheme": {
+          "description": "五笔方案(仅 method=wubi 生效)：jidian86(86 版五笔,默认)→wubi86_jidian / pinyinMix(五笔拼音混输)→wubi86_jidian_pinyin。",
+          "type": "string",
+          "enum": ["jidian86", "pinyinMix"],
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-select-schema.txt", "key": "schema_id" }
+        }
+      }
+    },
+
+    "clipboard": {
+      "description": "剪贴板历史面板设置。纯本地、默认关闭；开启后也只按用户点击捕获当前 Windows 剪贴板文本，不做后台监听。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "x-famo-privacy": "local-only",
+      "properties": {
+        "enabled": {
+          "description": "是否启用剪贴板历史。false 时捕获按钮不写入 clipboard-history.json。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "clipboard/enabled" }
+        }
+      }
+    },
+
+    "ai": {
+      "description": "AI 助手设置。默认关闭；只作为用户主动触发的云端 AI 功能总开关，不参与输入热路径。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cloudEnabled"],
+      "properties": {
+        "cloudEnabled": {
+          "description": "启用云端 AI（划词润色 / 任意提问）。false 时 AI 对话和润色入口必须阻止网络请求。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/cloudEnabled" }
+        },
+        "selectionMenuEnabled": {
+          "description": "划词菜单总开关，出厂开。false 时任意技能菜单项点击都必须提示已关闭，不再逐个检查具体技能开关。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/selectionMenuEnabled" }
+        },
+        "polishSkillEnabled": {
+          "description": "AI 润色选中技能开关，出厂开。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/polishSkillEnabled" }
+        },
+        "sourceCheckSkillEnabled": {
+          "description": "来源核验技能开关，出厂开。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/sourceCheckSkillEnabled" }
+        },
+        "researchAssistSkillEnabled": {
+          "description": "辅助检索技能开关，出厂开。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/researchAssistSkillEnabled" }
+        },
+        "documentFormattingSkillEnabled": {
+          "description": "公文排版技能开关，出厂开。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/documentFormattingSkillEnabled" }
+        },
+        "promptOptimizeSkillEnabled": {
+          "description": "提示词优化技能开关，出厂开。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/promptOptimizeSkillEnabled" }
+        }
+      }
+    },
+
+    "convenience": {
+      "description": "快捷键与键盘便利项(部署桶;例外:autoPairPunctuation/cjkEnglishSpacing/cjkNumberSpacing 走即时桶 famo-style.yaml)。Shift/Caps/翻页/选词/符号/App英文,翻译成 default.custom.yaml 的 ascii_composer/key_binder/punctuator/app_options,改后 /deploy 生效。对齐 macOS FamoRimePatchBuilder。可选(向后兼容旧 store)。",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "shiftSwitch": {
+          "description": "左右 Shift 切换中英:开启时 Shift_L/Shift_R→commit_code,关闭时两者→noop。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "ascii_composer/switch_key/Shift_L + Shift_R" }
+        },
+        "goodOldCapsLock": {
+          "description": "Caps Lock 保持大写锁语义。开启为 ascii_composer/good_old_caps_lock:true,关闭为 false。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "ascii_composer/good_old_caps_lock" }
+        },
+        "pageMinusEquals": {
+          "description": "- / = 翻页:minus/equal→Page_Up/Down。关闭时从法墨托管 key_binder/bindings 列表移除。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "key_binder/bindings" }
+        },
+        "pageBrackets": {
+          "description": "[ ] 翻页:停用以词定字 + bracketleft/right→Page_Up/Down。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "key_binder/bindings" }
+        },
+        "pageCommaPeriod": {
+          "description": "逗号句号翻页:comma/period→Page_Up/Down。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "key_binder/bindings" }
+        },
+        "select23Semicolon": {
+          "description": "分号引号选 2/3 位:semicolon→send 2、apostrophe→send 3。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "key_binder/bindings" }
+        },
+        "slashToDun": {
+          "description": "「/」→顿号:punctuator/half_shape|full_shape/+ 的 / commit 「、」。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "punctuator/half_shape" }
+        },
+        "digitSeparators": {
+          "description": "数字间标点回退 ASCII(16:00、3.14、1,000):punctuator/digit_separators \",.:\"。",
+          "type": "boolean",
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "punctuator/digit_separators" }
+        },
+        "autoPairPunctuation": {
+          "description": "成对标点自动补全。native TSF host 消费 style/famo_auto_pair，并在 edit session 内成对插入/type-over。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/famo_auto_pair" }
+        },
+        "cjkEnglishSpacing": {
+          "description": "中英文之间自动加空格。native TSF host 消费 style/famo_cjk_english_spacing。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/famo_cjk_english_spacing" }
+        },
+        "cjkNumberSpacing": {
+          "description": "中文与数字之间自动加空格。native TSF host 消费 style/famo_cjk_number_spacing。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/famo_cjk_number_spacing" }
+        },
+        "appEnglishExes": {
+          "description": "这些 App 默认英文模式(按 exe 名):每条生成 app_options/<exe>/ascii_mode: true。",
+          "type": "array",
+          "items": { "type": "string" },
+          "x-famo-bucket": "deploy",
+          "x-famo-target": { "file": "default.custom.yaml", "key": "app_options" }
+        }
+      }
+    }
+  }
+}

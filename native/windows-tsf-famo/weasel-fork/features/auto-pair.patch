@@ -1,0 +1,302 @@
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index 834e2ba..4b11e7b 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -1078,6 +1078,11 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+   body.append(L"config.inline_preedit=")
+       .append(std::to_wstring((int)session_status.style.inline_preedit))
+       .append(L"\n");
++  // 法墨标点配对：从 m_base_style 取值——ReloadStyleOverlay 即时刷新它，
++  // 已存在的会话不必等重建 session 即生效
++  body.append(L"config.famo_auto_pair=")
++      .append(std::to_wstring((int)m_base_style.famo_auto_pair))
++      .append(L"\n");
+ 
+   // style
+   if (!session_status.__synced) {
+@@ -1368,6 +1373,9 @@ static void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize) {
+                  style.candidate_abbreviate_length, 0, 0, _abs);
+   _RimeGetBool(config, "style/inline_preedit", initialize,
+                style.inline_preedit);
++  // 法墨：标点自动配对
++  _RimeGetBool(config, "style/famo_auto_pair", initialize,
++               style.famo_auto_pair);
+   _RimeGetBool(config, "style/vertical_auto_reverse", initialize,
+                style.vertical_auto_reverse);
+   static constexpr Array<UIStyle::PreeditType, 3> _preeditArr = {
+diff --git a/WeaselIPC/Configurator.cpp b/WeaselIPC/Configurator.cpp
+index a16c4fa..2ebf43f 100644
+--- a/WeaselIPC/Configurator.cpp
++++ b/WeaselIPC/Configurator.cpp
+@@ -19,5 +19,8 @@ void Configurator::Store(Deserializer::KeyType const& key,
+   bool bool_value = (!value.empty() && value != L"0");
+   if (key[1] == L"inline_preedit") {
+     m_pTarget->p_config->inline_preedit = bool_value;
++  } else if (key[1] == L"famo_auto_pair") {
++    // 法墨：标点自动配对
++    m_pTarget->p_config->famo_auto_pair = bool_value;
+   }
+ }
+diff --git a/WeaselTSF/EditSession.cpp b/WeaselTSF/EditSession.cpp
+index 8f4d503..becc396 100644
+--- a/WeaselTSF/EditSession.cpp
++++ b/WeaselTSF/EditSession.cpp
+@@ -16,6 +16,54 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+   _UpdateLanguageBar(_status);
+ 
+   if (ok) {
++    // 法墨标点配对：左符号上屏补右符号+光标居中；敲右符号且光标右侧已有 → 跳过。
++    // 表用码位转义，避免源码编码歧义：（）「」『』《》【】〔〕〈〉 共 7 对。
++    int caret_backshift = 0;
++    bool famo_typed_over = false;
++    wchar_t famo_close = 0;
++    if (config.famo_auto_pair && !commit.empty()) {
++      static const struct {
++        wchar_t open, close;
++      } kFamoPairs[] = {
++          {L'\xFF08', L'\xFF09'}, /* （） */
++          {L'\x300C', L'\x300D'}, /* 「」 */
++          {L'\x300E', L'\x300F'}, /* 『』 */
++          {L'\x300A', L'\x300B'}, /* 《》 */
++          {L'\x3010', L'\x3011'}, /* 【】 */
++          {L'\x3014', L'\x3015'}, /* 〔〕 */
++          {L'\x3008', L'\x3009'}, /* 〈〉 */
++      };
++      // type-over 仅限"标点直接上屏"（无 preedit），避免打断组句。
++      // 优先读文档核实右侧字符；读不到（transitory 上下文）时退回 pending
++      // 状态判定：上一个 commit 恰是配对补全 → 本次同一右符号视为闭合。
++      if (commit.size() == 1 && !_IsComposing()) {
++        for (const auto& p : kFamoPairs) {
++          if (commit[0] == p.close) {
++            int next_is = _FamoProbeNextChar(ec, p.close);
++            if (next_is == 1 ||
++                (next_is < 0 && _famo_pending_close == p.close)) {
++              commit.clear();
++              famo_typed_over = true;
++            }
++            break;
++          }
++        }
++      }
++      if (!commit.empty()) {
++        for (const auto& p : kFamoPairs) {
++          if (commit.back() == p.open) {
++            commit += p.close;
++            caret_backshift = 1;
++            famo_close = p.close;
++            break;
++          }
++        }
++      }
++    }
++    // pending 生命周期：任何非配对 commit（含 type-over 本身）都作废，
++    // 配对 commit 在下方注入光标时重新登记
++    if (!commit.empty() || famo_typed_over)
++      _famo_pending_close = 0;
+     if (!commit.empty()) {
+       // For auto-selecting, commit and preedit can both exist.
+       // Commit and close the original composition first.
+@@ -25,6 +73,17 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+       }
+       _InsertText(_pEditSessionContext, commit);
+       _EndComposition(_pEditSessionContext, false);
++      // 配对补全后把光标移回配对符号中间，并登记 pending 供 type-over 判定
++      if (caret_backshift > 0) {
++        _FamoInjectArrow(VK_LEFT, caret_backshift);
++        _famo_guard_until = GetTickCount64() + 200;
++        _famo_pending_close = famo_close;
++      }
++      _committed = TRUE;
++    } else if (famo_typed_over) {
++      // type-over：不插入，注入 → 越过既有右符号
++      _FamoInjectArrow(VK_RIGHT, 1);
++      _famo_guard_until = GetTickCount64() + 200;
+       _committed = TRUE;
+     } else {
+       _committed = FALSE;
+@@ -45,3 +104,76 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+ 
+   return TRUE;
+ }
++
++/* 法墨标点配对：commit 后注入方向键移动光标（←回到配对中间 / →越过右符号）。
++ * 与商业输入法（搜狗等）同方案：TSF SetSelection 在 CUAS/EDIT 控件下
++ * 会被结束 composition 时的光标同步覆盖，注入方向键则普适。
++ * 注入键会先过本 IME 的 key sink：无 composition 时不吃、直达应用。
++ * 中文括号多为 Shift 组合键（Shift+9 → （），注入时用户的修饰键可能仍
++ * 物理按住，Shift+←/→ 会变成选区扩展、Ctrl+← 变成词跳——先松开、注入、
++ * 再恢复，保证方向键以裸键落地。 */
++void WeaselTSF::_FamoInjectArrow(WORD vk, int count) {
++  static const WORD kMods[] = {VK_LSHIFT,   VK_RSHIFT, VK_LCONTROL,
++                               VK_RCONTROL, VK_LMENU,  VK_RMENU};
++  const int kModCount = sizeof(kMods) / sizeof(kMods[0]);
++  INPUT seq[kModCount * 2 + 8];
++  memset(seq, 0, sizeof(seq));
++  int n = 0;
++  bool held[kModCount];
++  for (int m = 0; m < kModCount; ++m) {
++    held[m] = (::GetAsyncKeyState(kMods[m]) & 0x8000) != 0;
++    if (held[m]) {
++      seq[n].type = INPUT_KEYBOARD;
++      seq[n].ki.wVk = kMods[m];
++      seq[n].ki.dwFlags = KEYEVENTF_KEYUP;
++      ++n;
++    }
++  }
++  for (int i = 0; i < count && i < 4; ++i) {
++    seq[n].type = INPUT_KEYBOARD;
++    seq[n].ki.wVk = vk;
++    ++n;
++    seq[n].type = INPUT_KEYBOARD;
++    seq[n].ki.wVk = vk;
++    seq[n].ki.dwFlags = KEYEVENTF_KEYUP;
++    ++n;
++  }
++  for (int m = 0; m < kModCount; ++m) {
++    if (held[m]) {
++      seq[n].type = INPUT_KEYBOARD;
++      seq[n].ki.wVk = kMods[m];
++      ++n;
++    }
++  }
++  ::SendInput(n, seq, sizeof(INPUT));
++}
++
++/* 法墨标点配对 type-over：光标为空选区且右侧紧邻字符 == ch 时，右移越过。
++ * 任一 COM 调用失败（应用不支持读周边文本）→ 返回 FALSE，走正常插入。 */
++int WeaselTSF::_FamoProbeNextChar(TfEditCookie ec, wchar_t ch) {
++  TF_SELECTION selection;
++  ULONG nSelection = 0;
++  if (FAILED(_pEditSessionContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1,
++                                                &selection, &nSelection)) ||
++      nSelection == 0 || selection.range == nullptr)
++    return -1;
++
++  int result = -1;
++  BOOL empty = FALSE;
++  com_ptr<ITfRange> pProbe;
++  com_ptr<ITfRange> pDocEnd;
++  if (SUCCEEDED(selection.range->IsEmpty(ec, &empty)) && empty &&
++      SUCCEEDED(selection.range->Clone(&pProbe)) &&
++      SUCCEEDED(_pEditSessionContext->GetEnd(ec, &pDocEnd))) {
++    WCHAR buf[2] = {0, 0};
++    ULONG cchRead = 0;
++    pProbe->Collapse(ec, TF_ANCHOR_END);
++    /* 探针末端推到文档末尾，GetText 只取光标后首字符。
++     * transitory/CUAS 上下文读不到周边文本（读出 0 字符）→ 返回未知 */
++    if (SUCCEEDED(pProbe->ShiftEndToRange(ec, pDocEnd, TF_ANCHOR_END)) &&
++        SUCCEEDED(pProbe->GetText(ec, 0, buf, 1, &cchRead)) && cchRead == 1)
++      result = (buf[0] == ch) ? 1 : 0;
++  }
++  selection.range->Release();
++  return result;
++}
+diff --git a/WeaselTSF/KeyEventSink.cpp b/WeaselTSF/KeyEventSink.cpp
+index c885ddd..dacb0af 100644
+--- a/WeaselTSF/KeyEventSink.cpp
++++ b/WeaselTSF/KeyEventSink.cpp
+@@ -34,6 +34,33 @@ void WeaselTSF::_ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
+       else if (ke.keycode == ibus::Down)
+         ke.keycode = ibus::Up;
+     }
++    // 法墨标点配对：导航/编辑键作废 pending type-over 状态
++    // （文本产生类按键由 DoEditSession 按 commit 内容处置）；
++    // 配对补全后自注入的方向键在 200ms 时间窗内豁免。
++    if (!(ke.mask & ibus::RELEASE_MASK) && _famo_pending_close) {
++      switch (ke.keycode) {
++        case ibus::Left:
++        case ibus::Right:
++          if (GetTickCount64() < _famo_guard_until)
++            break;  // 自注入的方向键，保留 pending
++          [[fallthrough]];
++        case ibus::Up:
++        case ibus::Down:
++        case ibus::Home:
++        case ibus::End:
++        case ibus::Page_Up:
++        case ibus::Page_Down:
++        case ibus::BackSpace:
++        case ibus::Delete:
++        case ibus::Return:
++        case ibus::Tab:
++        case ibus::Escape:
++          _famo_pending_close = 0;
++          break;
++        default:
++          break;
++      }
++    }
+     if (!keyCountToSimulate)
+       *pfEaten = (BOOL)m_client.ProcessKeyEvent(ke);
+ 
+@@ -63,6 +90,9 @@ void WeaselTSF::_ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
+ }
+ 
+ STDAPI WeaselTSF::OnSetFocus(BOOL fForeground) {
++  // 法墨标点配对：焦点变化作废 pending type-over 状态
++  _famo_pending_close = 0;
++  _famo_guard_until = 0;
+   if (fForeground)
+     m_client.FocusIn();
+   else {
+diff --git a/WeaselTSF/WeaselTSF.h b/WeaselTSF/WeaselTSF.h
+index 696d3cc..4d93e6e 100644
+--- a/WeaselTSF/WeaselTSF.h
++++ b/WeaselTSF/WeaselTSF.h
+@@ -181,6 +181,17 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   void _EnableLanguageBar(BOOL enable);
+ 
+   BOOL _InsertText(com_ptr<ITfContext> pContext, const std::wstring& ext);
++  // 法墨标点配对：读光标右侧一字符与 ch 比较。1=是 0=否 -1=读不到
++  //（transitory/CUAS 上下文文档不可读）
++  int _FamoProbeNextChar(TfEditCookie ec, wchar_t ch);
++  // 法墨标点配对：注入方向键移动光标（搜狗同方案）
++  void _FamoInjectArrow(WORD vk, int count);
++  // 法墨标点配对 pending 状态：配对补全后记住右符号；下一个 commit 若恰是
++  // 同一右符号且文档不可读（transitory），据此判定 type-over。
++  // 导航/编辑键、焦点变化、非匹配 commit 均作废（见 KeyEventSink/EditSession）。
++  wchar_t _famo_pending_close = 0;
++  // 自注入方向键的豁免时间窗（GetTickCount64 截止值）
++  unsigned long long _famo_guard_until = 0;
+ 
+   void _DeleteCandidateList();
+ 
+diff --git a/include/WeaselIPCData.h b/include/WeaselIPCData.h
+index 09f22f9..5b61f71 100644
+--- a/include/WeaselIPCData.h
++++ b/include/WeaselIPCData.h
+@@ -187,9 +187,14 @@ struct Status {
+ 
+ // 用於向前端告知設置信息
+ struct Config {
+-  Config() : inline_preedit(false) {}
+-  void reset() { inline_preedit = false; }
++  Config() : inline_preedit(false), famo_auto_pair(false) {}
++  void reset() {
++    inline_preedit = false;
++    famo_auto_pair = false;
++  }
+   bool inline_preedit;
++  // 法墨：标点自动配对（TSF 客户端消费，经 config. 文本行传输）
++  bool famo_auto_pair;
+ };
+ 
+ struct UIStyle {
+@@ -224,6 +229,9 @@ struct UIStyle {
+   int candidate_abbreviate_length;
+ 
+   bool inline_preedit;
++  // 法墨：标点自动配对开关（style/famo_auto_pair；不进 boost 序列化链，
++  // 只经 config.famo_auto_pair 文本行送 TSF 客户端）
++  bool famo_auto_pair;
+   bool display_tray_icon;
+   bool ascii_tip_follow_cursor;
+   bool paging_on_scroll;
+@@ -301,6 +309,7 @@ struct UIStyle {
+         comment_font_point(0),
+         candidate_abbreviate_length(0),
+         inline_preedit(false),
++        famo_auto_pair(false),
+         display_tray_icon(false),
+         ascii_tip_follow_cursor(false),
+         paging_on_scroll(false),

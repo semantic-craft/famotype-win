@@ -1,0 +1,57 @@
+================================================================================
+Famo Windows Input Method — THIRD-PARTY NOTICES
+================================================================================
+
+Famo Windows is distributed under GNU General Public License v3.0 (GPL-3.0).
+The complete GPLv3 text is in LICENSE. This notice lists code and data actually
+distributed in the Windows installer. The machine-readable inventory is
+SBOM.spdx.json.
+
+--------------------------------------------------------------------------------
+1. librime — RIME input method engine
+--------------------------------------------------------------------------------
+License: BSD-3-Clause
+Upstream: https://github.com/rime/librime
+Use: rime.dll and the engine ABI used by FamoRimeEngine.dll. The binary includes
+or links components such as OpenCC (Apache-2.0), google-glog (BSD-3-Clause),
+LevelDB (BSD-3-Clause), marisa-trie (BSD-2-Clause/LGPL-2.1), yaml-cpp (MIT),
+Boost (BSL-1.0), Lua 5.4.8 (MIT), and UTF-8 helper libraries (MIT/BSD families).
+
+--------------------------------------------------------------------------------
+2. iDvel/rime-ice — Rime configuration and dictionaries
+--------------------------------------------------------------------------------
+License: GPL-3.0
+Upstream: https://github.com/iDvel/rime-ice
+Use: pinyin schemas, dictionaries, Lua/OpenCC data, double-pinyin schemas,
+nine-key input, and English mixed-input data distributed under data/.
+
+--------------------------------------------------------------------------------
+3. KyleBing/rime-wubi86-jidian — Wubi 86 configuration and dictionaries
+--------------------------------------------------------------------------------
+License: Apache-2.0
+Upstream: https://github.com/KyleBing/rime-wubi86-jidian
+Use: Wubi 86 schemas, dictionaries, reverse lookup data, and Lua files
+distributed under data/.
+
+--------------------------------------------------------------------------------
+4. Microsoft .NET Runtime
+--------------------------------------------------------------------------------
+License: MIT
+Upstream: https://github.com/dotnet/runtime
+Use: self-contained runtime files shipped with FamoSettings.
+
+--------------------------------------------------------------------------------
+5. Windows App SDK / WinUI 3
+--------------------------------------------------------------------------------
+License: MIT
+Upstream: https://github.com/microsoft/WindowsAppSDK
+Use: self-contained WinUI runtime and resources shipped with FamoSettings.
+
+--------------------------------------------------------------------------------
+Notes
+--------------------------------------------------------------------------------
+- FamoTextService.dll and FamoRuntime.exe are the clean native Famo host/runtime;
+  no legacy TSF host, server, deployer, or updater binary is distributed.
+- The Windows system libraries and Microsoft Visual C++ runtime resolved from
+  the operating system are not copied into this payload.
+- 7-Zip, curl, and design-reference source trees are not distributed.

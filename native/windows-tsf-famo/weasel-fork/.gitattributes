@@ -1,0 +1,4 @@
+# features 补丁逐字节保存：勿做 EOL 归一化。
+# status-bar.patch 含 WeaselUI.vcxproj（CRLF）与 .cpp/.h（LF）混合 hunk，
+# 必须与上游目标文件行尾完全一致，否则 git apply 因行尾不符而失败。
+features/*.patch -text

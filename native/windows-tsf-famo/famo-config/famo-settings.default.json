@@ -1,0 +1,89 @@
+{
+  "version": 3,
+  "appearance": {
+    "skin": "shenda",
+    "appearanceMode": "system",
+    "fontFace": "微软雅黑",
+    "fontPoint": 19,
+    "candidateFormat": "full",
+    "orientation": "horizontal",
+    "inlinePreedit": false,
+    "inlineCandidatePreview": false,
+    "layout": {
+      "cornerRadius": 13,
+      "borderWidth": 1,
+      "shadowRadius": 16,
+      "margin": 8
+    }
+  },
+  "engine": {
+    "schemaList": [
+      { "id": "rime_ice", "enabled": true },
+      { "id": "wubi86_jidian", "enabled": true },
+      { "id": "double_pinyin_flypy", "enabled": true },
+      { "id": "t9", "enabled": true },
+      { "id": "wubi86_jidian_pinyin", "enabled": true },
+      { "id": "wubi86_jidian_trad", "enabled": true },
+      { "id": "wubi86_jidian_trad_pinyin", "enabled": true },
+      { "id": "double_pinyin", "enabled": true },
+      { "id": "double_pinyin_mspy", "enabled": true },
+      { "id": "double_pinyin_sogou", "enabled": true },
+      { "id": "double_pinyin_abc", "enabled": true },
+      { "id": "double_pinyin_ziguang", "enabled": true },
+      { "id": "double_pinyin_jiajia", "enabled": true }
+    ],
+    "pageSize": 8,
+    "fuzzyPinyin": {
+      "zh_z": false,
+      "ch_c": false,
+      "sh_s": false,
+      "n_l": false,
+      "r_l": false,
+      "f_h": false,
+      "an_ang": false,
+      "en_eng": false,
+      "in_ing": false
+    },
+    "emojiEnabled": false,
+    "wubi": {
+      "codeHint": false,
+      "autoClear": false,
+      "candidateMode": "normal",
+      "zReverseLookup": true
+    }
+  },
+  "switches": {
+    "asciiMode": false,
+    "asciiPunct": false,
+    "fullShape": false,
+    "traditionalization": false
+  },
+  "inputMethod": {
+    "method": "pinyin",
+    "doublePinyinLayout": "flypy",
+    "wubiScheme": "jidian86"
+  },
+  "clipboard": {
+    "enabled": false
+  },
+  "ai": {
+    "cloudEnabled": false,
+    "selectionMenuEnabled": true,
+    "polishSkillEnabled": true,
+    "sourceCheckSkillEnabled": true,
+    "researchAssistSkillEnabled": true,
+    "documentFormattingSkillEnabled": true,
+    "promptOptimizeSkillEnabled": true
+  },
+  "convenience": {
+    "shiftSwitch": true,
+    "goodOldCapsLock": true,
+    "pageMinusEquals": true,
+    "pageBrackets": false,
+    "pageCommaPeriod": false,
+    "select23Semicolon": false,
+    "slashToDun": false,
+    "digitSeparators": false,
+    "appEnglishExes": []
+  }
+}

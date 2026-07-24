@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>Famo.Settings</RootNamespace>
+    <AssemblyName>FamoSettings</AssemblyName>
+    <Platforms>x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 单实例：禁用自动生成的 Main，用 Program.cs 的自定义入口（AppInstance 重定向）。 -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <!-- 法墨品牌图标（深大红墨滴），与 macOS 版 Famo 对齐。源自 macOS 主线仓 Rime.appiconset。 -->
+    <ApplicationIcon>Assets\famo.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\famo.ico" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets\famo-256.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260529003" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FamoSettings.Core\FamoSettings.Core.csproj" />
+  </ItemGroup>
+
+  <Target Name="FamoCopyWinUIResourcesToPublishDir" AfterTargets="Publish">
+    <ItemGroup>
+      <_FamoWinUIRootResource Include="$(OutDir)FamoSettings.pri" />
+      <_FamoWinUIRootResource Include="$(OutDir)App.xbf" />
+      <_FamoWinUIRootResource Include="$(OutDir)MainWindow.xbf" />
+      <_FamoWinUIThemingResource Include="$(OutDir)Theming\*.xbf" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_FamoWinUIRootResource)" DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_FamoWinUIThemingResource)" DestinationFolder="$(PublishDir)Theming" SkipUnchangedFiles="true" />
+    <Error Condition="!Exists('$(PublishDir)FamoSettings.pri')"
+           Text="FamoSettings publish is missing FamoSettings.pri; the unpackaged WinUI settings window will crash before showing." />
+    <Error Condition="!Exists('$(PublishDir)Theming\FamoBrushes.xbf')"
+           Text="FamoSettings publish is missing Theming XBF resources; the unpackaged WinUI settings window will crash before showing." />
+  </Target>
+
+</Project>

@@ -1,0 +1,88 @@
+diff --git a/WeaselServer/WeaselServer.cpp b/WeaselServer/WeaselServer.cpp
+index b4cf8b2..ba68f35 100644
+--- a/WeaselServer/WeaselServer.cpp
++++ b/WeaselServer/WeaselServer.cpp
+@@ -18,6 +18,25 @@
+ #pragma comment(lib, "Shcore.lib")
+ CAppModule _Module;
+ 
++// 进程 DPI 感知：PerMonitorV2 优先（Win10 1703+），回退 PerMonitor v1（Win8.1+）。
++// 动态加载 user32!SetProcessDpiAwarenessContext —— 本工程 _WIN32_WINNT=8.1，新 SDK
++// 未声明该符号/V2 常量，故用 GetProcAddress 延迟绑定，且不强升编译期 Windows 版本要求。
++// V2 相对 v1 的收益：非客户区/对话框/子窗口随 DPI 正确缩放、跨屏 WM_DPICHANGED 行为更完整。
++// 须在任何窗口创建前调用；manifest 不再声明 dpiAware（见 .vcxproj EnableDpiAwareness=false），
++// 否则 manifest 会锁死感知级别使本调用变为 no-op。
++static void SetupProcessDpiAwareness() {
++  using SetCtxFn = BOOL(WINAPI*)(HANDLE);  // HANDLE = DPI_AWARENESS_CONTEXT
++  if (HMODULE u32 = ::GetModuleHandleW(L"user32.dll")) {
++    auto pSetCtx = reinterpret_cast<SetCtxFn>(
++        ::GetProcAddress(u32, "SetProcessDpiAwarenessContext"));
++    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (DPI_AWARENESS_CONTEXT)-4
++    if (pSetCtx && pSetCtx(reinterpret_cast<HANDLE>(-4)))
++      return;  // V2 设置成功
++  }
++  // 回退：PerMonitor v1（Shcore，Win8.1+）。IsWindowsBlueOrLaterEx 已挡掉更老系统。
++  ::SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
++}
++
+ int WINAPI _tWinMain(HINSTANCE hInstance,
+                      HINSTANCE /*hPrevInstance*/,
+                      LPTSTR lpstrCmdLine,
+@@ -33,7 +52,7 @@ int WINAPI _tWinMain(HINSTANCE hInstance,
+     MessageBoxExW(NULL, info, cap, MB_ICONERROR, langId);
+     return 0;
+   }
+-  SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
++  SetupProcessDpiAwareness();  // PerMonitorV2 优先，回退 v1
+ 
+   // 防止服务进程开启输入法
+   ImmDisableIME(-1);
+diff --git a/WeaselServer/WeaselServer.vcxproj b/WeaselServer/WeaselServer.vcxproj
+index 8b6b571..47e82f2 100644
+--- a/WeaselServer/WeaselServer.vcxproj
++++ b/WeaselServer/WeaselServer.vcxproj
+@@ -178,7 +178,7 @@
+       </Command>
+     </PostBuildEvent>
+     <Manifest>
+-      <EnableDpiAwareness>PerMonitorHighDPIAware</EnableDpiAwareness>
++      <EnableDpiAwareness>false</EnableDpiAwareness>
+     </Manifest>
+   </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
+@@ -263,7 +263,7 @@
+       <OutputFile>$(SolutionDir)\output\$(ProjectName).exe</OutputFile>
+     </Link>
+     <Manifest>
+-      <EnableDpiAwareness>PerMonitorHighDPIAware</EnableDpiAwareness>
++      <EnableDpiAwareness>false</EnableDpiAwareness>
+     </Manifest>
+   </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">
+@@ -348,7 +348,7 @@
+     </PostBuildEvent>
+     <ProjectReference />
+     <Manifest>
+-      <EnableDpiAwareness>PerMonitorHighDPIAware</EnableDpiAwareness>
++      <EnableDpiAwareness>false</EnableDpiAwareness>
+     </Manifest>
+   </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
+@@ -392,7 +392,7 @@
+     </PostBuildEvent>
+     <ProjectReference />
+     <Manifest>
+-      <EnableDpiAwareness>PerMonitorHighDPIAware</EnableDpiAwareness>
++      <EnableDpiAwareness>false</EnableDpiAwareness>
+     </Manifest>
+   </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+@@ -436,7 +436,7 @@
+       </Command>
+     </PostBuildEvent>
+     <Manifest>
+-      <EnableDpiAwareness>PerMonitorHighDPIAware</EnableDpiAwareness>
++      <EnableDpiAwareness>false</EnableDpiAwareness>
+     </Manifest>
+   </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM'">

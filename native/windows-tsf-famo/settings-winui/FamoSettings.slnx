@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="FamoSettings.Core/FamoSettings.Core.csproj" />
+  <Project Path="FamoSettings.Tests/FamoSettings.Tests.csproj" />
+  <Project Path="FamoSettings/FamoSettings.csproj" />
+</Solution>

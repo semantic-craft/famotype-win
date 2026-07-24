@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 法墨 8-token + 派生中性色笔刷。初值=荔园红浅色；运行时由 FamoTheme.Apply 原地改 Color。
+     必须在 FamoStyles.xaml 之前合并，使其 {StaticResource} 可解析。 -->
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- 8 token -->
+    <SolidColorBrush x:Key="Famo.Accent" Color="#A82C53" />
+    <SolidColorBrush x:Key="Famo.AccentDeep" Color="#8E2447" />
+    <SolidColorBrush x:Key="Famo.OnAccent" Color="#FBF9F5" />
+    <SolidColorBrush x:Key="Famo.Card" Color="#FBF9F5" />
+    <SolidColorBrush x:Key="Famo.Card2" Color="#F3EFE7" />
+    <SolidColorBrush x:Key="Famo.Ink" Color="#2A2622" />
+    <SolidColorBrush x:Key="Famo.Ink2" Color="#6B6A64" />
+    <SolidColorBrush x:Key="Famo.Ink3" Color="#9A9387" />
+
+    <!-- 派生 -->
+    <SolidColorBrush x:Key="Famo.Line" Color="#172A2622" />
+    <SolidColorBrush x:Key="Famo.Line2" Color="#0F2A2622" />
+    <SolidColorBrush x:Key="Famo.Hover" Color="#17A82C53" />
+    <SolidColorBrush x:Key="Famo.OnAccent20" Color="#33FBF9F5" />
+    <SolidColorBrush x:Key="Famo.Accent12" Color="#1FA82C53" />
+    <SolidColorBrush x:Key="Famo.Knob" Color="#FFFFFF" />
+    <SolidColorBrush x:Key="Famo.StatusGreen" Color="#2E7D52" />
+    <SolidColorBrush x:Key="Famo.Ink3_55" Color="#8C9A9387" />
+    <SolidColorBrush x:Key="Famo.Ink3_35" Color="#599A9387" />
+    <SolidColorBrush x:Key="Famo.Field" Color="#0D2A2622" />
+    <SolidColorBrush x:Key="Famo.SegBg" Color="#0F2A2622" />
+    <SolidColorBrush x:Key="Famo.BannerInstantBg" Color="#0A2A2622" />
+    <SolidColorBrush x:Key="Famo.BannerDeployBg" Color="#F0DCE0" />
+    <SolidColorBrush x:Key="Famo.BannerDeployBorder" Color="#43A82C53" />
+</ResourceDictionary>

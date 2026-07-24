@@ -1,0 +1,48 @@
+diff --git a/WeaselServer/WeaselServerApp.cpp b/WeaselServer/WeaselServerApp.cpp
+index e09c4c5..9c343b7 100644
+--- a/WeaselServer/WeaselServerApp.cpp
++++ b/WeaselServer/WeaselServerApp.cpp
+@@ -16,6 +16,10 @@ int WeaselServerApp::Run() {
+   if (!m_server.Start())
+     return -1;
+ 
++  // 法墨永不空配置兜底：用户 build 缺失（安装器 /deploy 被跳过/拒权/静默安装）时，
++  // 启动即异步跑一次部署，部署完成经 IPC 通知本 server reload → 首次输入即可用（装完即用）。
++  ensure_deployed();
++
+   // win_sparkle_set_appcast_url("http://localhost:8000/weasel/update/appcast.xml");
+   win_sparkle_set_registry_path("Software\\Rime\\Weasel\\Updates");
+   if (GetThreadUILanguage() ==
+@@ -74,3 +78,19 @@ void WeaselServerApp::SetupMenuHandlers() {
+   m_server.AddMenuHandler(ID_WEASELTRAY_LOGDIR,
+                           std::bind(explore, WeaselLogPath()));
+ }
++
++void WeaselServerApp::ensure_deployed() {
++  // 永不空配置兜底：若用户目录尚无编译产物（%LOCALAPPDATA%\Famo\build\default.yaml 缺失），
++  // 说明安装器的首启 /deploy 未跑成（静默安装 /VERYSILENT、用户拒提权、或异常）——此时
++  // 异步跑一次 WeaselDeployer /deploy，从共享数据（<exe>\data）编译到用户 build。
++  // fire-and-forget：deployer 部署完成会经 IPC 通知运行中的本 server 进入维护并重载方案，
++  // 故首次输入约数秒后即可用，无需用户手动「重新部署」。已部署则零开销跳过。
++  std::error_code ec;
++  fs::path build_marker = WeaselUserDataPath() / L"build" / L"default.yaml";
++  if (fs::exists(build_marker, ec))
++    return;  // 已有编译产物，正常路径，跳过。
++  fs::path deployer = install_dir() / L"WeaselDeployer.exe";
++  if (!fs::exists(deployer, ec))
++    return;  // 无 deployer（异常安装），无从兜底。
++  execute(deployer, std::wstring(L"/deploy"));
++}
+diff --git a/WeaselServer/WeaselServerApp.h b/WeaselServer/WeaselServerApp.h
+index d5e32e0..0d98147 100644
+--- a/WeaselServer/WeaselServerApp.h
++++ b/WeaselServer/WeaselServerApp.h
+@@ -62,6 +62,8 @@ class WeaselServerApp {
+ 
+  protected:
+   void SetupMenuHandlers();
++  // 法墨永不空配置兜底：用户 build 缺失时异步跑一次 /deploy（详见 .cpp）。
++  void ensure_deployed();
+ 
+   weasel::Server m_server;
+   weasel::UI m_ui;

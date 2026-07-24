@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "False positives: XAML brush resource names, settings-schema key names, and a public COM/TSF GUID"
+paths = [
+  '''native/windows-tsf-famo/settings-winui/FamoSettings/Theming/FamoBrushes\.xaml''',
+  '''native/windows-tsf-famo/famo-config/famo-settings\.schema\.json''',
+  '''native/windows-tsf-famo/weasel-fork/famo-identity\.json''',
+]

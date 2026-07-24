@@ -1,0 +1,605 @@
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index c4d3a5e..12d401f 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -1,4 +1,4 @@
+-﻿#include "stdafx.h"
++#include "stdafx.h"
+ #include <logging.h>
+ #include <RimeWithWeasel.h>
+ #include <StringAlgorithm.hpp>
+@@ -6,6 +6,8 @@
+ #include <WeaselUtility.h>
+ 
+ #include <filesystem>
++#include <fstream>
++#include <sstream>
+ #include <map>
+ #include <array>
+ #include <vector>
+@@ -64,6 +66,52 @@ RimeWithWeaselHandler::~RimeWithWeaselHandler() {
+ }
+ 
+ bool add_session = false;
++
++// 法墨即时外观②：读取 %LOCALAPPDATA%\Famo\famo-style.yaml 覆盖层为 UTF-8 串；
++// 不存在/读失败返回空串（调用方据此跳过覆盖，回退已编译 weasel.yaml）。
++static std::string _ReadFamoStyleOverlayYaml() {
++  try {
++    std::filesystem::path p = WeaselUserDataPath() / L"famo-style.yaml";
++    if (!std::filesystem::exists(p))
++      return std::string();
++    std::ifstream ifs(p, std::ios::binary);
++    if (!ifs)
++      return std::string();
++    std::stringstream ss;
++    ss << ifs.rdbuf();
++    std::string s = ss.str();
++    // 去 UTF-8 BOM（若有）：config_load_string 需纯 UTF-8。
++    if (s.size() >= 3 && (unsigned char)s[0] == 0xEF &&
++        (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
++      s.erase(0, 3);
++    return s;
++  } catch (...) {
++    return std::string();
++  }
++}
++
++// 法墨即时开关①：读取 %LOCALAPPDATA%\Famo\famo-options.yaml 为 UTF-8 串（去 BOM）。
++// 不存在/读失败返回空串。与覆盖层读取同形（共用一个底层读取）。
++static std::string _ReadFamoFile(const wchar_t* name) {
++  try {
++    std::filesystem::path p = WeaselUserDataPath() / name;
++    if (!std::filesystem::exists(p))
++      return std::string();
++    std::ifstream ifs(p, std::ios::binary);
++    if (!ifs)
++      return std::string();
++    std::stringstream ss;
++    ss << ifs.rdbuf();
++    std::string s = ss.str();
++    if (s.size() >= 3 && (unsigned char)s[0] == 0xEF &&
++        (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
++      s.erase(0, 3);
++    return s;
++  } catch (...) {
++    return std::string();
++  }
++}
++
+ void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize);
+ bool _UpdateUIStyleColor(RimeConfig* config,
+                          UIStyle& style,
+@@ -132,6 +180,8 @@ void RimeWithWeaselHandler::Initialize() {
+           _UpdateUIStyleColor(&config, m_ui->style(), color_name);
+         }
+       }
++      // 法墨即时外观②：启动时即叠加 famo-style.yaml 覆盖层 → 外观跨重启持久（不部署）。
++      _ApplyFamoStyleOverlay(&config);
+       m_base_style = m_ui->style();
+     }
+     Bool global_ascii = false;
+@@ -180,6 +230,8 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+       }
+     }
+   }
++  // 法墨即时开关①：新会话即回放 famo-options.yaml → 开关跨 App/重启持久（不部署）。
++  _ApplyFamoOptions(session_id);
+ 
+   WeaselSessionId ipc_id =
+       _GenerateNewWeaselSessionId(m_session_status_map, m_pid);
+@@ -261,6 +313,110 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
+   m_ui->style() = get_session_status(m_active_session).style;
+ }
+ 
++void RimeWithWeaselHandler::_ApplyFamoStyleOverlay(RimeConfig* base) {
++  // 法墨即时外观②：把 famo-style.yaml 覆盖层叠加到 m_ui->style() 之上。
++  // base 已含 preset_color_schemes（已编译 weasel.yaml），用于按名套皮肤。
++  if (!m_ui)
++    return;
++  std::string yaml = _ReadFamoStyleOverlayYaml();
++  if (yaml.empty())
++    return;
++  RimeConfig overlay = {NULL};
++  if (!rime_api->config_init(&overlay))
++    return;
++  if (rime_api->config_load_string(&overlay, yaml.c_str())) {
++    // initialize=false ⇒ 仅覆盖覆盖层中出现的标量键，其余保持 base。
++    _UpdateUIStyle(&overlay, m_ui, false);
++    // 皮肤：覆盖层给出 color_scheme(_dark) 时按名套用，preset 取自 base。
++    const int BUF_SIZE = 255;
++    char buffer[BUF_SIZE + 1] = {0};
++    const char* key =
++        m_current_dark_mode ? "style/color_scheme_dark" : "style/color_scheme";
++    if (rime_api->config_get_string(&overlay, key, buffer, BUF_SIZE) &&
++        buffer[0]) {
++      _UpdateUIStyleColor(base, m_ui->style(), std::string(buffer));
++    }
++  }
++  rime_api->config_close(&overlay);
++}
++
++void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
++                                               EatLine eat) {
++  // 法墨即时外观②：重读 base(weasel.yaml) + famo-style.yaml 覆盖层，刷新所有会话样式。
++  // 复用 UpdateColorTheme 的传播逻辑；不部署、不重建 prism、不碰 TSF 热路径。
++  LOG(INFO) << "Famo: ReloadStyleOverlay (instant style, no deploy).";
++  RimeConfig config = {NULL};
++  if (rime_api->config_open("weasel", &config)) {
++    if (m_ui) {
++      _UpdateUIStyle(&config, m_ui, true);
++      if (m_current_dark_mode) {
++        const int BUF_SIZE = 255;
++        char buffer[BUF_SIZE + 1] = {0};
++        if (rime_api->config_get_string(&config, "style/color_scheme_dark",
++                                        buffer, BUF_SIZE)) {
++          std::string color_name(buffer);
++          _UpdateUIStyleColor(&config, m_ui->style(), color_name);
++        }
++      }
++      _ApplyFamoStyleOverlay(&config);
++      m_base_style = m_ui->style();
++    }
++    rime_api->config_close(&config);
++  }
++
++  for (auto& pair : m_session_status_map) {
++    RIME_STRUCT(RimeStatus, status);
++    if (rime_api->get_status(to_session_id(pair.first), &status)) {
++      pair.second.style = m_base_style;
++      _LoadSchemaSpecificSettings(pair.first, std::string(status.schema_id));
++      _LoadAppInlinePreeditSet(pair.first, true);
++      _UpdateInlinePreeditStatus(pair.first);
++      pair.second.status = status;
++      pair.second.__synced = false;
++      rime_api->free_status(&status);
++    }
++  }
++  if (m_active_session) {
++    m_ui->style() = get_session_status(m_active_session).style;
++    _UpdateUI(m_active_session);
++  }
++  if (ipc_id && eat && m_session_status_map.find(ipc_id) != m_session_status_map.end())
++    _Respond(ipc_id, eat);
++}
++
++void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
++  // 法墨即时开关①：把 famo-options.yaml 的 options: 映射逐项 set_option 到一个会话。
++  std::string yaml = _ReadFamoFile(L"famo-options.yaml");
++  if (yaml.empty())
++    return;
++  RimeConfig cfg = {NULL};
++  if (!rime_api->config_init(&cfg))
++    return;
++  if (rime_api->config_load_string(&cfg, yaml.c_str())) {
++    RimeConfigIterator it = {0};
++    if (rime_api->config_begin_map(&it, &cfg, "options")) {
++      while (rime_api->config_next(&it)) {
++        Bool v = False;
++        if (rime_api->config_get_bool(&cfg, it.path, &v))
++          rime_api->set_option(session_id, it.key, !!v);
++      }
++      rime_api->config_end(&it);
++    }
++  }
++  rime_api->config_close(&cfg);
++}
++
++void RimeWithWeaselHandler::ReloadOptions() {
++  // 法墨即时开关①：重读 famo-options.yaml，set_option 到所有活动会话（不部署、不重建 prism）。
++  LOG(INFO) << "Famo: ReloadOptions (instant switches, no deploy).";
++  if (m_disabled)
++    return;
++  for (auto& pair : m_session_status_map)
++    _ApplyFamoOptions(to_session_id(pair.first));
++  if (m_active_session)
++    _UpdateUI(m_active_session);  // 中英/简繁等状态变化即时反映到候选窗/状态栏
++}
++
+ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
+                                             WeaselSessionId ipc_id,
+                                             EatLine eat) {
+@@ -507,7 +663,7 @@ void RimeWithWeaselHandler::OnUpdateUI(std::function<void()> const& cb) {
+ }
+ 
+ bool RimeWithWeaselHandler::_IsDeployerRunning() {
+-  HANDLE hMutex = CreateMutex(NULL, TRUE, L"WeaselDeployerMutex");
++  HANDLE hMutex = CreateMutex(NULL, TRUE, L"FamoDeployerMutex");
+   bool deployer_detected = hMutex && GetLastError() == ERROR_ALREADY_EXISTS;
+   if (hMutex) {
+     CloseHandle(hMutex);
+diff --git a/WeaselDeployer/WeaselDeployer.cpp b/WeaselDeployer/WeaselDeployer.cpp
+index a578014..daefe0c 100644
+--- a/WeaselDeployer/WeaselDeployer.cpp
++++ b/WeaselDeployer/WeaselDeployer.cpp
+@@ -2,6 +2,7 @@
+ //
+ #include "stdafx.h"
+ #include <WeaselUtility.h>
++#include <WeaselIPC.h>
+ #include <fstream>
+ #include "WeaselDeployer.h"
+ #include "Configurator.h"
+@@ -72,6 +73,8 @@ static int Run(LPTSTR lpCmdLine) {
+                  L"Usage: WeaselDeployer.exe [options]\n"
+                  L"/? or /help		- Show this help message\n"
+                  L"/deploy		- Update Workspace\n"
++                 L"/reloadstyle	- Reload famo-style.yaml overlay (no deploy)\n"
++                 L"/reloadoptions	- Reload famo-options.yaml switches (no deploy)\n"
+                  L"/dict		- Manage dictionary\n"
+                  L"/sync		- Sync user data\n"
+                  L"/install		- Install Weasel (Initial deployment)",
+@@ -80,6 +83,25 @@ static int Run(LPTSTR lpCmdLine) {
+     return 0;
+   }
+ 
++  // 法墨即时外观②：仅通知运行中的 server 重读 famo-style.yaml 覆盖层并重绘。
++  // 不做任何编译/部署，不抢 FamoDeployerMutex（不会禁用 server）。server 未运行则静默跳过。
++  bool reload_style = !wcscmp(L"/reloadstyle", lpCmdLine);
++  if (reload_style) {
++    weasel::Client client;
++    if (client.Connect())
++      client.ReloadStyle();
++    return 0;
++  }
++
++  // 法墨即时开关①：仅通知运行中的 server 重读 famo-options.yaml 并 set_option（不部署）。
++  bool reload_options = !wcscmp(L"/reloadoptions", lpCmdLine);
++  if (reload_options) {
++    weasel::Client client;
++    if (client.Connect())
++      client.ReloadOptions();
++    return 0;
++  }
++
+   bool deployment_scheduled = !wcscmp(L"/deploy", lpCmdLine);
+   if (deployment_scheduled) {
+     return configurator.UpdateWorkspace();
+diff --git a/WeaselIPC/WeaselClientImpl.cpp b/WeaselIPC/WeaselClientImpl.cpp
+index 26122ad..9da3aca 100644
+--- a/WeaselIPC/WeaselClientImpl.cpp
++++ b/WeaselIPC/WeaselClientImpl.cpp
+@@ -166,6 +166,16 @@ void ClientImpl::EndMaintenance() {
+   session_id = 0;
+ }
+ 
++void ClientImpl::ReloadStyle() {
++  // 无会话命令：令 server 重读 famo-style.yaml 覆盖层并重绘（不部署）。
++  _SendMessage(WEASEL_IPC_RELOAD_STYLE, 0, session_id);
++}
++
++void ClientImpl::ReloadOptions() {
++  // 无会话命令：令 server 重读 famo-options.yaml 并 set_option 到各会话（不部署）。
++  _SendMessage(WEASEL_IPC_RELOAD_OPTIONS, 0, 0);
++}
++
+ bool ClientImpl::Echo() {
+   if (!_Active())
+     return false;
+@@ -272,6 +282,14 @@ void Client::EndMaintenance() {
+   m_pImpl->EndMaintenance();
+ }
+ 
++void Client::ReloadStyle() {
++  m_pImpl->ReloadStyle();
++}
++
++void Client::ReloadOptions() {
++  m_pImpl->ReloadOptions();
++}
++
+ void Client::TrayCommand(UINT menuId) {
+   m_pImpl->TrayCommand(menuId);
+ }
+diff --git a/WeaselIPC/WeaselClientImpl.h b/WeaselIPC/WeaselClientImpl.h
+index 7602792..c0d1f44 100644
+--- a/WeaselIPC/WeaselClientImpl.h
++++ b/WeaselIPC/WeaselClientImpl.h
+@@ -16,6 +16,8 @@ class ClientImpl {
+   void EndSession();
+   void StartMaintenance();
+   void EndMaintenance();
++  void ReloadStyle();
++  void ReloadOptions();
+   bool Echo();
+   bool ProcessKeyEvent(KeyEvent const& keyEvent);
+   bool CommitComposition();
+diff --git a/WeaselIPCServer/WeaselServerImpl.cpp b/WeaselIPCServer/WeaselServerImpl.cpp
+index 1131e41..0e35a18 100644
+--- a/WeaselIPCServer/WeaselServerImpl.cpp
++++ b/WeaselIPCServer/WeaselServerImpl.cpp
+@@ -358,6 +358,29 @@ DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
+   return 0;
+ }
+ 
++DWORD ServerImpl::OnReloadStyle(WEASEL_IPC_COMMAND uMsg,
++                                DWORD wParam,
++                                DWORD lParam) {
++  // 法墨即时外观②：重读 famo-style.yaml 覆盖层并重绘（不部署）。
++  if (m_pRequestHandler) {
++    auto eat = [this](std::wstring& msg) -> bool {
++      *channel << msg;
++      return true;
++    };
++    m_pRequestHandler->ReloadStyleOverlay(lParam, eat);
++  }
++  return 0;
++}
++
++DWORD ServerImpl::OnReloadOptions(WEASEL_IPC_COMMAND uMsg,
++                                  DWORD wParam,
++                                  DWORD lParam) {
++  // 法墨即时开关①：重读 famo-options.yaml 并 set_option 到各会话（不部署）。
++  if (m_pRequestHandler)
++    m_pRequestHandler->ReloadOptions();
++  return 0;
++}
++
+ #define MAP_PIPE_MSG_HANDLE(__msg, __wParam, __lParam) \
+   {                                                    \
+     auto lParam = __lParam;                            \
+@@ -396,6 +414,8 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
+   PIPE_MSG_HANDLE(WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
+                   OnHighlightCandidateOnCurrentPage);
+   PIPE_MSG_HANDLE(WEASEL_IPC_CHANGE_PAGE, OnChangePage);
++  PIPE_MSG_HANDLE(WEASEL_IPC_RELOAD_STYLE, OnReloadStyle);
++  PIPE_MSG_HANDLE(WEASEL_IPC_RELOAD_OPTIONS, OnReloadOptions);
+   PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
+   END_MAP_PIPE_MSG_HANDLE(result);
+ 
+diff --git a/WeaselIPCServer/WeaselServerImpl.h b/WeaselIPCServer/WeaselServerImpl.h
+index 5a2e3ab..8f78191 100644
+--- a/WeaselIPCServer/WeaselServerImpl.h
++++ b/WeaselIPCServer/WeaselServerImpl.h
+@@ -70,6 +70,8 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+                                           DWORD wParam,
+                                           DWORD lParam);
+   DWORD OnChangePage(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
++  DWORD OnReloadStyle(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
++  DWORD OnReloadOptions(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+ 
+  public:
+   ServerImpl();
+diff --git a/WeaselTSF/CandidateList.cpp b/WeaselTSF/CandidateList.cpp
+index 66e282e..11c1e88 100644
+--- a/WeaselTSF/CandidateList.cpp
++++ b/WeaselTSF/CandidateList.cpp
+@@ -3,6 +3,7 @@
+ #include "WeaselTSF.h"
+ #include "CandidateList.h"
+ #include <KeyEvent.h>
++#include <ResponseParser.h>
+ #include <math.h>
+ 
+ using namespace std;
+@@ -74,10 +75,13 @@ STDMETHODIMP CCandidateList::GetGUID(GUID* pguid) {
+ }
+ 
+ STDMETHODIMP CCandidateList::Show(BOOL showCandidateWindow) {
+-  if (showCandidateWindow)
++  if (showCandidateWindow) {
+     _ui->Show();
+-  else
++    _StartStylePoll();
++  } else {
+     _ui->Hide();
++    _StopStylePoll();
++  }
+   return S_OK;
+ }
+ 
+@@ -227,12 +231,14 @@ void CCandidateList::UpdateInputPosition(RECT const& rc) {
+ 
+ void CCandidateList::Destroy() {
+   // EndUI();
++  _StopStylePoll();
+   Show(FALSE);
+   _DisposeUIWindow();
+ }
+ 
+ void CCandidateList::DestroyAll() {
+   // EndUI();
++  _StopStylePoll();
+   Show(FALSE);
+   _DisposeUIWindowAll();
+ }
+@@ -311,6 +317,7 @@ void CCandidateList::StartUI() {
+ }
+ 
+ void CCandidateList::EndUI() {
++  _StopStylePoll();
+   com_ptr<ITfThreadMgr> pThreadMgr = _tsf->_GetThreadMgr();
+   if (pThreadMgr) {
+     com_ptr<ITfUIElementMgr> emgr;
+@@ -323,6 +330,54 @@ void CCandidateList::EndUI() {
+   _DisposeUIWindow();
+ }
+ 
++bool CCandidateList::_ReadStyleFileTime(FILETIME* ft) {
++  wchar_t base[MAX_PATH] = {0};
++  DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
++  if (!len || len >= MAX_PATH)
++    return false;
++  std::wstring path(base);
++  path.append(L"\\Famo\\famo-style.yaml");
++  WIN32_FILE_ATTRIBUTE_DATA data = {};
++  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
++    return false;
++  *ft = data.ftLastWriteTime;
++  return true;
++}
++
++void CCandidateList::_StartStylePoll() {
++  if (_style_polling)
++    return;
++  _ReadStyleFileTime(&_style_mtime);
++  if (SetTimer(NULL, reinterpret_cast<UINT_PTR>(this), 500,
++               &CCandidateList::_StylePollTimerProc)) {
++    _style_polling = true;
++  }
++}
++
++void CCandidateList::_StopStylePoll() {
++  if (!_style_polling)
++    return;
++  KillTimer(NULL, reinterpret_cast<UINT_PTR>(this));
++  _style_polling = false;
++}
++
++void CCandidateList::_PollStyleFile() {
++  FILETIME ft = {};
++  if (!_ReadStyleFileTime(&ft))
++    return;
++  if (CompareFileTime(&ft, &_style_mtime) == 0)
++    return;
++  _style_mtime = ft;
++  _tsf->_ReloadStyleFromServerForCandidate();
++}
++
++VOID CALLBACK CCandidateList::_StylePollTimerProc(HWND,
++                                                  UINT,
++                                                  UINT_PTR id,
++                                                  DWORD) {
++  reinterpret_cast<CCandidateList*>(id)->_PollStyleFile();
++}
++
+ com_ptr<ITfContext> CCandidateList::GetContextDocument() {
+   return _pContextDocument;
+ }
+@@ -353,6 +408,15 @@ void WeaselTSF::_UpdateUI(const Context& ctx, const Status& status) {
+   _cand->UpdateUI(ctx, status);
+ }
+ 
++void WeaselTSF::_ReloadStyleFromServerForCandidate() {
++  m_client.ReloadStyle();
++  auto context = std::make_shared<weasel::Context>();
++  weasel::ResponseParser parser(NULL, context.get(), &_status, NULL,
++                                &_cand->style());
++  if (m_client.GetResponseData(std::ref(parser)))
++    _UpdateUI(*context, _status);
++}
++
+ void WeaselTSF::_StartUI() {
+   _cand->StartUI();
+ }
+diff --git a/WeaselTSF/CandidateList.h b/WeaselTSF/CandidateList.h
+index 648732c..291f5ec 100644
+--- a/WeaselTSF/CandidateList.h
++++ b/WeaselTSF/CandidateList.h
+@@ -69,6 +69,14 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
+   // void _UpdateOwner();
+   HWND _GetActiveWnd();
+   HRESULT _UpdateUIElement();
++  void _StartStylePoll();
++  void _StopStylePoll();
++  void _PollStyleFile();
++  bool _ReadStyleFileTime(FILETIME* ft);
++  static VOID CALLBACK _StylePollTimerProc(HWND hwnd,
++                                           UINT msg,
++                                           UINT_PTR id,
++                                           DWORD time);
+ 
+   // for CCandidateList::EndUI(), after ending composition ||
+   // WeaselTSF::_EndUI()
+@@ -86,6 +94,8 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
+ 
+   BOOL _pbShow;
+   weasel::UIStyle _style;
++  bool _style_polling = false;
++  FILETIME _style_mtime = {};
+ 
+   com_ptr<ITfContext> _pContextDocument;
+ };
+diff --git a/WeaselTSF/WeaselTSF.h b/WeaselTSF/WeaselTSF.h
+index 696d3cc..6645c23 100644
+--- a/WeaselTSF/WeaselTSF.h
++++ b/WeaselTSF/WeaselTSF.h
+@@ -132,6 +132,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+ 
+   /* UI */
+   void _UpdateUI(const weasel::Context& ctx, const weasel::Status& status);
++  void _ReloadStyleFromServerForCandidate();
+   void _StartUI();
+   void _EndUI();
+   void _ShowUI();
+diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
+index ab20d8d..bc8950d 100644
+--- a/include/RimeWithWeasel.h
++++ b/include/RimeWithWeasel.h
+@@ -62,6 +62,8 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+                          const std::string& opt,
+                          bool val);
+   virtual void UpdateColorTheme(BOOL darkMode);
++  virtual void ReloadStyleOverlay(WeaselSessionId ipc_id = 0, EatLine eat = 0);
++  virtual void ReloadOptions();
+ 
+   void OnUpdateUI(std::function<void()> const& cb);
+ 
+@@ -82,6 +84,11 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+                   weasel::Context& ctx);
+   void _GetContext(weasel::Context& ctx, RimeSessionId session_id);
+   void _UpdateShowNotifications(RimeConfig* config, bool initialize = false);
++  // 法墨即时外观②：读 %LOCALAPPDATA%\Famo\famo-style.yaml 覆盖层并应用到 m_ui->style()。
++  // base = 已编译的 "weasel" 配置（含 preset_color_schemes，用于按名套皮肤）。
++  void _ApplyFamoStyleOverlay(RimeConfig* base);
++  // 法墨即时开关①：读 famo-options.yaml 的 options: 映射，set_option 到给定会话（不部署）。
++  void _ApplyFamoOptions(RimeSessionId session_id);
+ 
+   void _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
+ 
+diff --git a/include/WeaselIPC.h b/include/WeaselIPC.h
+index d260ac2..fe67d7e 100644
+--- a/include/WeaselIPC.h
++++ b/include/WeaselIPC.h
+@@ -1,4 +1,4 @@
+-﻿#pragma once
++#pragma once
+ #include <WeaselIPCData.h>
+ #include <WeaselUtility.h>
+ #include <windows.h>
+@@ -6,8 +6,8 @@
+ #include <memory>
+ #include <KeyEvent.h>
+ 
+-#define WEASEL_IPC_WINDOW L"WeaselIPCWindow_1.0"
+-#define WEASEL_IPC_PIPE_NAME L"WeaselNamedPipe"
++#define WEASEL_IPC_WINDOW L"FamoIPCWindow_1.0"
++#define WEASEL_IPC_PIPE_NAME L"FamoNamedPipe"
+ 
+ #define WEASEL_IPC_METADATA_SIZE 1024
+ #define WEASEL_IPC_BUFFER_SIZE (4 * 1024)
+@@ -32,6 +32,12 @@ enum WEASEL_IPC_COMMAND {
+   WEASEL_IPC_SELECT_CANDIDATE_ON_CURRENT_PAGE,
+   WEASEL_IPC_HIGHLIGHT_CANDIDATE_ON_CURRENT_PAGE,
+   WEASEL_IPC_CHANGE_PAGE,
++  // 法墨即时外观②：令运行中的 server 重读 famo-style.yaml 覆盖层并重绘，
++  // 无需 deploy / 重建 prism。详见 design/INSTANT-APPLY-DESIGN.md。
++  WEASEL_IPC_RELOAD_STYLE,
++  // 法墨即时开关①：令 server 重读 famo-options.yaml 并 set_option 到各会话（简繁/中英标点/emoji…），
++  // 无需 deploy。与 ② 对称，无字符串载荷。
++  WEASEL_IPC_RELOAD_OPTIONS,
+   WEASEL_IPC_LAST_COMMAND
+ };
+ 
+@@ -81,6 +87,10 @@ struct RequestHandler {
+   virtual void EndMaintenance() {}
+   virtual void SetOption(DWORD session_id, const std::string& opt, bool val) {}
+   virtual void UpdateColorTheme(BOOL darkMode) {}
++  // 法墨即时外观②：重读 famo-style.yaml 覆盖层，原地更新 UIStyle 并重绘（不部署）。
++  virtual void ReloadStyleOverlay(DWORD session_id = 0, EatLine eat = 0) {}
++  // 法墨即时开关①：重读 famo-options.yaml，set_option 到各会话（不部署）。
++  virtual void ReloadOptions() {}
+ };
+ 
+ // 處理server端回應之物件
+@@ -118,6 +128,10 @@ class Client {
+   void StartMaintenance();
+   // 退出維護模式
+   void EndMaintenance();
++  // 法墨即时外观②：通知 server 重读 famo-style.yaml 覆盖层并重绘（不部署）。
++  void ReloadStyle();
++  // 法墨即时开关①：通知 server 重读 famo-options.yaml 并 set_option 到各会话（不部署）。
++  void ReloadOptions();
+   // 测试连接
+   bool Echo();
+   // 请求服务处理按键消息

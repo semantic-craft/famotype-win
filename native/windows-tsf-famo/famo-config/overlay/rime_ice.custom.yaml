@@ -1,0 +1,50 @@
+# rime_ice.custom.yaml — 法墨 Windows (Famo) 雾凇全拼方案补丁 · rime-ice 底座
+# 落 %LOCALAPPDATA%\Famo\，部署生效。出处对照见 CONFIG-MAPPING.md §④。
+#
+# 本文件承载「部署桶」中归属方案层的出厂锚定：
+#   - emoji 候选：出厂关（rime-ice emoji reset 默认 1 → 法墨 0）
+#   - 模糊音：出厂全关（speller/algebra 不追加；设置面板勾选后由写入层 speller/algebra/+ 追加）
+#
+# 已下线：tone_display（带声调预编辑）。rime-ice 无此开关，且用户已确认"声调关掉没用"，
+#   故迁移即正式下线——本文件不含 tone 相关项。
+#
+# 已移除：codeLengthLimit（oh-my-rime 薄荷把输入码长硬截到 25，长句打到一半拒收后续按键）。
+#   rime-ice 无此隐性处理器，长句不再被截断。
+#
+# 关于 switches：RIME 的 switches 是 list，custom patch 不支持「按名改单条 reset」，
+# 故此处整体 patch switches:，镜像 rime-ice rime_ice.schema.yaml 的 switches 列表，
+# 仅把 emoji 的 reset 由 1（开）翻成 0（关）。其余开关不设 reset，沿用 rime-ice 的
+# save_options 记忆行为（ascii_punct/traditionalization/full_shape/search_single_char 跨会话记住）。
+# ⚠ 若上游 rime_ice.schema 的 switches 增删项，需同步本块(assemble-payload.sh 不自动 diff)。
+
+patch:
+  switches:
+    - name: ascii_mode
+      states: [ 中, Ａ ]
+    - name: ascii_punct                  # 中英标点
+      states: [ ¥, $ ]
+    - name: traditionalization
+      states: [ 简, 繁 ]
+    - name: emoji
+      states: [ 💀, 😄 ]
+      reset: 0                            # 法墨出厂：emoji 关（rime-ice 默认 1）
+    - name: full_shape
+      states: [ 半角, 全角 ]
+    - name: search_single_char           # search.lua：辅码查词时是否单字优先
+      states: [ 正常, 单字 ]
+      abbrev: [ 词, 单 ]
+
+  # 法墨品牌托盘/状态图标（与 macOS 版 Famo 对齐）：墨滴品牌。
+  # Windows 前端 load_icon 按 %LOCALAPPDATA%\Famo 解析文件名；图标随 payload seed 到该目录。
+  #   中文 = 奶白墨滴 + 深大红底（呼应默认荔园红皮肤）；英文 = 反相墨滴（深大红墨滴 + 奶白底），
+  #   同一墨滴形状、图地反转区分中/英，一眼是法墨。全/半角沿用中文墨滴。
+  "schema/icon": famo_zh.ico               # 中文模式（zhung）
+  "schema/ascii_icon": famo_ascii.ico      # 英文模式（ascii）
+  "schema/full_icon": famo_zh.ico          # 全角
+  "schema/half_icon": famo_zh.ico          # 半角
+
+  # 模糊音出厂全关。设置面板勾选规则后，写入层以 speller/algebra/+ 追加，例如：
+  #   "speller/algebra/+":
+  #     - derive/^([zcs])h/$1/        # zh=z ch=c sh=s
+  #     - derive/^([aei])n$/$1ng/     # an=ang en=eng in=ing
+  # 此处不预置，保持出厂干净。

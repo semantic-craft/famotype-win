@@ -1,0 +1,200 @@
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index 4b11e7b..3856aca 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -1083,6 +1083,13 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+   body.append(L"config.famo_auto_pair=")
+       .append(std::to_wstring((int)m_base_style.famo_auto_pair))
+       .append(L"\n");
++  // 法墨中英/中数字自动加空格：同上，从 m_base_style 取值，/reloadstyle 即时刷新
++  body.append(L"config.famo_cjk_english_spacing=")
++      .append(std::to_wstring((int)m_base_style.famo_cjk_english_spacing))
++      .append(L"\n");
++  body.append(L"config.famo_cjk_number_spacing=")
++      .append(std::to_wstring((int)m_base_style.famo_cjk_number_spacing))
++      .append(L"\n");
+ 
+   // style
+   if (!session_status.__synced) {
+@@ -1376,6 +1383,12 @@ static void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize) {
+   // 法墨：标点自动配对
+   _RimeGetBool(config, "style/famo_auto_pair", initialize,
+                style.famo_auto_pair);
++  // 法墨：中英文自动加空格
++  _RimeGetBool(config, "style/famo_cjk_english_spacing", initialize,
++               style.famo_cjk_english_spacing);
++  // 法墨：中文与数字自动加空格
++  _RimeGetBool(config, "style/famo_cjk_number_spacing", initialize,
++               style.famo_cjk_number_spacing);
+   _RimeGetBool(config, "style/vertical_auto_reverse", initialize,
+                style.vertical_auto_reverse);
+   static constexpr Array<UIStyle::PreeditType, 3> _preeditArr = {
+diff --git a/WeaselIPC/Configurator.cpp b/WeaselIPC/Configurator.cpp
+index 2ebf43f..337eb06 100644
+--- a/WeaselIPC/Configurator.cpp
++++ b/WeaselIPC/Configurator.cpp
+@@ -22,5 +22,11 @@ void Configurator::Store(Deserializer::KeyType const& key,
+   } else if (key[1] == L"famo_auto_pair") {
+     // 法墨：标点自动配对
+     m_pTarget->p_config->famo_auto_pair = bool_value;
++  } else if (key[1] == L"famo_cjk_english_spacing") {
++    // 法墨：中英文自动加空格
++    m_pTarget->p_config->famo_cjk_english_spacing = bool_value;
++  } else if (key[1] == L"famo_cjk_number_spacing") {
++    // 法墨：中文与数字自动加空格
++    m_pTarget->p_config->famo_cjk_number_spacing = bool_value;
+   }
+ }
+diff --git a/WeaselTSF/EditSession.cpp b/WeaselTSF/EditSession.cpp
+index becc396..c61b2cd 100644
+--- a/WeaselTSF/EditSession.cpp
++++ b/WeaselTSF/EditSession.cpp
+@@ -3,6 +3,42 @@
+ #include "CandidateList.h"
+ #include "ResponseParser.h"
+ 
++namespace {
++// 法墨中英/中数字自动加空格：commit 字符边界分类（移植 macOS
++// FamoCommitTransform 的 BoundaryKind/classify）。
++FamoBoundaryKind FamoClassify(wchar_t ch) {
++  if (ch >= 0x3400 && ch <= 0x9FFF)
++    return FamoBoundaryKind::CJK;
++  if (ch >= 0xF900 && ch <= 0xFAFF)
++    return FamoBoundaryKind::CJK;
++  // 0x20000-0x2FA1F(CJK 扩展区)在 UTF-16 里是代理对，逐 wchar_t 遍历时高低
++  // 代理项都不落在以上范围，天然归 None——只是"不加空格"，不会"加错位置"。
++  if ((ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z'))
++    return FamoBoundaryKind::Latin;
++  if (ch >= L'0' && ch <= L'9')
++    return FamoBoundaryKind::Digit;
++  return FamoBoundaryKind::None;  // 空白/标点：打断边界判定，同 Mac 的 nil 语义
++}
++
++// 法墨中英/中数字自动加空格：两个开关各自独立生效。
++bool FamoNeedsSpace(FamoBoundaryKind left,
++                    FamoBoundaryKind right,
++                    bool cjk_english,
++                    bool cjk_number) {
++  bool is_cjk_latin =
++      (left == FamoBoundaryKind::CJK && right == FamoBoundaryKind::Latin) ||
++      (left == FamoBoundaryKind::Latin && right == FamoBoundaryKind::CJK);
++  bool is_cjk_digit =
++      (left == FamoBoundaryKind::CJK && right == FamoBoundaryKind::Digit) ||
++      (left == FamoBoundaryKind::Digit && right == FamoBoundaryKind::CJK);
++  if (is_cjk_latin)
++    return cjk_english;
++  if (is_cjk_digit)
++    return cjk_number;
++  return false;
++}
++}  // namespace
++
+ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+   // get commit string from server
+   std::wstring commit;
+@@ -60,6 +96,27 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+         }
+       }
+     }
++    // 法墨中英/中数字自动加空格：在 auto-pair 决策块之后跑，此时 commit 已是
++    // 最终形态；两个开关各自独立，互不依赖（design.md 顺序小节）。
++    if (config.famo_cjk_english_spacing || config.famo_cjk_number_spacing) {
++      std::wstring spaced;
++      spaced.reserve(commit.size() * 2);
++      FamoBoundaryKind prev = _famo_prev_commit_boundary;
++      for (wchar_t ch : commit) {
++        FamoBoundaryKind cur = FamoClassify(ch);
++        if (prev != FamoBoundaryKind::None && cur != FamoBoundaryKind::None &&
++            FamoNeedsSpace(prev, cur, config.famo_cjk_english_spacing,
++                          config.famo_cjk_number_spacing) &&
++            (spaced.empty() || spaced.back() != L' ')) {
++          spaced.push_back(L' ');
++        }
++        spaced.push_back(ch);
++        prev = cur;
++      }
++      commit.swap(spaced);
++      if (!commit.empty())
++        _famo_prev_commit_boundary = prev;
++    }
+     // pending 生命周期：任何非配对 commit（含 type-over 本身）都作废，
+     // 配对 commit 在下方注入光标时重新登记
+     if (!commit.empty() || famo_typed_over)
+diff --git a/WeaselTSF/WeaselTSF.h b/WeaselTSF/WeaselTSF.h
+index 4d93e6e..735a19b 100644
+--- a/WeaselTSF/WeaselTSF.h
++++ b/WeaselTSF/WeaselTSF.h
+@@ -8,6 +8,10 @@ class CCandidateList;
+ class CLangBarItemButton;
+ class CCompartmentEventSink;
+ 
++// 法墨：中英/中数字自动加空格——commit 边界字符分类（移植 macOS
++// FamoCommitTransform 的 BoundaryKind）。None 含空白/标点，打断边界判定。
++enum class FamoBoundaryKind { None, CJK, Latin, Digit };
++
+ class WeaselTSF : public ITfTextInputProcessorEx,
+                   public ITfThreadMgrEventSink,
+                   public ITfTextEditSink,
+@@ -192,6 +196,10 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   wchar_t _famo_pending_close = 0;
+   // 自注入方向键的豁免时间窗（GetTickCount64 截止值）
+   unsigned long long _famo_guard_until = 0;
++  // 法墨中英/中数字自动加空格：跨两次独立 commit 保留边界字符分类
++  // （对应 macOS FamoCommitTransform 的 previous 参数语义）。焦点切换/组合
++  // 结束不清零，见 design.md 风险表——ponytail：先用最简单的"从不清零"策略。
++  FamoBoundaryKind _famo_prev_commit_boundary = FamoBoundaryKind::None;
+ 
+   void _DeleteCandidateList();
+ 
+diff --git a/include/WeaselIPCData.h b/include/WeaselIPCData.h
+index 5b61f71..a9f676f 100644
+--- a/include/WeaselIPCData.h
++++ b/include/WeaselIPCData.h
+@@ -187,14 +187,24 @@ struct Status {
+ 
+ // 用於向前端告知設置信息
+ struct Config {
+-  Config() : inline_preedit(false), famo_auto_pair(false) {}
++  Config()
++      : inline_preedit(false),
++        famo_auto_pair(false),
++        famo_cjk_english_spacing(false),
++        famo_cjk_number_spacing(false) {}
+   void reset() {
+     inline_preedit = false;
+     famo_auto_pair = false;
++    famo_cjk_english_spacing = false;
++    famo_cjk_number_spacing = false;
+   }
+   bool inline_preedit;
+   // 法墨：标点自动配对（TSF 客户端消费，经 config. 文本行传输）
+   bool famo_auto_pair;
++  // 法墨：中英文之间自动加空格（TSF 客户端消费，经 config. 文本行传输）
++  bool famo_cjk_english_spacing;
++  // 法墨：中文与数字之间自动加空格（TSF 客户端消费，经 config. 文本行传输）
++  bool famo_cjk_number_spacing;
+ };
+ 
+ struct UIStyle {
+@@ -232,6 +242,12 @@ struct UIStyle {
+   // 法墨：标点自动配对开关（style/famo_auto_pair；不进 boost 序列化链，
+   // 只经 config.famo_auto_pair 文本行送 TSF 客户端）
+   bool famo_auto_pair;
++  // 法墨：中英文自动加空格开关（style/famo_cjk_english_spacing；不进 boost
++  // 序列化链，只经 config.famo_cjk_english_spacing 文本行送 TSF 客户端）
++  bool famo_cjk_english_spacing;
++  // 法墨：中文与数字自动加空格开关（style/famo_cjk_number_spacing；不进 boost
++  // 序列化链，只经 config.famo_cjk_number_spacing 文本行送 TSF 客户端）
++  bool famo_cjk_number_spacing;
+   bool display_tray_icon;
+   bool ascii_tip_follow_cursor;
+   bool paging_on_scroll;
+@@ -310,6 +326,8 @@ struct UIStyle {
+         candidate_abbreviate_length(0),
+         inline_preedit(false),
+         famo_auto_pair(false),
++        famo_cjk_english_spacing(false),
++        famo_cjk_number_spacing(false),
+         display_tray_icon(false),
+         ascii_tip_follow_cursor(false),
+         paging_on_scroll(false),

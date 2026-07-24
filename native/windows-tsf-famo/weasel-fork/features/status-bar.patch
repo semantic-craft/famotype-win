@@ -1,0 +1,203 @@
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index 12d401f..4b24bbe 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -500,6 +500,8 @@ void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
+     return;
+   _UpdateUI(ipc_id);
+   m_active_session = ipc_id;
++  if (_FocusInCallback)
++    _FocusInCallback();  // 法墨状态栏：随焦点显示 + 跟随定位
+ }
+ 
+ void RimeWithWeaselHandler::FocusOut(DWORD param, WeaselSessionId ipc_id) {
+@@ -507,6 +509,8 @@ void RimeWithWeaselHandler::FocusOut(DWORD param, WeaselSessionId ipc_id) {
+   if (m_ui)
+     m_ui->Hide();
+   m_active_session = 0;
++  if (_FocusOutCallback)
++    _FocusOutCallback();  // 法墨状态栏：失焦隐藏
+ }
+ 
+ void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
+diff --git a/WeaselServer/WeaselServerApp.cpp b/WeaselServer/WeaselServerApp.cpp
+index 3789752..f8b0ac4 100644
+--- a/WeaselServer/WeaselServerApp.cpp
++++ b/WeaselServer/WeaselServerApp.cpp
+@@ -30,14 +30,105 @@ int WeaselServerApp::Run() {
+   m_ui.Create(m_server.GetHWnd());
+ 
+   m_handler->Initialize();
+-  m_handler->OnUpdateUI([this]() { tray_icon.Refresh(); });
++  m_handler->OnUpdateUI([this]() {
++    tray_icon.Refresh();
++    // 法墨状态栏：从真实 Rime 状态同步中英/全半角（Rime 无 GetOption）。
++    m_status_bar.SyncStatus(m_ui.status().ascii_mode, m_ui.status().full_shape);
++    // 皮肤跟随候选窗（含 famo-style.yaml 覆盖 / 深色切换）；带变更检测，不会每次重建。
++    m_status_bar.ApplySkin(m_ui.style());
++    m_popup.ApplySkin(m_ui.style());
++    m_context_popup.ApplySkin(m_ui.style());
++  });
+ 
+   tray_icon.Create(m_server.GetHWnd());
+   tray_icon.Refresh();
+ 
++  // 法墨悬浮状态栏（阶段 1）：开关回调直达同进程 RimeWithWeaselHandler::SetOption
++  // （ipc_id=0 -> 活跃 session），零 IPC。创建后置于主屏右下角并显示。
++  m_status_bar.Bind([this](const std::string& opt, bool val) {
++    m_handler->SetOption(0, opt, val);
++  });
++  // 拖动位置持久化：%LOCALAPPDATA%\Famo\famo-statusbar.txt（跨会话记住）。
++  m_status_bar.SetStatePath((WeaselUserDataPath() / L"famo-statusbar.txt").wstring());
++  if (m_status_bar.CreateBar(m_server.GetHWnd()))
++    m_status_bar.ApplySkin(m_ui.style());  // 初次套皮肤（与候选窗一致）
++  // 焦点驱动显隐：编辑域获得焦点 -> 显示（跟随前台窗/或固定拖动位）；失焦 -> 隐藏。
++  m_handler->OnFocusIn([this] { m_status_bar.ShowOnFocus(); });
++  m_handler->OnFocusOut([this] { m_status_bar.HideBar(); });
++
++  // 法墨弹出面板（阶段 2）：4 开关复用状态栏单一真相源 + 设定/关于/退出动作。
++  {
++    std::filesystem::path dir = install_dir();
++    std::vector<FamoPopupPanel::Item> items;
++    items.push_back({L"输入法设定",
++                     [dir] { launch_famo_settings(dir, L"input"); },
++                     nullptr});
++    items.push_back({L"英文输入",
++                     [this] { m_status_bar.ToggleOption("ascii_mode"); },
++                     [this] { return m_status_bar.QueryOption("ascii_mode"); }});
++    items.push_back(
++        {L"英文标点", [this] { m_status_bar.ToggleOption("ascii_punct"); },
++         [this] { return m_status_bar.QueryOption("ascii_punct"); }});
++    items.push_back(
++        {L"繁体输出",
++         [this] { m_status_bar.ToggleOption("traditionalization"); },
++         [this] { return m_status_bar.QueryOption("traditionalization"); }});
++    items.push_back({L"全角", [this] { m_status_bar.ToggleOption("full_shape"); },
++                     [this] { return m_status_bar.QueryOption("full_shape"); }});
++    items.push_back({L"关于",
++                     [dir] { launch_famo_settings(dir, L"about"); },
++                     nullptr});
++    items.push_back({L"退出", [this] { m_server.Stop(); }, nullptr});
++    m_popup.SetItems(std::move(items));
++    m_popup.CreatePanel(m_server.GetHWnd());
++    m_popup.ApplySkin(m_ui.style());  // 初次套皮肤（与候选窗+状态栏一致）
++    m_status_bar.OnExpand(
++        [this] { m_popup.Toggle(m_status_bar.AnchorTopLeftScreen()); });
++  }
++
++  // 法墨右键菜单：只放已实现动作，不展示语音/软键盘/扩展中心等空按钮。
++  {
++    std::filesystem::path dir = install_dir();
++    std::vector<FamoPopupPanel::Item> items;
++    items.push_back({L"输入法设定",
++                     [dir] { launch_famo_settings(dir, L"input"); },
++                     nullptr});
++    items.push_back({L"英文输入",
++                     [this] { m_status_bar.ToggleOption("ascii_mode"); },
++                     [this] { return m_status_bar.QueryOption("ascii_mode"); }});
++    items.push_back(
++        {L"英文标点", [this] { m_status_bar.ToggleOption("ascii_punct"); },
++         [this] { return m_status_bar.QueryOption("ascii_punct"); }});
++    items.push_back(
++        {L"繁体输出",
++         [this] { m_status_bar.ToggleOption("traditionalization"); },
++         [this] { return m_status_bar.QueryOption("traditionalization"); }});
++    items.push_back({L"全角", [this] { m_status_bar.ToggleOption("full_shape"); },
++                     [this] { return m_status_bar.QueryOption("full_shape"); }});
++    items.push_back({L"关于",
++                     [dir] { launch_famo_settings(dir, L"about"); },
++                     nullptr});
++    items.push_back({L"退出", [this] { m_server.Stop(); }, nullptr});
++    m_context_popup.SetItems(std::move(items));
++    m_context_popup.CreatePanel(m_server.GetHWnd());
++    m_context_popup.ApplySkin(m_ui.style());
++    m_status_bar.OnRightClick([this](POINT anchor) {
++      if (m_context_popup.IsOpen())
++        m_context_popup.HidePanel();
++      else
++        m_context_popup.ShowAt(anchor);
++    });
++  }
++
+   int ret = m_server.Run();
+ 
+   m_handler->Finalize();
++  if (m_popup.IsWindow())
++    m_popup.DestroyWindow();
++  if (m_context_popup.IsWindow())
++    m_context_popup.DestroyWindow();
++  if (m_status_bar.IsWindow())
++    m_status_bar.DestroyWindow();
+   m_ui.Destroy();
+   tray_icon.RemoveIcon();
+   win_sparkle_cleanup();
+diff --git a/WeaselServer/WeaselServerApp.h b/WeaselServer/WeaselServerApp.h
+index f056382..04664c9 100644
+--- a/WeaselServer/WeaselServerApp.h
++++ b/WeaselServer/WeaselServerApp.h
+@@ -4,6 +4,8 @@
+ #include <resource.h>
+ #include <WeaselIPC.h>
+ #include <WeaselUI.h>
++#include <FamoStatusBar.h>
++#include <FamoPopupPanel.h>
+ #include <RimeWithWeasel.h>
+ #include <WeaselUtility.h>
+ #include <filesystem>
+@@ -67,4 +69,10 @@ class WeaselServerApp {
+   weasel::UI m_ui;
+   WeaselTrayIcon tray_icon;
+   std::unique_ptr<RimeWithWeaselHandler> m_handler;
++  // 法墨悬浮状态栏（阶段 1）：与 m_ui / m_handler 同进程，开关直达 SetOption。
++  FamoStatusBar m_status_bar;
++  // 法墨弹出功能面板（阶段 2）：☰ 展开，开关复用状态栏 + 设定/关于/退出动作。
++  FamoPopupPanel m_popup;
++  // 法墨右键菜单面板：状态栏任意位置右键弹出，只含已实现动作。
++  FamoPopupPanel m_context_popup;
+ };
+diff --git a/WeaselUI/WeaselUI.vcxproj b/WeaselUI/WeaselUI.vcxproj
+index 7b3bafe..0b94920 100644
+--- a/WeaselUI/WeaselUI.vcxproj
++++ b/WeaselUI/WeaselUI.vcxproj
+@@ -291,6 +291,8 @@
+   </ItemDefinitionGroup>
+   <ItemGroup>
+     <ClCompile Include="DirectWriteResources.cpp" />
++    <ClCompile Include="FamoStatusBar.cpp" />
++    <ClCompile Include="FamoPopupPanel.cpp" />
+     <ClCompile Include="FullScreenLayout.cpp" />
+     <ClCompile Include="GdiplusBlur.cpp" />
+     <ClCompile Include="HorizontalLayout.cpp" />
+@@ -323,6 +325,9 @@
+     <ClInclude Include="VHorizontalLayout.h" />
+     <ClInclude Include="WeaselPanel.h" />
+     <ClInclude Include="..\include\WeaselUI.h" />
++    <ClInclude Include="..\include\FamoStatusBar.h" />
++    <ClInclude Include="..\include\FamoStatusBarInteraction.h" />
++    <ClInclude Include="..\include\FamoPopupPanel.h" />
+   </ItemGroup>
+   <ItemGroup>
+     <None Include="ReadMe.txt" />
+diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
+index bc8950d..75eb723 100644
+--- a/include/RimeWithWeasel.h
++++ b/include/RimeWithWeasel.h
+@@ -66,6 +66,9 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   virtual void ReloadOptions();
+ 
+   void OnUpdateUI(std::function<void()> const& cb);
++  // 法墨状态栏：焦点驱动显隐回调（FocusIn/FocusOut 时触发）。
++  void OnFocusIn(std::function<void()> const& cb) { _FocusInCallback = cb; }
++  void OnFocusOut(std::function<void()> const& cb) { _FocusOutCallback = cb; }
+ 
+  private:
+   void _Setup();
+@@ -112,6 +115,8 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   std::map<std::string, bool> m_show_notifications;
+   std::map<std::string, bool> m_show_notifications_base;
+   std::function<void()> _UpdateUICallback;
++  std::function<void()> _FocusInCallback;   // 法墨状态栏 focus-in
++  std::function<void()> _FocusOutCallback;  // 法墨状态栏 focus-out
+ 
+   static void OnNotify(void* context_object,
+                        uintptr_t session_id,

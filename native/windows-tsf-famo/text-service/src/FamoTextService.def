@@ -1,0 +1,8 @@
+LIBRARY FamoTextService
+EXPORTS
+  DllCanUnloadNow PRIVATE
+  DllGetClassObject PRIVATE
+  DllRegisterServer PRIVATE
+  DllUnregisterServer PRIVATE
+  FamoCreateTextServiceForTest PRIVATE
+  FamoReactivateTextServiceForTest PRIVATE

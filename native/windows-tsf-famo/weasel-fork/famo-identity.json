@@ -1,0 +1,39 @@
+{
+  "_comment": "法墨独立 TSF identity 单一真相源（S3.2）。apply-famo-identity.ps1 据此把上游 Weasel 改写成法墨。所有值与日用 Weasel 完全不相交，保证并存不冲突（形态甲）。GUID 为本任务新生成，勿复用 Weasel 的。",
+  "brand": {
+    "codeName": "Famo",
+    "displayNameZh": "法墨输入法",
+    "displayNameEn": "Famo Input Method",
+    "serverExe": "FamoRuntime.exe",
+    "deployerExe": "FamoDeploy.exe"
+  },
+  "guids": {
+    "_note": "对应 .reference/weasel/WeaselTSF/Globals.cpp 的同名常量。系统/共享 GUID（GUID_TFCAT_*、GUID_LBI_INPUTMODE）不改。",
+    "clsidTextService": "54EAD76A-B864-4A6D-9C82-148E3352BEE7",
+    "guidProfile": "0158C2BA-4E96-4BA8-B505-E1BBEBB3FA33",
+    "guidLangBarItemButton": "903A6C32-FD79-4DE5-AACC-3740594D312A",
+    "guidDisplayAttributeInput": "AC217550-D35E-49C1-97DD-D5ED1415BAC1",
+    "guidImeModePreservedKey": "E0C4D79C-1D37-4929-87F9-D1476A3FBF03"
+  },
+  "registry": {
+    "_note": "日用 Weasel = HKCU\\Software\\Rime\\Weasel；法墨新写入使用 HKCU/HKLM\\Software\\Famo\\InputMethod，RimeUserDir 指向 %LOCALAPPDATA%\\Famo。旧 Software\\Famo\\Weasel 只允许迁移读取。",
+    "brandKey": "Software\\Famo\\InputMethod",
+    "rimeRootKey": "Software\\Famo",
+    "rimeUserDir": "%LOCALAPPDATA%\\Famo"
+  },
+  "ipc": {
+    "_note": "独立命名，避免与 Weasel 的 IPC 窗口/管道/互斥体撞名（并存关键）。",
+    "ipcWindow": "FamoIPCWindow_1.0",
+    "pipeName": "FamoNamedPipe",
+    "deployerMutex": "FamoDeployerMutex",
+    "deployerExclusiveMutex": "FamoDeployerExclusiveMutex",
+    "runtimeEndpointSuffix": "runtime-v1",
+    "controlEndpointSuffix": "control-v1",
+    "runtimeSingletonPrefix": "Famo.Runtime.v1"
+  },
+  "upstream": {
+    "repo": "https://github.com/rime/weasel.git",
+    "commit": "93eec2dc33dfcf04c356cce87732b638888fff4d",
+    "license": "GPL-3.0"
+  }
+}

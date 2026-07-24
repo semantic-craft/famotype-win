@@ -1,0 +1,37 @@
+diff --git a/WeaselServer/WeaselServerApp.cpp b/WeaselServer/WeaselServerApp.cpp
+index e09c4c5..7dbc235 100644
+--- a/WeaselServer/WeaselServerApp.cpp
++++ b/WeaselServer/WeaselServerApp.cpp
+@@ -52,9 +52,10 @@ void WeaselServerApp::SetupMenuHandlers() {
+   m_server.AddMenuHandler(ID_WEASELTRAY_DEPLOY,
+                           std::bind(execute, dir / L"WeaselDeployer.exe",
+                                     std::wstring(L"/deploy")));
++  // 法墨：托盘「设置」改拉起 FamoSettings WinUI 面板（深链输入方式页），取代老配置对话框。
+   m_server.AddMenuHandler(
+       ID_WEASELTRAY_SETTINGS,
+-      std::bind(execute, dir / L"WeaselDeployer.exe", std::wstring()));
++      std::bind(launch_famo_settings, dir, std::wstring(L"input")));
+   m_server.AddMenuHandler(
+       ID_WEASELTRAY_DICT_MANAGEMENT,
+       std::bind(execute, dir / L"WeaselDeployer.exe", std::wstring(L"/dict")));
+diff --git a/WeaselServer/WeaselServerApp.h b/WeaselServer/WeaselServerApp.h
+index d5e32e0..36f0885 100644
+--- a/WeaselServer/WeaselServerApp.h
++++ b/WeaselServer/WeaselServerApp.h
+@@ -22,6 +22,16 @@ class WeaselServerApp {
+                                     SW_SHOWNORMAL) > 32;
+   }
+ 
++  // 法墨：拉起 FamoSettings WinUI 设置面板，深链到指定页（如 L"input" 输入方式页）。
++  // 托盘「设置」与悬浮面板「输入法设定」共用此入口，取代老 WeaselDeployer 配置对话框。
++  // 支持安装器布局 dir\\settings\\FamoSettings.exe 与开发平铺布局 dir\\FamoSettings.exe。
++  static bool launch_famo_settings(const fs::path& dir, const std::wstring& page) {
++    fs::path settings = dir / L"settings" / L"FamoSettings.exe";
++    if (!fs::exists(settings))
++      settings = dir / L"FamoSettings.exe";
++    return execute(settings, L"--page " + page);
++  }
++
+   static bool explore(const fs::path& path) {
+     std::wstring quoted_path(L"\"" + path.wstring() + L"\"");
+     return (uintptr_t)ShellExecuteW(NULL, L"explore", quoted_path.c_str(), NULL,

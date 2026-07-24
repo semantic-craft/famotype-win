@@ -1,0 +1,133 @@
+diff --git a/WeaselTSF/LanguageBar.cpp b/WeaselTSF/LanguageBar.cpp
+index 0ab85be..8e04fdf 100644
+--- a/WeaselTSF/LanguageBar.cpp
++++ b/WeaselTSF/LanguageBar.cpp
+@@ -37,3 +37,56 @@
++#ifndef ID_WEASELTRAY_OPT_ASCII_MODE
++#define ID_WEASELTRAY_OPT_ASCII_MODE        40020
++#define ID_WEASELTRAY_OPT_ASCII_PUNCT       40021
++#define ID_WEASELTRAY_OPT_TRADITIONALIZE    40022
++#define ID_WEASELTRAY_OPT_FULL_SHAPE        40023
++#define ID_WEASELTRAY_FAMO_STATUS_BAR       40027
++#endif
++
++static HMENU BuildFamoLanguageBarMenu(bool ascii_mode, bool full_shape) {
++  // 法墨：TSF 语言栏按钮右键菜单实际来自 WeaselTSF.dll，而不是
++  // WeaselServer 的托盘图标。这里运行时重建菜单，避免继续显示上游
++  // WeaselTSF.rc 里的词典/同步/检查更新等旧项。
++  HMENU menu = CreatePopupMenu();
++  if (!menu)
++    return NULL;
++  auto add_toggle = [&](UINT id, const wchar_t* off_text,
++                        const wchar_t* on_text, bool enabled) {
++    AppendMenuW(menu, MF_STRING, id, enabled ? on_text : off_text);
++  };
++  auto add_action = [&](UINT id, const wchar_t* text) {
++    AppendMenuW(menu, MF_STRING, id, text);
++  };
++  add_toggle(ID_WEASELTRAY_OPT_ASCII_MODE, L"切换至英文输入",
++             L"切换至中文输入", ascii_mode);
++  add_action(ID_WEASELTRAY_OPT_TRADITIONALIZE, L"切换至繁体输入");
++  add_action(ID_WEASELTRAY_OPT_ASCII_PUNCT, L"使用英文标点符号");
++  add_toggle(ID_WEASELTRAY_OPT_FULL_SHAPE, L"使用全角输入",
++             L"使用半角输入", full_shape);
++  AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
++  add_action(ID_WEASELTRAY_SETTINGS, L"设置…");
++  add_action(ID_WEASELTRAY_FAMO_STATUS_BAR, L"显示悬浮状态条");
++  AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
++  add_action(ID_WEASELTRAY_DEPLOY, L"刷新配置");
++  add_action(ID_WEASELTRAY_QUIT, L"退出");
++  return menu;
++}
++
++static UINT TrackFamoLanguageBarMenu(HMENU menu, POINT pt, HWND hwnd) {
++  if (!hwnd)
++    hwnd = GetForegroundWindow();
++  if (!hwnd)
++    hwnd = GetDesktopWindow();
++  if (pt.x == 0 && pt.y == 0)
++    GetCursorPos(&pt);
++  SetForegroundWindow(hwnd);
++  UINT wID = TrackPopupMenuEx(
++      menu, TPM_NONOTIFY | TPM_RETURNCMD | TPM_RIGHTBUTTON |
++                TPM_HORPOSANIMATION,
++      pt.x, pt.y, hwnd, NULL);
++  PostMessageW(hwnd, WM_NULL, 0, 0);
++  return wID;
++}
++
+ static LPCWSTR GetWeaselRegName() {
+   LPCWSTR WEASEL_REG_NAME_;
+   if (is_wow64())
+@@ -64,6 +123,7 @@ CLangBarItemButton::CLangBarItemButton(com_ptr<WeaselTSF> pTextService,
+   _pTextService = pTextService;
+   _guid = guid;
+   ascii_mode = false;
++  full_shape = false;
+ }
+ 
+ CLangBarItemButton::~CLangBarItemButton() {
+@@ -162,31 +222,22 @@ STDAPI CLangBarItemButton::OnClick(TfLBIClick click,
+   } else if (click == TF_LBI_CLK_RIGHT) {
+     /* Open menu */
+     HWND hwnd = _pTextService->_GetFocusedContextWindow();
+-    if (hwnd != NULL) {
+-      LANGID langid = get_language_id();
+-      HMENU menu;
+-      if (langid == TEXTSERVICE_LANGID_HANS) {
+-        menu = LoadMenuW(g_hInst, MAKEINTRESOURCE(IDR_MENU_POPUP_HANS));
+-      } else if (langid == TEXTSERVICE_LANGID_HANT) {
+-        menu = LoadMenuW(g_hInst, MAKEINTRESOURCE(IDR_MENU_POPUP_HANT));
+-      } else {
+-        menu = LoadMenuW(g_hInst, MAKEINTRESOURCE(IDR_MENU_POPUP));
+-      }
+-      HMENU popupMenu = GetSubMenu(menu, 0);
+-      UINT wID = TrackPopupMenuEx(
+-          popupMenu, TPM_NONOTIFY | TPM_RETURNCMD | TPM_HORPOSANIMATION, pt.x,
+-          pt.y, hwnd, NULL);
+-      DestroyMenu(menu);
++    HMENU menu = BuildFamoLanguageBarMenu(ascii_mode, full_shape);
++    if (!menu)
++      return S_OK;
++    UINT wID = TrackFamoLanguageBarMenu(menu, pt, hwnd);
++    DestroyMenu(menu);
++    if (wID != 0)
+       _pTextService->_HandleLangBarMenuSelect(wID);
+-    }
+   }
+   return S_OK;
+ }
+ 
+ STDAPI CLangBarItemButton::InitMenu(ITfMenu* pMenu) {
+-  HMENU menu = LoadMenuW(g_hInst, MAKEINTRESOURCE(IDR_MENU_POPUP));
+-  HMENU popupMenu = GetSubMenu(menu, 0);
+-  HMENU2ITfMenu(popupMenu, pMenu);
++  HMENU menu = BuildFamoLanguageBarMenu(ascii_mode, full_shape);
++  if (!menu)
++    return S_OK;
++  HMENU2ITfMenu(menu, pMenu);
+   DestroyMenu(menu);
+   return S_OK;
+ }
+@@ -254,6 +305,9 @@ void CLangBarItemButton::UpdateWeaselStatus(weasel::Status stat) {
+   if (stat.ascii_mode != ascii_mode) {
+     ascii_mode = stat.ascii_mode;
+   }
++  if (stat.full_shape != full_shape) {
++    full_shape = stat.full_shape;
++  }
+   if (_current_schema_zhung_icon != _style.current_zhung_icon) {
+     _current_schema_zhung_icon = _style.current_zhung_icon;
+   }
+diff --git a/WeaselTSF/LanguageBar.h b/WeaselTSF/LanguageBar.h
+index 2c0513a..ea3460d 100644
+--- a/WeaselTSF/LanguageBar.h
++++ b/WeaselTSF/LanguageBar.h
+@@ -42,6 +42,7 @@ class CLangBarItemButton : public ITfLangBarItemButton, public ITfSource {
+   LONG _cRef; /* COM Reference count */
+   DWORD _status;
+   bool ascii_mode;
++  bool full_shape;
+   weasel::UIStyle& _style;
+   std::wstring _current_schema_zhung_icon;
+   std::wstring _current_schema_ascii_icon;

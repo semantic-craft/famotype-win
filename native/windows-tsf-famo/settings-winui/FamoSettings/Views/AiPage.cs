@@ -1,0 +1,294 @@
+using Famo.Settings.Core.Ai;
+using Famo.Settings.Theming;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+
+namespace Famo.Settings.Views;
+
+/// <summary>AI 助手（智）—— 供应商资料和安全密钥入口。</summary>
+public sealed class AiPage : UserControl
+{
+    private static readonly AiProviderPreset[] Presets =
+    {
+        new("DeepSeek", "DeepSeek", "https://api.deepseek.com/chat/completions", "deepseek-v4-flash"),
+        new("OpenAI", "OpenAI", "https://api.openai.com/v1/chat/completions", "gpt-5.5"),
+        new("Google Gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3-flash"),
+        new("小米 MiMo", "小米 MiMo", "https://api.xiaomimimo.com/v1/chat/completions", "mimo-v2.5"),
+        new("火山引擎 · 豆包 Seed", "火山引擎 · 豆包 Seed", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-seed-2-0-lite-260428"),
+        new("+ 自定义（OpenAI 兼容）", "自定义 OpenAI 兼容", "", ""),
+    };
+
+    private readonly AiProviderProfileStore _providerStore = new();
+    private readonly ISecretStore _secretStore = new WindowsCredentialSecretStore();
+    private readonly AiProviderProfileService _providerService;
+
+    private TextBlock _status = null!;
+    private ComboBox _preset = null!;
+    private TextBox _displayName = null!;
+    private TextBox _endpoint = null!;
+    private TextBox _model = null!;
+    private PasswordBox _apiKey = null!;
+    private FrameworkElement _deepSeekModelRow = null!;
+    private StackPanel _providerList = null!;
+
+    public AiPage()
+    {
+        _providerService = new AiProviderProfileService(_providerStore, _secretStore);
+        BuildContent();
+    }
+
+    private void BuildContent()
+    {
+        var sp = new StackPanel();
+        sp.Children.Add(FamoUI.PaneHeader("AI 助手", "只在你主动触发时工作；打字候选始终来自本地 Rime。"));
+        sp.Children.Add(FamoUI.Banner(false, "设置页只保存供应商资料和密钥，不会向供应商发送请求"));
+
+        _status = new TextBlock
+        {
+            Text = "选择一个供应商预设，填入 API Key 后保存；不会显示已保存的 API Key。",
+            FontSize = 12.5,
+            Foreground = FamoUI.Br("Famo.Ink2"),
+            Margin = new Thickness(0, 0, 0, 12),
+            TextWrapping = TextWrapping.Wrap,
+        };
+        sp.Children.Add(_status);
+
+        _preset = BuildPresetCombo();
+        _displayName = new TextBox { PlaceholderText = "供应商名称", MinWidth = 260 };
+        _endpoint = new TextBox { PlaceholderText = "https://.../chat/completions", MinWidth = 360 };
+        _model = new TextBox { PlaceholderText = "模型 ID", MinWidth = 260 };
+        _apiKey = new PasswordBox { PlaceholderText = "API Key", MinWidth = 260 };
+        _deepSeekModelRow = FamoUI.Row("DeepSeek 模型", "Chat · V4 Flash 更快；Reasoner · V4 Pro 更适合复杂推理。",
+            FamoUI.SegBar(new[] { "Chat · V4 Flash", "Reasoner · V4 Pro" }, 0, idx =>
+            {
+                _model.Text = idx == 0 ? "deepseek-v4-flash" : "deepseek-v4-pro";
+            }));
+
+        sp.Children.Add(FamoUI.Card("供应商（配一个就行）",
+            FamoUI.Row("预设", "可直接填充 OpenAI-compatible endpoint 与模型。", _preset, divider: false),
+            _deepSeekModelRow,
+            FamoUI.Row("名称", "显示在 AI 对话和菜单状态里。", _displayName),
+            FamoUI.Row("Endpoint", "必须是 HTTPS，或本机 HTTP 调试地址。", _endpoint),
+            FamoUI.Row("模型", "按供应商文档填写模型 ID。", _model),
+            FamoUI.Row("API Key", "保存到 Windows Credential Manager；不会写入 JSON。", _apiKey),
+            FamoUI.RowFull(BuildProviderActions(), divider: true)));
+
+        _providerList = new StackPanel { Spacing = 8 };
+        sp.Children.Add(FamoUI.Card("已保存供应商", FamoUI.RowFull(_providerList)));
+
+        Content = sp;
+        FillPreset(Presets[0]);
+        RenderProviderList();
+    }
+
+    private ComboBox BuildPresetCombo()
+    {
+        var combo = new ComboBox { MinWidth = 260 };
+        foreach (AiProviderPreset preset in Presets)
+        {
+            combo.Items.Add(new ComboBoxItem { Content = preset.Label });
+        }
+
+        combo.SelectedIndex = 0;
+        combo.SelectionChanged += (_, _) =>
+        {
+            if (combo.SelectedIndex >= 0)
+            {
+                FillPreset(Presets[combo.SelectedIndex]);
+            }
+        };
+        return combo;
+    }
+
+    private FrameworkElement BuildProviderActions()
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(0, 12, 0, 0) };
+        var save = new Button { Content = "保存供应商" };
+        save.Click += (_, _) => SaveProviderProfile();
+        var clear = new Button { Content = "清空表单" };
+        clear.Click += (_, _) => ClearProviderForm();
+        row.Children.Add(save);
+        row.Children.Add(clear);
+        return row;
+    }
+
+    private void FillPreset(AiProviderPreset preset)
+    {
+        _displayName.Text = preset.DisplayName;
+        _endpoint.Text = preset.Endpoint;
+        _model.Text = preset.Model;
+        _deepSeekModelRow.Visibility = preset.DisplayName == "DeepSeek" ? Visibility.Visible : Visibility.Collapsed;
+        SetStatus("已填充 " + preset.Label + " 预设，请输入 API Key 后保存。");
+    }
+
+    private void SaveProviderProfile()
+    {
+        try
+        {
+            AiProviderProfile profile = _providerService.AddProfile(new AiProviderProfileDraft
+            {
+                DisplayName = _displayName.Text,
+                Endpoint = _endpoint.Text,
+                Model = _model.Text,
+                ApiKey = _apiKey.Password,
+                MakeDefault = true,
+            });
+
+            _apiKey.Password = "";
+            RenderProviderList();
+            SetStatus($"{profile.DisplayName} 密钥已保存；不会显示已保存的 API Key。");
+        }
+        catch (InvalidDataException ex)
+        {
+            SetStatus(ex.Message);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("保存 AI 供应商失败：" + ex.Message);
+        }
+    }
+
+    private void SetDefaultProvider(string id)
+    {
+        try
+        {
+            AiProviderProfile profile = _providerService.SetDefault(id);
+            RenderProviderList();
+            SetStatus($"{profile.DisplayName} 已设为默认 AI 供应商。");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("设置默认 AI 供应商失败：" + ex.Message);
+        }
+    }
+
+    private void DeleteProviderProfile(string id)
+    {
+        try
+        {
+            if (_providerService.DeleteProfile(id))
+            {
+                RenderProviderList();
+                SetStatus("AI 供应商已删除。");
+                return;
+            }
+
+            SetStatus("找不到要删除的 AI 供应商。");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("删除 AI 供应商失败：" + ex.Message);
+        }
+    }
+
+    private void RenderProviderList()
+    {
+        if (_providerList is null) return;
+
+        _providerList.Children.Clear();
+        IReadOnlyList<AiProviderProfile> profiles = _providerStore.Load();
+        if (profiles.Count == 0)
+        {
+            _providerList.Children.Add(new TextBlock
+            {
+                Text = "暂无供应商；保存一个后，AI 对话会使用默认供应商。",
+                FontSize = 13,
+                Foreground = FamoUI.Br("Famo.Ink2"),
+                Margin = new Thickness(0, 8, 0, 4),
+                TextWrapping = TextWrapping.Wrap,
+            });
+            return;
+        }
+
+        foreach (AiProviderProfile profile in profiles)
+        {
+            _providerList.Children.Add(BuildProviderEntry(profile));
+        }
+    }
+
+    private UIElement BuildProviderEntry(AiProviderProfile profile)
+    {
+        var info = new StackPanel { Spacing = 4 };
+        info.Children.Add(new TextBlock
+        {
+            Text = profile.DisplayName + (profile.IsDefault ? " · 默认" : ""),
+            FontSize = 13.5,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground = FamoUI.Br("Famo.Ink"),
+        });
+        info.Children.Add(new TextBlock
+        {
+            Text = (string.IsNullOrWhiteSpace(profile.Model) ? "默认模型" : profile.Model) + " · " + profile.Endpoint,
+            FontSize = 12,
+            FontFamily = FamoUI.Mono,
+            Foreground = FamoUI.Br("Famo.Ink2"),
+            TextWrapping = TextWrapping.Wrap,
+        });
+        info.Children.Add(new TextBlock
+        {
+            Text = HasSecret(profile) ? "密钥已保存（不会显示已保存的 API Key）" : "需要重新保存 API Key",
+            FontSize = 12,
+            Foreground = FamoUI.Br("Famo.Ink3"),
+        });
+
+        var makeDefault = new Button { Content = "设为默认", IsEnabled = !profile.IsDefault };
+        makeDefault.Click += (_, _) => SetDefaultProvider(profile.Id);
+        var delete = new Button { Content = "删除" };
+        delete.Click += (_, _) => DeleteProviderProfile(profile.Id);
+
+        var actions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        actions.Children.Add(makeDefault);
+        actions.Children.Add(delete);
+
+        var grid = new Grid { ColumnSpacing = 12 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        Grid.SetColumn(info, 0);
+        Grid.SetColumn(actions, 1);
+        grid.Children.Add(info);
+        grid.Children.Add(actions);
+
+        return new Border
+        {
+            CornerRadius = new CornerRadius(7),
+            Background = FamoUI.Br("Famo.Field"),
+            BorderBrush = FamoUI.Br("Famo.Line2"),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(10),
+            Child = grid,
+        };
+    }
+
+    private bool HasSecret(AiProviderProfile profile)
+    {
+        try
+        {
+            return _secretStore.GetSecret(profile.SecretName) is { Length: > 0 };
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void ClearProviderForm()
+    {
+        _displayName.Text = "";
+        _endpoint.Text = "";
+        _model.Text = "";
+        _apiKey.Password = "";
+        SetStatus("表单已清空。");
+    }
+
+    private void SetStatus(string text)
+    {
+        if (_status != null) _status.Text = text;
+    }
+
+    private sealed record AiProviderPreset(string Label, string DisplayName, string Endpoint, string Model);
+}

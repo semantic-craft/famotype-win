@@ -1,0 +1,48 @@
+name: Famo identity gate
+
+# Lightweight release-identity regression gate — guide §9 task 7 / §11 gate item 9
+# ("旧脚手架不能被 release CI 调用" + guard/contract enforcement on every change).
+#
+# Runs the identity guard self-test + the pure-net10.0 contract & unit test project
+# (identity / About-page layering / installer / legacy-scaffold-blocked / engine-ABI
+# contracts). It does NOT build the native installer — that needs the pinned weasel-fork
+# VS/MSVC/Boost toolchain + engine-api build, which stays a manual release step
+# (installer/build-installer.ps1). This gate catches identity/branding regressions in
+# source without that heavy toolchain. Focused current-machine smoke is documented in
+# installer/smoke_test.md and installer/smoke-harness.ps1; VM work is never an implicit gate.
+
+on:
+  push:
+    branches: [ main, windows-edition ]
+    paths:
+      - 'native/windows-tsf-famo/**'
+      - '.github/workflows/famo-identity-gate.yml'
+  pull_request:
+    paths:
+      - 'native/windows-tsf-famo/**'
+      - '.github/workflows/famo-identity-gate.yml'
+  workflow_dispatch:
+
+jobs:
+  identity-gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Identity guard self-test
+        shell: pwsh
+        run: ./native/windows-tsf-famo/tools/identity_guard/check_release_identity.ps1 -SelfTest
+
+      # Contract tests only (~ContractTests): identity / About-layering / installer /
+      # legacy-scaffold-blocked / engine-ABI / page-parity. These read git-tracked source and
+      # are hermetic in a clean checkout. The full `dotnet test` also has unit tests
+      # (ConfigWriter/CandidateFormat) that read the gitignored assembled payload
+      # (famo-config/payload/, built by assemble-payload.sh) — not present in CI, so they run
+      # locally, not here. This gate is about identity/branding regressions, not payload output.
+      - name: Identity / branding / installer contract tests
+        shell: pwsh
+        run: dotnet test native/windows-tsf-famo/settings-winui/FamoSettings.Tests/FamoSettings.Tests.csproj -c Release --nologo --filter "FullyQualifiedName~ContractTests"
