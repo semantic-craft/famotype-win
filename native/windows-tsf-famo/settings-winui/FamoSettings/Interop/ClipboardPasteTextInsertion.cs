@@ -90,6 +90,12 @@ public sealed class SendInputPasteCommandSender : IPasteCommandSender
 
     public static nint CaptureForegroundWindow() => GetForegroundWindow();
 
+    public static bool TryActivateTarget(nint targetWindow) =>
+        targetWindow != 0 && IsWindow(targetWindow) && SetForegroundWindow(targetWindow);
+
+    public static bool IsForegroundTarget(nint targetWindow) =>
+        targetWindow != 0 && GetForegroundWindow() == targetWindow;
+
     private static INPUT Key(ushort virtualKey, bool keyUp) => new()
     {
         type = INPUT_KEYBOARD,
@@ -145,4 +151,20 @@ public static class TextInsertionServices
         new ClipboardPasteInsertionService(
             new WindowsClipboardTextBridge(),
             new SendInputPasteCommandSender(SendInputPasteCommandSender.CaptureForegroundWindow()));
+
+    public static ITextInsertionService VerifiedClipboardPasteForTarget(
+        nint targetWindow,
+        WindowsUiAutomationSelectionAnchor anchor)
+    {
+        var paste = new ClipboardPasteInsertionService(
+            new WindowsClipboardTextBridge(),
+            new SendInputPasteCommandSender(targetWindow));
+        return new SelectionVerifiedInsertionService(anchor.Text, async cancellationToken =>
+        {
+            if (!SendInputPasteCommandSender.TryActivateTarget(targetWindow)) return null;
+            await Task.Delay(60, cancellationToken);
+            if (!SendInputPasteCommandSender.IsForegroundTarget(targetWindow)) return null;
+            return await anchor.VerifyAndReselectAsync(cancellationToken);
+        }, paste);
+    }
 }

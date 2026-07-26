@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using Famo.Settings.Core;
 using Famo.Settings.Core.Ai;
+using Famo.Settings.Core.Insertion;
 using Famo.Settings.Core.QuickPhrases;
 using Famo.Settings.Core.Selection;
 using Famo.Settings.Interop;
@@ -102,16 +103,16 @@ public partial class App : Application
     /// <summary>显示 AI 对话窗口（懒建 + 复用），仅响应用户显式触发。</summary>
     public static void ShowAiConversation()
     {
-        ShowAiConversation(selectedText: null);
+        ShowAiConversation(selectedText: null, replacement: null);
     }
 
-    private static void ShowAiConversation(string? selectedText)
+    private static void ShowAiConversation(string? selectedText, ITextInsertionService? replacement)
     {
         ApplyTheme();
         if (_aiConversationWindow is null || selectedText is not null)
         {
             _aiConversationWindow?.Close();
-            var window = new AiConversationWindow(selectedText);
+            var window = new AiConversationWindow(selectedText, replacement);
             _aiConversationWindow = window;
             window.Closed += (_, _) =>
             {
@@ -129,8 +130,15 @@ public partial class App : Application
 
     private static async Task ShowAiConversationForSelectionAsync()
     {
-        SelectedTextCaptureResult result = await BuildSelectionCaptureService().CaptureAsync(CancellationToken.None);
-        ShowAiConversation(result.Status == SelectedTextCaptureStatus.Success ? result.Text : null);
+        nint targetWindow = SendInputPasteCommandSender.CaptureForegroundWindow();
+        (SelectedTextCaptureResult result, WindowsUiAutomationSelectionAnchor? anchor) =
+            await CaptureSelectionForReplacementAsync();
+        ITextInsertionService? replacement = anchor is not null
+            ? TextInsertionServices.VerifiedClipboardPasteForTarget(targetWindow, anchor)
+            : null;
+        ShowAiConversation(
+            result.Status == SelectedTextCaptureStatus.Success ? result.Text : null,
+            replacement);
     }
 
     /// <summary>显示提示词选择器。创建窗口前捕获当前前台窗口作为粘贴目标。</summary>
@@ -210,20 +218,61 @@ public partial class App : Application
         _ = ShowAiSelectionSkillAsync(skill);
     }
 
+    public static void ShowAiSelectionSkill(
+        AiSelectionSkillDefinition skill,
+        string selectedText,
+        ITextInsertionService? replacement)
+    {
+        _ = ShowCapturedAiSelectionSkillAsync(skill, selectedText, replacement);
+    }
+
     private static async Task ShowAiSelectionSkillAsync(AiSelectionSkillDefinition skill)
     {
         ApplyTheme();
-        if (_aiSelectionSkillWindow is null
-            || !string.Equals(_aiSelectionSkillWindow.Skill.Id, skill.Id, StringComparison.Ordinal))
+        if (!AiSelectionSkills.IsEnabled(Settings, skill.Id))
         {
-            _aiSelectionSkillWindow?.Close();
-            _aiSelectionSkillWindow = new AiSelectionPolishWindow(skill);
-            _aiSelectionSkillWindow.Closed += (_, _) => _aiSelectionSkillWindow = null;
+            AiSelectionPolishWindow disabledWindow = CreateAiSelectionSkillWindow(skill, null);
+            await disabledWindow.CaptureSelectionBeforeActivationAsync();
+            disabledWindow.Activate();
+            return;
         }
+        nint targetWindow = SendInputPasteCommandSender.CaptureForegroundWindow();
+        (SelectedTextCaptureResult result, WindowsUiAutomationSelectionAnchor? anchor) =
+            await CaptureSelectionForReplacementAsync();
+        ITextInsertionService? replacement = anchor is not null
+            ? TextInsertionServices.VerifiedClipboardPasteForTarget(targetWindow, anchor)
+            : null;
+        AiSelectionPolishWindow window = CreateAiSelectionSkillWindow(skill, replacement);
+        window.LoadCapturedSelection(result);
+        window.Activate();
+        await window.RunSkillAsync();
+    }
 
-        await _aiSelectionSkillWindow.CaptureSelectionBeforeActivationAsync();
-        _aiSelectionSkillWindow.Activate();
-        await _aiSelectionSkillWindow.RunSkillAsync();
+    private static async Task ShowCapturedAiSelectionSkillAsync(
+        AiSelectionSkillDefinition skill,
+        string selectedText,
+        ITextInsertionService? replacement)
+    {
+        ApplyTheme();
+        AiSelectionPolishWindow window = CreateAiSelectionSkillWindow(skill, replacement);
+        window.LoadCapturedSelection(selectedText);
+        window.Activate();
+        await window.RunSkillAsync();
+    }
+
+    private static AiSelectionPolishWindow CreateAiSelectionSkillWindow(
+        AiSelectionSkillDefinition skill,
+        ITextInsertionService? replacement)
+    {
+        _aiSelectionSkillWindow?.Close();
+        var window = new AiSelectionPolishWindow(skill, replacement);
+        _aiSelectionSkillWindow = window;
+        window.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_aiSelectionSkillWindow, window))
+                _aiSelectionSkillWindow = null;
+        };
+        return window;
     }
 
     /// <summary>当前进程加载的设置 store（单一真相源，供各页读写）。</summary>
@@ -454,6 +503,19 @@ public partial class App : Application
             new ClipboardCopySelectionReader(
                 new WindowsClipboardTextChannel(),
                 new Win32CopyShortcutSender()));
+
+    private static async Task<(SelectedTextCaptureResult Result, WindowsUiAutomationSelectionAnchor? Anchor)>
+        CaptureSelectionForReplacementAsync()
+    {
+        WindowsUiAutomationSelectionAnchor? anchor =
+            await WindowsUiAutomationSelectionAnchor.CaptureAsync(CancellationToken.None);
+        if (anchor is not null)
+        {
+            return (SelectedTextCaptureResult.Success(
+                anchor.Text, SelectedTextCaptureSource.FocusedControl), anchor);
+        }
+        return (await BuildSelectionCaptureService().CaptureAsync(CancellationToken.None), null);
+    }
 
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);

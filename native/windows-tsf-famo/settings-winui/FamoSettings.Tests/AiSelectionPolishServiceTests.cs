@@ -152,9 +152,9 @@ public sealed class AiSelectionPolishServiceTests : IDisposable
     }
 
     [Theory]
-    [InlineData("ai-source-check", "来源核验")]
     [InlineData("ai-research", "辅助检索")]
-    [InlineData("ai-document-formatting", "公文排版")]
+    [InlineData("ai-publish-formatting", "规范排版")]
+    [InlineData("ai-translation", "划词翻译")]
     public async Task RunAsync_UsesBuiltInSelectionSkillsWithCurrentDefaultProvider(string pageId, string title)
     {
         FamoSettings settings = SettingsStore.CreateDefault();
@@ -174,11 +174,71 @@ public sealed class AiSelectionPolishServiceTests : IDisposable
         AiSelectionSkillResult result = await service.RunAsync(skill, "待处理选中文本", CancellationToken.None);
 
         Assert.Equal(title, result.Skill.Title);
-        Assert.Equal(new[] { "技能结果" }, result.Candidates);
+        Assert.Equal(
+            pageId == "ai-publish-formatting" ? new[] { "待处理选中文本" } : new[] { "技能结果" },
+            result.Candidates);
         Assert.Equal("deepseek-chat", result.Model);
         Assert.NotNull(captured);
         Assert.Contains("待处理选中文本", capturedBody);
         Assert.Contains("\"response_format\":{\"type\":\"json_object\"}", capturedBody);
+    }
+
+    [Theory]
+    [InlineData("阿里云百炼", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.6-flash", "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation", "\"forced_search\":true", false)]
+    [InlineData("小米 MiMo", "https://api.xiaomimimo.com/v1/chat/completions", "mimo-v2.5", "https://api.xiaomimimo.com/v1/chat/completions", "\"force_search\":true", true)]
+    [InlineData("火山引擎 · 豆包 Seed", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-seed", "https://ark.cn-beijing.volces.com/api/v3/responses", "\"max_tool_calls\":3", false)]
+    [InlineData("OpenAI", "https://api.openai.com/v1/chat/completions", "chat-latest", "https://api.openai.com/v1/responses", "\"type\":\"web_search\"", false)]
+    public async Task SourceCheck_UsesProviderSearchWireAndReturnsSourceUrls(
+        string displayName,
+        string endpoint,
+        string model,
+        string expectedEndpoint,
+        string expectedBody,
+        bool usesApiKeyHeader)
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile("sk-secret", displayName, endpoint, model);
+        HttpRequestMessage? captured = null;
+        string capturedBody = "";
+        var handler = new CaptureHandler(request =>
+        {
+            captured = request;
+            capturedBody = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return JsonResponse("""{"choices":[{"message":{"content":"核验摘要"}}],"search_results":[{"title":"最高法","url":"https://www.court.gov.cn/a"}]}""");
+        });
+        var service = new AiSelectionSkillService(
+            settings, new AiProviderProfileStore(_file), _secrets, new HttpClient(handler));
+
+        AiSelectionSkillResult result = await service.RunAsync(
+            AiSelectionSkills.SourceCheck, "待核验事实", CancellationToken.None);
+
+        Assert.Equal(expectedEndpoint, captured!.RequestUri!.ToString());
+        Assert.Contains(expectedBody, capturedBody);
+        Assert.Equal(usesApiKeyHeader ? "sk-secret" : null,
+            captured.Headers.TryGetValues("api-key", out IEnumerable<string>? values) ? Assert.Single(values) : null);
+        Assert.Equal(usesApiKeyHeader ? null : "sk-secret", captured.Headers.Authorization?.Parameter);
+        string rendered = Assert.Single(result.Candidates);
+        Assert.Contains("已找到可核来源", rendered);
+        Assert.Contains("https://www.court.gov.cn/a", rendered);
+    }
+
+    [Fact]
+    public async Task SourceCheck_RejectsUnsupportedProviderBeforeReadingSecretOrNetwork()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile("sk-secret");
+        var handler = new CaptureHandler(_ => throw new InvalidOperationException("network should not be called"));
+        var service = new AiSelectionSkillService(
+            settings, new AiProviderProfileStore(_file), _secrets, new HttpClient(handler));
+
+        InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.RunAsync(AiSelectionSkills.SourceCheck, "待核验事实", CancellationToken.None));
+
+        Assert.Contains("不支持返回来源的联网核验", ex.Message);
+        Assert.Equal(0, _secrets.GetCalls);
+        Assert.Equal(0, handler.Calls);
     }
 
     [Fact]
@@ -261,20 +321,21 @@ public sealed class AiSelectionPolishServiceTests : IDisposable
     }
 
     [Fact]
-    public void BuiltIn_ContainsDocumentFormattingSkill()
+    public void BuiltIn_ContainsCurrentFormattingAndTranslationSkills()
     {
-        Assert.Contains(AiSelectionSkills.DocumentFormatting, AiSelectionSkills.BuiltIn);
-        Assert.Equal(5, AiSelectionSkills.BuiltIn.Count);
-        Assert.Equal("document-formatting", AiSelectionSkills.DocumentFormatting.Id);
-        Assert.Equal("ai-document-formatting", AiSelectionSkills.DocumentFormatting.PageId);
-        Assert.Same(AiSelectionSkills.DocumentFormatting, AiSelectionSkills.FromPageId("ai-document-formatting"));
+        Assert.Contains(AiSelectionSkills.PublishFormatting, AiSelectionSkills.BuiltIn);
+        Assert.Contains(AiSelectionSkills.Translation, AiSelectionSkills.BuiltIn);
+        Assert.Equal(6, AiSelectionSkills.BuiltIn.Count);
+        Assert.Same(AiSelectionSkills.PublishFormatting, AiSelectionSkills.FromPageId("ai-publish-formatting"));
+        Assert.Same(AiSelectionSkills.Translation, AiSelectionSkills.FromPageId("ai-translation"));
     }
 
     [Theory]
     [InlineData("polish")]
     [InlineData("source-check")]
     [InlineData("research-assist")]
-    [InlineData("document-formatting")]
+    [InlineData("publish-formatting")]
+    [InlineData("translation")]
     [InlineData("prompt-optimize")]
     public void IsEnabled_ReflectsToggledOffSkillSetting(string skillId)
     {
@@ -286,7 +347,8 @@ public sealed class AiSelectionPolishServiceTests : IDisposable
             case "polish": settings.Ai.PolishSkillEnabled = false; break;
             case "source-check": settings.Ai.SourceCheckSkillEnabled = false; break;
             case "research-assist": settings.Ai.ResearchAssistSkillEnabled = false; break;
-            case "document-formatting": settings.Ai.DocumentFormattingSkillEnabled = false; break;
+            case "publish-formatting": settings.Ai.PublishFormattingSkillEnabled = false; break;
+            case "translation": settings.Ai.TranslationSkillEnabled = false; break;
             case "prompt-optimize": settings.Ai.PromptOptimizeSkillEnabled = false; break;
         }
 
@@ -303,14 +365,56 @@ public sealed class AiSelectionPolishServiceTests : IDisposable
         Assert.True(result); // 容错风格对齐 FromPageId：未知 id 不当作被关闭处理
     }
 
-    private AiProviderProfile AddDefaultProfile(string key)
+    [Fact]
+    public async Task PublishFormatting_RejectsAiContentChangesAndFallsBackToRules()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile("sk-secret");
+        var handler = new CaptureHandler(_ => JsonResponse(
+            """{ "choices": [ { "message": { "content": "{\"candidates\":[\"模型擅自改字。\"]}" } } ] }"""));
+        var service = new AiSelectionSkillService(
+            settings, new AiProviderProfileStore(_file), _secrets, new HttpClient(handler));
+
+        AiSelectionSkillResult result = await service.RunAsync(
+            AiSelectionSkills.PublishFormatting, "原文,测试...", CancellationToken.None);
+
+        Assert.Equal("原文，测试……", Assert.Single(result.Candidates));
+    }
+
+    [Fact]
+    public void ChineseTypesetting_ContentFingerprintIncludesSupplementaryLetters()
+    {
+        Assert.Equal("甲，𠀀A-1", ChineseTypesetting.ContentFingerprint("甲，𠀀 A-1"));
+        Assert.Equal(
+            "调用Console.WriteLine(\"你好\"),见https://例子.中国/a?x=1。",
+            ChineseTypesetting.Finalize("调用Console.WriteLine(\"你好\"),见https://例子.中国/a?x=1。"));
+        Assert.Equal("curl --help ...args /usr/bin/tool",
+            ChineseTypesetting.Finalize("curl --help ...args /usr/bin/tool"));
+        Assert.Equal("配置 {\"mode\":\"...\",\"flag\":\"--raw\"}.",
+            ChineseTypesetting.Finalize("配置 {\"mode\":\"...\",\"flag\":\"--raw\"}."));
+        Assert.Equal("代码：\n```sh\ncurl --help ...args\n```",
+            ChineseTypesetting.Finalize("代码:\n```sh\ncurl --help ...args\n```"));
+        Assert.Equal("配置：\n{\n  \"mode\": \"...\",\n  \"flags\": [\"--raw\"]\n}",
+            ChineseTypesetting.Finalize("配置:\n{\n  \"mode\": \"...\",\n  \"flags\": [\"--raw\"]\n}"));
+        Assert.Equal("数组 [\"...\",\"--raw\"].",
+            ChineseTypesetting.Finalize("数组 [\"...\",\"--raw\"]."));
+        Assert.Equal("代码：\n~~~sh\necho \"...\"\n~~~",
+            ChineseTypesetting.Finalize("代码:\n~~~sh\necho \"...\"\n~~~"));
+    }
+
+    private AiProviderProfile AddDefaultProfile(
+        string key,
+        string displayName = "DeepSeek",
+        string endpoint = "https://api.deepseek.com/v1/chat/completions",
+        string model = "deepseek-chat")
     {
         var service = new AiProviderProfileService(new AiProviderProfileStore(_file), _secrets);
         return service.AddProfile(new AiProviderProfileDraft
         {
-            DisplayName = "DeepSeek",
-            Endpoint = "https://api.deepseek.com/v1/chat/completions",
-            Model = "deepseek-chat",
+            DisplayName = displayName,
+            Endpoint = endpoint,
+            Model = model,
             ApiKey = key,
             MakeDefault = true,
         });

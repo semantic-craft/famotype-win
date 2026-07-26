@@ -1,12 +1,12 @@
 {
-  "version": 3,
+  "version": 4,
   "appearance": {
     "skin": "shenda",
     "appearanceMode": "system",
     "fontFace": "微软雅黑",
     "fontPoint": 19,
     "candidateFormat": "full",
-    "orientation": "horizontal",
+    "orientation": "auto",
     "inlinePreedit": false,
     "showPreedit": true,
     "previewPages": false,
@@ -72,11 +72,17 @@
   "ai": {
     "cloudEnabled": false,
     "selectionMenuEnabled": true,
+    "askAnythingSkillEnabled": true,
     "polishSkillEnabled": true,
     "sourceCheckSkillEnabled": true,
     "researchAssistSkillEnabled": true,
-    "documentFormattingSkillEnabled": true,
+    "publishFormattingSkillEnabled": true,
+    "translationSkillEnabled": true,
     "promptOptimizeSkillEnabled": true
+  },
+  "hotKeys": {
+    "quickPhrasePanel": "",
+    "selectionToolbox": ""
   },
   "convenience": {
     "shiftSwitch": true,

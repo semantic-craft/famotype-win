@@ -228,6 +228,17 @@ bool ApplyScalar(std::string_view key, std::string_view value, bool dark,
     skin->layout_type =
         v == "true" ? FAMO_LAYOUT_HORIZONTAL : FAMO_LAYOUT_VERTICAL;
     skin->min_width = v == "true" ? 210 : 76;
+  } else if (key == "orientation") {
+    const auto v = Trim(value);
+    if (v == "auto")
+      skin->layout_type = FAMO_LAYOUT_AUTO;
+    else if (v == "horizontal" || v == "scroll")
+      skin->layout_type = FAMO_LAYOUT_HORIZONTAL;
+    else if (v == "vertical")
+      skin->layout_type = FAMO_LAYOUT_VERTICAL;
+    else
+      return false;
+    skin->min_width = skin->layout_type == FAMO_LAYOUT_VERTICAL ? 76 : 210;
   } else if (key == "show_preedit" || key == "preview_pages") {
     const auto v = Trim(value);
     if (v != "true" && v != "false")

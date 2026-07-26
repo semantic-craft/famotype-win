@@ -30,17 +30,18 @@ public sealed class CandidatePage : UserControl
         sp.Children.Add(FamoUI.PaneHeader("候选窗设置", "候选窗的排列、字体、字号与行为。本页改动实时生效，无需刷新配置。"));
         sp.Children.Add(FamoUI.Banner(false, "本页改动实时生效，无需刷新配置"));
 
-        int dir = A.Orientation == "vertical" ? 2 : 1; // 自动/横排/竖排
+        int dir = A.Orientation switch { "auto" => 0, "vertical" => 2, "scroll" => 3, _ => 1 };
         int sizeIdx = Math.Max(0, Array.IndexOf(FontPoints, NearestPoint((int)A.FontPoint)));
         int formatIdx = IndexOf(CandidateFormats, A.CandidateFormat);
 
         _pageSizeStepper = FamoUI.Stepper(Math.Clamp(E.PageSize, 3, 9), 3, 9, OnPageSizeChanged);
 
         sp.Children.Add(FamoUI.Card("候选显示",
-            FamoUI.Row("排列方向", "候选横排或竖排。",
-                FamoUI.SegBar(new[] { "自动", "横排", "竖排" }, dir, i =>
+            FamoUI.Row("排列方向", "卷轴按页对齐：首行是当前页，下方一至两行后页候选可点。",
+                FamoUI.SegBar(new[] { "自动", "横排", "竖排", "卷轴" }, dir, i =>
                 {
-                    A.Orientation = i == 2 ? "vertical" : "horizontal";
+                    A.Orientation = i switch { 0 => "auto", 2 => "vertical", 3 => "scroll", _ => "horizontal" };
+                    A.PreviewPages = false;
                     ReloadResult result = App.SaveAndApplyInstant();
                     ReportInstantResult(result);
                     RefreshPreview();
@@ -69,9 +70,7 @@ public sealed class CandidatePage : UserControl
                 FamoUI.Pill(A.InlinePreedit, v => { A.InlinePreedit = v; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); }), divider: false),
             FamoUI.Row("候选窗显示输入串", "显示原始字母、活动音节和可用左右键移动的光标。",
                 FamoUI.Pill(A.ShowPreedit, v => { A.ShowPreedit = v; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); })),
-            FamoUI.Row("预览后页", "横排候选条下方淡显后面一/两页；无序号、不可点，翻页键行为不变。",
-                FamoUI.Pill(A.PreviewPages, v => { A.PreviewPages = v; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); })),
-            FamoUI.Row("预览行数", "预览后续一页或两页。",
+            FamoUI.Row("卷轴行数", "卷轴显示后续一页或两页；后页无序号，鼠标点击即可选择。",
                 FamoUI.SegBar(new[] { "1 行", "2 行" }, Math.Clamp(A.PreviewRows, 1, 2) - 1,
                     i => { A.PreviewRows = i + 1; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); })),
             FamoUI.Row("内嵌候选预览", "开=光标处显示当前候选词的实际文字；关=光标处显示拼音本身（区别于内嵌预编辑，那是控制显示的位置，这个控制显示的内容）。",

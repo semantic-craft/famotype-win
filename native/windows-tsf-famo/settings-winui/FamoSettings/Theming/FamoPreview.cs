@@ -6,7 +6,7 @@ using Microsoft.UI.Xaml.Shapes;
 
 namespace Famo.Settings.Theming;
 
-/// <summary>候选窗预览 mock：输入串光标、薄雾候选、竖排通栏与后页预览。</summary>
+/// <summary>候选窗预览 mock：输入串光标、薄雾候选、竖排通栏与卷轴后页。</summary>
 public static class FamoPreview
 {
     public static Border Build()
@@ -53,12 +53,12 @@ public static class FamoPreview
         }
         cw.Children.Add(cands);
 
-        if (!vertical && A.PreviewPages)
+        if (!vertical && (A.Orientation == "scroll" || A.PreviewPages))
         {
             string[][] rows = { new[] { "你号", "拟好", "霓濠", "泥蚝" }, new[] { "倪皓", "逆豪", "匿好", "睨毫" } };
             for (int row = 0; row < Math.Clamp(A.PreviewRows, 1, 2); row++)
             {
-                var preview = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, Opacity = row == 0 ? 0.45 : 0.30 };
+                var preview = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 5, Opacity = 0.75 };
                 foreach (string word in rows[row])
                     preview.Children.Add(new TextBlock { Text = word, FontFamily = wordFont, FontSize = fs, Foreground = FamoUI.Br("Famo.Ink"), Margin = new Thickness(8, 7, 8, 7) });
                 cw.Children.Add(preview);

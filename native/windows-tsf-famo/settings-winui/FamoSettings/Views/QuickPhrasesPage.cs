@@ -26,7 +26,7 @@ public sealed class QuickPhrasesPage : UserControl
     private void BuildContent()
     {
         var sp = new StackPanel();
-        sp.Children.Add(FamoUI.PaneHeader("快捷短语", "给固定话术设置短编码；拼音下输入完整编码，五笔下用快捷短语面板直接插入。"));
+        sp.Children.Add(FamoUI.PaneHeader("快捷短语", "给固定话术设置短编码；拼音下输入完整编码，任意方案可用录制热键打开快捷短语面板。"));
         sp.Children.Add(FamoUI.Banner(true, "本地快捷短语只写入 Famo 托管的 famo_quick_send.txt，不改 custom_phrase.txt 或其他词库"));
 
         _status = new TextBlock

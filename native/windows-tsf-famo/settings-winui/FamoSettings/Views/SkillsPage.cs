@@ -11,10 +11,10 @@ public sealed class SkillsPage : UserControl
     public SkillsPage()
     {
         var sp = new StackPanel();
-        sp.Children.Add(FamoUI.PaneHeader("技能平台", "选区到技能的显式入口；不进入 Rime 输入热路径。"));
+        sp.Children.Add(FamoUI.PaneHeader("技能平台", "配置划词工具箱；任意提问是具体技能之外的兜底。"));
 
-        sp.Children.Add(FamoUI.Card("划词菜单",
-            FamoUI.Row("启用划词菜单", "系统菜单会显示已实现的划词技能入口；每次都由你显式触发。",
+        sp.Children.Add(FamoUI.Card("划词工具箱",
+            FamoUI.Row("启用划词工具箱", "在任意 App 选中文字后快速双击 Alt 呼出；每次都由你显式触发。",
                 FamoUI.Pill(App.Settings.Ai.SelectionMenuEnabled, v =>
                 {
                     App.Settings.Ai.SelectionMenuEnabled = v;
@@ -40,9 +40,9 @@ public sealed class SkillsPage : UserControl
                 FamoUI.Value("显式触发"))));
 
         var builtInSkills = FamoUI.Card("内置技能",
-            SkillRow(AiSelectionSkills.Polish, "把选中文本改写为更顺畅的书面中文，结果只显示和复制。",
-                App.Settings.Ai.PolishSkillEnabled,
-                v => { App.Settings.Ai.PolishSkillEnabled = v; App.Store.Save(App.Settings); },
+            SkillRow("任意提问", "全部划词动作的输入框兜底。",
+                App.Settings.Ai.AskAnythingSkillEnabled,
+                v => { App.Settings.Ai.AskAnythingSkillEnabled = v; App.Store.Save(App.Settings); },
                 divider: false),
             SkillRow(AiSelectionSkills.SourceCheck, "从选中文本提取待核验断言、一手来源类型和检索关键词。",
                 App.Settings.Ai.SourceCheckSkillEnabled,
@@ -50,14 +50,18 @@ public sealed class SkillsPage : UserControl
             SkillRow(AiSelectionSkills.ResearchAssist, "从选中文本生成检索式、追问方向和资料路径。",
                 App.Settings.Ai.ResearchAssistSkillEnabled,
                 v => { App.Settings.Ai.ResearchAssistSkillEnabled = v; App.Store.Save(App.Settings); }),
-            SkillRow(AiSelectionSkills.DocumentFormatting, "把选中文本按公文格式改写：结论先行、公文用语、标准格式。",
-                App.Settings.Ai.DocumentFormattingSkillEnabled,
-                v => { App.Settings.Ai.DocumentFormattingSkillEnabled = v; App.Store.Save(App.Settings); }),
+            SkillRow(AiSelectionSkills.PublishFormatting, "只整理空格、标点、换行和列表，不改内容。",
+                App.Settings.Ai.PublishFormattingSkillEnabled,
+                v => { App.Settings.Ai.PublishFormattingSkillEnabled = v; App.Store.Save(App.Settings); }),
+            SkillRow(AiSelectionSkills.Translation, "中译英，其他语言译为简体中文。",
+                App.Settings.Ai.TranslationSkillEnabled,
+                v => { App.Settings.Ai.TranslationSkillEnabled = v; App.Store.Save(App.Settings); }),
+            SkillRow(AiSelectionSkills.Polish, "把选中文本改写为更顺畅的书面中文，可确认替换原选区。",
+                App.Settings.Ai.PolishSkillEnabled,
+                v => { App.Settings.Ai.PolishSkillEnabled = v; App.Store.Save(App.Settings); }),
             SkillRow(AiSelectionSkills.PromptOptimize, "把选中的草稿提示词补齐意图/目标/约束/产出形态四要素；信息不足时先反问再定稿。",
                 App.Settings.Ai.PromptOptimizeSkillEnabled,
-                v => { App.Settings.Ai.PromptOptimizeSkillEnabled = v; App.Store.Save(App.Settings); }),
-            FamoUI.Row("任意提问", "全部划词技能的兜底：从划词入口可对选中文本改写、排版、翻译、拟回复或提问；这里打开普通对话。",
-                FamoUI.ActionButton("打开", App.ShowAiConversation)));
+                v => { App.Settings.Ai.PromptOptimizeSkillEnabled = v; App.Store.Save(App.Settings); }));
         sp.Children.Add(builtInSkills);
 
         sp.Children.Add(FamoUI.Card("提示词",
@@ -78,9 +82,16 @@ public sealed class SkillsPage : UserControl
         Action<bool> onToggle,
         bool divider = true)
     {
-        var controls = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
-        controls.Children.Add(FamoUI.ActionButton("打开", () => App.ShowAiSelectionSkill(skill)));
-        controls.Children.Add(FamoUI.Pill(enabled, onToggle));
-        return FamoUI.Row(skill.Title, description, controls, divider);
+        return SkillRow(skill.Title, description, enabled, onToggle, divider);
+    }
+
+    private static FrameworkElement SkillRow(
+        string title,
+        string description,
+        bool enabled,
+        Action<bool> onToggle,
+        bool divider = true)
+    {
+        return FamoUI.Row(title, description, FamoUI.Pill(enabled, onToggle), divider);
     }
 }

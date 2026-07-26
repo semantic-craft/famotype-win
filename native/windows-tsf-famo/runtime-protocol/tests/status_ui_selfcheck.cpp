@@ -28,6 +28,62 @@ using namespace famo::runtime;
 
 namespace {
 
+bool DoubleAltRequiresTwoShortCleanTaps() {
+  AltDoubleTapDetector detector;
+  CHECK(!detector.Process(true, true, 100));
+  CHECK(!detector.Process(true, false, 200));
+  CHECK(!detector.Process(true, true, 400));
+  CHECK(detector.Process(true, false, 450));
+
+  CHECK(!detector.Process(true, true, 1000));
+  CHECK(!detector.Process(true, false, 1600));
+  CHECK(!detector.Process(true, true, 1700));
+  CHECK(!detector.Process(true, false, 1750));
+
+  CHECK(!detector.Process(true, true, 2300));
+  CHECK(!detector.Process(true, false, 2350));
+  CHECK(!detector.Process(false, true, 2400));
+  CHECK(!detector.Process(true, true, 2450));
+  CHECK(!detector.Process(true, false, 2500));
+  return true;
+}
+
+bool GlobalHotKeysAcceptOnlyRestrictedCanonicalBindings() {
+  GlobalHotKeyBinding binding;
+  CHECK(ParseGlobalHotKeyBinding("Ctrl+Alt+J", &binding));
+  CHECK((binding.modifiers & MOD_CONTROL) != 0);
+  CHECK((binding.modifiers & MOD_ALT) != 0);
+  CHECK(binding.virtual_key == 'J');
+  CHECK(GlobalHotKeyBindingMatches(binding, 'J', true, true, false, false));
+  CHECK(!GlobalHotKeyBindingMatches(binding, 'J', true, true, true, false));
+  CHECK(!GlobalHotKeyBindingMatches(binding, 'J', true, true, false, true));
+  CHECK(!ParseGlobalHotKeyBinding("Ctrl+J", &binding));
+  CHECK(!ParseGlobalHotKeyBinding("Win+Alt+J", &binding));
+  CHECK(!ParseGlobalHotKeyBinding("Ctrl+Ctrl+J", &binding));
+  CHECK(!ParseGlobalHotKeyBinding("Ctrl+Alt+1", &binding));
+  return true;
+}
+
+bool ToolboxPolicyMatchesGestureAndRecordedHotKeySemantics() {
+  const std::string enabled =
+      R"({"ai":{"cloudEnabled":true,"selectionMenuEnabled":true}})";
+  CHECK(ToolboxPolicyAllows(enabled, true));
+  CHECK(ToolboxPolicyAllows(enabled, false));
+
+  const std::string menu_disabled =
+      R"({"ai":{"cloudEnabled":true,"selectionMenuEnabled":false}})";
+  CHECK(!ToolboxPolicyAllows(menu_disabled, true));
+  CHECK(ToolboxPolicyAllows(menu_disabled, false));
+
+  CHECK(!ToolboxPolicyAllows(
+      R"({"ai":{"cloudEnabled":false,"selectionMenuEnabled":true}})",
+      false));
+  CHECK(!ToolboxPolicyAllows(
+      R"({"ai":{"cloudEnabled":true,"askAnythingSkillEnabled":false,"polishSkillEnabled":false,"sourceCheckSkillEnabled":false,"researchAssistSkillEnabled":false,"publishFormattingSkillEnabled":false,"translationSkillEnabled":false,"promptOptimizeSkillEnabled":false}})",
+      false));
+  return true;
+}
+
 struct WindowSearch {
   const wchar_t *class_name;
   HWND found;
@@ -765,7 +821,10 @@ bool DumpBarFrame() {
 } // namespace
 
 int main() {
-  if (!SchemaListParsesFromDefaultYaml() || !SchemaNameParsesFromSchemaYaml() ||
+  if (!DoubleAltRequiresTwoShortCleanTaps() ||
+      !GlobalHotKeysAcceptOnlyRestrictedCanonicalBindings() ||
+      !ToolboxPolicyMatchesGestureAndRecordedHotKeySemantics() ||
+      !SchemaListParsesFromDefaultYaml() || !SchemaNameParsesFromSchemaYaml() ||
       !SchemaGlyphNamesTheInputMethod() ||
       !SchemaClickAlwaysHasADifferentTarget() ||
       !PreviousSchemaPersistsBesidePosition() ||

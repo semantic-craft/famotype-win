@@ -24,6 +24,7 @@ constexpr uint32_t kHostCjkEnglishSpacing = 1u << 27;
 constexpr uint32_t kHostCjkNumberSpacing = 1u << 28;
 constexpr uint32_t kHostPreviewPages = 1u << 29;
 constexpr uint32_t kHostPreviewRowsTwo = 1u << 30;
+constexpr uint32_t kHostRimeVertical = 1u << 31;
 
 enum class Command : uint16_t {
   Hello = 1,
