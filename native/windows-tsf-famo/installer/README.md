@@ -32,7 +32,7 @@
 
 ## 卸载语义
 
-卸载先停 runtime，再用 `FamoProfileTool switch-away` 切到其他输入法，然后移除当前用户 TIP、profile、HKCU COM override、Run 项和 `{app}\versions`。
+卸载器先由 `FamoProfileTool cleanup-user` 借当前桌面 Explorer 的令牌停止该用户 runtime、切走输入法并移除其 TIP/profile/HKCU COM override，再以管理员身份移除机器注册、Run 项和 `{app}\versions`。Inno Setup 的 `ExecAsOriginalUser` 不支持卸载阶段，因此卸载不依赖它。
 
 - 静默卸载保留 `%LOCALAPPDATA%\Famo`。
 - 交互卸载会询问是否删除 `%LOCALAPPDATA%\Famo`，默认保留。
