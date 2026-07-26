@@ -103,6 +103,11 @@ public partial class App : Application
     /// <summary>显示 AI 对话窗口（懒建 + 复用），仅响应用户显式触发。</summary>
     public static void ShowAiConversation()
     {
+        if (!Settings.Ai.AskAnythingSkillEnabled)
+        {
+            FamoLog.Append("AI conversation dropped: Ask Anything skill disabled");
+            return;
+        }
         ShowAiConversation(selectedText: null, replacement: null);
     }
 
@@ -122,7 +127,7 @@ public partial class App : Application
         _aiConversationWindow.Activate();
     }
 
-    /// <summary>在窗口抢焦点前捕获明确选区；无选区时仍打开普通任意提问。</summary>
+    /// <summary>在窗口抢焦点前捕获明确选区；不合格选区绝不降级成普通任意提问。</summary>
     public static void ShowAiConversationForSelection()
     {
         _ = ShowAiConversationForSelectionAsync();
@@ -133,12 +138,16 @@ public partial class App : Application
         nint targetWindow = SendInputPasteCommandSender.CaptureForegroundWindow();
         (SelectedTextCaptureResult result, WindowsUiAutomationSelectionAnchor? anchor) =
             await CaptureSelectionForReplacementAsync();
+        string? rejection = AiSelectionToolboxEligibility.RejectionReason(Settings, result);
+        if (rejection is not null)
+        {
+            FamoLog.Append("Selection toolbox dropped: " + rejection);
+            return;
+        }
         ITextInsertionService? replacement = anchor is not null
             ? TextInsertionServices.VerifiedClipboardPasteForTarget(targetWindow, anchor)
             : null;
-        ShowAiConversation(
-            result.Status == SelectedTextCaptureStatus.Success ? result.Text : null,
-            replacement);
+        ShowAiConversation(result.Text!, replacement);
     }
 
     /// <summary>显示提示词选择器。创建窗口前捕获当前前台窗口作为粘贴目标。</summary>

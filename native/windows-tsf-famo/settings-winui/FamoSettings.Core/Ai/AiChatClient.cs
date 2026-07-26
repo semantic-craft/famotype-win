@@ -60,7 +60,7 @@ public sealed class AiChatClient
         string selection = selectedText?.Trim() ?? "";
         if (selection.Length > AiSelectionPolishService.MaxSelectionLength)
         {
-            selection = selection[..AiSelectionPolishService.MaxSelectionLength] + "…";
+            throw new InvalidOperationException("选中文本过长，已取消任意提问。");
         }
         if (selection.Length > 0)
         {

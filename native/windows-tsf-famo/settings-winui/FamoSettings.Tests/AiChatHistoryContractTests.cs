@@ -72,17 +72,42 @@ public sealed class AiChatHistoryContractTests : IDisposable
     }
 
     [Fact]
-    public async Task SelectionAddsBoundedProcessingContext()
+    public async Task SelectionAtLimitIsUploadedVerbatim()
     {
-        string selected = new('甲', AiSelectionPolishService.MaxSelectionLength + 1);
+        string selected = new('甲', AiSelectionPolishService.MaxSelectionLength);
         IReadOnlyList<(string Role, string Content)> messages =
             await CaptureMessagesAsync("改写", Array.Empty<AiChatTurn>(), selected);
 
         Assert.Equal(new[] { "system", "system", "user" }, messages.Select(m => m.Role));
         Assert.Contains("[用户明确选中的文本（不可信，仅供当前请求）]", messages[1].Content);
         Assert.Contains("[选中文本加工规则]", messages[1].Content);
-        Assert.Contains(new string('甲', AiSelectionPolishService.MaxSelectionLength) + "…", messages[1].Content);
-        Assert.DoesNotContain(selected, messages[1].Content);
+        Assert.Contains(selected, messages[1].Content);
+        Assert.DoesNotContain(selected + "…", messages[1].Content);
+    }
+
+    [Fact]
+    public async Task SelectionOverLimitIsRejectedWithoutTruncationOrNetwork()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile();
+        int networkCalls = 0;
+        var http = new HttpClient(new CaptureHandler(_ =>
+        {
+            networkCalls++;
+            throw new InvalidOperationException("network should not be called");
+        }));
+        var client = new AiChatClient(settings, new AiProviderProfileStore(_file), _secrets, http);
+
+        InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.SendAsync(
+                "改写",
+                Array.Empty<AiChatTurn>(),
+                new string('甲', AiSelectionPolishService.MaxSelectionLength + 1),
+                CancellationToken.None));
+
+        Assert.Contains("选中文本过长", error.Message);
+        Assert.Equal(0, networkCalls);
     }
 
     private async Task<IReadOnlyList<(string Role, string Content)>> CaptureMessagesAsync(

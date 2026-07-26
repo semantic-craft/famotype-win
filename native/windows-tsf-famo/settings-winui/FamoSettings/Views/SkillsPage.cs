@@ -59,7 +59,7 @@ public sealed class SkillsPage : UserControl
             SkillRow(AiSelectionSkills.Polish, "把选中文本改写为更顺畅的书面中文，可确认替换原选区。",
                 App.Settings.Ai.PolishSkillEnabled,
                 v => { App.Settings.Ai.PolishSkillEnabled = v; App.Store.Save(App.Settings); }),
-            SkillRow(AiSelectionSkills.PromptOptimize, "把选中的草稿提示词补齐意图/目标/约束/产出形态四要素；信息不足时先反问再定稿。",
+            SkillRow(AiSelectionSkills.PromptOptimize, "补齐提示词四要素并用成对 XML 标签按语义分区；信息不足时先反问再定稿。",
                 App.Settings.Ai.PromptOptimizeSkillEnabled,
                 v => { App.Settings.Ai.PromptOptimizeSkillEnabled = v; App.Store.Save(App.Settings); }));
         sp.Children.Add(builtInSkills);

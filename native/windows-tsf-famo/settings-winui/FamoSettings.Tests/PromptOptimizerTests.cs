@@ -129,6 +129,17 @@ public sealed class PromptOptimizerTests
         Assert.Contains("needs_clarification", PromptOptimizer.SystemPrompt);
     }
 
+    [Fact]
+    public void SystemPrompt_RequiresPairedSemanticTagsAndVerbatimInputMaterial()
+    {
+        Assert.Contains("成对 XML 标签", PromptOptimizer.SystemPrompt);
+        Assert.Contains("<context>", PromptOptimizer.SystemPrompt);
+        Assert.Contains("<input>", PromptOptimizer.SystemPrompt);
+        Assert.Contains("有天然层级就嵌套", PromptOptimizer.SystemPrompt);
+        Assert.Contains("原样输入材料", PromptOptimizer.SystemPrompt);
+        Assert.Contains("逐字保留", PromptOptimizer.SystemPrompt);
+    }
+
     private static int CountOccurrences(string haystack, string needle)
     {
         int count = 0;
