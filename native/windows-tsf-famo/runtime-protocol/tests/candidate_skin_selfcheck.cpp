@@ -58,6 +58,17 @@ int main() {
   CHECK(skin.comment_color == 0xff66706bu);
   CHECK(skin.shadow_color == 0x80000000u);
 
+  const std::string system_style =
+      "style:\n  color_scheme: shenda\n  color_scheme_dark: shenda_dark\n";
+  FamoSkin system_light{};
+  FamoSkin system_dark{};
+  CHECK(ParseCandidateSkinForTheme(system_style, false, &system_light));
+  CHECK(ParseCandidateSkinForTheme(system_style, true, &system_dark));
+  CHECK(system_light.hilited_back_color == 0xffa82c53u);
+  CHECK(system_dark.hilited_back_color == 0xffe06a8eu);
+  CHECK(ParseCandidateSkinForTheme(system_style, false, &system_light));
+  CHECK(system_light.hilited_back_color == 0xffa82c53u);
+
   struct PaletteCase {
     const char *name;
     uint32_t accent, deep, card, card2, on_accent, ink, ink2, ink3;

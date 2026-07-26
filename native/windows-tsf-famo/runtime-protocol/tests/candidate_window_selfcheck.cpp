@@ -182,7 +182,9 @@ bool InlineHostPreeditStillShowsPanelHeader() {
   FamoSkin hidden_skin = FamoSkinDefault();
   hidden_skin.show_preedit = 0;
   auto hidden_style = std::make_shared<const RuntimeStyleState>(
-      RuntimeStyleState{0, std::make_shared<const FamoSkin>(hidden_skin)});
+      RuntimeStyleState{0, std::make_shared<const CandidateStylePresentation>(
+                               CandidateStylePresentation{hidden_skin,
+                                                          hidden_skin})});
   window.ActivateStyle(hidden_style);
   CHECK(WaitForCounters(window, [&](CandidateWindow::Counters counters) {
     return counters.full > full_before;
@@ -277,10 +279,15 @@ bool HealthyWindowAndHideRules() {
   FamoSkin wide_skin = FamoSkinDefault();
   wide_skin.min_width = 600;
   auto independent_style = std::make_shared<const RuntimeStyleState>(
-      RuntimeStyleState{0, std::make_shared<const FamoSkin>(wide_skin)});
+      RuntimeStyleState{0, std::make_shared<const CandidateStylePresentation>(
+                               CandidateStylePresentation{wide_skin,
+                                                          wide_skin})});
   window.ActivateStyle(independent_style);
   auto snapshot_style = std::make_shared<const RuntimeStyleState>(
-      RuntimeStyleState{0, std::make_shared<const FamoSkin>(FamoSkinDefault())});
+      RuntimeStyleState{
+          0, std::make_shared<const CandidateStylePresentation>(
+                 CandidateStylePresentation{FamoSkinDefault(),
+                                            FamoSkinDefault()})});
   auto styled = VisibleSnapshot(placement_sequence++);
   styled->revision = 200;
   styled->style = snapshot_style;

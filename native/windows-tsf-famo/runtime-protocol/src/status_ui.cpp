@@ -17,6 +17,7 @@
 #include <windowsx.h>
 
 #include "../../famo-candidate-ui/famo_candidate_ui.h"
+#include "candidate_skin.h"
 #include "dib_surface.h"
 
 namespace famo::runtime {
@@ -574,7 +575,8 @@ struct StatusUi::State {
   // Floating bar, UI thread only.
   HWND bar = nullptr;
   FamoTextResources *resources = nullptr;
-  std::shared_ptr<const FamoSkin> bar_skin;  // the one `resources` was built for
+  std::shared_ptr<const CandidateStylePresentation> bar_style;
+  bool bar_dark = false;
   uint32_t resource_dpi = 0;
   uint32_t bar_dpi = 96;
   DibSurface bar_surface;
@@ -1030,13 +1032,17 @@ void PaintBar(StatusUi::State *state) {
   if (!state->bar)
     return;
   std::shared_ptr<const void> presentation = state->presentation.load();
-  std::shared_ptr<const FamoSkin> skin =
-      presentation ? std::static_pointer_cast<const FamoSkin>(presentation)
-                   : nullptr;
-  const FamoSkin &active = skin ? *skin : FallbackSkin();
+  std::shared_ptr<const CandidateStylePresentation> style =
+      presentation
+          ? std::static_pointer_cast<const CandidateStylePresentation>(
+                presentation)
+          : nullptr;
+  const bool dark = SystemUsesDarkPalette();
+  const FamoSkin &active = style ? (dark ? style->dark : style->light)
+                                 : FallbackSkin();
   const uint32_t dpi = state->bar_dpi;
-  if (!state->resources || state->bar_skin != skin ||
-      state->resource_dpi != dpi) {
+  if (!state->resources || state->bar_style != style ||
+      state->bar_dark != dark || state->resource_dpi != dpi) {
     const FamoSkin text_skin = BarTextSkin(active);
     if (state->resources &&
         FamoTextResourcesReconfigure(state->resources, &text_skin, dpi) !=
@@ -1046,7 +1052,8 @@ void PaintBar(StatusUi::State *state) {
     }
     if (!state->resources)
       state->resources = FamoTextResourcesCreate(&text_skin, dpi);
-    state->bar_skin = skin;
+    state->bar_style = style;
+    state->bar_dark = dark;
     state->resource_dpi = dpi;
   }
   // A renderer that will not start leaves the bar hidden; typing is unaffected
@@ -1298,6 +1305,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     return 0;
   }
   switch (message) {
+  case WM_SETTINGCHANGE:
+  case WM_THEMECHANGED:
+    PaintBar(state);
+    return 0;
   case WM_TIMER: {
     if (wparam != kPromoteTimer)
       break;
@@ -1429,7 +1440,7 @@ void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
   // D2D/DirectWrite and the GDI+ token belong to this thread; State outlives it.
   FamoTextResourcesDestroy(state->resources);
   state->resources = nullptr;
-  state->bar_skin.reset();
+  state->bar_style.reset();
   if (SUCCEEDED(com))
     CoUninitialize();
 }
