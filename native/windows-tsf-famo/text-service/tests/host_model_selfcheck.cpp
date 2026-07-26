@@ -67,6 +67,11 @@ bool CandidateAndCorrelation() {
   state.Open(Identity(60));
   auto plan = state.PlanKey(Down('N'));
   state.ApplySucceeded(Preedit("ni", 3));
+  CHECK(!state.PlanAbsoluteCandidate(plan.correlation.sequence - 1));
+  const auto absolute =
+      state.PlanAbsoluteCandidate(plan.correlation.sequence);
+  CHECK(absolute && absolute->sequence == plan.correlation.sequence + 1);
+  state.CompleteUnhandled();
   plan = state.PlanKey(Down('2'));
   CHECK(plan.request == RequestKind::SelectCandidate);
   CHECK(plan.candidate_index == 1);

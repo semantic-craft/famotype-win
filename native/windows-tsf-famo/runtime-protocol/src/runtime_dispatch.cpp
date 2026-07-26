@@ -157,11 +157,33 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
       return Reply(request, Status::InvalidFrame);
     const FamoKeyEvent engine_key = EngineKey(value);
     rc = engine_.api().process_key(session.context, &engine_key, &view);
-  } else if (request.command == Command::SelectCandidate) {
+  } else if (request.command == Command::SelectCandidate ||
+             request.command == Command::SelectCandidateAbsolute) {
     uint32_t index = 0;
-    if (!DecodeCandidateIndex(request.payload, &index, &error))
-      return Reply(request, Status::InvalidFrame);
-    rc = engine_.api().select_candidate(session.context, index, &view);
+    if (request.command == Command::SelectCandidateAbsolute) {
+      uint64_t expected_sequence = 0;
+      if (!DecodeAbsoluteCandidateSelection(
+              request.payload, &index, &expected_sequence, &error))
+        return Reply(request, Status::InvalidFrame);
+      const uint64_t preview_start =
+          (static_cast<uint64_t>(session.composition.page_index) + 1) *
+          session.composition.page_size;
+      const uint64_t preview_end =
+          preview_start + session.composition.preview_candidates.size();
+      if (expected_sequence != session.composition_sequence)
+        return Reply(request, Status::StaleRequest);
+      if (preview_start > UINT32_MAX || index < preview_start ||
+          index >= preview_end)
+        return Reply(request, Status::InvalidFrame);
+      if (!engine_.CanSelectCandidateAbsolute())
+        return Reply(request, Status::EngineError);
+      rc = engine_.api().select_candidate_absolute(session.context, index,
+                                                    &view);
+    } else {
+      if (!DecodeCandidateIndex(request.payload, &index, &error))
+        return Reply(request, Status::InvalidFrame);
+      rc = engine_.api().select_candidate(session.context, index, &view);
+    }
     if (rc == FAMO_ENGINE_OK) {
       composition_ready = CopyView(view, &composition, &error);
       const int32_t free_rc = engine_.FreeView(&view);
@@ -263,7 +285,8 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
     composition.state_flags |=
         FAMO_COMPOSITION_HAS_COMMIT | FAMO_COMPOSITION_HANDLED;
   }
-  if (request.command == Command::SelectCandidate &&
+  if ((request.command == Command::SelectCandidate ||
+       request.command == Command::SelectCandidateAbsolute) &&
       candidate_selection_handled) {
     composition.handled = true;
     composition.state_flags |= FAMO_COMPOSITION_HANDLED;

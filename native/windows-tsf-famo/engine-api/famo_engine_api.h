@@ -8,9 +8,9 @@
 // fields to FamoCompositionView and functions to FamoEngineApi; both are
 // size-negotiated, so a v1.0 host/engine and a v1.1 one interoperate at v1.0.
 // v1.2 appends FamoCandidate::label and FamoCompositionView::is_last_page (the
-// FamoCandidateUI render inputs); v1.3 appends peek_candidates. Both follow the
-// same append-only/size-negotiated discipline.
-#define FAMO_ENGINE_ABI_MINOR 3u
+// FamoCandidateUI render inputs); v1.3 appends peek_candidates and v1.4 appends
+// absolute candidate selection. All follow the same append-only discipline.
+#define FAMO_ENGINE_ABI_MINOR 4u
 
 #if defined(_WIN32)
 #define FAMO_ENGINE_CALL __stdcall
@@ -187,6 +187,11 @@ typedef struct FamoEngineApi {
                                                uint32_t index,
                                                uint32_t count,
                                                FamoCompositionView* out_view);
+  // ── v1.4 optional addition (append only; callable iff size covers it) ────
+  int32_t (FAMO_ENGINE_CALL *select_candidate_absolute)(
+      FamoEngineContext* context,
+      uint32_t index,
+      FamoCompositionView* out_view);
 } FamoEngineApi;
 
 FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL FamoCreateEngineApi(

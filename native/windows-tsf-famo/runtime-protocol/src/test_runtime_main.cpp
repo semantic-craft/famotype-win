@@ -42,6 +42,7 @@ int wmain(int argc, wchar_t **argv) {
   int fault_after = 0;
   bool parallel = false;
   bool inline_preedit = true;
+  int preview_rows = 0;
   for (int i = 1; i < argc; ++i) {
     const std::wstring_view argument(argv[i]);
     if (argument == L"--endpoint-suffix" && i + 1 < argc) {
@@ -61,6 +62,8 @@ int wmain(int argc, wchar_t **argv) {
         return 2;
       }
       inline_preedit = value == L"true";
+    } else if (argument == L"--preview-rows" && i + 1 < argc) {
+      preview_rows = _wtoi(argv[++i]);
     } else {
       std::fprintf(stderr, "invalid arguments\n");
       return 2;
@@ -72,6 +75,7 @@ int wmain(int argc, wchar_t **argv) {
   const int max_connections = parallel ? 64 : 4;
   if (connections < 1 || connections > max_connections || fault_after < 0 ||
       fault_after > 100 ||
+      preview_rows < 0 || preview_rows > 2 ||
       !ParseServerFault(fault_name, &fault) ||
       !BuildCurrentPipeEndpoint(suffix, &endpoint, &error)) {
     std::fprintf(stderr, "runtime setup failed: %s\n", error.c_str());
@@ -79,14 +83,19 @@ int wmain(int argc, wchar_t **argv) {
   }
   const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
 
+  if (preview_rows > 0)
+    _putenv_s("FAMO_TEST_MULTIPAGE", "1");
   const std::wstring engine = ModuleDirectory() + L"\\FamoTestEngine.dll";
   RuntimeService service;
   if (!service.Start(engine.c_str(), "", &error)) {
     std::fprintf(stderr, "engine setup failed: %s\n", error.c_str());
     return 3;
   }
-  const uint32_t behavior_flags =
-      inline_preedit ? kHostInlinePreedit : 0;
+  uint32_t behavior_flags = inline_preedit ? kHostInlinePreedit : 0;
+  if (preview_rows > 0)
+    behavior_flags |= kHostPreviewPages;
+  if (preview_rows == 2)
+    behavior_flags |= kHostPreviewRowsTwo;
   if (service.InitializeControlState(behavior_flags) != ControlError::None) {
     std::fprintf(stderr, "runtime control state setup failed\n");
     return 3;

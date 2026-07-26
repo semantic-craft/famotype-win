@@ -446,15 +446,9 @@ void PipeRuntimePort::WorkerMain() {
       OpenCircuit();
       result.status = io == pipe_io::Result::Timeout ? Status::Timeout
                                                      : Status::Unavailable;
-    } else if (reply.status == Status::Ok) {
-      result.reply = std::move(reply);
-      result.status = Status::Ok;
-    } else if (reply.status == Status::Unavailable) {
-      result.reply = std::move(reply);
-      result.status = Status::Unavailable;
     } else {
-      OpenCircuit();
-      result.status = Status::Unavailable;
+      result.reply = std::move(reply);
+      result.status = result.reply.status;
     }
     {
       std::lock_guard lock(mutex_);

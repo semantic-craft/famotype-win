@@ -393,6 +393,12 @@ int32_t FAMO_ENGINE_CALL TePeekCandidates(FamoEngineContext* context,
   return FAMO_ENGINE_OK;
 }
 
+int32_t FAMO_ENGINE_CALL TeSelectCandidateAbsolute(
+    FamoEngineContext* context, uint32_t index,
+    FamoCompositionView* out_view) {
+  return TeSelectCandidate(context, index, out_view);
+}
+
 }  // namespace
 
 extern "C" FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL
@@ -427,6 +433,7 @@ FamoCreateEngineApi(uint32_t requested_abi_version, FamoEngineApi* out_api) {
   api.highlight_candidate = &TeHighlightCandidate;
   api.change_page = &TeChangePage;
   api.peek_candidates = &TePeekCandidates;
+  api.select_candidate_absolute = &TeSelectCandidateAbsolute;
   std::memcpy(out_api, &api, api.size);
   return FAMO_ENGINE_OK;
 }
