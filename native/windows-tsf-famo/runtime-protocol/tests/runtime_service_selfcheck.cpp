@@ -142,6 +142,9 @@ int main() {
       << "style:\n"
          "  color_scheme: wuda\n"
          "  inline_preedit: true\n"
+         "  show_preedit: true\n"
+         "  preview_pages: true\n"
+         "  preview_rows: 2\n"
          "  preedit_type: preview\n"
          "  famo_auto_pair: true\n"
          "  famo_cjk_english_spacing: true\n"
@@ -160,7 +163,8 @@ int main() {
   CHECK(sink.active_style);
   CHECK(sink.active_style->host_behavior_flags ==
         (kHostInlinePreedit | kHostCandidatePreview | kHostAutoPair |
-         kHostCjkEnglishSpacing | kHostCjkNumberSpacing));
+         kHostCjkEnglishSpacing | kHostCjkNumberSpacing |
+         kHostPreviewPages | kHostPreviewRowsTwo));
   const auto active_style_text = std::static_pointer_cast<const std::string>(
       sink.active_style->presentation);
   CHECK(active_style_text &&
@@ -202,7 +206,8 @@ int main() {
                           &option_failure_composition, &error));
   const uint32_t all_host_flags = kHostInlinePreedit | kHostCandidatePreview |
                                   kHostAutoPair | kHostCjkEnglishSpacing |
-                                  kHostCjkNumberSpacing;
+                                  kHostCjkNumberSpacing | kHostPreviewPages |
+                                  kHostPreviewRowsTwo;
   CHECK((option_failure_composition.state_flags & all_host_flags) ==
         all_host_flags);
   Frame clear_after_option_failure = Request(Command::ClearComposition, 3);
@@ -381,6 +386,33 @@ int main() {
   _putenv_s("FAMO_TEST_DEPLOY_DELAY_MS", "");
   control.Stop();
 
+  std::filesystem::create_directories(data_root / "rime_ice.userdb");
+  std::filesystem::create_directories(data_root / "wubi86_jidian.userdb");
+  std::ofstream(data_root / "rime_ice.userdb" / "CURRENT") << "rime-marker";
+  std::ofstream(data_root / "wubi86_jidian.userdb" / "CURRENT") << "wubi-marker";
+  std::ofstream(data_root / "quick-phrases.json") << "keep-me";
+  const uint64_t generation_before_reset = service.engine_generation();
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::None);
+  CHECK(service.readiness() == RuntimeReadiness::Ready);
+  CHECK(service.engine_generation() == generation_before_reset + 1);
+  CHECK(!std::filesystem::exists(data_root / "rime_ice.userdb"));
+  CHECK(!std::filesystem::exists(data_root / "wubi86_jidian.userdb"));
+  CHECK(std::filesystem::exists(data_root / "quick-phrases.json"));
+  std::vector<std::filesystem::path> reset_backups;
+  for (const auto &entry :
+       std::filesystem::directory_iterator(data_root / ".famo-backup")) {
+    if (entry.is_directory() &&
+        entry.path().filename().wstring().starts_with(L"userdb-reset-"))
+      reset_backups.push_back(entry.path());
+  }
+  CHECK(reset_backups.size() == 1);
+  CHECK(std::filesystem::exists(reset_backups[0] / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(reset_backups[0] / "wubi86_jidian.userdb" / "CURRENT"));
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::None);
+  CHECK(service.engine_generation() == generation_before_reset + 1);
+
   Frame invalidated_key = Request(Command::ProcessKey, 4);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 1},
                        &invalidated_key.payload));
@@ -394,6 +426,7 @@ int main() {
   CHECK(EncodeOpenSession("test", &reconnected_open.payload, &error));
   CHECK(service.Dispatch(reconnected_open).status == Status::Ok);
 
+  _putenv_s("FAMO_TEST_MULTIPAGE", "1");
   Frame process_n = Request(Command::ProcessKey, 2);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 1},
                        &process_n.payload));
@@ -413,6 +446,10 @@ int main() {
   CHECK(composition.handled && composition.preedit == "ni");
   CHECK(!composition.candidates.empty());
   CHECK(composition.candidates[0].text == "\xe4\xbd\xa0");
+  CHECK(composition.preview_candidates.empty());
+  CHECK(sink.latest && sink.latest->composition.preview_candidates.size() == 2);
+  CHECK(sink.latest->composition.preview_candidates[0].text == "\xe5\xb0\xbc");
+  _putenv_s("FAMO_TEST_MULTIPAGE", "");
 
   Frame highlight = Request(Command::HighlightCandidate, 4);
   CHECK(EncodeCandidateIndex(1, &highlight.payload));
@@ -483,7 +520,9 @@ int main() {
 
   Frame select = Request(Command::SelectCandidate, 12);
   CHECK(EncodeCandidateIndex(0, &select.payload));
+  _putenv_s("FAMO_TEST_DEFER_SELECTION_COMMIT", "1");
   reply = service.Dispatch(select);
+  _putenv_s("FAMO_TEST_DEFER_SELECTION_COMMIT", "");
   CHECK(reply.status == Status::Ok);
   CHECK(DecodeComposition(reply.payload, &composition, &error));
   CHECK(composition.handled && composition.commit == "\xe4\xbd\xa0");

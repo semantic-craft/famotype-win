@@ -11,6 +11,69 @@
 
 namespace famo::runtime {
 
+class AltDoubleTapDetector {
+public:
+  bool Process(bool alt, bool down, uint64_t milliseconds) noexcept {
+    if (!alt) {
+      if (down)
+        Reset();
+      return false;
+    }
+    if (down) {
+      if (key_down_)
+        return false;
+      if (taps_ == 1 && milliseconds >= last_up_ &&
+          milliseconds - last_up_ <= 450) {
+        taps_ = 2;
+      } else {
+        taps_ = 1;
+      }
+      key_down_ = true;
+      down_at_ = milliseconds;
+      return false;
+    }
+    if (!key_down_ || milliseconds < down_at_ ||
+        milliseconds - down_at_ > 500) {
+      Reset();
+      return false;
+    }
+    key_down_ = false;
+    if (taps_ == 2) {
+      Reset();
+      return true;
+    }
+    last_up_ = milliseconds;
+    return false;
+  }
+
+  void Reset() noexcept {
+    taps_ = 0;
+    key_down_ = false;
+    down_at_ = 0;
+    last_up_ = 0;
+  }
+
+private:
+  int taps_ = 0;
+  bool key_down_ = false;
+  uint64_t down_at_ = 0;
+  uint64_t last_up_ = 0;
+};
+
+struct GlobalHotKeyBinding {
+  uint32_t modifiers = 0;
+  uint32_t virtual_key = 0;
+};
+
+bool ParseGlobalHotKeyBinding(std::string_view text,
+                              GlobalHotKeyBinding *binding) noexcept;
+bool GlobalHotKeyBindingMatches(const GlobalHotKeyBinding &binding,
+                                uint32_t virtual_key, bool control, bool alt,
+                                bool shift, bool windows) noexcept;
+
+bool ToolboxPolicyAllows(std::string_view compact_json,
+                         bool require_menu_enabled) noexcept;
+
 // ─── Floating status bar geometry ────────────────────────────────────────────
 // Kept as pure functions of DPI so hit-testing, button order and the option
 // mapping are all assertable without creating a window or faking mouse input.
@@ -45,6 +108,11 @@ int StatusBarHitTest(const StatusBarLayout &layout, int x, int y);
 bool StatusBarHitsSchema(const StatusBarLayout &layout, int x, int y);
 // Engine option a button toggles; nullptr out of range.
 const char *StatusBarOption(int index);
+// The simplification segment fans out to the option used by Wubi schemas.
+const char *StatusBarSecondaryOption(int index);
+// Desired engine-option value after a click. Simplified status is the inverse
+// of the traditionalization options; the other flags match their options.
+bool StatusBarNextOptionValue(uint32_t status_flags, int index);
 // Whether a button draws enabled for these status flags.
 bool StatusBarButtonOn(uint32_t status_flags, int index);
 // The label a button draws: the state the option is currently IN (中 vs 英),
@@ -70,6 +138,11 @@ bool StatusBarParseSchemaName(std::istream &yaml, std::string_view id,
 // input method. Ordered keyword match, first hit wins, first character only as
 // a last resort.
 std::string StatusBarSchemaGlyph(std::string_view name);
+// Target for a single click on the schema segment: normally the previous
+// schema, or the first different schema when there is no usable previous one.
+std::string StatusBarSchemaSwitchTarget(
+    std::string_view current_schema, std::string_view previous_schema,
+    const std::vector<std::string> &schema_list);
 
 // ─── Floating status bar position persistence ────────────────────────────────
 // The bar's screen top-left, then the schema a single click on the segment

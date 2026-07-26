@@ -105,8 +105,19 @@ int main() {
                          FAMO_STATUS_DISABLED | FAMO_STATUS_FULL_SHAPE |
                          FAMO_STATUS_ASCII_PUNCT | FAMO_STATUS_SIMPLIFIED;
   CHECK((st.status_flags & ~known) == 0);  // no stray bits
+  CHECK((st.status_flags & FAMO_STATUS_SIMPLIFIED) != 0);
   CHECK(st.schema_id.data == nullptr ||
         st.schema_id.length_bytes == std::strlen(st.schema_id.data));  // well-formed
+  host.FreeView(&st);
+
+  FamoUtf8String traditional;
+  traditional.size = static_cast<uint32_t>(sizeof(FamoUtf8String));
+  traditional.data = "traditionalization";
+  traditional.length_bytes =
+      static_cast<uint32_t>(std::strlen(traditional.data));
+  CHECK(host.api().set_option(ctx, &traditional, 1) == FAMO_ENGINE_OK);
+  CHECK(host.api().get_status(ctx, &st) == FAMO_ENGINE_OK);
+  CHECK((st.status_flags & FAMO_STATUS_SIMPLIFIED) == 0);
   host.FreeView(&st);
 
   // get_option: OK, boolean read.

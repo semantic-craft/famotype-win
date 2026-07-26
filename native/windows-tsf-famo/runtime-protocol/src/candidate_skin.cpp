@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -23,6 +24,7 @@ struct Palette {
   uint32_t accent;
   uint32_t deep;
   uint32_t card;
+  uint32_t card2;
   uint32_t on_accent;
   uint32_t ink;
   uint32_t ink2;
@@ -32,29 +34,47 @@ struct Palette {
 const std::map<std::string, Palette> &Palettes() {
   static const std::map<std::string, Palette> values = {
       {"shenda",
-       {0xffa82c53, 0xff8e2447, 0xfffbf9f5, 0xfffbf9f5, 0xff2a2622,
-        0xff6b6a64, 0xff9a9387}},
+       {0xffa82c53, 0xff8e2447, 0xfffbf9f5, 0xfff3efe7, 0xfffbf9f5,
+        0xff2a2622, 0xff6b6a64, 0xff9a9387}},
       {"stanford",
-       {0xff8c1515, 0xff820000, 0xfffbfbfc, 0xfffbfbfc, 0xff2e2d29,
-        0xff53565a, 0xff8a8d90}},
+       {0xff8c1515, 0xff820000, 0xfffbfbfc, 0xfff1f2f4, 0xfffbfbfc,
+        0xff2e2d29, 0xff53565a, 0xff8a8d90}},
       {"wuda",
-       {0xff2a8367, 0xff1f6b52, 0xfff8fbf9, 0xfff9faf8, 0xff282d2a,
-        0xff565f5a, 0xff8a938e}},
+       {0xff2a8367, 0xff1f6b52, 0xfff8fbf9, 0xffeff2ee, 0xfff9faf8,
+        0xff282d2a, 0xff565f5a, 0xff8a938e}},
       {"xiada",
-       {0xff1d4a8c, 0xff123061, 0xfff8fafc, 0xfff8fafc, 0xff242a36,
-        0xff5c6a81, 0xff8898af}},
+       {0xff1d4a8c, 0xff123061, 0xfff8fafc, 0xffeff2f7, 0xfff8fafc,
+        0xff242a36, 0xff5c6a81, 0xff8898af}},
+      {"illinois",
+       {0xff13294b, 0xffcc4a00, 0xfffcf4e9, 0xfffbe7d4, 0xffff7a2e,
+        0xff13294b, 0xff6e5a3a, 0xff9a8a6e}},
+      {"illinoisflame",
+       {0xffc24a00, 0xff9a3a00, 0xfffdf6ec, 0xfff6e9d4, 0xfffff4e8,
+        0xff3a2a1b, 0xff7b6248, 0xffab9174}},
+      {"nyu",
+       {0xff57068c, 0xff3f0567, 0xfffbf9fe, 0xfff2ecf9, 0xfffbf9fe,
+        0xff2a2333, 0xff655b79, 0xff958bac}},
       {"shenda_dark",
-       {0xffe06a8e, 0xffc24e72, 0xff262321, 0xff1a1816, 0xffece4d8,
-        0xffa89e90, 0xff766d62}},
+       {0xffe06a8e, 0xffc24e72, 0xff262321, 0xff211e1c, 0xff1a1816,
+        0xffece4d8, 0xffa89e90, 0xff766d62}},
       {"stanford_dark",
-       {0xffb83a4b, 0xff8c1515, 0xff26282c, 0xfff2f2f0, 0xffe8eaed,
-        0xff9da1a6, 0xff6c7075}},
+       {0xffb83a4b, 0xff8c1515, 0xff26282c, 0xff212327, 0xfff2f2f0,
+        0xffe8eaed, 0xff9da1a6, 0xff6c7075}},
       {"wuda_dark",
-       {0xff3ca081, 0xff2a8367, 0xff212423, 0xff121413, 0xffe5eae7,
-        0xff98a19c, 0xff66706b}},
+       {0xff3ca081, 0xff2a8367, 0xff212423, 0xff1c1e1d, 0xff121413,
+        0xffe5eae7, 0xff98a19c, 0xff66706b}},
       {"xiada_dark",
-       {0xff4879c5, 0xff1d4a8c, 0xff212429, 0xff0f141c, 0xffe6eaf0,
-        0xff98a4b8, 0xff66758a}},
+       {0xff4879c5, 0xff1d4a8c, 0xff212429, 0xff1b1e22, 0xff0f141c,
+        0xffe6eaf0, 0xff98a4b8, 0xff66758a}},
+      {"illinois_dark",
+       {0xffff7a2e, 0xff13294b, 0xff1e2334, 0xff262e44, 0xff13294b,
+        0xffece6dc, 0xff9aa0b0, 0xff6a7185}},
+      {"illinoisflame_dark",
+       {0xffff6e24, 0xffc24a00, 0xff241a12, 0xff2c2117, 0xff2b1707,
+        0xfff1e5d7, 0xffb49c85, 0xff7f6c59}},
+      {"nyu_dark",
+       {0xffa274da, 0xff57068c, 0xff242029, 0xff1d1a25, 0xff15101f,
+        0xffeae5f1, 0xffa99ebb, 0xff786c8c}},
   };
   return values;
 }
@@ -97,7 +117,8 @@ bool ParseFloat(std::string_view value, float low, float high, float *result) {
   char *end = nullptr;
   errno = 0;
   const float parsed = std::strtof(text.c_str(), &end);
-  if (errno || end != text.c_str() + text.size() || parsed < low ||
+  if (errno || end != text.c_str() + text.size() || !std::isfinite(parsed) ||
+      parsed < low ||
       parsed > high)
     return false;
   *result = parsed;
@@ -128,7 +149,17 @@ bool ApplyPalette(std::string_view name, FamoSkin *skin) {
   const Palette &p = found->second;
   const bool dark = name.size() >= 5 && name.substr(name.size() - 5) == "_dark";
   skin->text_color = p.ink2;
-  skin->back_color = p.card;
+  DWORD transparency = 1;
+  DWORD transparency_size = sizeof(transparency);
+  const bool transparent =
+      RegGetValueW(HKEY_CURRENT_USER,
+                   L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                   L"EnableTransparency", RRF_RT_REG_DWORD, nullptr,
+                   &transparency, &transparency_size) != ERROR_SUCCESS ||
+      transparency != 0;
+  skin->back_color = (p.card & 0x00ffffffu) |
+                     (transparent ? 0xb8000000u : 0xff000000u);
+  skin->card2_color = p.card2;
   skin->border_color = (p.deep & 0x00ffffffu) | 0x29000000u;
   skin->hilited_text_color = p.on_accent;
   skin->hilited_back_color = p.accent;
@@ -138,7 +169,7 @@ bool ApplyPalette(std::string_view name, FamoSkin *skin) {
   skin->hilited_comment_color = p.on_accent;
   skin->prevpage_color = p.ink3;
   skin->nextpage_color = p.ink3;
-  skin->shadow_color = dark ? 0x73000000u : 0x29000000u;
+  skin->shadow_color = dark ? 0x80000000u : 0x38000000u;
   return true;
 }
 
@@ -196,7 +227,32 @@ bool ApplyScalar(std::string_view key, std::string_view value, bool dark,
       return false;
     skin->layout_type =
         v == "true" ? FAMO_LAYOUT_HORIZONTAL : FAMO_LAYOUT_VERTICAL;
-    skin->min_width = v == "true" ? 210 : 150;
+    skin->min_width = v == "true" ? 210 : 76;
+  } else if (key == "orientation") {
+    const auto v = Trim(value);
+    if (v == "auto")
+      skin->layout_type = FAMO_LAYOUT_AUTO;
+    else if (v == "horizontal" || v == "scroll")
+      skin->layout_type = FAMO_LAYOUT_HORIZONTAL;
+    else if (v == "vertical")
+      skin->layout_type = FAMO_LAYOUT_VERTICAL;
+    else
+      return false;
+    skin->min_width = skin->layout_type == FAMO_LAYOUT_VERTICAL ? 76 : 210;
+  } else if (key == "show_preedit" || key == "preview_pages") {
+    const auto v = Trim(value);
+    if (v != "true" && v != "false")
+      return false;
+    const uint32_t enabled = v == "true" ? 1u : 0u;
+    if (key == "show_preedit")
+      skin->show_preedit = enabled;
+    else
+      skin->preview_pages = enabled;
+  } else if (key == "preview_rows") {
+    int rows = 0;
+    if (!ParseInt(value, 1, 2, &rows))
+      return false;
+    skin->preview_rows = static_cast<uint32_t>(rows);
   } else if (key == "inline_preedit" || key == "famo_auto_pair" ||
              key == "famo_cjk_english_spacing" ||
              key == "famo_cjk_number_spacing") {
@@ -284,6 +340,9 @@ bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
         !ApplyScalar(key, child.substr(colon + 1), dark, skin))
       return false;
   }
+  if (skin->layout_type != FAMO_LAYOUT_HORIZONTAL) {
+    skin->min_width = (std::max)(64, static_cast<int>(skin->text_font.point_size * 4.0f + 0.5f));
+  }
   return input.eof() && saw_style;
 }
 
@@ -324,6 +383,7 @@ void ApplyHighContrastPalette(FamoSkin *skin, uint32_t background,
   const bool show_next_page = (skin->nextpage_color & 0xff000000u) != 0;
   skin->text_color = foreground;
   skin->back_color = background;
+  skin->card2_color = background;
   skin->border_color = foreground;
   skin->hilited_text_color = selected_foreground;
   skin->hilited_back_color = selected_background;

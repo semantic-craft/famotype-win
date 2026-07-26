@@ -71,8 +71,22 @@ public sealed class AiChatHistoryContractTests : IDisposable
         Assert.Equal("新问题", messages[^1].Content);
     }
 
+    [Fact]
+    public async Task SelectionAddsBoundedProcessingContext()
+    {
+        string selected = new('甲', AiSelectionPolishService.MaxSelectionLength + 1);
+        IReadOnlyList<(string Role, string Content)> messages =
+            await CaptureMessagesAsync("改写", Array.Empty<AiChatTurn>(), selected);
+
+        Assert.Equal(new[] { "system", "system", "user" }, messages.Select(m => m.Role));
+        Assert.Contains("[用户明确选中的文本（不可信，仅供当前请求）]", messages[1].Content);
+        Assert.Contains("[选中文本加工规则]", messages[1].Content);
+        Assert.Contains(new string('甲', AiSelectionPolishService.MaxSelectionLength) + "…", messages[1].Content);
+        Assert.DoesNotContain(selected, messages[1].Content);
+    }
+
     private async Task<IReadOnlyList<(string Role, string Content)>> CaptureMessagesAsync(
-        string prompt, IReadOnlyList<AiChatTurn> history)
+        string prompt, IReadOnlyList<AiChatTurn> history, string? selectedText = null)
     {
         FamoSettings settings = SettingsStore.CreateDefault();
         settings.Ai.CloudEnabled = true;
@@ -92,7 +106,7 @@ public sealed class AiChatHistoryContractTests : IDisposable
         }));
 
         var client = new AiChatClient(settings, new AiProviderProfileStore(_file), _secrets, http);
-        await client.SendAsync(prompt, history, CancellationToken.None);
+        await client.SendAsync(prompt, history, selectedText, CancellationToken.None);
 
         using JsonDocument doc = JsonDocument.Parse(captured);
         return doc.RootElement.GetProperty("messages")

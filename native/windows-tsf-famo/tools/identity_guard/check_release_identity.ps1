@@ -76,7 +76,7 @@ function Test-AllowedRuntimeCompatibilityPath {
   param([string] $RelativePath)
 
   $p = ($RelativePath -replace '\\', '/')
-  return ($p -match '(?i)^(data/)?weasel(\.custom)?\.yaml$')
+  return ($p -match '(?i)^(?:(?:payload/)?data/)?weasel(\.custom)?\.yaml$')
 }
 
 function Test-SkipIdentityContentPath {
@@ -84,7 +84,8 @@ function Test-SkipIdentityContentPath {
 
   $p = ($RelativePath -replace '\\', '/')
   if ($p -match '(?i)\.dict\.yaml$') { return $true }
-  if ($p -match '(?i)^(data/)?(cn_dicts|en_dicts|opencc)/') { return $true }
+  if ($p -match '(?i)^(?:(?:payload/)?data/)?(cn_dicts|en_dicts|opencc)/') { return $true }
+  if ($p -match '(?i)^(payload/)?payload-manifest\.txt$') { return $true }
   return $false
 }
 
@@ -163,6 +164,7 @@ function Invoke-SelfTest {
     New-Item -ItemType Directory -Force -Path (Join-Path $root 'legacy_weasel_adapter') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $root 'data\cn_dicts') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $root 'data\opencc') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'payload\data\opencc') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $root 'engine') | Out-Null
 
     Set-Content -LiteralPath (Join-Path $root 'FamoSettings.txt') -Encoding UTF8 -Value 'Famo Input Method Settings'
@@ -171,6 +173,9 @@ function Invoke-SelfTest {
     Set-Content -LiteralPath (Join-Path $root 'data\weasel.custom.yaml') -Encoding UTF8 -Value 'patch: {}'
     Set-Content -LiteralPath (Join-Path $root 'data\cn_dicts\base.dict.yaml') -Encoding UTF8 -Value ($Script:XiaoLangHao + "`txiao lang hao`t100")
     Set-Content -LiteralPath (Join-Path $root 'data\opencc\others.txt') -Encoding UTF8 -Value ($Script:XiaoLangHao + "`t" + $Script:XiaoLangHao + ' Weasel')
+    Set-Content -LiteralPath (Join-Path $root 'payload\data\opencc\others.txt') -Encoding UTF8 -Value ($Script:XiaoLangHao + "`t" + $Script:XiaoLangHao + ' Weasel')
+    Set-Content -LiteralPath (Join-Path $root 'payload\data\weasel.custom.yaml') -Encoding UTF8 -Value 'patch: {}'
+    Set-Content -LiteralPath (Join-Path $root 'payload\payload-manifest.txt') -Encoding UTF8 -Value 'file=data\weasel.custom.yaml|0|HASH'
     # 干净二进制：含内部 Weasel 类名(允许保留)、无品牌串 —— 二进制扫描不得误报。
     [System.IO.File]::WriteAllBytes((Join-Path $root 'engine\FamoTsf.dll'),
       [System.Text.Encoding]::Unicode.GetBytes('WeaselTSF internal symbol; FamoNamedPipe'))

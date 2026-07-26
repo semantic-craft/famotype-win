@@ -29,7 +29,10 @@ constexpr uint32_t kRimeAltLeft = 0xffe9;
 constexpr uint32_t kRimeAltRight = 0xffea;
 constexpr uint32_t kRimeKeypadEnter = 0xff8d;
 constexpr uint32_t kRimeF1 = 0xffbe;
-constexpr uint32_t kRimeReleaseMask = 1u << 14;
+// Weasel compresses high IBus modifier bits before IPC and expands them again
+// in RimeWithWeasel.  This TSF talks to librime through the engine ABI directly,
+// so a release must use librime's expanded bit rather than Weasel's wire bit 14.
+constexpr uint32_t kRimeReleaseMask = 1u << 30;
 constexpr UINT kToUnicodeNoStateChange = 1u << 2;
 
 uint32_t SpecialKey(WPARAM key, LPARAM key_data) {

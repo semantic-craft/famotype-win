@@ -8,8 +8,9 @@
 // fields to FamoCompositionView and functions to FamoEngineApi; both are
 // size-negotiated, so a v1.0 host/engine and a v1.1 one interoperate at v1.0.
 // v1.2 appends FamoCandidate::label and FamoCompositionView::is_last_page (the
-// FamoCandidateUI render inputs), same append-only/size-negotiated discipline.
-#define FAMO_ENGINE_ABI_MINOR 2u
+// FamoCandidateUI render inputs); v1.3 appends peek_candidates. Both follow the
+// same append-only/size-negotiated discipline.
+#define FAMO_ENGINE_ABI_MINOR 3u
 
 #if defined(_WIN32)
 #define FAMO_ENGINE_CALL __stdcall
@@ -64,7 +65,8 @@ typedef enum FamoEngineLogLevel {
 #define FAMO_COMPOSITION_HANDLED (1u << 3)
 
 // v1.1 status bits carried in FamoCompositionView::status_flags (distinct from
-// state_flags above). Mirror the librime RimeStatus booleans the runtime reads.
+// state_flags above). Simplified is derived from the supported schemas'
+// traditionalization options; the other bits mirror RimeStatus booleans.
 #define FAMO_STATUS_ASCII_MODE (1u << 0)
 #define FAMO_STATUS_COMPOSING (1u << 1)
 #define FAMO_STATUS_DISABLED (1u << 2)
@@ -177,6 +179,14 @@ typedef struct FamoEngineApi {
                                                   uint32_t index);
   int32_t (FAMO_ENGINE_CALL *change_page)(FamoEngineContext* context,
                                           int32_t backward);
+  // ── v1.3 optional addition (append only; callable iff size covers it) ────
+  // Read up to count candidates from the absolute list index without changing
+  // the current page/highlight. The returned view owns only its candidate array
+  // and is released through free_view. Missing support degrades to no preview.
+  int32_t (FAMO_ENGINE_CALL *peek_candidates)(FamoEngineContext* context,
+                                               uint32_t index,
+                                               uint32_t count,
+                                               FamoCompositionView* out_view);
 } FamoEngineApi;
 
 FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL FamoCreateEngineApi(

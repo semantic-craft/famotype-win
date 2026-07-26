@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -34,6 +35,9 @@ constexpr UINT kStyleChanged = WM_APP + 3;
 // so the "previously used" bookkeeping is committed on the UI thread that owns
 // it rather than raced into from the worker.
 constexpr UINT kSchemaSwitched = WM_APP + 4;
+constexpr UINT kSummonToolboxGesture = WM_APP + 5;
+constexpr UINT kSummonQuickPhrase = WM_APP + 6;
+constexpr UINT kSummonToolboxHotKey = WM_APP + 7;
 
 constexpr wchar_t kNotifyIconSettings[] = L"Control Panel\\NotifyIconSettings";
 constexpr UINT_PTR kPromoteTimer = 1;
@@ -93,8 +97,8 @@ constexpr Toggle kToggles[] = {
      "中"},
     {kCmdAsciiPunct, FAMO_STATUS_ASCII_PUNCT, "ascii_punct", L"英文标点", ".",
      "。"},
-    {kCmdSimplification, FAMO_STATUS_SIMPLIFIED, "simplification", L"简体字",
-     "简", "繁"},
+    {kCmdSimplification, FAMO_STATUS_SIMPLIFIED, "traditionalization",
+     L"简体字", "简", "繁"},
     {kCmdFullShape, FAMO_STATUS_FULL_SHAPE, "full_shape", L"全角", "全", "半"},
 };
 static_assert(sizeof(kToggles) / sizeof(kToggles[0]) == kStatusBarButtonCount,
@@ -216,6 +220,74 @@ bool WriteSelectedSchema(const std::wstring &data_root, const std::string &id) {
 
 } // namespace
 
+bool ParseGlobalHotKeyBinding(std::string_view text,
+                              GlobalHotKeyBinding *binding) noexcept {
+  if (!binding || text.empty())
+    return false;
+  uint32_t modifiers = MOD_NOREPEAT;
+  int modifier_count = 0;
+  size_t start = 0;
+  for (;;) {
+    const size_t plus = text.find('+', start);
+    const std::string_view part = text.substr(start, plus - start);
+    if (plus == std::string_view::npos) {
+      if (part.size() != 1 || part[0] < 'A' || part[0] > 'Z' ||
+          modifier_count < 2)
+        return false;
+      binding->modifiers = modifiers;
+      binding->virtual_key = static_cast<uint32_t>(part[0]);
+      return true;
+    }
+    uint32_t flag = 0;
+    if (part == "Ctrl")
+      flag = MOD_CONTROL;
+    else if (part == "Alt")
+      flag = MOD_ALT;
+    else if (part == "Shift")
+      flag = MOD_SHIFT;
+    else
+      return false;
+    if ((modifiers & flag) != 0)
+      return false;
+    modifiers |= flag;
+    ++modifier_count;
+    start = plus + 1;
+  }
+}
+
+bool GlobalHotKeyBindingMatches(const GlobalHotKeyBinding &binding,
+                                uint32_t virtual_key, bool control, bool alt,
+                                bool shift, bool windows) noexcept {
+  if (windows || binding.virtual_key == 0 || binding.virtual_key != virtual_key)
+    return false;
+  uint32_t modifiers = MOD_NOREPEAT;
+  if (control)
+    modifiers |= MOD_CONTROL;
+  if (alt)
+    modifiers |= MOD_ALT;
+  if (shift)
+    modifiers |= MOD_SHIFT;
+  return modifiers == binding.modifiers;
+}
+
+bool ToolboxPolicyAllows(std::string_view compact_json,
+                         bool require_menu_enabled) noexcept {
+  if (compact_json.find("\"cloudEnabled\":true") == std::string_view::npos ||
+      (require_menu_enabled &&
+       compact_json.find("\"selectionMenuEnabled\":false") !=
+           std::string_view::npos))
+    return false;
+  for (const char *key : {"askAnythingSkillEnabled", "polishSkillEnabled",
+                          "sourceCheckSkillEnabled", "researchAssistSkillEnabled",
+                          "publishFormattingSkillEnabled", "translationSkillEnabled",
+                          "promptOptimizeSkillEnabled"}) {
+    if (compact_json.find("\"" + std::string(key) + "\":false") ==
+        std::string_view::npos)
+      return true;
+  }
+  return false;
+}
+
 std::vector<std::string> StatusBarParseSchemaList(std::istream &yaml) {
   std::vector<std::string> ids;
   std::string line;
@@ -288,6 +360,18 @@ std::string StatusBarSchemaGlyph(std::string_view name) {
   return FirstUtf8Char(name);
 }
 
+std::string StatusBarSchemaSwitchTarget(
+    std::string_view current_schema, std::string_view previous_schema,
+    const std::vector<std::string> &schema_list) {
+  if (!previous_schema.empty() && previous_schema != current_schema)
+    return std::string(previous_schema);
+  for (const std::string &id : schema_list) {
+    if (id != current_schema)
+      return id;
+  }
+  return {};
+}
+
 namespace {
 
 bool Inside(const StatusBarLayout::Button &button, int x, int y) {
@@ -332,6 +416,17 @@ bool StatusBarHitsSchema(const StatusBarLayout &layout, int x, int y) {
 
 const char *StatusBarOption(int index) {
   return InRange(index) ? kToggles[index].option : nullptr;
+}
+
+const char *StatusBarSecondaryOption(int index) {
+  return index == 2 ? "zh_trad" : nullptr;
+}
+
+bool StatusBarNextOptionValue(uint32_t status_flags, int index) {
+  if (!InRange(index))
+    return false;
+  const bool on = (status_flags & kToggles[index].status_flag) != 0;
+  return index == 2 ? on : !on;
 }
 
 bool StatusBarButtonOn(uint32_t status_flags, int index) {
@@ -452,7 +547,10 @@ struct StatusUi::State {
   std::wstring data_root;  // set before the thread starts, read-only after
 
   // Written by the engine thread, read by the UI thread.
-  std::atomic<uint32_t> status_flags{0};
+  std::atomic<uint32_t> status_flags{FAMO_STATUS_SIMPLIFIED};
+  std::atomic<bool> focused{false};
+  std::atomic<uint64_t> snapshot_revision{0};
+  std::mutex publish_mutex;
   std::atomic<HWND> window{nullptr};
   std::atomic<bool> ready{false};
   std::atomic<uint64_t> icon_registrations{0};
@@ -466,6 +564,12 @@ struct StatusUi::State {
   bool icon_added = false;
   int promote_attempts = 0;
   std::future<void> deploy;
+  HHOOK keyboard_hook = nullptr;
+  HHOOK mouse_hook = nullptr;
+  AltDoubleTapDetector alt_double_tap;
+  GlobalHotKeyBinding quick_phrase_hotkey;
+  GlobalHotKeyBinding selection_toolbox_hotkey;
+  DWORD swallowed_hotkey = 0;
 
   // Floating bar, UI thread only.
   HWND bar = nullptr;
@@ -494,6 +598,124 @@ struct StatusUi::State {
 };
 
 namespace {
+
+StatusUi::State *g_hook_state = nullptr;
+
+LRESULT CALLBACK KeyboardHook(int code, WPARAM wparam, LPARAM lparam) {
+  if (code >= 0 && g_hook_state) {
+    const auto *key = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lparam);
+    if ((key->flags & LLKHF_INJECTED) == 0) {
+      const bool down = wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN;
+      const bool up = wparam == WM_KEYUP || wparam == WM_SYSKEYUP;
+      const bool alt = key->vkCode == VK_MENU || key->vkCode == VK_LMENU ||
+                       key->vkCode == VK_RMENU;
+      if (!g_hook_state->focused.load()) {
+        g_hook_state->alt_double_tap.Reset();
+        g_hook_state->swallowed_hotkey = 0;
+        return CallNextHookEx(nullptr, code, wparam, lparam);
+      }
+      if (key->vkCode == g_hook_state->swallowed_hotkey) {
+        if (up)
+          g_hook_state->swallowed_hotkey = 0;
+        return 1;
+      }
+      const bool control = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+      const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+      const bool alt_down = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+      const bool windows = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+                           (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+      if (down && GlobalHotKeyBindingMatches(
+                      g_hook_state->quick_phrase_hotkey, key->vkCode, control,
+                      alt_down, shift, windows)) {
+        g_hook_state->swallowed_hotkey = key->vkCode;
+        PostMessageW(g_hook_state->window.load(), kSummonQuickPhrase, 0, 0);
+        return 1;
+      }
+      if (down && GlobalHotKeyBindingMatches(
+                      g_hook_state->selection_toolbox_hotkey, key->vkCode,
+                      control, alt_down, shift, windows)) {
+        g_hook_state->swallowed_hotkey = key->vkCode;
+        PostMessageW(g_hook_state->window.load(), kSummonToolboxHotKey, 0, 0);
+        return 1;
+      }
+      const bool chord = control || shift || windows;
+      if (chord)
+        g_hook_state->alt_double_tap.Reset();
+      else if ((down || up) && g_hook_state->alt_double_tap.Process(
+                                   alt, down, GetTickCount64()))
+        PostMessageW(g_hook_state->window.load(), kSummonToolboxGesture, 0, 0);
+    }
+  }
+  return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+LRESULT CALLBACK MouseHook(int code, WPARAM wparam, LPARAM lparam) {
+  if (code >= 0 && g_hook_state && wparam != WM_MOUSEMOVE)
+    g_hook_state->alt_double_tap.Reset();
+  return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+bool ToolboxEnabled(const std::wstring &data_root, bool require_menu_enabled) {
+  std::ifstream file(data_root + L"\\famo-settings.json", std::ios::binary);
+  if (!file)
+    return false;
+  std::string json((std::istreambuf_iterator<char>(file)),
+                   std::istreambuf_iterator<char>());
+  json.erase(std::remove_if(json.begin(), json.end(), [](unsigned char ch) {
+               return std::isspace(ch) != 0;
+             }),
+             json.end());
+  return ToolboxPolicyAllows(json, require_menu_enabled);
+}
+
+void OpenPage(std::wstring_view page) {
+  const std::wstring directory = ModuleDirectory() + L"\\settings";
+  const std::wstring settings = directory + L"\\FamoSettings.exe";
+  const std::wstring arguments = L"--page " + std::wstring(page);
+  ShellExecuteW(nullptr, L"open", settings.c_str(), arguments.c_str(),
+                directory.c_str(), SW_SHOWNORMAL);
+}
+
+void OpenToolbox(StatusUi::State *state, bool require_menu_enabled) {
+  if (ToolboxEnabled(state->data_root, require_menu_enabled))
+    OpenPage(L"ai-chat");
+}
+
+std::string SettingsJson(const std::wstring &data_root) {
+  std::ifstream file(data_root + L"\\famo-settings.json", std::ios::binary);
+  if (!file)
+    return {};
+  std::string json((std::istreambuf_iterator<char>(file)),
+                   std::istreambuf_iterator<char>());
+  json.erase(std::remove_if(json.begin(), json.end(), [](unsigned char ch) {
+               return std::isspace(ch) != 0;
+             }),
+             json.end());
+  return json;
+}
+
+std::string SettingsString(std::string_view json, std::string_view name) {
+  const std::string key = "\"" + std::string(name) + "\":\"";
+  const size_t begin = json.find(key);
+  if (begin == std::string::npos)
+    return {};
+  const size_t value = begin + key.size();
+  const size_t end = json.find('"', value);
+  return end == std::string::npos
+             ? std::string()
+             : std::string(json.substr(value, end - value));
+}
+
+void RefreshHotKeys(StatusUi::State *state) {
+  const std::string json = SettingsJson(state->data_root);
+  const auto parse_one = [&](std::string_view name) {
+    GlobalHotKeyBinding binding;
+    ParseGlobalHotKeyBinding(SettingsString(json, name), &binding);
+    return binding;
+  };
+  state->quick_phrase_hotkey = parse_one("quickPhrasePanel");
+  state->selection_toolbox_hotkey = parse_one("selectionToolbox");
+}
 
 void FillIconData(NOTIFYICONDATAW *data, HWND window) {
   *data = {};
@@ -590,11 +812,15 @@ Promote PromoteTrayIcon() {
 }
 
 void RunCommand(StatusUi::State *state, UINT command) {
-  for (const Toggle &toggle : kToggles) {
+  for (int index = 0; index < kStatusBarButtonCount; ++index) {
+    const Toggle &toggle = kToggles[index];
     if (command != toggle.command)
       continue;
-    const bool next = (state->status_flags.load() & toggle.status_flag) == 0;
+    const bool next =
+        StatusBarNextOptionValue(state->status_flags.load(), index);
     state->service->SetOption(toggle.option, next);
+    if (const char *secondary = StatusBarSecondaryOption(index))
+      state->service->SetOption(secondary, next);
     return;
   }
   if (command == kCmdSettings) {
@@ -683,6 +909,12 @@ void SwitchSchema(StatusUi::State *state, HWND window, const std::string &id) {
     if (state->service->ExecuteControl(Command::ControlSelectSchema) !=
         ControlError::None)
       return;
+    try {
+      state->schema.store(std::make_shared<const SchemaState>(
+          SchemaState{id, SchemaDisplayName(state, id)}));
+    } catch (...) {
+      return;
+    }
     PostMessageW(window, kSchemaSwitched, 0, 0);
   });
 }
@@ -691,17 +923,12 @@ void SwitchSchema(StatusUi::State *state, HWND window, const std::string &id) {
 // first list entry that is not the current one, so a fresh profile still
 // switches instead of doing nothing.
 void SwitchToPreviousSchema(StatusUi::State *state, HWND window) {
-  if (!state->previous_schema.empty()) {
-    SwitchSchema(state, window, state->previous_schema);
-    return;
-  }
   std::shared_ptr<const SchemaState> current = CurrentSchema(state);
-  for (const std::string &id : SchemaList(state)) {
-    if (!current || id != current->id) {
-      SwitchSchema(state, window, id);
-      return;
-    }
-  }
+  const std::string target = StatusBarSchemaSwitchTarget(
+      current ? current->id : std::string_view(), state->previous_schema,
+      SchemaList(state));
+  if (!target.empty())
+    SwitchSchema(state, window, target);
 }
 
 void ShowSchemaMenu(StatusUi::State *state, HWND window) {
@@ -995,6 +1222,7 @@ LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
     state->pending_previous.clear();
     StatusBarSavePosition(state->bar_state_path, state->bar_x, state->bar_y,
                           state->previous_schema);
+    PaintBar(state);
     return 0;
   case WM_DPICHANGED: {
     state->bar_dpi = HIWORD(wparam) ? HIWORD(wparam) : GetDpiForWindow(window);
@@ -1090,7 +1318,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     PaintBar(state);
     return 0;
   case kStyleChanged:
+    RefreshHotKeys(state);
     PaintBar(state);
+    return 0;
+  case kSummonToolboxGesture:
+    OpenToolbox(state, true);
+    return 0;
+  case kSummonToolboxHotKey:
+    OpenToolbox(state, false);
+    return 0;
+  case kSummonQuickPhrase:
+    OpenPage(L"quick-phrase-picker");
     return 0;
   case kTrayCallback:
     if (LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == WM_LBUTTONUP)
@@ -1157,6 +1395,12 @@ void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
   // its only other entry point.
   CreateBar(state);
   state->window.store(window);
+  RefreshHotKeys(state.get());
+  g_hook_state = state.get();
+  state->keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook,
+                                           GetModuleHandleW(nullptr), 0);
+  state->mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook,
+                                        GetModuleHandleW(nullptr), 0);
   state->ready.store(true);
 
   MSG message;
@@ -1171,6 +1415,11 @@ void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
     Shell_NotifyIconW(NIM_DELETE, &data);
     state->icon_added = false;
   }
+  if (state->keyboard_hook)
+    UnhookWindowsHookEx(state->keyboard_hook);
+  if (state->mouse_hook)
+    UnhookWindowsHookEx(state->mouse_hook);
+  g_hook_state = nullptr;
   state->window.store(nullptr);
   if (state->bar) {
     DestroyWindow(state->bar);
@@ -1214,17 +1463,31 @@ uint32_t StatusUi::status_flags() const noexcept {
 
 void StatusUi::Publish(
     std::shared_ptr<const RuntimeSnapshot> snapshot) noexcept {
+  // Revision acceptance and all fields derived from the accepted snapshot are
+  // one transaction. A CAS on the revision alone still allowed an older
+  // publisher paused after the CAS to overwrite a newer publisher's fields.
+  std::lock_guard<std::mutex> publish_lock(state_->publish_mutex);
   // A defocused publish clears the composition wholesale, taking status_flags
   // to zero with it. Honouring that would flip the icon back to Chinese every
   // time focus leaves, so only focused snapshots carry mode here.
+  if (snapshot && snapshot->revision != 0) {
+    uint64_t seen = state_->snapshot_revision.load(std::memory_order_acquire);
+    do {
+      if (snapshot->revision <= seen)
+        return;
+    } while (!state_->snapshot_revision.compare_exchange_weak(
+        seen, snapshot->revision, std::memory_order_acq_rel,
+        std::memory_order_acquire));
+  }
+  state_->focused.store(snapshot && snapshot->ui_state.focused);
   if (!snapshot || !snapshot->ui_state.focused)
     return;
   const uint32_t flags = snapshot->composition.status_flags;
   bool changed = state_->status_flags.exchange(flags) != flags;
   // Same gate for the schema: a defocused publish clears schema_id too, and
   // acting on that would blank the segment on every focus change. This is the
-  // only writer of the displayed schema -- a click never sets it optimistically,
-  // so a switch the engine rejected leaves the segment on what is really live.
+  // authoritative source for external changes. A status-bar click also updates
+  // this state, but only after the engine confirms the switch.
   const std::string &id = snapshot->composition.schema_id;
   std::shared_ptr<const SchemaState> current = state_->schema.load();
   if (!id.empty() && (!current || current->id != id ||

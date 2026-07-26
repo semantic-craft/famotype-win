@@ -1,5 +1,7 @@
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Famo.Settings.Core.Ai;
 
@@ -29,7 +31,7 @@ public static class AiSelectionSkills
     public static readonly AiSelectionSkillDefinition Polish = new(
         "polish",
         "ai-polish",
-        "AI 润色选中",
+        "润色",
         "候选",
         "正在润色选中文本...",
         "润色结果已复制。",
@@ -56,11 +58,9 @@ public static class AiSelectionSkills
         "核验",
         "正在生成来源核验清单...",
         "来源核验结果已复制。",
-        "You help a legal professional verify sources for selected text. " +
-        "Use only the selected text; do not browse, do not claim a fact is verified, and do not add unsupported facts. " +
-        "Return a JSON object only, exactly shaped as {\"candidates\":[\"核验清单\"]}. " +
-        "Each candidate should list concrete claims to verify, primary-source types to look for, and precise search terms. " +
-        "Do not explain outside JSON and do not include code fences.");
+        "你是来源核验助手。必须使用联网检索结果核验选中文本。" +
+        "不要凭常识补来源；没有可核 URL 时说明需要人工确认。" +
+        "返回判断、可核来源 URL、关键信息。");
 
     public static readonly AiSelectionSkillDefinition ResearchAssist = new(
         "research-assist",
@@ -74,18 +74,28 @@ public static class AiSelectionSkills
         "Return a JSON object only, exactly shaped as {\"candidates\":[\"检索方案\"]}. " +
         "Do not answer with unsupported facts, do not explain outside JSON, and do not include code fences.");
 
-    public static readonly AiSelectionSkillDefinition DocumentFormatting = new(
-        "document-formatting",
-        "ai-document-formatting",
-        "公文排版",
+    public static readonly AiSelectionSkillDefinition PublishFormatting = new(
+        "publish-formatting",
+        "ai-publish-formatting",
+        "规范排版",
         "排版结果",
-        "正在生成公文排版建议...",
-        "公文排版结果已复制。",
-        "You reformat selected Chinese text into standard official-document (公文) style: lead with the conclusion, " +
-        "use formal official register, and follow standard document structure. " +
-        "Use only the selected text; preserve meaning and do not add facts. " +
+        "正在规范排版...",
+        "规范排版结果已复制。",
+        "You normalize the typography of selected text for publication. Preserve every fact, word, number, URL, " +
+        "citation, code fragment, and paragraph order; change only spacing, punctuation, line breaks, and list layout. " +
         "Return a JSON object only, exactly shaped as {\"candidates\":[\"排版结果\"]}. " +
         "Do not explain outside JSON and do not include code fences.");
+
+    public static readonly AiSelectionSkillDefinition Translation = new(
+        "translation",
+        "ai-translation",
+        "划词翻译",
+        "译文",
+        "正在翻译选中文本...",
+        "译文已复制。",
+        "Translate the selected text faithfully. Chinese input becomes natural English; all other input becomes natural Simplified Chinese. " +
+        "Preserve names, numbers, citations, links, code, formatting, stance, and uncertainty; add no facts or commentary. " +
+        "Return a JSON object only, exactly shaped as {\"candidates\":[\"译文\"]}. Do not include code fences.");
 
     /// <summary>提示词优化。走两态契约（终稿 or 澄清问题），不是别家的
     /// <c>{"candidates":[…]}</c>——只能用 <see cref="AiSelectionSkillService.OptimizePromptAsync"/> 跑，
@@ -104,7 +114,8 @@ public static class AiSelectionSkills
         Polish,
         SourceCheck,
         ResearchAssist,
-        DocumentFormatting,
+        PublishFormatting,
+        Translation,
         PromptOptimize,
     ];
 
@@ -129,7 +140,8 @@ public static class AiSelectionSkills
             "polish" => settings.Ai.PolishSkillEnabled,
             "source-check" => settings.Ai.SourceCheckSkillEnabled,
             "research-assist" => settings.Ai.ResearchAssistSkillEnabled,
-            "document-formatting" => settings.Ai.DocumentFormattingSkillEnabled,
+            "publish-formatting" => settings.Ai.PublishFormattingSkillEnabled,
+            "translation" => settings.Ai.TranslationSkillEnabled,
             "prompt-optimize" => settings.Ai.PromptOptimizeSkillEnabled,
             _ => true,
         };
@@ -165,7 +177,23 @@ public sealed class AiSelectionSkillService
     {
         EnsureRunnable(selection);
 
-        string payload = JsonSerializer.Serialize(new { text = selection }, JsonOptions);
+        string requestText = skill == AiSelectionSkills.PublishFormatting
+            ? ChineseTypesetting.PreClean(selection)
+            : selection;
+        if (skill == AiSelectionSkills.SourceCheck)
+        {
+            AiProviderChatCompletionResult verification = await _client.SendSourceVerificationAsync(
+                new[]
+                {
+                    new AiProviderChatMessage("system", skill.SystemPrompt),
+                    new AiProviderChatMessage("user", "请核验以下选中文本：\n" + requestText),
+                },
+                cancellationToken);
+            return new AiSelectionSkillResult(
+                [verification.Text], verification.ProviderId, verification.Model, skill);
+        }
+
+        string payload = JsonSerializer.Serialize(new { text = requestText }, JsonOptions);
         AiProviderChatCompletionResult response = await _client.SendAsync(
             new[]
             {
@@ -175,8 +203,17 @@ public sealed class AiSelectionSkillService
             cancellationToken,
             jsonObjectResponse: true);
 
+        IReadOnlyList<string> candidates = ParseCandidates(response.Text);
+        if (skill == AiSelectionSkills.PublishFormatting)
+        {
+            string reflowed = candidates[0];
+            string safe = ChineseTypesetting.ContentFingerprint(reflowed)
+                == ChineseTypesetting.ContentFingerprint(requestText) ? reflowed : requestText;
+            candidates = [ChineseTypesetting.Finalize(safe)];
+        }
+
         return new AiSelectionSkillResult(
-            ParseCandidates(response.Text),
+            candidates,
             response.ProviderId,
             response.Model,
             skill);
@@ -263,6 +300,199 @@ public sealed class AiSelectionSkillService
             throw new InvalidOperationException("AI 润色响应格式无法解析。", ex);
         }
     }
+}
+
+internal static partial class ChineseTypesetting
+{
+    private const string Cjk = @"\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}";
+
+    internal static string PreClean(string text)
+    {
+        string value = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        value = string.Join('\n', value.Split('\n').Select(line => LineEndSpace().Replace(line, "")));
+        return ExcessBlankLines().Replace(value, "\n\n");
+    }
+
+    internal static string Finalize(string text)
+    {
+        var protectedTokens = new List<string>();
+        string Protect(Match match)
+        {
+            protectedTokens.Add(match.Value);
+            return $"\uE000{protectedTokens.Count - 1}\uE001";
+        }
+
+        string value = ProtectedBlock().Replace(text, Protect);
+        value = ProtectJsonDocuments(value, protectedTokens);
+        value = ProtectedToken().Replace(value, Protect);
+        value = NormalizeSpaces(NormalizePunctuationWidth(NormalizeQuotes(NormalizeEllipsisAndDash(value))));
+        for (int i = protectedTokens.Count - 1; i >= 0; i--)
+            value = value.Replace($"\uE000{i}\uE001", protectedTokens[i], StringComparison.Ordinal);
+        return value;
+    }
+
+    private static string ProtectJsonDocuments(string text, List<string> protectedTokens)
+    {
+        var result = new StringBuilder(text.Length);
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] is not ('{' or '[') || !TryFindJsonEnd(text, i, out int end))
+            {
+                result.Append(text[i]);
+                continue;
+            }
+            string candidate = text[i..(end + 1)];
+            try
+            {
+                using JsonDocument _ = JsonDocument.Parse(candidate);
+            }
+            catch (JsonException)
+            {
+                result.Append(text[i]);
+                continue;
+            }
+            protectedTokens.Add(candidate);
+            result.Append('\uE000').Append(protectedTokens.Count - 1).Append('\uE001');
+            i = end;
+        }
+        return result.ToString();
+    }
+
+    private static bool TryFindJsonEnd(string text, int start, out int end)
+    {
+        var closing = new Stack<char>();
+        bool quoted = false;
+        bool escaped = false;
+        for (int i = start; i < text.Length; i++)
+        {
+            char ch = text[i];
+            if (quoted)
+            {
+                if (escaped) escaped = false;
+                else if (ch == '\\') escaped = true;
+                else if (ch == '"') quoted = false;
+                continue;
+            }
+            if (ch == '"') quoted = true;
+            else if (ch == '{') closing.Push('}');
+            else if (ch == '[') closing.Push(']');
+            else if (ch is '}' or ']')
+            {
+                if (closing.Count == 0 || closing.Pop() != ch) break;
+                if (closing.Count == 0)
+                {
+                    end = i;
+                    return true;
+                }
+            }
+        }
+        end = -1;
+        return false;
+    }
+
+    internal static string ContentFingerprint(string text)
+    {
+        var result = new StringBuilder(text.Length);
+        foreach (Rune rune in text.EnumerateRunes())
+            if (!Rune.IsWhiteSpace(rune))
+                result.Append(rune);
+        return result.ToString();
+    }
+
+    private static string NormalizeEllipsisAndDash(string text)
+    {
+        string value = AsciiEllipsis().Replace(text, "……");
+        value = ChineseEllipsis().Replace(value, "……");
+        value = Ellipsis().Replace(value, "……");
+        value = AsciiDash().Replace(value, "——");
+        return EmDash().Replace(value, "——");
+    }
+
+    private static string NormalizeQuotes(string text)
+    {
+        var result = new StringBuilder(text.Length);
+        bool doubleOpen = true;
+        bool singleOpen = true;
+        for (int i = 0; i < text.Length; i++)
+        {
+            char ch = text[i];
+            switch (ch)
+            {
+                case '"': result.Append(doubleOpen ? '“' : '”'); doubleOpen = !doubleOpen; break;
+                case '「': result.Append('“'); break;
+                case '」': result.Append('”'); break;
+                case '『': result.Append('‘'); break;
+                case '』': result.Append('’'); break;
+                case '\'':
+                    bool apostrophe = i > 0 && i + 1 < text.Length
+                        && IsAsciiLetter(text[i - 1]) && IsAsciiLetter(text[i + 1]);
+                    result.Append(apostrophe ? '\'' : singleOpen ? '‘' : '’');
+                    if (!apostrophe) singleOpen = !singleOpen;
+                    break;
+                default: result.Append(ch); break;
+            }
+        }
+        return result.ToString();
+    }
+
+    private static string NormalizePunctuationWidth(string text)
+    {
+        var result = new StringBuilder(text.Length);
+        for (int i = 0; i < text.Length; i++)
+        {
+            char ch = text[i];
+            char? previous = i > 0 ? text[i - 1] : null;
+            char? next = i + 1 < text.Length ? text[i + 1] : null;
+            result.Append(ch switch
+            {
+                ',' when IsCjk(previous) => '，',
+                '.' when IsCjk(previous) && !(next is not null && char.IsNumber(next.Value)) => '。',
+                '!' when IsCjk(previous) => '！',
+                '?' when IsCjk(previous) => '？',
+                ':' when IsCjk(previous) => '：',
+                ';' when IsCjk(previous) => '；',
+                '(' when IsCjk(next) => '（',
+                ')' when IsCjk(previous) => '）',
+                _ => ch,
+            });
+        }
+        return result.ToString();
+    }
+
+    private static string NormalizeSpaces(string text)
+    {
+        string value = Regex.Replace(text, $@"(?<=[{Cjk}])[ \u3000]+(?=[{Cjk}0-9])|(?<=[0-9])[ \u3000]+(?=[{Cjk}])", "");
+        value = Regex.Replace(value, $@"(?<=[{Cjk}])[ \u3000]*(?=[A-Za-z])|(?<=[A-Za-z])[ \u3000]*(?=[{Cjk}])", " ");
+        return Regex.Replace(value, " {2,}", " ");
+    }
+
+    private static bool IsAsciiLetter(char value) =>
+        value is >= 'A' and <= 'Z' or >= 'a' and <= 'z';
+
+    private static bool IsCjk(char? value) => value is not null &&
+        (value is >= '\u3400' and <= '\u4DBF'
+         or >= '\u4E00' and <= '\u9FFF'
+         or >= '\uF900' and <= '\uFAFF'
+         or >= '\u3040' and <= '\u30FF');
+
+    [GeneratedRegex(@"[ \t\u3000]+$")]
+    private static partial Regex LineEndSpace();
+    [GeneratedRegex(@"\n{3,}")]
+    private static partial Regex ExcessBlankLines();
+    [GeneratedRegex(@"\.{3,}")]
+    private static partial Regex AsciiEllipsis();
+    [GeneratedRegex(@"。{3,}")]
+    private static partial Regex ChineseEllipsis();
+    [GeneratedRegex(@"…+")]
+    private static partial Regex Ellipsis();
+    [GeneratedRegex(@"-{2,}")]
+    private static partial Regex AsciiDash();
+    [GeneratedRegex(@"—+")]
+    private static partial Regex EmDash();
+    [GeneratedRegex(@"(?s:(?<fence>```|~~~).*?\k<fence>)")]
+    private static partial Regex ProtectedBlock();
+    [GeneratedRegex(@"https?://\S+|www\.\S+|[A-Za-z]:\\\S+|\\\\\S+|(?<!\w)(?:\.\.?/|/)[^\s,，。；;！？!?]+|--[A-Za-z0-9][A-Za-z0-9_.=-]*|\.{3}[A-Za-z_$][A-Za-z0-9_$]*|`[^`\r\n]+`|[A-Za-z_][A-Za-z0-9_.]*\([^()\r\n]*\)|[\p{L}\p{N}]+(?:\.[\p{L}\p{N}-]+)+(?!\()")]
+    private static partial Regex ProtectedToken();
 }
 
 public sealed class AiSelectionPolishService

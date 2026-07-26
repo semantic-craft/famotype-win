@@ -7,7 +7,7 @@ using Microsoft.UI.Xaml.Media;
 
 namespace Famo.Settings.Views;
 
-/// <summary>快捷短语（短）—— 本地编辑；拼音可部署成短码候选，五笔走显式选择器。</summary>
+/// <summary>快捷短语（短）—— 本地编辑；拼音输入完整裸码触发，五笔走显式选择器。</summary>
 public sealed class QuickPhrasesPage : UserControl
 {
     private readonly QuickPhraseStore _store = new();
@@ -26,7 +26,7 @@ public sealed class QuickPhrasesPage : UserControl
     private void BuildContent()
     {
         var sp = new StackPanel();
-        sp.Children.Add(FamoUI.PaneHeader("快捷短语", "给固定话术设置短编码；五笔下用快捷短语面板直接插入。"));
+        sp.Children.Add(FamoUI.PaneHeader("快捷短语", "给固定话术设置短编码；拼音下输入完整编码，任意方案可用录制热键打开快捷短语面板。"));
         sp.Children.Add(FamoUI.Banner(true, "本地快捷短语只写入 Famo 托管的 famo_quick_send.txt，不改 custom_phrase.txt 或其他词库"));
 
         _status = new TextBlock
@@ -49,7 +49,7 @@ public sealed class QuickPhrasesPage : UserControl
         };
         sp.Children.Add(FamoUI.Card("添加 / 编辑",
             FamoUI.Row("短语", "固定话术；不能包含换行或制表符。", _text, divider: false),
-            FamoUI.Row("编码", "唯一键；同一编码再次保存会更新短语，并同步生成 v+编码入口。", _code),
+            FamoUI.Row("编码", "唯一键；输入完整编码时短语置顶，输入一半不会抢候选。", _code),
             FamoUI.RowFull(BuildActions(), divider: true)));
 
         _list = new StackPanel { Spacing = 8 };

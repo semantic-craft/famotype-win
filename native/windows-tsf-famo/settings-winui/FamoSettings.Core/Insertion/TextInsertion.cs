@@ -13,6 +13,41 @@ public interface ITextInsertionService
     Task<TextInsertionResult> InsertAsync(string text, CancellationToken cancellationToken);
 }
 
+public sealed class SelectionVerifiedInsertionService : ITextInsertionService
+{
+    private readonly string _originalSelection;
+    private readonly Func<CancellationToken, Task<string?>> _readCurrentSelection;
+    private readonly ITextInsertionService _inner;
+
+    public SelectionVerifiedInsertionService(
+        string originalSelection,
+        Func<CancellationToken, Task<string?>> readCurrentSelection,
+        ITextInsertionService inner)
+    {
+        _originalSelection = originalSelection;
+        _readCurrentSelection = readCurrentSelection;
+        _inner = inner;
+    }
+
+    public async Task<TextInsertionResult> InsertAsync(string text, CancellationToken cancellationToken)
+    {
+        try
+        {
+            string? currentSelection = await _readCurrentSelection(cancellationToken);
+            if (!string.Equals(currentSelection, _originalSelection, StringComparison.Ordinal))
+            {
+                return TextInsertionResult.Fail("原选区已变化，未执行替换；结果仍可手动复制。");
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return TextInsertionResult.Fail("无法确认原选区，未执行替换：" + ex.Message);
+        }
+
+        return await _inner.InsertAsync(text, cancellationToken);
+    }
+}
+
 public sealed record ClipboardTextSnapshot(bool HasText, string? Text);
 
 public interface IClipboardTextBridge

@@ -24,6 +24,7 @@ bool IsControlOperation(Command command) {
          command == Command::ControlReloadOptions ||
          command == Command::ControlSelectSchema ||
          command == Command::ControlDeploy ||
+         command == Command::ControlResetUserDictionary ||
          command == Command::ControlShutdown;
 }
 

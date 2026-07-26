@@ -22,6 +22,9 @@ constexpr uint32_t kHostCandidatePreview = 1u << 25;
 constexpr uint32_t kHostAutoPair = 1u << 26;
 constexpr uint32_t kHostCjkEnglishSpacing = 1u << 27;
 constexpr uint32_t kHostCjkNumberSpacing = 1u << 28;
+constexpr uint32_t kHostPreviewPages = 1u << 29;
+constexpr uint32_t kHostPreviewRowsTwo = 1u << 30;
+constexpr uint32_t kHostRimeVertical = 1u << 31;
 
 enum class Command : uint16_t {
   Hello = 1,
@@ -40,6 +43,7 @@ enum class Command : uint16_t {
   ControlDeploy = 14,
   ControlStatus = 15,
   ControlShutdown = 16,
+  ControlResetUserDictionary = 17,
 };
 
 enum class Status : uint32_t {
@@ -143,6 +147,9 @@ struct Composition {
   std::string schema_id;
   std::string schema_name;
   std::vector<Candidate> candidates;
+  // UI-only next-page candidates. They stay inside FamoRuntime snapshots and
+  // are deliberately not serialized back across the TSF request pipe.
+  std::vector<Candidate> preview_candidates;
   uint32_t highlighted_index = 0;
   uint32_t page_index = 0;
   uint32_t page_size = 0;

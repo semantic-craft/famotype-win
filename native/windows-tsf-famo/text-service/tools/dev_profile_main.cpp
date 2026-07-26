@@ -20,6 +20,89 @@ std::wstring ModuleDirectory() {
   return separator == std::wstring::npos ? L"." : path.substr(0, separator);
 }
 
+HRESULT EnablePrivilege(const wchar_t *name) {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(),
+                        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+    return HRESULT_FROM_WIN32(GetLastError());
+  LUID luid{};
+  if (!LookupPrivilegeValueW(nullptr, name, &luid)) {
+    const DWORD error = GetLastError();
+    CloseHandle(token);
+    return HRESULT_FROM_WIN32(error);
+  }
+  TOKEN_PRIVILEGES privileges{};
+  privileges.PrivilegeCount = 1;
+  privileges.Privileges[0].Luid = luid;
+  privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+  SetLastError(ERROR_SUCCESS);
+  const BOOL adjusted = AdjustTokenPrivileges(
+      token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr);
+  const DWORD error = GetLastError();
+  CloseHandle(token);
+  return adjusted ? HRESULT_FROM_WIN32(error)
+                  : HRESULT_FROM_WIN32(error == ERROR_SUCCESS
+                                           ? ERROR_PRIVILEGE_NOT_HELD
+                                           : error);
+}
+
+HRESULT StartRuntimeAsDesktopUser() {
+  const HRESULT privilege = EnablePrivilege(L"SeImpersonatePrivilege");
+  if (FAILED(privilege))
+    return privilege;
+  const std::wstring directory = ModuleDirectory();
+  if (directory.empty())
+    return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+  const std::wstring runtime = directory + L"\\FamoRuntime.exe";
+
+  const HWND shell = GetShellWindow();
+  if (!shell)
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+  DWORD shell_process_id = 0;
+  GetWindowThreadProcessId(shell, &shell_process_id);
+  if (shell_process_id == 0)
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+
+  HANDLE shell_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                     shell_process_id);
+  if (!shell_process)
+    return HRESULT_FROM_WIN32(GetLastError());
+  HANDLE shell_token = nullptr;
+  if (!OpenProcessToken(shell_process, TOKEN_QUERY | TOKEN_DUPLICATE,
+                        &shell_token)) {
+    const DWORD error = GetLastError();
+    CloseHandle(shell_process);
+    return HRESULT_FROM_WIN32(error);
+  }
+  HANDLE primary_token = nullptr;
+  if (!DuplicateTokenEx(shell_token, MAXIMUM_ALLOWED, nullptr,
+                        SecurityImpersonation, TokenPrimary, &primary_token)) {
+    const DWORD error = GetLastError();
+    CloseHandle(shell_token);
+    CloseHandle(shell_process);
+    return HRESULT_FROM_WIN32(error);
+  }
+
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESHOWWINDOW;
+  startup.wShowWindow = SW_HIDE;
+  PROCESS_INFORMATION process{};
+  std::wstring command_line = L"\"" + runtime + L"\"";
+  const BOOL created = CreateProcessWithTokenW(
+      primary_token, 0, runtime.c_str(), command_line.data(), 0,
+      nullptr, directory.c_str(), &startup, &process);
+  const DWORD error = created ? ERROR_SUCCESS : GetLastError();
+  if (created) {
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+  }
+  CloseHandle(primary_token);
+  CloseHandle(shell_token);
+  CloseHandle(shell_process);
+  return HRESULT_FROM_WIN32(error);
+}
+
 using RegistrationEntry = HRESULT(STDAPICALLTYPE *)();
 
 HRESULT InvokeRegistration(const char *export_name) {
@@ -39,12 +122,18 @@ bool RegistryPresent() {
   StringFromGUID2(famo::tsf::kTextServiceClsid, guid, ARRAYSIZE(guid));
   const std::wstring path = std::wstring(L"Software\\Classes\\CLSID\\") +
                             guid + L"\\InprocServer32";
-  HKEY key = nullptr;
-  const LSTATUS result = RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0,
-                                       KEY_READ, &key);
-  if (result == ERROR_SUCCESS)
-    RegCloseKey(key);
-  return result == ERROR_SUCCESS;
+  // COM registration moved to HKLM (system-wide) so the Win11 switcher lists
+  // the IME; still accept HKCU so the probe recognises legacy per-user
+  // development registrations during upgrades.
+  for (HKEY root : {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER}) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, path.c_str(), 0, KEY_READ, &key) ==
+        ERROR_SUCCESS) {
+      RegCloseKey(key);
+      return true;
+    }
+  }
+  return false;
 }
 
 bool ProfileEnabled() {
@@ -314,11 +403,21 @@ int wmain(int argc, wchar_t **argv) {
   if (argc != 2) {
     std::fwprintf(
         stderr,
-        L"usage: FamoProfileTool register|register-disabled|enable|disable|activate|check|check-disabled|is-active|switch-away|unregister|loaded <dll>\n");
+        L"usage: FamoProfileTool register|register-disabled|enable|disable|activate|check|check-disabled|is-active|switch-away|start-runtime|unregister|loaded <dll>\n");
     return 2;
   }
   const std::wstring_view command(argv[1]);
-  if (command == L"register" || command == L"register-disabled") {
+  if (command == L"start-runtime") {
+    const HRESULT result = StartRuntimeAsDesktopUser();
+    if (FAILED(result)) {
+      std::fwprintf(stderr, L"runtime start failed: 0x%08lx\n",
+                    static_cast<unsigned long>(result));
+      return static_cast<int>(HRESULT_CODE(result));
+    }
+    std::wprintf(L"runtime_started=yes path=%ls\\FamoRuntime.exe\n",
+                 ModuleDirectory().c_str());
+    return 0;
+  } else if (command == L"register" || command == L"register-disabled") {
     const HRESULT result = InvokeRegistration("DllRegisterServer");
     if (FAILED(result)) {
       std::fwprintf(stderr, L"profile registration failed: 0x%08lx\n",

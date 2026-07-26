@@ -12,7 +12,8 @@ $clsid = '{' + ([string]$identity.guids.clsidTextService).ToUpperInvariant() + '
 $profileGuid = '{' + ([string]$identity.guids.guidProfile).ToUpperInvariant() + '}'
 $expectedTip = "0804:$clsid$profileGuid"
 $brandKey = 'HKLM:\' + [string]$identity.registry.brandKey
-$comKey = "HKCU:\Software\Classes\CLSID\$clsid\InProcServer32"
+$machineComKey = "HKLM:\Software\Classes\CLSID\$clsid\InProcServer32"
+$userComKey = "HKCU:\Software\Classes\CLSID\$clsid\InProcServer32"
 $tipKey = "HKLM:\Software\Microsoft\CTF\TIP\$clsid"
 $probeMode = 'ReadOnly'
 $userWeaselDataPolicy = 'NoWrite:%AppData%\Rime'
@@ -56,10 +57,11 @@ function Same-Path {
 }
 
 $brandPresent = Test-Path -LiteralPath $brandKey
-$comPresent = Test-Path -LiteralPath $comKey
+$machineComPresent = Test-Path -LiteralPath $machineComKey
+$userComPresent = Test-Path -LiteralPath $userComKey
 $tipPresent = Test-Path -LiteralPath $tipKey
 $brand = if ($brandPresent) { Get-ItemProperty -LiteralPath $brandKey } else { $null }
-$notInstalled = -not $brandPresent -and -not $comPresent -and -not $tipPresent
+$notInstalled = -not $brandPresent -and -not $machineComPresent -and -not $userComPresent -and -not $tipPresent
 $installState = if ($brand) { [string]$brand.InstallState } else { 'NotInstalled' }
 $isPending = $installState -eq 'PendingReboot'
 $target = if ($isPending) { [string]$brand.PendingTarget } elseif ($brand) { [string]$brand.InstallDir } else { '' }
@@ -67,17 +69,17 @@ $profileTool = if ($isPending -and $target) { Join-Path $target 'FamoProfileTool
 
 $inprocDll = ''
 $threadingModel = ''
-if ($comPresent) {
-  $com = Get-Item -LiteralPath $comKey
+if ($machineComPresent) {
+  $com = Get-Item -LiteralPath $machineComKey
   $inprocDll = [string]$com.GetValue('')
   $threadingModel = [string]$com.GetValue('ThreadingModel')
 }
 $expectedDll = if ($target) { Join-Path $target 'FamoTextService.dll' } else { '' }
-$comOk = $comPresent -and (Same-Path $inprocDll $expectedDll) -and $threadingModel -eq 'Apartment'
-Add-Audit 'TSF-COM' 'HKCU COM registration' ($notInstalled -or [bool]$comOk) `
-  'The stable native COM override must point to the active immutable transaction.' `
-  "HKCU COM=$expectedDll; ThreadingModel=Apartment" `
-  $(if ($notInstalled) { 'absent with clean uninstall' } else { "COM=$inprocDll; ThreadingModel=$threadingModel" })
+$comOk = $machineComPresent -and -not $userComPresent -and (Same-Path $inprocDll $expectedDll) -and $threadingModel -eq 'Apartment'
+Add-Audit 'TSF-COM' 'HKLM COM registration; per-user COM override absent' ($notInstalled -or [bool]$comOk) `
+  'The machine COM registration must point to the active transaction and no legacy HKCU key may shadow it.' `
+  "HKLM COM=$expectedDll; ThreadingModel=Apartment; HKCU override absent" `
+  $(if ($notInstalled) { 'absent with clean uninstall' } else { "COM=$inprocDll; ThreadingModel=$threadingModel; userOverride=$userComPresent" })
 
 $profileOutput = ''
 $profileExit = -1

@@ -1,5 +1,6 @@
 #include "famo_runtime_service.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace famo::runtime {
@@ -141,6 +142,7 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
   std::string explicit_commit;
   Composition composition;
   bool composition_ready = false;
+  bool candidate_selection_handled = false;
   if (request.command == Command::ProcessKey) {
     KeyEvent value;
     if (!DecodeKeyEvent(request.payload, &value, &error))
@@ -157,6 +159,7 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
       const int32_t free_rc = engine_.FreeView(&view);
       if (!composition_ready || free_rc != FAMO_ENGINE_OK)
         return Reply(request, Status::EngineError);
+      candidate_selection_handled = composition.handled;
     }
     if (rc == FAMO_ENGINE_OK && composition.commit.empty()) {
       // The Rime ABI intentionally leaves the selection commit pending so the
@@ -206,6 +209,41 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
     if (!copied || free_rc != FAMO_ENGINE_OK)
       return Reply(request, Status::EngineError);
   }
+
+  const FamoUtf8String vertical_option{sizeof(FamoUtf8String), "_vertical", 9};
+  int32_t rime_vertical = 0;
+  if (engine_.api().get_option(session.context, &vertical_option,
+                               &rime_vertical) == FAMO_ENGINE_OK &&
+      rime_vertical != 0)
+    composition.state_flags |= kHostRimeVertical;
+
+  // macOS parity: optional, read-only preview of the following one or two
+  // candidate pages. The engine iterator does not move the live page/highlight;
+  // any unsupported/error path simply leaves the preview empty.
+  if ((composition.state_flags & kHostPreviewPages) != 0 &&
+      composition.is_last_page == 0 && composition.page_size > 0 &&
+      engine_.CanPeekCandidates()) {
+    const uint32_t rows =
+        (composition.state_flags & kHostPreviewRowsTwo) != 0 ? 2u : 1u;
+    const uint64_t start =
+        (static_cast<uint64_t>(composition.page_index) + 1) *
+        composition.page_size;
+    const uint32_t count = static_cast<uint32_t>((std::min)(
+        static_cast<uint64_t>(kMaxCandidateCount),
+        static_cast<uint64_t>(composition.page_size) * rows));
+    if (start <= UINT32_MAX && count > 0) {
+      FamoCompositionView preview_view{};
+      if (engine_.api().peek_candidates(
+              session.context, static_cast<uint32_t>(start), count,
+              &preview_view) == FAMO_ENGINE_OK) {
+        Composition preview;
+        std::string preview_error;
+        if (CopyView(preview_view, &preview, &preview_error))
+          composition.preview_candidates = std::move(preview.candidates);
+        (void)engine_.FreeView(&preview_view);
+      }
+    }
+  }
   // The v1.1 commit_composition ABI returns only success; the following
   // get_status deliberately does not consume or repeat a commit. Preserve the
   // already-validated preview from the last engine view so the host can apply
@@ -216,6 +254,11 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
     composition.handled = true;
     composition.state_flags |=
         FAMO_COMPOSITION_HAS_COMMIT | FAMO_COMPOSITION_HANDLED;
+  }
+  if (request.command == Command::SelectCandidate &&
+      candidate_selection_handled) {
+    composition.handled = true;
+    composition.state_flags |= FAMO_COMPOSITION_HANDLED;
   }
   Frame reply = Reply(request, Status::Ok);
   if (!EncodeComposition(composition, &reply.payload, &error))

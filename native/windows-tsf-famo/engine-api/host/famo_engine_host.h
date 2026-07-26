@@ -39,6 +39,8 @@ class FamoEngineHost {
   // decide "abi runnable"; a v1.0 engine returns false -> fall back to legacy.
   bool AbiRunnable() const;
 
+  bool CanPeekCandidates() const;
+
   // Release a view the engine filled. Always route view teardown through here.
   int32_t FreeView(FamoCompositionView* view);
 

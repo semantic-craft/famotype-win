@@ -310,6 +310,8 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
   const int highlight_rc_dev = (std::max)(0, rc_dev - Scale(4, dpi));
   const int border_dev = Scale(skin->border, dpi);
   const bool vertical = skin->layout_type == FAMO_LAYOUT_VERTICAL_TEXT;
+  const bool vertical_list = skin->layout_type != FAMO_LAYOUT_HORIZONTAL;
+  const bool mist = (skin->back_color >> 24) < 0xffu;
 
   // Drop-shadow margin: content is drawn at (sm,sm); the buffer is content+2*sm
   // (host sizes the DIB to match) with the gaussian shadow in the ring. sm==0 → no
@@ -383,6 +385,24 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
       AddRoundRect(path, 0, 0, cx, cy, rc_dev);
       Gdiplus::SolidBrush brush(ToGdiColor(skin->back_color));
       g.FillPath(&brush, &path);
+    }
+    if (mist) {
+      Gdiplus::GraphicsPath panel;
+      AddRoundRect(panel, 0, 0, cx, cy, rc_dev);
+      const uint32_t rgb = skin->back_color & 0x00ffffffu;
+      const int luminance =
+          ((rgb >> 16) & 0xff) * 3 + ((rgb >> 8) & 0xff) * 6 + (rgb & 0xff);
+      const BYTE top_alpha = luminance < 1280 ? 20 : 77;
+      const int sheen_h = (std::max)(1, cy / 4);
+      Gdiplus::LinearGradientBrush sheen(
+          Gdiplus::Rect(0, 0, cx, sheen_h),
+          Gdiplus::Color(top_alpha, 255, 255, 255),
+          Gdiplus::Color(0, 255, 255, 255),
+          Gdiplus::LinearGradientModeVertical);
+      const Gdiplus::GraphicsState saved = g.Save();
+      g.SetClip(&panel);
+      g.FillRectangle(&sheen, 0, 0, cx, sheen_h);
+      g.Restore(saved);
     }
     if (!RectEmpty2(layout->highlight) && Opaque(skin->hilited_back_color)) {
       const FamoRect& h = layout->highlight;
@@ -540,7 +560,16 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
                                   ? skin->hilited_text_color
                                   : skin->label_color;
           brush->SetColor(ToColorF(lc));
-          DrawUtf8(rt, fLabel, brush, cand.label, r.label, vertical, sm_f, sm_f);
+          if (vertical_list) {
+            std::wstring label = Widen(cand.label.data, cand.label.length_bytes);
+            label.push_back(L'.');
+            DrawRun(rt, fText, brush, label.c_str(),
+                    static_cast<uint32_t>(label.size()), r.label, vertical,
+                    sm_f, sm_f);
+          } else {
+            DrawUtf8(rt, fLabel, brush, cand.label, r.label, vertical, sm_f,
+                     sm_f);
+          }
         }
         uint32_t tc = hl ? skin->hilited_text_color : skin->candidate_text_color;
         if (Opaque(tc)) {
@@ -553,6 +582,20 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
             brush->SetColor(ToColorF(cc));
             DrawUtf8(rt, fComment, brush, cand.comment, r.comment, vertical, sm_f, sm_f);
           }
+        }
+      }
+      if (input->size >= offsetof(FamoLayoutInput, preview_page_size) +
+                             sizeof(input->preview_page_size) &&
+          input->preview_candidates) {
+        const uint32_t preview_count = (std::min)(
+            layout->preview_candidate_count,
+            static_cast<uint32_t>(FAMO_MAX_PREVIEW_CANDIDATES));
+        for (uint32_t i = 0; i < preview_count; ++i) {
+          D2D1_COLOR_F color = ToColorF(skin->candidate_text_color);
+          color.a *= 0.75f;
+          brush->SetColor(color);
+          DrawUtf8(rt, fText, brush, input->preview_candidates[i].text,
+                   layout->preview_candidates[i].text, false, sm_f, sm_f);
         }
       }
       // Page affordances use typographic chevrons rather than raw ASCII operators.
@@ -648,14 +691,7 @@ D2D1_COLOR_F WithAlpha(uint32_t argb, float alpha) {
   return color;
 }
 
-// The segmented control's trough (the design system's card2) has no FamoSkin
-// token. Deriving it by blending toward border_color does not survive both
-// themes: border_color is the accent at ~16% alpha, so the blend tints the
-// trough and, on a dark skin, moves it AWAY from the shipped card2 (lighter
-// where card2 is darker). Across all four skins in both themes card2 is simply
-// card stepped darker, so step darker here. A proportional step alone collapses
-// on a dark card (4.5% of 38 is one level), hence the absolute floor; a
-// near-black card cannot go darker at all, so it steps up instead.
+// Compatibility fallback for callers built before FamoSkin carried card2.
 uint32_t TroughColor(uint32_t card) {
   const int channel[3] = {static_cast<int>((card >> 16) & 0xff),
                           static_cast<int>((card >> 8) & 0xff),
@@ -743,8 +779,12 @@ int32_t StatusBarPaintImpl(const FamoStatusBarSpec* spec, const FamoSkin* skin,
   // Trough first: the segments sit in it, so it is the bar's background.
   const D2D1_RECT_F panel =
       D2D1::RectF(0.0f, 0.0f, static_cast<float>(cx), static_cast<float>(cy));
+  const bool has_card2 =
+      skin->size >= offsetof(FamoSkin, card2_color) + sizeof(uint32_t) &&
+      Opaque(skin->card2_color);
   if (Opaque(skin->back_color)) {
-    brush->SetColor(ToColorF(TroughColor(skin->back_color)));
+    brush->SetColor(ToColorF(has_card2 ? skin->card2_color
+                                      : TroughColor(skin->back_color)));
     rt->FillRoundedRectangle(D2D1::RoundedRect(panel, panel_r, panel_r), brush);
   }
   if (border > 0.0f && Opaque(skin->border_color)) {
@@ -771,33 +811,23 @@ int32_t StatusBarPaintImpl(const FamoStatusBarSpec* spec, const FamoSkin* skin,
         i == 0 || spec->buttons[i - 1].bounds.right != button.bounds.left;
     const bool last = i + 1 == spec->button_count ||
                       spec->buttons[i + 1].bounds.left != button.bounds.right;
-    // An enabled option is filled with the accent and takes the accent's text
-    // color; the rest are cards in the trough. Either way the label contrasts
-    // with what it sits on without another palette entry to configure.
-    const uint32_t fill_color =
-        button.on ? skin->hilited_back_color : skin->back_color;
-    const uint32_t label_color =
-        button.on ? skin->hilited_text_color : skin->text_color;
+    // The current state is already carried by the label (中/英, 简/繁, ...), so
+    // clicking never needs the skin accent behind it.
+    const uint32_t fill_color = skin->back_color;
+    const uint32_t label_color = skin->text_color;
     if (Opaque(fill_color)) {
       brush->SetColor(ToColorF(fill_color));
       FillSegment(rt, brush, cell, segment_r, first, last);
     }
     if (!Opaque(label_color)) continue;
-    // Scrim tuned per fill: an ink scrim on a light card reads much stronger
-    // than an onAccent scrim on the accent, so the accent side gets more.
     if (button.pressed || button.hover) {
-      const float scrim = button.on ? (button.pressed ? 0.30f : 0.16f)
-                                    : (button.pressed ? 0.20f : 0.10f);
-      brush->SetColor(WithAlpha(label_color, scrim));
+      brush->SetColor(WithAlpha(label_color, 0.10f));
       FillSegment(rt, brush, cell, segment_r, first, last);
     }
     brush->SetColor(ToColorF(label_color));
     DrawCenteredLabel(res, rt, brush, button.bounds, button.label);
-    // Hairline between two plain neighbours that actually touch. An accent fill
-    // already separates itself, so a divider beside one would just dirty the
-    // edge, and a gap needs no divider drawn across it.
-    if (!last && !button.on && !spec->buttons[i + 1].on &&
-        Opaque(skin->border_color)) {
+    // Hairline between neighbours that actually touch; a gap needs no divider.
+    if (!last && Opaque(skin->border_color)) {
       const float line = (std::max)(1.0f, border);
       const float trim = static_cast<float>(Scale(7, dpi));
       brush->SetColor(ToColorF(skin->border_color));

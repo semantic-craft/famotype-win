@@ -14,6 +14,8 @@ public sealed class AiPageParityContractTests
         Assert.Contains("供应商（配一个就行）", page);
 
         Assert.Contains("DeepSeek", page);
+        Assert.Contains("阿里云百炼", page);
+        Assert.Contains("MiniMax", page);
         Assert.Contains("OpenAI", page);
         Assert.Contains("Google Gemini", page);
         Assert.Contains("小米 MiMo", page);

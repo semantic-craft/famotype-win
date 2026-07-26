@@ -34,6 +34,21 @@ public sealed class AboutPageParityContractTests
     }
 
     [Fact]
+    public void AboutPage_ResetsOnlyUserDictionaryBehindSafeConfirmation()
+    {
+        string page = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AboutPage.cs"));
+        string ui = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Theming/FamoUI.cs"));
+        string deploy = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings.Core/DeployService.cs"));
+
+        Assert.Contains("重置用户词典？", page);
+        Assert.Contains("方案、皮肤、快捷短语或词库", page);
+        Assert.Contains(".famo-backup", page);
+        Assert.Contains("DeployService.ResetUserDictionary()", page);
+        Assert.Contains("DefaultButton = ContentDialogButton.Close", ui);
+        Assert.Contains("--control reset-user-dictionary", deploy);
+    }
+
+    [Fact]
     public void AboutPage_ExposesHonestManualUpdateCheck()
     {
         string page = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AboutPage.cs"));

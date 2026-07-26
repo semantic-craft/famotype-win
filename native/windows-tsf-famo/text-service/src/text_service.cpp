@@ -621,6 +621,30 @@ void TextService::ApplySessionResult() {
   }
 }
 
+void TextService::DisconnectRuntimeIfIdle() {
+  for (const auto &entry : contexts_) {
+    if (entry->ui_state.focused || !entry->state.displayed().preedit.empty() ||
+        entry->state.pending_sequence() != 0) {
+      return;
+    }
+  }
+  {
+    std::lock_guard lock(session_publication_mutex_);
+    desired_session_.store(nullptr);
+    session_request_.store(nullptr);
+    session_result_.store(nullptr);
+    for (auto &entry : contexts_) {
+      entry->session_pending = false;
+      entry->pending_session = {};
+      entry->state.Close();
+    }
+  }
+  session_disconnect_requested_.store(true);
+  session_worker_epoch_.fetch_add(1);
+  session_worker_epoch_.notify_one();
+  session_retry_wake_.notify_all();
+}
+
 TextService::ContextEntry *TextService::FindContext(ITfContext *context) {
   const auto found = std::find_if(
       contexts_.begin(), contexts_.end(), [&](const auto &entry) {
@@ -683,6 +707,7 @@ HRESULT TextService::OnSetFocus(BOOL foreground) {
   if (!foreground) {
     for (auto &entry : contexts_)
       SetFocused(entry.get(), false);
+    DisconnectRuntimeIfIdle();
     return S_OK;
   }
   ComPtr<ITfDocumentMgr> focus;

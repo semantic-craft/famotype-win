@@ -14,6 +14,15 @@ namespace Famo.Settings.Core;
 /// </summary>
 public static class ConfigWriter
 {
+    private const string FuzzyBegin = "  # >>> famo-fuzzy >>>（设置面板生成，请勿手改）";
+    private const string FuzzyEnd = "  # <<< famo-fuzzy <<<";
+    private static readonly Regex FuzzyBlockRx =
+        new(@"[ \t]*#\s*>>> famo-fuzzy >>>.*?#\s*<<< famo-fuzzy <<<[^\n]*\r?\n?",
+            RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex LegacyFuzzyBlockRx =
+        new(@"[ \t]*# 模糊音（设置面板勾选，追加到既有 algebra 末尾）\r?\n[ \t]*""speller/algebra/\+"":\r?\n(?:[ \t]*- derive/[^\r\n]*(?:\r?\n|$))+",
+            RegexOptions.Compiled);
+
     /// <summary>
     /// 由 store 生成 weasel.custom.yaml 文本（基于 baseYaml 模板做定点替换）。
     /// baseYaml 为 null 时用内置 overlay 模板。
@@ -33,8 +42,11 @@ public static class ConfigWriter
         yaml = SetScalar(yaml, "label_format", Quote(labelFormat));
         yaml = SetScalar(yaml, "label_font_point", labelPoint);
         yaml = SetScalar(yaml, "comment_font_point", commentPoint);
-        yaml = SetScalar(yaml, "horizontal", a.Orientation == "horizontal" ? "true" : "false");
+        yaml = SetScalar(yaml, "horizontal", a.Orientation != "vertical" ? "true" : "false");
         yaml = SetScalar(yaml, "inline_preedit", a.InlinePreedit ? "true" : "false");
+        yaml = SetScalar(yaml, "show_preedit", a.ShowPreedit ? "true" : "false");
+        yaml = SetScalar(yaml, "preview_pages", a.Orientation == "scroll" || a.PreviewPages ? "true" : "false");
+        yaml = SetScalar(yaml, "preview_rows", Math.Clamp(a.PreviewRows, 1, 2).ToString(CultureInfo.InvariantCulture));
         yaml = SetScalar(yaml, "preedit_type", a.InlineCandidatePreview ? "preview" : "composition");
         yaml = SetScalar(yaml, "corner_radius", a.Layout.CornerRadius.ToString(CultureInfo.InvariantCulture));
         yaml = SetScalar(yaml, "border_width", a.Layout.BorderWidth.ToString(CultureInfo.InvariantCulture));
@@ -86,8 +98,12 @@ public static class ConfigWriter
         sb.Append("  label_format: ").Append(Quote(labelFormat)).Append('\n');
         sb.Append("  label_font_point: ").Append(labelPoint).Append('\n');
         sb.Append("  comment_font_point: ").Append(commentPoint).Append('\n');
-        sb.Append("  horizontal: ").Append(a.Orientation == "horizontal" ? "true" : "false").Append('\n');
+        sb.Append("  horizontal: ").Append(a.Orientation != "vertical" ? "true" : "false").Append('\n');
+        sb.Append("  orientation: ").Append(a.Orientation).Append('\n');
         sb.Append("  inline_preedit: ").Append(a.InlinePreedit ? "true" : "false").Append('\n');
+        sb.Append("  show_preedit: ").Append(a.ShowPreedit ? "true" : "false").Append('\n');
+        sb.Append("  preview_pages: ").Append(a.Orientation == "scroll" || a.PreviewPages ? "true" : "false").Append('\n');
+        sb.Append("  preview_rows: ").Append(Math.Clamp(a.PreviewRows, 1, 2)).Append('\n');
         sb.Append("  preedit_type: ").Append(a.InlineCandidatePreview ? "preview" : "composition").Append('\n');
         sb.Append("  corner_radius: ").Append(Int(a.Layout.CornerRadius)).Append('\n');
         sb.Append("  border_width: ").Append(Int(a.Layout.BorderWidth)).Append('\n');
@@ -225,7 +241,7 @@ public static class ConfigWriter
                 sb.Append("    - schema: ").Append(e.Id).Append('\n');
             }
         }
-        sb.Append("  menu/page_size: ").Append(settings.Engine.PageSize.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append("  menu/page_size: ").Append(Math.Clamp(settings.Engine.PageSize, 3, 9).ToString(CultureInfo.InvariantCulture)).Append('\n');
 
         // 固定项（必随每次生成，避免覆盖 seed 丢失）：
         //   去 F4/Ctrl+` 方案选单（switcher/hotkeys 置空，无方案概念，切换走 WinUI + select_schema）。
@@ -322,6 +338,8 @@ public static class ConfigWriter
 
         // 仅改 emoji 块内的 reset（按 name 定位，避开其它 switch 的 reset）。
         yaml = SetSwitchReset(yaml, "emoji", e.EmojiEnabled ? 1 : 0);
+        yaml = FuzzyBlockRx.Replace(yaml, "");
+        yaml = LegacyFuzzyBlockRx.Replace(yaml, "");
 
         // 模糊音：9 独立对，各自 gated 追加 speller/algebra/+（锚定 derive，逐字段镜像
         // macOS FamoRimePatchBuilder.fuzzyAlgebraDerives；n/l、f/h、an/ang、en/eng、in/ing 双向发两条）。
@@ -339,19 +357,19 @@ public static class ConfigWriter
 
         if (rules.Count > 0)
         {
+            yaml = QuickSendBlockRx.Replace(yaml, "").TrimEnd('\r', '\n') + "\n";
             var sb = new System.Text.StringBuilder();
-            if (!yaml.EndsWith("\n")) sb.Append('\n');
-            sb.Append("\n  # 模糊音（设置面板勾选，追加到既有 algebra 末尾）\n");
+            sb.Append('\n').Append(FuzzyBegin).Append('\n');
             sb.Append("  \"speller/algebra/+\":\n");
             foreach ((string rule, string note) in rules)
                 sb.Append("    - ").Append(rule).Append("  # ").Append(note).Append('\n');
+            sb.Append(FuzzyEnd).Append('\n');
             yaml += sb.ToString();
         }
         return AppendQuickSendBlock(yaml);
     }
 
-    // 法墨快捷短语 translator 注入块。只用于拼音类短码候选路径。
-    // 五笔的字母键是编码空间，不能注入裸字母 quick-send translator；五笔走显式选择器插入。
+    // 法墨快捷短语 translator 注入块。拼音类用裸码精确触发；五笔仍走显式选择器插入。
     private const string QuickSendBegin = "  # >>> famo-quick-send >>>（设置面板生成，请勿手改）";
     private const string QuickSendEnd = "  # <<< famo-quick-send <<<";
     private static readonly Regex QuickSendBlockRx =
@@ -374,9 +392,9 @@ public static class ConfigWriter
         block.Append("    dictionary: \"\"\n");
         block.Append("    user_dict: famo_quick_send\n");
         block.Append("    db_class: stabledb\n");
-        block.Append("    enable_completion: true\n");
+        block.Append("    enable_completion: false\n");
         block.Append("    enable_sentence: false\n");
-        block.Append("    initial_quality: 100\n");
+        block.Append("    initial_quality: 99\n");
         block.Append(QuickSendEnd).Append('\n');
         return merged + block;
     }

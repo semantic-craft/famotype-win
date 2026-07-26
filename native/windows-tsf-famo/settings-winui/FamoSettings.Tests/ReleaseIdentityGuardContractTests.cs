@@ -10,11 +10,12 @@ public sealed class ReleaseIdentityGuardContractTests
         string guard = File.ReadAllText(RepoFile("native/windows-tsf-famo/tools/identity_guard/check_release_identity.ps1"));
 
         Assert.Contains("Test-AllowedRuntimeCompatibilityPath", guard);
-        Assert.Contains(@"^(data/)?weasel(\.custom)?\.yaml$", guard);
+        Assert.Contains(@"^(?:(?:payload/)?data/)?weasel(\.custom)?\.yaml$", guard);
         Assert.Contains("-not $allowRuntimeCompatibilityPath -and $relative -match", guard);
         Assert.Contains("Test-SkipIdentityContentPath", guard);
         Assert.Contains(@"\.dict\.yaml$", guard);
-        Assert.Contains("^(data/)?(cn_dicts|en_dicts|opencc)/", guard);
+        Assert.Contains("^(?:(?:payload/)?data/)?(cn_dicts|en_dicts|opencc)/", guard);
+        Assert.Contains("^(payload/)?payload-manifest\\.txt$", guard);
     }
 
     [Fact]
@@ -27,6 +28,21 @@ public sealed class ReleaseIdentityGuardContractTests
         Assert.Contains("! -name '*.dict.yaml'", assemble);
         Assert.Contains("[Ww]easel", assemble);
         Assert.Contains("小狼毫", assemble);
+    }
+
+    [Fact]
+    public void AssemblePayload_ReownsOpenCcOverlayDestinations()
+    {
+        string assemble = File.ReadAllText(RepoFile("native/windows-tsf-famo/famo-config/assemble-payload.sh"));
+        int start = assemble.IndexOf("overlay_opencc_standard()", StringComparison.Ordinal);
+        int end = assemble.IndexOf("strip_law_layer()", start, StringComparison.Ordinal);
+        string overlay = assemble[start..end];
+
+        Assert.Contains("[ ! -L \"${opencc_dir}\" ]", overlay);
+        Assert.Contains("rm -f -- \"${destination}\"", overlay);
+        Assert.True(
+            overlay.IndexOf("rm -f -- \"${destination}\"", StringComparison.Ordinal) <
+            overlay.IndexOf("cp -- \"${OPENCC_STANDARD_DIR}/${f}\" \"${destination}\"", StringComparison.Ordinal));
     }
 
     private static string RepoFile(string relativePath)
