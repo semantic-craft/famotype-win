@@ -61,6 +61,7 @@ public sealed class InputEntryWinuiContractTests
         Assert.Contains("RunDemoAppearance()", program);
         Assert.Contains("FirstLaunchSeeder.SeedFromInstalledData", program);
         Assert.Contains("WriteHeadlessOverlays(settings)", program);
+        Assert.Contains("ConfigWriter.WriteDeployBucket(settings, FamoPaths.FamoDir)", program);
         Assert.Contains("ConfigWriter.WriteSelectSchema", program);
         Assert.True(
             program.IndexOf("RunSeedOnly(args)", StringComparison.Ordinal) <

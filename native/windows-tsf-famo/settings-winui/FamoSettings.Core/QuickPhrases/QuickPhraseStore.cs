@@ -51,7 +51,6 @@ public sealed class QuickPhraseStore
     public void Upsert(QuickPhraseEntry entry)
     {
         QuickPhraseEntry normalized = Normalize(entry);
-
         var entries = LoadOrThrow().ToList();
         int index = entries.FindIndex(e => e.Code == normalized.Code);
         if (index >= 0)
@@ -59,6 +58,31 @@ public sealed class QuickPhraseStore
         else
             entries.Add(normalized);
         Save(entries);
+    }
+
+    public void SaveEdit(QuickPhraseEntry entry, string? previousCode, string tablePath)
+    {
+        QuickPhraseEntry normalized = Normalize(entry);
+        var entries = LoadOrThrow().ToList();
+        int targetIndex = entries.FindIndex(e => e.Code == normalized.Code);
+        if (previousCode is null)
+        {
+            if (targetIndex >= 0)
+                throw new InvalidDataException($"编码「{normalized.Code}」已存在");
+            entries.Add(normalized);
+        }
+        else
+        {
+            string sourceCode = NormalizeCode(previousCode);
+            int sourceIndex = entries.FindIndex(e => e.Code == sourceCode);
+            if (sourceIndex < 0)
+                throw new InvalidDataException($"原编码「{sourceCode}」不存在");
+            if (targetIndex >= 0 && targetIndex != sourceIndex)
+                throw new InvalidDataException($"编码「{normalized.Code}」已存在");
+            entries[sourceIndex] = normalized;
+        }
+        Save(entries);
+        WriteTableDb(tablePath, entries);
     }
 
     public void Delete(string code)
@@ -70,7 +94,12 @@ public sealed class QuickPhraseStore
     public bool WriteTableDb(string? tablePath = null)
     {
         string path = tablePath ?? FamoPaths.QuickSendTableFile;
-        string content = BuildTableDb(LoadOrThrow());
+        return WriteTableDb(path, LoadOrThrow());
+    }
+
+    private static bool WriteTableDb(string path, IEnumerable<QuickPhraseEntry> entries)
+    {
+        string content = BuildTableDb(entries);
         if (File.Exists(path) && File.ReadAllText(path) == content) return false;
 
         string dir = Path.GetDirectoryName(path)!;

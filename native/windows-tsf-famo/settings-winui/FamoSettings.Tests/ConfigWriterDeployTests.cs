@@ -7,6 +7,59 @@ namespace Famo.Settings.Tests;
 public class ConfigWriterDeployTests
 {
     [Fact]
+    public void WriteDeployBucket_RebuildsStaleManagedFilesForEveryWubiSchema()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "famo-deploy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string[] wubiFiles =
+            {
+                "wubi86_jidian.custom.yaml",
+                "wubi86_jidian_pinyin.custom.yaml",
+                "wubi86_jidian_trad.custom.yaml",
+                "wubi86_jidian_trad_pinyin.custom.yaml",
+            };
+            foreach (string file in wubiFiles)
+                File.WriteAllText(Path.Combine(dir, file),
+                    "patch:\n  \"schema/icon\": keep.ico\n" +
+                    "  # >>> famo-wubi >>>（设置面板生成，请勿手改）\n" +
+                    "  stale_wubi: true\n  # <<< famo-wubi <<<\n");
+            File.WriteAllText(Path.Combine(dir, "default.custom.yaml"), "stale\n");
+            File.WriteAllText(Path.Combine(dir, "rime_ice.custom.yaml"),
+                "patch:\n  switches:\n    - name: emoji\n      reset: 0\n" +
+                "  # >>> famo-fuzzy >>>（设置面板生成，请勿手改）\n" +
+                "  stale_fuzzy: true\n  # <<< famo-fuzzy <<<\n");
+
+            FamoSettings settings = SettingsStore.CreateDefault();
+            settings.Engine.PageSize = 9;
+            settings.Engine.Wubi.CodeHint = true;
+            settings.Engine.EmojiEnabled = true;
+            settings.Engine.FuzzyPinyin.ZhZ = true;
+            ConfigWriter.WriteDeployBucket(settings, dir);
+            ConfigWriter.WriteDeployBucket(settings, dir);
+
+            Assert.Contains("menu/page_size: 9", File.ReadAllText(Path.Combine(dir, "default.custom.yaml")));
+            string ice = File.ReadAllText(Path.Combine(dir, "rime_ice.custom.yaml"));
+            Assert.Contains("reset: 1", ice);
+            Assert.Contains("derive/^zh/z/", ice);
+            Assert.DoesNotContain("stale_fuzzy", ice);
+            foreach (string file in wubiFiles)
+            {
+                string yaml = File.ReadAllText(Path.Combine(dir, file));
+                Assert.Contains("\"schema/icon\": keep.ico", yaml);
+                Assert.Contains("\"translator/comment_format\": []", yaml);
+                Assert.DoesNotContain("stale_wubi", yaml);
+                Assert.Single(System.Text.RegularExpressions.Regex.Matches(yaml, ">>> famo-wubi >>>"));
+            }
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void DefaultCustom_EmitsEnabledSchemasInOrderPlusPageSize()
     {
         FamoSettings s = SettingsStore.CreateDefault(); // 雾凇全套 + 五笔，全 enabled，page_size 8

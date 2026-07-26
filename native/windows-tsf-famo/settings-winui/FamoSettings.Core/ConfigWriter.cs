@@ -474,7 +474,15 @@ public static class ConfigWriter
         return merged + block;
     }
 
-    /// <summary>部署桶落盘：写 default.custom.yaml + rime_ice.custom.yaml + wubi86_jidian.custom.yaml 到 famoDir。</summary>
+    private static readonly string[] WubiCustomFiles =
+    {
+        "wubi86_jidian.custom.yaml",
+        "wubi86_jidian_pinyin.custom.yaml",
+        "wubi86_jidian_trad.custom.yaml",
+        "wubi86_jidian_trad_pinyin.custom.yaml",
+    };
+
+    /// <summary>部署桶落盘：写 default/rime_ice 与全部五笔方案的 Famo 托管块。</summary>
     public static void WriteDeployBucket(FamoSettings settings, string famoDir)
     {
         Directory.CreateDirectory(famoDir);
@@ -484,9 +492,12 @@ public static class ConfigWriter
         string? baseIce = File.Exists(icePath) ? File.ReadAllText(icePath) : null;
         WriteAtomic(icePath, BuildRimeIceCustom(settings, baseIce));
 
-        string wubiPath = Path.Combine(famoDir, "wubi86_jidian.custom.yaml");
-        string? baseWubi = File.Exists(wubiPath) ? File.ReadAllText(wubiPath) : null;
-        WriteAtomic(wubiPath, BuildWubiCustom(settings, baseWubi));
+        foreach (string fileName in WubiCustomFiles)
+        {
+            string wubiPath = Path.Combine(famoDir, fileName);
+            string? baseWubi = File.Exists(wubiPath) ? File.ReadAllText(wubiPath) : null;
+            WriteAtomic(wubiPath, BuildWubiCustom(settings, baseWubi));
+        }
     }
 
     private static void WriteAtomic(string path, string content) => SafeJsonFile.WriteAtomic(path, content);
