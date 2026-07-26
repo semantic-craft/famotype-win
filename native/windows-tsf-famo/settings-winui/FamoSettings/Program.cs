@@ -15,7 +15,9 @@ namespace Famo.Settings;
 public static class Program
 {
     private const string SingleInstanceKeyPrefix = "Famo.Settings.SingleInstance";
+    private const uint RedirectTimeoutMilliseconds = 10_000;
     private static string SingleInstanceKey => $"{SingleInstanceKeyPrefix}.{BuildKeySegment()}";
+    private enum RedirectionDecision { Primary, Redirected, Failed }
 
     [STAThread]
     private static int Main(string[] args)
@@ -42,10 +44,10 @@ public static class Program
 
         WinRT.ComWrappersSupport.InitializeComWrappers();
 
-        bool isRedirect = DecideRedirection();
-        if (isRedirect)
+        RedirectionDecision redirection = DecideRedirection();
+        if (redirection != RedirectionDecision.Primary)
         {
-            return 0; // 已重定向到主实例，本进程退出。
+            return redirection == RedirectionDecision.Redirected ? 0 : 2;
         }
 
         Microsoft.UI.Xaml.Application.Start(p =>
@@ -116,7 +118,7 @@ public static class Program
     }
 
     /// <summary>注册单实例 key。本实例为主 → 订阅 Activated 返 false；否则写 handoff + 重定向返 true。</summary>
-    private static bool DecideRedirection()
+    private static RedirectionDecision DecideRedirection()
     {
         AppActivationArguments activation = AppInstance.GetCurrent().GetActivatedEventArgs();
         AppInstance keyInstance = AppInstance.FindOrRegisterForKey(SingleInstanceKey);
@@ -124,13 +126,25 @@ public static class Program
         if (keyInstance.IsCurrent)
         {
             keyInstance.Activated += OnActivated;
-            return false;
+            return RedirectionDecision.Primary;
         }
 
         // 已有主实例：把本次请求的 page 交给主实例（handoff 文件，不依赖激活参数携带命令行）。
         App.WritePendingPage(GetPageArg(Environment.GetCommandLineArgs()));
-        RedirectActivationTo(activation, keyInstance);
-        return true;
+        if (RedirectActivationTo(activation, keyInstance))
+        {
+            return RedirectionDecision.Redirected;
+        }
+
+        // The old primary may have exited while redirection was in flight. Try
+        // once to take ownership; otherwise exit with a visible failure code.
+        AppInstance retry = AppInstance.FindOrRegisterForKey(SingleInstanceKey);
+        if (retry.IsCurrent)
+        {
+            retry.Activated += OnActivated;
+            return RedirectionDecision.Primary;
+        }
+        return RedirectionDecision.Failed;
     }
 
     private static string BuildKeySegment()
@@ -173,25 +187,52 @@ public static class Program
         argv.Any(a => string.Equals(a, flag, StringComparison.OrdinalIgnoreCase));
 
     // ── 重定向需在 STA Main 内同步等待 async 完成（官方模式：事件 + CoWaitForMultipleObjects 泵消息）──
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string? lpName);
-
-    [DllImport("kernel32.dll")]
-    private static extern bool SetEvent(IntPtr hEvent);
-
     [DllImport("ole32.dll")]
     private static extern uint CoWaitForMultipleObjects(uint dwFlags, uint dwMilliseconds, ulong nHandles, IntPtr[] pHandles, out uint dwIndex);
 
-    private static void RedirectActivationTo(AppActivationArguments args, AppInstance keyInstance)
+    private static bool RedirectActivationTo(AppActivationArguments args, AppInstance keyInstance)
     {
-        IntPtr eventHandle = CreateEvent(IntPtr.Zero, true, false, null);
-        Task.Run(() =>
+        try
         {
-            keyInstance.RedirectActivationToAsync(args).AsTask().Wait();
-            SetEvent(eventHandle);
-        });
-        const uint CWMO_DEFAULT = 0;
-        const uint INFINITE = 0xFFFFFFFF;
-        _ = CoWaitForMultipleObjects(CWMO_DEFAULT, INFINITE, 1, new[] { eventHandle }, out _);
+            using var completed = new EventWaitHandle(false, EventResetMode.ManualReset);
+            if (completed.SafeWaitHandle.IsInvalid)
+            {
+                FamoLog.Append("single-instance redirect event creation failed");
+                return false;
+            }
+
+            int result = 0;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await keyInstance.RedirectActivationToAsync(args).AsTask();
+                    Volatile.Write(ref result, 1);
+                }
+                catch (Exception ex)
+                {
+                    FamoLog.Append($"single-instance redirect failed: {ex.Message}");
+                    Volatile.Write(ref result, -1);
+                }
+                finally
+                {
+                    try { completed.Set(); }
+                    catch (ObjectDisposedException) { }
+                }
+            });
+
+            const uint CWMO_DEFAULT = 0;
+            uint wait = CoWaitForMultipleObjects(
+                CWMO_DEFAULT, RedirectTimeoutMilliseconds, 1,
+                new[] { completed.SafeWaitHandle.DangerousGetHandle() }, out _);
+            if (wait == 0 && Volatile.Read(ref result) == 1) return true;
+            if (wait != 0) FamoLog.Append($"single-instance redirect timed out or wait failed: 0x{wait:X8}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            FamoLog.Append($"single-instance redirect setup failed: {ex.Message}");
+            return false;
+        }
     }
 }
