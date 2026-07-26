@@ -20,6 +20,7 @@ public sealed class AiSelectionPolishWindow : Window
     private readonly SelectedTextCaptureService _captureService;
     private readonly AiSelectionSkillDefinition _skill;
     private readonly ITextInsertionService? _replacement;
+    private readonly WindowsForegroundWindowTarget? _focusTarget;
 
     private TextBlock _status = null!;
     private TextBox _selection = null!;
@@ -33,21 +34,23 @@ public sealed class AiSelectionPolishWindow : Window
     public AiSelectionSkillDefinition Skill => _skill;
 
     public AiSelectionPolishWindow()
-        : this(AiSelectionSkills.Polish)
+        : this(AiSelectionSkills.Polish, null, WindowsForegroundWindowTarget.CaptureForeground())
     {
     }
 
     public AiSelectionPolishWindow(AiSelectionSkillDefinition skill)
-        : this(skill, null)
+        : this(skill, null, WindowsForegroundWindowTarget.CaptureForeground())
     {
     }
 
     public AiSelectionPolishWindow(
         AiSelectionSkillDefinition skill,
-        ITextInsertionService? replacement)
+        ITextInsertionService? replacement,
+        WindowsForegroundWindowTarget? focusTarget)
     {
         _skill = skill;
         _replacement = replacement;
+        _focusTarget = focusTarget;
         Title = skill.Title;
         _captureService = new SelectedTextCaptureService(
             new WindowsFocusedTextSelectionReader(),
@@ -55,6 +58,7 @@ public sealed class AiSelectionPolishWindow : Window
                 new WindowsClipboardTextChannel(),
                 new Win32CopyShortcutSender()));
         BuildContent();
+        Closed += (_, _) => _focusTarget?.TryRestore();
     }
 
     public void LoadCapturedSelection(string selectedText)

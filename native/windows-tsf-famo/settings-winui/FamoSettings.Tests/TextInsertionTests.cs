@@ -1,4 +1,5 @@
 using Famo.Settings.Core.Insertion;
+using System.Runtime.InteropServices;
 using Xunit;
 
 namespace Famo.Settings.Tests;
@@ -78,6 +79,22 @@ public sealed class TextInsertionTests
         Assert.Null(inner.InsertedText);
     }
 
+    [Fact]
+    public void ForegroundWindowTarget_RejectsAClosedRealWindow()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        nint window = CreateWindowExW(0, "STATIC", "Famo focus target test", 0,
+            0, 0, 100, 100, 0, 0, 0, 0);
+        Assert.NotEqual(0, window);
+        WindowsForegroundWindowTarget? target = WindowsForegroundWindowTarget.Capture(window);
+        Assert.NotNull(target);
+        Assert.True(target.IsStillValid());
+
+        Assert.True(DestroyWindow(window));
+        Assert.False(target.IsStillValid());
+        Assert.False(target.TryRestore());
+    }
+
     private sealed class FakeClipboard : IClipboardTextBridge
     {
         private readonly ClipboardTextSnapshot _snapshot;
@@ -135,4 +152,10 @@ public sealed class TextInsertionTests
             return Task.FromResult(TextInsertionResult.Ok());
         }
     }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern nint CreateWindowExW(
+        uint extendedStyle, string className, string windowName, uint style,
+        int x, int y, int width, int height, nint parent, nint menu, nint instance, nint parameter);
+    [DllImport("user32.dll")] private static extern bool DestroyWindow(nint hWnd);
 }

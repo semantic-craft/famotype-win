@@ -15,6 +15,7 @@ public sealed class AiConversationWindow : Window
     private readonly ISecretStore _secretStore = new WindowsCredentialSecretStore();
     private readonly string? _selectedText;
     private readonly ITextInsertionService? _replacement;
+    private readonly WindowsForegroundWindowTarget? _focusTarget;
     /// <summary>已完成的问答轮，按序喂回后续请求（真·多轮）；client 侧自会截到历史上限。</summary>
     private readonly List<AiChatTurn> _turns = new();
 
@@ -23,10 +24,14 @@ public sealed class AiConversationWindow : Window
     private TextBlock _status = null!;
     private Button _send = null!;
 
-    public AiConversationWindow(string? selectedText = null, ITextInsertionService? replacement = null)
+    public AiConversationWindow(
+        string? selectedText = null,
+        ITextInsertionService? replacement = null,
+        WindowsForegroundWindowTarget? focusTarget = null)
     {
         _selectedText = selectedText;
         _replacement = replacement;
+        _focusTarget = focusTarget ?? WindowsForegroundWindowTarget.CaptureForeground();
         Title = selectedText is null ? "任意提问" : "划词工具箱";
         BuildContent();
         Activated += (_, _) =>
@@ -34,6 +39,7 @@ public sealed class AiConversationWindow : Window
             if (_prompt.IsEnabled)
                 _prompt.DispatcherQueue.TryEnqueue(() => _prompt.Focus(FocusState.Programmatic));
         };
+        Closed += (_, _) => _focusTarget?.TryRestore();
     }
 
     private void BuildContent()
@@ -132,8 +138,8 @@ public sealed class AiConversationWindow : Window
                     await RunToolboxSkillAsync(skill, button);
                     return;
                 }
-                App.ShowAiSelectionSkill(skill, _selectedText!, _replacement);
                 Close();
+                App.ShowAiSelectionSkill(skill, _selectedText!, _replacement, _focusTarget);
             };
             Grid.SetRow(button, row);
             Grid.SetColumn(button, index % 3);
