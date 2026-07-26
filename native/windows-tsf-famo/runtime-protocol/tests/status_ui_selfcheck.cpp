@@ -227,6 +227,37 @@ bool SetOptionReportsHonestly() {
   return true;
 }
 
+// Opening and focusing a context must publish the engine's option state before
+// the first key. Otherwise the empty OpenSession snapshot renders simplified as
+// traditional until ProcessKey finally refreshes it.
+bool OpenSessionPublishesStatusBeforeFirstKey() {
+  _putenv_s("FAMO_TEST_SIMPLIFIED", "1");
+  RuntimeService service;
+  std::atomic<bool> running{true};
+  StatusUi ui(&service, &running);
+  service.SetSnapshotSink(&ui);
+  CHECK(ui.Start());
+
+  ui.Publish(Snapshot(true, 0));
+  CHECK(ui.status_flags() == 0);
+  CHECK(OpenSessionOn(&service));
+
+  Frame update;
+  update.command = Command::UpdateUiState;
+  update.correlation = {11, 12, 13, 14, 15, 2};
+  UiState focused;
+  focused.focused = true;
+  std::string error;
+  CHECK(EncodeUiState(focused, &update.payload, &error));
+  CHECK(service.Dispatch(update).status == Status::Ok);
+  CHECK(ui.status_flags() == FAMO_STATUS_SIMPLIFIED);
+
+  service.Stop();
+  ui.Stop();
+  _putenv_s("FAMO_TEST_SIMPLIFIED", "");
+  return true;
+}
+
 // The bar sits over whatever the user is typing into. Losing any one of these
 // styles turns it from an overlay into a window that steals the caret.
 bool BarNeverStealsFocus() {
@@ -833,6 +864,7 @@ int main() {
   if (!TrayPathMatchesTheShellsStoredForm() ||
       !TrayReregistersAfterTaskbarCreated() ||
       !DefocusedSnapshotsDoNotMoveTheIcon() || !SetOptionReportsHonestly() ||
+      !OpenSessionPublishesStatusBeforeFirstKey() ||
       !BarNeverStealsFocus() || !BarHitTestMapsToOptions() ||
       !BarPositionPersistsAndClamps() || !BarDrawnStateFollowsStatusFlags() ||
       !BarPaintProducesVisiblePixels() || !DumpBarFrame())

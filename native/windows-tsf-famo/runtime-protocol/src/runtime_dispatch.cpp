@@ -92,14 +92,22 @@ Frame RuntimeService::DispatchLocked(const Frame &request) {
         engine_.api().destroy_context(context);
       return Reply(request, Status::EngineError);
     }
+    Composition composition;
+    if (!ReadStatusLocked(context, &composition)) {
+      engine_.api().destroy_context(context);
+      return Reply(request, Status::EngineError);
+    }
     auto ui = std::make_shared<UiSessionState>();
     auto snapshot = std::make_shared<RuntimeSnapshot>();
     snapshot->correlation = c;
+    snapshot->composition = composition;
+    snapshot->composition_sequence = c.sequence;
     snapshot->style = style_state_;
     snapshot->revision = snapshot_revision_.fetch_add(1) + 1;
     ui->latest.store(std::move(snapshot));
-    sessions_.emplace(key,
-                      Session{context, c.sequence, c, Composition{}, 0, ui});
+    sessions_.emplace(
+        key, Session{context, c.sequence, c, std::move(composition), c.sequence,
+                     ui});
     {
       std::lock_guard ui_lock(ui_sessions_mutex_);
       ui_sessions_[key] = std::move(ui);
