@@ -212,8 +212,12 @@ int main() {
         all_host_flags);
   Frame clear_after_option_failure = Request(Command::ClearComposition, 3);
   CHECK(service.Dispatch(clear_after_option_failure).status == Status::Ok);
+  _putenv_s("FAMO_TEST_SIMPLIFIED", "1");
   CHECK(service.ExecuteControl(Command::ControlReloadOptions) ==
         ControlError::None);
+  CHECK(sink.latest &&
+        (sink.latest->composition.status_flags & FAMO_STATUS_SIMPLIFIED) != 0);
+  _putenv_s("FAMO_TEST_SIMPLIFIED", "");
 
   std::atomic<bool> runtime_running{true};
   RuntimeControlService control(&service, &runtime_running);
