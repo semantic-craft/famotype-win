@@ -308,7 +308,8 @@ int32_t SystemCaretWidth() {
 
 } // namespace
 
-bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
+bool ParseCandidateSkinForTheme(std::string_view text, bool dark,
+                                FamoSkin *skin) {
   if (!skin)
     return false;
   *skin = FamoSkinDefault();
@@ -317,7 +318,6 @@ bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
   std::string line;
   bool saw_style = false;
   std::set<std::string> seen;
-  const bool dark = UseDarkPalette();
   while (std::getline(input, line)) {
     if (!line.empty() && line.back() == '\r')
       line.pop_back();
@@ -344,6 +344,12 @@ bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
     skin->min_width = (std::max)(64, static_cast<int>(skin->text_font.point_size * 4.0f + 0.5f));
   }
   return input.eof() && saw_style;
+}
+
+bool SystemUsesDarkPalette() { return UseDarkPalette(); }
+
+bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
+  return ParseCandidateSkinForTheme(text, SystemUsesDarkPalette(), skin);
 }
 
 bool LoadCandidateSkin(std::string_view data_root, FamoSkin *skin) {

@@ -359,10 +359,13 @@ bool CandidateWindow::PrepareStyle(
   try {
     if (!presentation)
       return false;
-    FamoSkin skin = FamoSkinDefault();
-    if (exists && !ParseCandidateSkin(text, &skin))
+    CandidateStylePresentation style{FamoSkinDefault(), FamoSkinDefault()};
+    if (exists &&
+        (!ParseCandidateSkinForTheme(text, false, &style.light) ||
+         !ParseCandidateSkinForTheme(text, true, &style.dark)))
       return false;
-    *presentation = std::make_shared<const FamoSkin>(skin);
+    *presentation =
+        std::make_shared<const CandidateStylePresentation>(std::move(style));
     return true;
   } catch (...) {
     return false;
@@ -463,7 +466,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   DibSurface surface;
   const FamoSkin fallback_skin = FamoSkinDefault();
   std::shared_ptr<const void> active_presentation;
-  std::shared_ptr<const FamoSkin> active_skin;
+  std::shared_ptr<const CandidateStylePresentation> active_style;
   FamoTextResources *resources = nullptr;
   uint32_t resource_dpi = 0;
   bool resource_skin_dirty = true;
@@ -505,14 +508,19 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       next_presentation = state->presentation.load(std::memory_order_acquire);
     if (next_presentation != active_presentation) {
       active_presentation = std::move(next_presentation);
-      active_skin =
+      active_style =
           active_presentation
-              ? std::static_pointer_cast<const FamoSkin>(active_presentation)
+              ? std::static_pointer_cast<const CandidateStylePresentation>(
+                    active_presentation)
               : nullptr;
       resource_skin_dirty = true;
       resources_warmed = false;
     }
-    const FamoSkin &configured_skin = active_skin ? *active_skin : fallback_skin;
+    const bool system_dark = SystemUsesDarkPalette();
+    const FamoSkin &configured_skin = active_style
+                                          ? (system_dark ? active_style->dark
+                                                         : active_style->light)
+                                          : fallback_skin;
     FamoSkin resolved_skin = configured_skin;
     if (resolved_skin.layout_type == FAMO_LAYOUT_AUTO) {
       const bool vertical = snapshot &&
