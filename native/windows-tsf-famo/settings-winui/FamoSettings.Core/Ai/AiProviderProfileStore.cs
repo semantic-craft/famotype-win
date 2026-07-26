@@ -230,6 +230,7 @@ public sealed class AiProviderProfileService
         var errors = new List<string>();
         if (string.IsNullOrWhiteSpace(draft.DisplayName)) errors.Add("供应商名称不能为空");
         if (!IsAllowedEndpoint(draft.Endpoint)) errors.Add("Endpoint 必须是 HTTPS 地址，或本机 HTTP 地址");
+        if (string.IsNullOrWhiteSpace(draft.Model)) errors.Add("模型 ID 不能为空");
         if (string.IsNullOrWhiteSpace(draft.ApiKey)) errors.Add("API Key 不能为空");
 
         if (errors.Count > 0)

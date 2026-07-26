@@ -42,6 +42,10 @@ internal sealed class AiProviderChatCompletionClient
 
         AiProviderProfile profile = _profiles.DefaultProfile()
             ?? throw new InvalidOperationException("尚未配置 AI 供应商。");
+        if (string.IsNullOrWhiteSpace(profile.Model))
+        {
+            throw new InvalidOperationException("默认 AI 供应商缺少模型 ID，请先在设置中补全。");
+        }
         string apiKey = _secrets.GetSecret(profile.SecretName)
             ?? throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
         Uri endpoint = ParseEndpoint(profile.Endpoint);
@@ -74,6 +78,10 @@ internal sealed class AiProviderChatCompletionClient
 
         AiProviderProfile profile = _profiles.DefaultProfile()
             ?? throw new InvalidOperationException("尚未配置 AI 供应商。");
+        if (string.IsNullOrWhiteSpace(profile.Model))
+        {
+            throw new InvalidOperationException("默认 AI 供应商缺少模型 ID，请先在设置中补全。");
+        }
         string provider = InferProvider(profile);
         if (provider is not ("qwen" or "mimo" or "doubao" or "openai"))
         {
