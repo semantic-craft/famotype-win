@@ -108,16 +108,22 @@ public partial class App : Application
             FamoLog.Append("AI conversation dropped: Ask Anything skill disabled");
             return;
         }
-        ShowAiConversation(selectedText: null, replacement: null);
+        ShowAiConversation(
+            selectedText: null,
+            replacement: null,
+            WindowsForegroundWindowTarget.CaptureForeground());
     }
 
-    private static void ShowAiConversation(string? selectedText, ITextInsertionService? replacement)
+    private static void ShowAiConversation(
+        string? selectedText,
+        ITextInsertionService? replacement,
+        WindowsForegroundWindowTarget? focusTarget)
     {
         ApplyTheme();
         if (_aiConversationWindow is null || selectedText is not null)
         {
             _aiConversationWindow?.Close();
-            var window = new AiConversationWindow(selectedText, replacement);
+            var window = new AiConversationWindow(selectedText, replacement, focusTarget);
             _aiConversationWindow = window;
             window.Closed += (_, _) =>
             {
@@ -135,7 +141,8 @@ public partial class App : Application
 
     private static async Task ShowAiConversationForSelectionAsync()
     {
-        nint targetWindow = SendInputPasteCommandSender.CaptureForegroundWindow();
+        WindowsForegroundWindowTarget? focusTarget = WindowsForegroundWindowTarget.CaptureForeground();
+        nint targetWindow = focusTarget?.Handle ?? 0;
         (SelectedTextCaptureResult result, WindowsUiAutomationSelectionAnchor? anchor) =
             await CaptureSelectionForReplacementAsync();
         string? rejection = AiSelectionToolboxEligibility.RejectionReason(Settings, result);
@@ -147,7 +154,7 @@ public partial class App : Application
         ITextInsertionService? replacement = anchor is not null
             ? TextInsertionServices.VerifiedClipboardPasteForTarget(targetWindow, anchor)
             : null;
-        ShowAiConversation(result.Text!, replacement);
+        ShowAiConversation(result.Text!, replacement, focusTarget);
     }
 
     /// <summary>显示提示词选择器。创建窗口前捕获当前前台窗口作为粘贴目标。</summary>
@@ -230,28 +237,30 @@ public partial class App : Application
     public static void ShowAiSelectionSkill(
         AiSelectionSkillDefinition skill,
         string selectedText,
-        ITextInsertionService? replacement)
+        ITextInsertionService? replacement,
+        WindowsForegroundWindowTarget? focusTarget)
     {
-        _ = ShowCapturedAiSelectionSkillAsync(skill, selectedText, replacement);
+        _ = ShowCapturedAiSelectionSkillAsync(skill, selectedText, replacement, focusTarget);
     }
 
     private static async Task ShowAiSelectionSkillAsync(AiSelectionSkillDefinition skill)
     {
+        WindowsForegroundWindowTarget? focusTarget = WindowsForegroundWindowTarget.CaptureForeground();
         ApplyTheme();
         if (!AiSelectionSkills.IsEnabled(Settings, skill.Id))
         {
-            AiSelectionPolishWindow disabledWindow = CreateAiSelectionSkillWindow(skill, null);
+            AiSelectionPolishWindow disabledWindow = CreateAiSelectionSkillWindow(skill, null, focusTarget);
             await disabledWindow.CaptureSelectionBeforeActivationAsync();
             disabledWindow.Activate();
             return;
         }
-        nint targetWindow = SendInputPasteCommandSender.CaptureForegroundWindow();
+        nint targetWindow = focusTarget?.Handle ?? 0;
         (SelectedTextCaptureResult result, WindowsUiAutomationSelectionAnchor? anchor) =
             await CaptureSelectionForReplacementAsync();
         ITextInsertionService? replacement = anchor is not null
             ? TextInsertionServices.VerifiedClipboardPasteForTarget(targetWindow, anchor)
             : null;
-        AiSelectionPolishWindow window = CreateAiSelectionSkillWindow(skill, replacement);
+        AiSelectionPolishWindow window = CreateAiSelectionSkillWindow(skill, replacement, focusTarget);
         window.LoadCapturedSelection(result);
         window.Activate();
         await window.RunSkillAsync();
@@ -260,10 +269,11 @@ public partial class App : Application
     private static async Task ShowCapturedAiSelectionSkillAsync(
         AiSelectionSkillDefinition skill,
         string selectedText,
-        ITextInsertionService? replacement)
+        ITextInsertionService? replacement,
+        WindowsForegroundWindowTarget? focusTarget)
     {
         ApplyTheme();
-        AiSelectionPolishWindow window = CreateAiSelectionSkillWindow(skill, replacement);
+        AiSelectionPolishWindow window = CreateAiSelectionSkillWindow(skill, replacement, focusTarget);
         window.LoadCapturedSelection(selectedText);
         window.Activate();
         await window.RunSkillAsync();
@@ -271,10 +281,11 @@ public partial class App : Application
 
     private static AiSelectionPolishWindow CreateAiSelectionSkillWindow(
         AiSelectionSkillDefinition skill,
-        ITextInsertionService? replacement)
+        ITextInsertionService? replacement,
+        WindowsForegroundWindowTarget? focusTarget)
     {
         _aiSelectionSkillWindow?.Close();
-        var window = new AiSelectionPolishWindow(skill, replacement);
+        var window = new AiSelectionPolishWindow(skill, replacement, focusTarget);
         _aiSelectionSkillWindow = window;
         window.Closed += (_, _) =>
         {
