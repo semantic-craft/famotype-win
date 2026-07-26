@@ -10,11 +10,12 @@ public sealed class ReleaseIdentityGuardContractTests
         string guard = File.ReadAllText(RepoFile("native/windows-tsf-famo/tools/identity_guard/check_release_identity.ps1"));
 
         Assert.Contains("Test-AllowedRuntimeCompatibilityPath", guard);
-        Assert.Contains(@"^(data/)?weasel(\.custom)?\.yaml$", guard);
+        Assert.Contains(@"^(?:(?:payload/)?data/)?weasel(\.custom)?\.yaml$", guard);
         Assert.Contains("-not $allowRuntimeCompatibilityPath -and $relative -match", guard);
         Assert.Contains("Test-SkipIdentityContentPath", guard);
         Assert.Contains(@"\.dict\.yaml$", guard);
-        Assert.Contains("^(data/)?(cn_dicts|en_dicts|opencc)/", guard);
+        Assert.Contains("^(?:(?:payload/)?data/)?(cn_dicts|en_dicts|opencc)/", guard);
+        Assert.Contains("^(payload/)?payload-manifest\\.txt$", guard);
     }
 
     [Fact]

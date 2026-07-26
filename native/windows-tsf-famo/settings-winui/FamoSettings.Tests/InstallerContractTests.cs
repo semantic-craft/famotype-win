@@ -209,6 +209,7 @@ public sealed class InstallerContractTests
 
         Assert.Contains("RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str())", registerBody);
         Assert.Contains("ERROR_FILE_NOT_FOUND", registerBody);
+        Assert.Contains("RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str())", registerBody);
     }
 
     [Fact]
@@ -221,6 +222,8 @@ public sealed class InstallerContractTests
 
         Assert.Contains("PreviousHost := '';", body);
         Assert.Contains("RegQueryStringValue(HKLM64", body);
+        Assert.Contains("(PreviousTarget <> '') and (PreviousManifest <> '')", body);
+        Assert.Contains("PreviousHost := AddBackslash(PreviousTarget) + 'FamoTextService.dll';", body);
         Assert.DoesNotContain("RegQueryStringValue(HKCU,\n      'Software\\Classes\\CLSID\\'", body);
     }
 

@@ -366,27 +366,34 @@ extern "C" FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL
 FamoCreateEngineApi(uint32_t requested_abi_version, FamoEngineApi* out_api) {
   if (requested_abi_version != FAMO_ENGINE_ABI_VERSION)
     return FAMO_ENGINE_E_UNSUPPORTED_ABI;
-  if (!out_api || out_api->size < static_cast<uint32_t>(sizeof(FamoEngineApi)))
+  if (!out_api)
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  const uint32_t caller_size = out_api->size;
+  if (caller_size < static_cast<uint32_t>(offsetof(FamoEngineApi, get_status)))
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
 
-  out_api->abi_version = FAMO_ENGINE_ABI_VERSION;
-  out_api->size = static_cast<uint32_t>(sizeof(FamoEngineApi));
-  out_api->get_info = &TeGetInfo;
-  out_api->initialize = &TeInitialize;
-  out_api->shutdown = &TeShutdown;
-  out_api->create_context = &TeCreateContext;
-  out_api->destroy_context = &TeDestroyContext;
-  out_api->process_key = &TeProcessKey;
-  out_api->select_candidate = &TeSelectCandidate;
-  out_api->set_option = &TeSetOption;
-  out_api->deploy_schema = &TeDeploySchema;
-  out_api->free_view = &TeFreeView;
-  out_api->get_status = &TeGetStatus;
-  out_api->get_option = &TeGetOption;
-  out_api->commit_composition = &TeCommitComposition;
-  out_api->clear_composition = &TeClearComposition;
-  out_api->highlight_candidate = &TeHighlightCandidate;
-  out_api->change_page = &TeChangePage;
-  out_api->peek_candidates = &TePeekCandidates;
+  FamoEngineApi api{};
+  api.size = caller_size < static_cast<uint32_t>(sizeof(api))
+                 ? caller_size
+                 : static_cast<uint32_t>(sizeof(api));
+  api.abi_version = FAMO_ENGINE_ABI_VERSION;
+  api.get_info = &TeGetInfo;
+  api.initialize = &TeInitialize;
+  api.shutdown = &TeShutdown;
+  api.create_context = &TeCreateContext;
+  api.destroy_context = &TeDestroyContext;
+  api.process_key = &TeProcessKey;
+  api.select_candidate = &TeSelectCandidate;
+  api.set_option = &TeSetOption;
+  api.deploy_schema = &TeDeploySchema;
+  api.free_view = &TeFreeView;
+  api.get_status = &TeGetStatus;
+  api.get_option = &TeGetOption;
+  api.commit_composition = &TeCommitComposition;
+  api.clear_composition = &TeClearComposition;
+  api.highlight_candidate = &TeHighlightCandidate;
+  api.change_page = &TeChangePage;
+  api.peek_candidates = &TePeekCandidates;
+  std::memcpy(out_api, &api, api.size);
   return FAMO_ENGINE_OK;
 }
