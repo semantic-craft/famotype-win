@@ -220,6 +220,9 @@ int wmain(int argc, wchar_t **argv) {
   // it; typing keeps working, the menu is simply unreachable.
   if (!status_ui.Start())
     std::fprintf(stderr, "tray icon setup failed\n");
+  else if (!status_ui.keyboard_hook_ready())
+    std::fprintf(stderr, "global shortcut hook degraded: error=%lu\n",
+                 status_ui.keyboard_hook_error());
 
   std::vector<std::thread> servers;
   PipeServerStop key_server_stop;

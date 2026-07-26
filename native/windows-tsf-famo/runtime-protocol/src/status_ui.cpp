@@ -46,6 +46,9 @@ constexpr UINT_PTR kPromoteTimer = 1;
 // seen the first look always misses. Retry across ~5s, then stop scanning.
 constexpr UINT kPromoteInterval = 500;
 constexpr int kPromoteAttempts = 10;
+constexpr UINT_PTR kKeyboardHookTimer = 2;
+constexpr UINT kKeyboardHookInterval = 500;
+constexpr int kKeyboardHookAttempts = 3;
 
 // Bar metrics in logical px @96dpi. The bar is a segmented control: the window
 // is the trough and the segments tile it, inset all round, sharing edges.
@@ -554,6 +557,8 @@ struct StatusUi::State {
   std::mutex publish_mutex;
   std::atomic<HWND> window{nullptr};
   std::atomic<bool> ready{false};
+  std::atomic<bool> keyboard_hook_ready{false};
+  std::atomic<uint32_t> keyboard_hook_error{ERROR_SUCCESS};
   std::atomic<uint64_t> icon_registrations{0};
   std::atomic<std::shared_ptr<const void>> presentation;
   std::atomic<std::shared_ptr<const SchemaState>> schema;
@@ -566,6 +571,8 @@ struct StatusUi::State {
   int promote_attempts = 0;
   std::future<void> deploy;
   HHOOK keyboard_hook = nullptr;
+  int keyboard_hook_attempts = 0;
+  int injected_keyboard_hook_failures = 0;
   HHOOK mouse_hook = nullptr;
   AltDoubleTapDetector alt_double_tap;
   GlobalHotKeyBinding quick_phrase_hotkey;
@@ -741,12 +748,46 @@ void AddOrUpdateIcon(StatusUi::State *state, HWND window, bool add) {
   data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   data.uCallbackMessage = kTrayCallback;
   data.hIcon = IconFor(state, state->status_flags.load());
-  wcsncpy_s(data.szTip, kTip, _TRUNCATE);
+  if (state->keyboard_hook_ready.load() ||
+      state->keyboard_hook_error.load() == ERROR_SUCCESS) {
+    wcsncpy_s(data.szTip, kTip, _TRUNCATE);
+  } else {
+    swprintf_s(data.szTip, L"法墨 - 全局快捷键不可用 (错误 %lu)",
+               state->keyboard_hook_error.load());
+  }
   if (!Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data))
     return;
   state->icon_added = true;
   if (add)
     state->icon_registrations.fetch_add(1);
+}
+
+bool InstallKeyboardHook(StatusUi::State *state, HWND window) {
+  if (state->keyboard_hook)
+    return true;
+  if (state->injected_keyboard_hook_failures > 0) {
+    --state->injected_keyboard_hook_failures;
+    SetLastError(ERROR_ACCESS_DENIED);
+  } else {
+    state->keyboard_hook = SetWindowsHookExW(
+        WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0);
+  }
+  const DWORD error = state->keyboard_hook ? ERROR_SUCCESS : GetLastError();
+  state->keyboard_hook_ready.store(state->keyboard_hook != nullptr);
+  state->keyboard_hook_error.store(error);
+  AddOrUpdateIcon(state, window, !state->icon_added);
+  return state->keyboard_hook != nullptr;
+}
+
+void StartKeyboardHookRecovery(StatusUi::State *state, HWND window) {
+  if (state->keyboard_hook)
+    return;
+  state->keyboard_hook_attempts = 0;
+  if (InstallKeyboardHook(state, window)) {
+    KillTimer(window, kKeyboardHookTimer);
+    return;
+  }
+  SetTimer(window, kKeyboardHookTimer, kKeyboardHookInterval, nullptr);
 }
 
 // NIM_ADD on a live id fails, so a genuine re-registration has to delete first.
@@ -1302,6 +1343,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     // The broadcast can arrive while our icon is still registered, and NIM_ADD
     // on a live id fails -- which would strand the icon at its last glyph.
     ReAddIcon(state, window);
+    StartKeyboardHookRecovery(state, window);
     return 0;
   }
   switch (message) {
@@ -1309,7 +1351,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
   case WM_THEMECHANGED:
     PaintBar(state);
     return 0;
+  case WM_POWERBROADCAST:
+    if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND)
+      StartKeyboardHookRecovery(state, window);
+    return TRUE;
   case WM_TIMER: {
+    if (wparam == kKeyboardHookTimer) {
+      if (InstallKeyboardHook(state, window) ||
+          ++state->keyboard_hook_attempts >= kKeyboardHookAttempts)
+        KillTimer(window, kKeyboardHookTimer);
+      return 0;
+    }
     if (wparam != kPromoteTimer)
       break;
     const Promote promote = PromoteTrayIcon();
@@ -1330,6 +1382,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     return 0;
   case kStyleChanged:
     RefreshHotKeys(state);
+    StartKeyboardHookRecovery(state, window);
     PaintBar(state);
     return 0;
   case kSummonToolboxGesture:
@@ -1362,6 +1415,14 @@ StatusUi::StatusUi(RuntimeService *service, std::atomic<bool> *running,
   // still finds the profile's build\ output.
   state_->data_root =
       data_root.empty() ? LocalFamoDirectory() : std::move(data_root);
+  char *failures = nullptr;
+  size_t failures_size = 0;
+  if (_dupenv_s(&failures, &failures_size,
+                "FAMO_TEST_KEYBOARD_HOOK_FAILURES") == 0 &&
+      failures)
+    state_->injected_keyboard_hook_failures =
+        std::clamp(std::atoi(failures), 0, kKeyboardHookAttempts);
+  std::free(failures);
 }
 
 StatusUi::~StatusUi() { Stop(); }
@@ -1408,8 +1469,7 @@ void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
   state->window.store(window);
   RefreshHotKeys(state.get());
   g_hook_state = state.get();
-  state->keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook,
-                                           GetModuleHandleW(nullptr), 0);
+  StartKeyboardHookRecovery(state.get(), window);
   state->mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook,
                                         GetModuleHandleW(nullptr), 0);
   state->ready.store(true);
@@ -1470,6 +1530,14 @@ uint64_t StatusUi::icon_registrations() const noexcept {
 
 uint32_t StatusUi::status_flags() const noexcept {
   return state_->status_flags.load();
+}
+
+bool StatusUi::keyboard_hook_ready() const noexcept {
+  return state_->keyboard_hook_ready.load();
+}
+
+uint32_t StatusUi::keyboard_hook_error() const noexcept {
+  return state_->keyboard_hook_error.load();
 }
 
 void StatusUi::Publish(

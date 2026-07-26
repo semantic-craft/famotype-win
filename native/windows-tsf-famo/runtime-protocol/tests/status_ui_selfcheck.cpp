@@ -151,6 +151,23 @@ bool TrayReregistersAfterTaskbarCreated() {
   return true;
 }
 
+bool KeyboardHookFailureIsVisibleAndRecovers() {
+  _putenv_s("FAMO_TEST_KEYBOARD_HOOK_FAILURES", "2");
+  RuntimeService service;
+  std::atomic<bool> running{true};
+  StatusUi ui(&service, &running);
+  CHECK(ui.Start());
+  CHECK(!ui.keyboard_hook_ready());
+  CHECK(ui.keyboard_hook_error() == ERROR_ACCESS_DENIED);
+  for (int attempt = 0; attempt < 300 && !ui.keyboard_hook_ready(); ++attempt)
+    Sleep(10);
+  CHECK(ui.keyboard_hook_ready());
+  CHECK(ui.keyboard_hook_error() == ERROR_SUCCESS);
+  ui.Stop();
+  _putenv_s("FAMO_TEST_KEYBOARD_HOOK_FAILURES", "");
+  return true;
+}
+
 // A defocused publish clears the whole composition, status_flags included.
 // Treating that as "mode is now Chinese" would flip the icon on every focus
 // change, so unfocused snapshots must not move it.
@@ -863,6 +880,7 @@ int main() {
     return 1;
   if (!TrayPathMatchesTheShellsStoredForm() ||
       !TrayReregistersAfterTaskbarCreated() ||
+      !KeyboardHookFailureIsVisibleAndRecovers() ||
       !DefocusedSnapshotsDoNotMoveTheIcon() || !SetOptionReportsHonestly() ||
       !OpenSessionPublishesStatusBeforeFirstKey() ||
       !BarNeverStealsFocus() || !BarHitTestMapsToOptions() ||
