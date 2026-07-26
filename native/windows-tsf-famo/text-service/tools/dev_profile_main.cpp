@@ -9,6 +9,11 @@
 
 namespace {
 
+bool ProfileActive();
+bool ProfileRegistered();
+HRESULT SetProfileEnabled(BOOL enabled);
+HRESULT SwitchAwayFromProfile();
+
 std::wstring ModuleDirectory() {
   std::wstring path(32768, L'\0');
   const DWORD length = GetModuleFileNameW(
@@ -46,14 +51,11 @@ HRESULT EnablePrivilege(const wchar_t *name) {
                                            : error);
 }
 
-HRESULT StartRuntimeAsDesktopUser() {
+HRESULT RunAsDesktopUser(const std::wstring &executable,
+                         const std::wstring &arguments, bool wait) {
   const HRESULT privilege = EnablePrivilege(L"SeImpersonatePrivilege");
   if (FAILED(privilege))
     return privilege;
-  const std::wstring directory = ModuleDirectory();
-  if (directory.empty())
-    return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
-  const std::wstring runtime = directory + L"\\FamoRuntime.exe";
 
   const HWND shell = GetShellWindow();
   if (!shell)
@@ -88,12 +90,25 @@ HRESULT StartRuntimeAsDesktopUser() {
   startup.dwFlags = STARTF_USESHOWWINDOW;
   startup.wShowWindow = SW_HIDE;
   PROCESS_INFORMATION process{};
-  std::wstring command_line = L"\"" + runtime + L"\"";
+  std::wstring command_line = L"\"" + executable + L"\"";
+  if (!arguments.empty())
+    command_line += L" " + arguments;
   const BOOL created = CreateProcessWithTokenW(
-      primary_token, 0, runtime.c_str(), command_line.data(), 0,
-      nullptr, directory.c_str(), &startup, &process);
-  const DWORD error = created ? ERROR_SUCCESS : GetLastError();
+      primary_token, LOGON_WITH_PROFILE, executable.c_str(),
+      command_line.data(), 0, nullptr, ModuleDirectory().c_str(), &startup,
+      &process);
+  DWORD error = created ? ERROR_SUCCESS : GetLastError();
   if (created) {
+    if (wait) {
+      const DWORD waited = WaitForSingleObject(process.hProcess, INFINITE);
+      DWORD exit_code = 1;
+      if (waited != WAIT_OBJECT_0)
+        error = GetLastError();
+      else if (!GetExitCodeProcess(process.hProcess, &exit_code))
+        error = GetLastError();
+      else if (exit_code != 0)
+        error = ERROR_PROCESS_ABORTED;
+    }
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
   }
@@ -101,6 +116,64 @@ HRESULT StartRuntimeAsDesktopUser() {
   CloseHandle(shell_token);
   CloseHandle(shell_process);
   return HRESULT_FROM_WIN32(error);
+}
+
+HRESULT StartRuntimeAsDesktopUser() {
+  const std::wstring directory = ModuleDirectory();
+  if (directory.empty())
+    return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+  return RunAsDesktopUser(directory + L"\\FamoRuntime.exe", L"", false);
+}
+
+std::wstring TextServiceGuidText() {
+  wchar_t guid[40]{};
+  StringFromGUID2(famo::tsf::kTextServiceClsid, guid, ARRAYSIZE(guid));
+  return guid;
+}
+
+bool UserKeyPresent(const std::wstring &path) {
+  HKEY key = nullptr;
+  const LSTATUS opened =
+      RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_READ, &key);
+  if (opened == ERROR_SUCCESS)
+    RegCloseKey(key);
+  return opened == ERROR_SUCCESS;
+}
+
+HRESULT CleanupCurrentUserProfileState() {
+  HRESULT result = SwitchAwayFromProfile();
+  if (SUCCEEDED(result) && ProfileRegistered())
+    result = SetProfileEnabled(FALSE);
+
+  const std::wstring guid = TextServiceGuidText();
+  const std::wstring tip = L"Software\\Microsoft\\CTF\\TIP\\" + guid;
+  const std::wstring com = L"Software\\Classes\\CLSID\\" + guid;
+  const LSTATUS tip_removed = RegDeleteTreeW(HKEY_CURRENT_USER, tip.c_str());
+  const LSTATUS com_removed = RegDeleteTreeW(HKEY_CURRENT_USER, com.c_str());
+  if (FAILED(result))
+    return result;
+  if (tip_removed != ERROR_SUCCESS && tip_removed != ERROR_FILE_NOT_FOUND)
+    return HRESULT_FROM_WIN32(tip_removed);
+  if (com_removed != ERROR_SUCCESS && com_removed != ERROR_FILE_NOT_FOUND)
+    return HRESULT_FROM_WIN32(com_removed);
+  return !ProfileActive() && !UserKeyPresent(tip) && !UserKeyPresent(com)
+             ? S_OK
+             : E_FAIL;
+}
+
+HRESULT CleanupDesktopUser() {
+  const std::wstring directory = ModuleDirectory();
+  if (directory.empty())
+    return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+
+  RunAsDesktopUser(directory + L"\\FamoRuntime.exe", L"--control shutdown",
+                   true);
+  HRESULT result = RunAsDesktopUser(
+      directory + L"\\FamoProfileTool.exe", L"cleanup-user-state", true);
+  if (FAILED(result))
+    return result;
+  return RunAsDesktopUser(directory + L"\\settings\\FamoSettings.exe",
+                          L"--remove-input-tip", true);
 }
 
 using RegistrationEntry = HRESULT(STDAPICALLTYPE *)();
@@ -117,23 +190,24 @@ HRESULT InvokeRegistration(const char *export_name) {
   return result;
 }
 
-bool RegistryPresent() {
+bool RegistryPresentAt(HKEY root) {
   wchar_t guid[40]{};
   StringFromGUID2(famo::tsf::kTextServiceClsid, guid, ARRAYSIZE(guid));
   const std::wstring path = std::wstring(L"Software\\Classes\\CLSID\\") +
                             guid + L"\\InprocServer32";
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(root, path.c_str(), 0, KEY_READ, &key) != ERROR_SUCCESS)
+    return false;
+  RegCloseKey(key);
+  return true;
+}
+
+bool RegistryPresent() {
   // COM registration moved to HKLM (system-wide) so the Win11 switcher lists
   // the IME; still accept HKCU so the probe recognises legacy per-user
   // development registrations during upgrades.
-  for (HKEY root : {HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER}) {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(root, path.c_str(), 0, KEY_READ, &key) ==
-        ERROR_SUCCESS) {
-      RegCloseKey(key);
-      return true;
-    }
-  }
-  return false;
+  return RegistryPresentAt(HKEY_LOCAL_MACHINE) ||
+         RegistryPresentAt(HKEY_CURRENT_USER);
 }
 
 bool ProfileEnabled() {
@@ -357,6 +431,17 @@ void WaitForRegistrationVisibility(bool present, bool expected_enabled = true) {
   }
 }
 
+void WaitForMachineRegistrationRemoval() {
+  constexpr DWORD kPollIntervalMs = 50;
+  constexpr DWORD kMaxWaitMs = 2000;
+  for (DWORD waited = 0; waited < kMaxWaitMs; waited += kPollIntervalMs) {
+    if (!RegistryPresentAt(HKEY_LOCAL_MACHINE) && !ProfileRegistered() &&
+        !KeyboardCategoryRegistered())
+      return;
+    Sleep(kPollIntervalMs);
+  }
+}
+
 enum class LoadedState { NotLoaded, Loaded, Error };
 
 LoadedState IsFileLoaded(const wchar_t *path, DWORD *error) {
@@ -403,7 +488,7 @@ int wmain(int argc, wchar_t **argv) {
   if (argc != 2) {
     std::fwprintf(
         stderr,
-        L"usage: FamoProfileTool register|register-disabled|enable|disable|activate|check|check-disabled|check-absent|is-active|switch-away|start-runtime|unregister|loaded <dll>\n");
+        L"usage: FamoProfileTool register|register-disabled|enable|disable|activate|check|check-disabled|check-absent|is-active|switch-away|start-runtime|cleanup-user|unregister|unregister-machine|loaded <dll>\n");
     return 2;
   }
   const std::wstring_view command(argv[1]);
@@ -415,7 +500,25 @@ int wmain(int argc, wchar_t **argv) {
       return static_cast<int>(HRESULT_CODE(result));
     }
     std::wprintf(L"runtime_started=yes path=%ls\\FamoRuntime.exe\n",
-                 ModuleDirectory().c_str());
+                  ModuleDirectory().c_str());
+    return 0;
+  } else if (command == L"cleanup-user") {
+    const HRESULT result = CleanupDesktopUser();
+    if (FAILED(result)) {
+      std::fwprintf(stderr, L"desktop user cleanup failed: 0x%08lx\n",
+                    static_cast<unsigned long>(result));
+      return 1;
+    }
+    std::wprintf(L"desktop_user_cleanup=yes\n");
+    return 0;
+  } else if (command == L"cleanup-user-state") {
+    const HRESULT result = CleanupCurrentUserProfileState();
+    if (FAILED(result)) {
+      std::fwprintf(stderr, L"current user profile cleanup failed: 0x%08lx\n",
+                    static_cast<unsigned long>(result));
+      return 1;
+    }
+    std::wprintf(L"current_user_profile_cleanup=yes\n");
     return 0;
   } else if (command == L"register" || command == L"register-disabled") {
     const HRESULT result = InvokeRegistration("DllRegisterServer");
@@ -462,17 +565,22 @@ int wmain(int argc, wchar_t **argv) {
                     static_cast<unsigned long>(result));
       return 1;
     }
-  } else if (command == L"unregister") {
-    const HRESULT result = InvokeRegistration("DllUnregisterServer");
+  } else if (command == L"unregister" || command == L"unregister-machine") {
+    const HRESULT result = InvokeRegistration(
+        command == L"unregister-machine" ? "DllUnregisterMachine"
+                                          : "DllUnregisterServer");
     if (FAILED(result)) {
       std::fwprintf(stderr, L"profile removal failed: 0x%08lx\n",
                     static_cast<unsigned long>(result));
       return 1;
     }
-    WaitForRegistrationVisibility(false);
+    if (command == L"unregister-machine")
+      WaitForMachineRegistrationRemoval();
+    else
+      WaitForRegistrationVisibility(false);
   } else if (command != L"check" && command != L"check-disabled" &&
-             command != L"check-absent" &&
-             command != L"is-active") {
+              command != L"check-absent" &&
+              command != L"is-active") {
     return 2;
   }
 
@@ -481,6 +589,14 @@ int wmain(int argc, wchar_t **argv) {
   const bool enabled = ProfileEnabled();
   const bool category = KeyboardCategoryRegistered();
   const bool active = ProfileActive();
+  if (command == L"unregister-machine") {
+    const bool machine_registry = RegistryPresentAt(HKEY_LOCAL_MACHINE);
+    std::wprintf(L"machine_registry=%ls profile=%ls category=%ls\n",
+                 machine_registry ? L"present" : L"absent",
+                 profile ? L"present" : L"absent",
+                 category ? L"present" : L"absent");
+    return !machine_registry && !profile && !category ? 0 : 1;
+  }
   if (command == L"unregister") {
     std::wprintf(
         L"registry=%ls profile=%ls enabled=%ls category=%ls active=%ls\n",

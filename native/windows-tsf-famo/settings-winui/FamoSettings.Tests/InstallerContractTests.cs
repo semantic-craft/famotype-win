@@ -204,7 +204,7 @@ public sealed class InstallerContractTests
     {
         string source = RepoText("native/windows-tsf-famo/text-service/src/registration.cpp");
         int register = Position(source, "HRESULT RegisterComServer()");
-        int unregister = Position(source, "void UnregisterComServer()", register);
+        int unregister = Position(source, "void UnregisterComServer(bool cleanup_current_user)", register);
         string registerBody = source[register..unregister];
 
         Assert.Contains("RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str())", registerBody);
@@ -279,18 +279,27 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
-    public void InnoSetup_UninstallSwitchesAwayBeforeRemoval()
+    public void InnoSetup_UninstallSplitsDesktopUserAndMachineCleanup()
     {
         string iss = InstallerText("famo-setup.iss");
+        string profileTool = RepoText("native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
         int uninstall = Position(iss, "procedure RemoveActiveInstall");
+        string uninstallBody = iss[uninstall..Position(iss, "procedure CurUninstallStepChanged", uninstall)];
 
-        int switchAway = Position(iss, "switch-away", uninstall);
-        int removeTip = Position(iss, "--remove-input-tip", switchAway);
-        int unregister = Position(iss, "UnregisterTarget(ActiveTarget)", removeTip);
-        int deleteRun = Position(iss, "FamoRuntime", unregister);
-        Assert.True(switchAway < removeTip && removeTip < unregister && unregister < deleteRun);
-        Assert.Contains("RunAndRequire(Runtime, '--control shutdown', False)", iss);
-        Assert.Contains("RunAndRequire(Settings, '--remove-input-tip', False)", iss);
+        int userCleanup = Position(uninstallBody, "'cleanup-user', False");
+        int unregister = Position(uninstallBody, "UnregisterMachineTarget(ActiveTarget)", userCleanup);
+        int deleteRun = Position(uninstallBody, "FamoRuntime", unregister);
+        Assert.True(userCleanup < unregister && unregister < deleteRun);
+        Assert.DoesNotContain("ExecAsOriginalUser", uninstallBody);
+        Assert.DoesNotContain("'switch-away', False", uninstallBody);
+        Assert.DoesNotContain("'--remove-input-tip', False", uninstallBody);
+        Assert.Contains("GetShellWindow()", profileTool);
+        Assert.Contains("CreateProcessWithTokenW", profileTool);
+        Assert.Contains("LOGON_WITH_PROFILE", profileTool);
+        Assert.Contains("L\"cleanup-user-state\"", profileTool);
+        Assert.Contains("L\"--remove-input-tip\"", profileTool);
+        Assert.Contains("RegDeleteTreeW(HKEY_CURRENT_USER", profileTool);
+        Assert.Contains("DllUnregisterMachine", profileTool);
         Assert.Contains("DeleteUserData", iss);
         Assert.Contains("UninstallSilent", iss);
         Assert.Contains(@"{app}\versions", iss);

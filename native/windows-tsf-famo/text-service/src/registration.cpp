@@ -112,12 +112,10 @@ HRESULT RegisterComServer() {
   return HRESULT_FROM_WIN32(removed);
 }
 
-void UnregisterComServer() {
-  // Delete both roots: HKLM is the current registration; HKCU covers machines
-  // that still carry the legacy per-user development registration, which
-  // would otherwise shadow HKLM at COM activation time.
+void UnregisterComServer(bool cleanup_current_user) {
   RegDeleteTreeW(HKEY_LOCAL_MACHINE, ComKey().c_str());
-  RegDeleteTreeW(HKEY_CURRENT_USER, ComKey().c_str());
+  if (cleanup_current_user)
+    RegDeleteTreeW(HKEY_CURRENT_USER, ComKey().c_str());
 }
 
 HRESULT CreateProfiles(ComPtr<ITfInputProcessorProfiles> *profiles) {
@@ -198,7 +196,7 @@ HRESULT RegisterTsfProfile() {
   return S_OK;
 }
 
-void UnregisterTsfProfile() {
+void UnregisterTsfProfile(bool cleanup_current_user) {
   {
     ComScope com;
     if (SUCCEEDED(com.result())) {
@@ -210,19 +208,21 @@ void UnregisterTsfProfile() {
       }
       ComPtr<ITfInputProcessorProfiles> profiles;
       if (SUCCEEDED(CreateProfiles(&profiles))) {
-        profiles->EnableLanguageProfile(kTextServiceClsid, kLanguageId,
-                                        kLanguageProfileGuid, FALSE);
+        if (cleanup_current_user) {
+          profiles->EnableLanguageProfile(kTextServiceClsid, kLanguageId,
+                                          kLanguageProfileGuid, FALSE);
+        }
         profiles->RemoveLanguageProfile(kTextServiceClsid, kLanguageId,
                                         kLanguageProfileGuid);
         profiles->Unregister(kTextServiceClsid);
       }
     }
   }
-  // Windows can retain a disabled per-user preference after profile removal.
-  // Delete it only after the TSF manager has been released; otherwise its
-  // destructor can write the disabled preference back. The key is scoped to
-  // this development CLSID, so unregister restores the exact prior state.
-  RegDeleteTreeW(HKEY_CURRENT_USER, TipKey().c_str());
+  if (cleanup_current_user) {
+    // Delete only after the TSF manager has been released; its destructor can
+    // otherwise write the disabled preference back.
+    RegDeleteTreeW(HKEY_CURRENT_USER, TipKey().c_str());
+  }
 }
 
 } // namespace
@@ -233,15 +233,21 @@ HRESULT RegisterDevelopmentProfile() {
     return result;
   result = RegisterTsfProfile();
   if (FAILED(result)) {
-    UnregisterTsfProfile();
-    UnregisterComServer();
+    UnregisterTsfProfile(true);
+    UnregisterComServer(true);
   }
   return result;
 }
 
 HRESULT UnregisterDevelopmentProfile() {
-  UnregisterTsfProfile();
-  UnregisterComServer();
+  UnregisterTsfProfile(true);
+  UnregisterComServer(true);
+  return S_OK;
+}
+
+HRESULT UnregisterMachineProfile() {
+  UnregisterTsfProfile(false);
+  UnregisterComServer(false);
   return S_OK;
 }
 
@@ -253,4 +259,8 @@ STDAPI DllRegisterServer() {
 
 STDAPI DllUnregisterServer() {
   return famo::tsf::UnregisterDevelopmentProfile();
+}
+
+STDAPI DllUnregisterMachine() {
+  return famo::tsf::UnregisterMachineProfile();
 }

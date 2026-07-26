@@ -3,6 +3,7 @@ EXPORTS
   DllCanUnloadNow PRIVATE
   DllGetClassObject PRIVATE
   DllRegisterServer PRIVATE
+  DllUnregisterMachine PRIVATE
   DllUnregisterServer PRIVATE
   FamoCreateTextServiceForTest PRIVATE
   FamoReactivateTextServiceForTest PRIVATE

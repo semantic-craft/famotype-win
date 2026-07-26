@@ -171,6 +171,13 @@ begin
     Result := RunAndRequire(ProfileTool(Target), 'unregister', False);
 end;
 
+function UnregisterMachineTarget(const Target: String): Boolean;
+begin
+  Result := True;
+  if FileExists(ProfileTool(Target)) then
+    Result := RunAndRequire(ProfileTool(Target), 'unregister-machine', False);
+end;
+
 procedure WriteOrDelete(const Name, Value: String);
 begin
   if Value <> '' then
@@ -1002,7 +1009,7 @@ end;
 
 procedure RemoveActiveInstall;
 var
-  ActiveTarget, Runtime, Settings, RegisteredDll, State, PendingId: String;
+  ActiveTarget, RegisteredDll, State, PendingId: String;
 begin
   if RegQueryStringValue(HKLM64, BrandKey, 'InstallState', State) and
      (CompareText(State, StatePendingReboot) = 0) and
@@ -1012,22 +1019,14 @@ begin
   else
     ActiveTarget := ReadActiveTarget;
   if ActiveTarget = '' then Exit;
-  Runtime := AddBackslash(ActiveTarget) + 'FamoRuntime.exe';
-  Settings := AddBackslash(ActiveTarget) + 'settings\FamoSettings.exe';
-  RunAndRequire(Runtime, '--control shutdown', False);
-  Sleep(750);
-  if not RunAndRequire(ProfileTool(ActiveTarget), 'switch-away', False) then
-    RaiseException('cannot switch away from Famo before uninstall');
-  if not RunAndRequire(Settings, '--remove-input-tip', False) then
-    RaiseException('cannot remove current-user input tip');
-  if not UnregisterTarget(ActiveTarget) then
+  if not RunAndRequire(ProfileTool(ActiveTarget), 'cleanup-user', False) then
+    RaiseException('cannot clean the original desktop user before uninstall');
+  if not UnregisterMachineTarget(ActiveTarget) then
     RaiseException('cannot unregister Famo profile');
   RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
   if RegQueryStringValue(HKLM64,
-    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) or
-     RegQueryStringValue(HKCU,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) then
-    RaiseException('dangling COM override after unregister');
+    RaiseException('dangling machine COM registration after unregister');
   UninstallPrepared := True;
 end;
 

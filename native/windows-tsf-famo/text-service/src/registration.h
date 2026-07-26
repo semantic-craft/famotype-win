@@ -6,5 +6,6 @@ namespace famo::tsf {
 
 HRESULT RegisterDevelopmentProfile();
 HRESULT UnregisterDevelopmentProfile();
+HRESULT UnregisterMachineProfile();
 
 } // namespace famo::tsf
