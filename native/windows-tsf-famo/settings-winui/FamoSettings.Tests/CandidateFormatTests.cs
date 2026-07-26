@@ -173,7 +173,7 @@ public sealed class CandidateFormatTests
         FamoSettings settings = SettingsStore.CreateDefault();
         settings.Appearance.InlinePreedit = true;
         settings.Appearance.ShowPreedit = false;
-        settings.Appearance.PreviewPages = true;
+        settings.Appearance.Orientation = "scroll";
         settings.Appearance.PreviewRows = 1;
 
         string overlay = ConfigWriter.BuildStyleOverlay(settings);
@@ -202,7 +202,7 @@ public sealed class CandidateFormatTests
         Assert.Contains("_previewHost.Content = FamoPreview.Build();", page);
         Assert.Contains("A.InlineCandidatePreview", page);
         Assert.Contains("A.ShowPreedit", page);
-        Assert.Contains("A.PreviewPages", page);
+        Assert.Contains("A.Orientation", page);
         Assert.Contains("A.PreviewRows", page);
     }
 

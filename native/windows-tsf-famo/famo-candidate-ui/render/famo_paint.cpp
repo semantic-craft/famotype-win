@@ -411,25 +411,6 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
                    highlight_rc_dev);
       Gdiplus::SolidBrush brush(ToGdiColor(skin->hilited_back_color));
       g.FillPath(&brush, &path);
-      if (mist) {
-        const int highlight_h = h.bottom - h.top;
-        Gdiplus::LinearGradientBrush top_light(
-            Gdiplus::Rect(h.left, h.top, h.right - h.left,
-                          (std::max)(1, highlight_h)),
-            Gdiplus::Color(36, 255, 255, 255),
-            Gdiplus::Color(0, 255, 255, 255),
-            Gdiplus::LinearGradientModeVertical);
-        g.FillPath(&top_light, &path);
-        Gdiplus::LinearGradientBrush edge_light(
-            Gdiplus::Rect(h.left, h.top, h.right - h.left,
-                          (std::max)(1, highlight_h)),
-            Gdiplus::Color(71, 255, 255, 255),
-            Gdiplus::Color(5, 255, 255, 255),
-            Gdiplus::LinearGradientModeVertical);
-        Gdiplus::Pen edge(&edge_light,
-                          static_cast<float>((std::max)(1, Scale(1, dpi))));
-        g.DrawPath(&edge, &path);
-      }
     }
     if (border_dev > 0 && Opaque(skin->border_color)) {
       // Inset by half the pen width so the stroke stays inside the panel.
@@ -611,10 +592,7 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
             static_cast<uint32_t>(FAMO_MAX_PREVIEW_CANDIDATES));
         for (uint32_t i = 0; i < preview_count; ++i) {
           D2D1_COLOR_F color = ToColorF(skin->candidate_text_color);
-          const uint32_t row = input->preview_page_size == 0
-                                   ? 0
-                                   : i / input->preview_page_size;
-          color.a *= row == 0 ? 0.45f : 0.30f;
+          color.a *= 0.75f;
           brush->SetColor(color);
           DrawUtf8(rt, fText, brush, input->preview_candidates[i].text,
                    layout->preview_candidates[i].text, false, sm_f, sm_f);

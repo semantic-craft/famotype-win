@@ -75,6 +75,26 @@ public sealed class SettingsStore
             layout.Margin = 8;
             changed = true;
         }
+        if (oldVersion < 4 && settings.Appearance.PreviewPages
+            && settings.Appearance.Orientation != "vertical")
+        {
+            settings.Appearance.Orientation = "scroll";
+            settings.Appearance.PreviewPages = false;
+            changed = true;
+        }
+        if (oldVersion < 4 && root.TryGetProperty("ai", out JsonElement ai)
+            && ai.TryGetProperty("documentFormattingSkillEnabled", out JsonElement legacyFormatting)
+            && legacyFormatting.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            settings.Ai.PublishFormattingSkillEnabled = legacyFormatting.GetBoolean();
+            changed = true;
+        }
+        int pageSize = Math.Clamp(settings.Engine.PageSize, 3, 9);
+        if (settings.Engine.PageSize != pageSize)
+        {
+            settings.Engine.PageSize = pageSize;
+            changed = true;
+        }
         if (settings.Version != FamoSettings.CurrentVersion)
         {
             settings.Version = FamoSettings.CurrentVersion;

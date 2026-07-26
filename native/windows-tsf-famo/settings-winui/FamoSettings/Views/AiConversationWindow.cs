@@ -1,4 +1,5 @@
 using Famo.Settings.Core.Ai;
+using Famo.Settings.Core.Insertion;
 using Famo.Settings.Theming;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
@@ -7,12 +8,13 @@ using Windows.ApplicationModel.DataTransfer;
 
 namespace Famo.Settings.Views;
 
-/// <summary>AI 对话窗口：显式发送、复制结果，不改写 Rime 会话或当前输入内容。</summary>
+/// <summary>划词工具箱；上方技能进入各自窗口，下方任意提问是兜底。</summary>
 public sealed class AiConversationWindow : Window
 {
     private readonly AiProviderProfileStore _providerStore = new();
     private readonly ISecretStore _secretStore = new WindowsCredentialSecretStore();
     private readonly string? _selectedText;
+    private readonly ITextInsertionService? _replacement;
     /// <summary>已完成的问答轮，按序喂回后续请求（真·多轮）；client 侧自会截到历史上限。</summary>
     private readonly List<AiChatTurn> _turns = new();
 
@@ -21,32 +23,37 @@ public sealed class AiConversationWindow : Window
     private TextBlock _status = null!;
     private Button _send = null!;
 
-    public AiConversationWindow(string? selectedText = null)
+    public AiConversationWindow(string? selectedText = null, ITextInsertionService? replacement = null)
     {
         _selectedText = selectedText;
-        Title = "AI 对话";
+        _replacement = replacement;
+        Title = selectedText is null ? "任意提问" : "划词工具箱";
         BuildContent();
-        Activated += (_, _) => _prompt.DispatcherQueue.TryEnqueue(
-            () => _prompt.Focus(FocusState.Programmatic));
+        Activated += (_, _) =>
+        {
+            if (_prompt.IsEnabled)
+                _prompt.DispatcherQueue.TryEnqueue(() => _prompt.Focus(FocusState.Programmatic));
+        };
     }
 
     private void BuildContent()
     {
+        bool askEnabled = _selectedText is null || App.Settings.Ai.AskAnythingSkillEnabled;
         var root = new ScrollViewer
         {
             Padding = new Thickness(24),
             Background = FamoUI.Br("Famo.Bg"),
         };
         var sp = new StackPanel();
-        sp.Children.Add(FamoUI.PaneHeader("AI 对话", _selectedText is null
+        sp.Children.Add(FamoUI.PaneHeader(_selectedText is null ? "任意提问" : "划词工具箱", _selectedText is null
             ? "只处理你在这里主动发送的文本；不会读取普通输入候选。"
-            : "对选中文本下指令或提问；不会读取选区之外的普通输入候选。"));
+            : "选择一个明确技能，或在下方任意提问；每个技能在独立窗口中运行。"));
 
         _status = new TextBlock
         {
             Text = _selectedText is null
                 ? "输入问题后发送；结果只显示在本窗口，可手动复制。"
-                : "对选中文本下指令：改写、排版、翻译、拟回复……也可以直接提问。",
+                : "已读取当前选区。上方是启用的技能，下方任意提问作为兜底。",
             FontSize = 12.5,
             Foreground = FamoUI.Br("Famo.Ink2"),
             Margin = new Thickness(0, 0, 0, 12),
@@ -60,6 +67,7 @@ public sealed class AiConversationWindow : Window
             AcceptsReturn = true,
             TextWrapping = TextWrapping.Wrap,
             MinHeight = 96,
+            IsEnabled = askEnabled,
         };
         _result = new TextBox
         {
@@ -69,14 +77,73 @@ public sealed class AiConversationWindow : Window
             IsReadOnly = true,
             MinHeight = 180,
         };
-        _send = new Button { Content = "发送" };
+        _send = new Button
+        {
+            Content = "发送",
+            IsEnabled = askEnabled,
+        };
         _send.Click += async (_, _) => await SendAsync();
 
-        sp.Children.Add(FamoUI.Card("问题", FamoUI.RowFull(_prompt), FamoUI.RowFull(BuildActions(), divider: true)));
-        sp.Children.Add(FamoUI.Card("结果", FamoUI.RowFull(_result)));
+        if (_selectedText is not null)
+        {
+            sp.Children.Add(FamoUI.Card("选中文本", FamoUI.RowFull(new TextBox
+            {
+                Text = _selectedText,
+                AcceptsReturn = true,
+                TextWrapping = TextWrapping.Wrap,
+                IsReadOnly = true,
+                MaxHeight = 160,
+            })));
+            sp.Children.Add(BuildToolboxSkills());
+        }
+        if (askEnabled)
+        {
+            sp.Children.Add(FamoUI.Card("任意提问", FamoUI.RowFull(_prompt), FamoUI.RowFull(BuildActions(), divider: true)));
+            sp.Children.Add(FamoUI.Card("回答", FamoUI.RowFull(_result)));
+        }
 
         root.Content = sp;
         Content = root;
+    }
+
+    private FrameworkElement BuildToolboxSkills()
+    {
+        var grid = new Grid { ColumnSpacing = 8, RowSpacing = 8 };
+        for (int column = 0; column < 3; column++)
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        int index = 0;
+        foreach (AiSelectionSkillDefinition skill in AiSelectionSkills.BuiltIn)
+        {
+            if (!AiSelectionSkills.IsEnabled(App.Settings, skill.Id)) continue;
+            int row = index / 3;
+            if (row == grid.RowDefinitions.Count)
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            var button = new Button
+            {
+                Content = skill.Title,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                IsEnabled = App.Settings.Ai.CloudEnabled,
+            };
+            button.Click += (_, _) =>
+            {
+                App.ShowAiSelectionSkill(skill, _selectedText!, _replacement);
+                Close();
+            };
+            Grid.SetRow(button, row);
+            Grid.SetColumn(button, index % 3);
+            grid.Children.Add(button);
+            index++;
+        }
+        if (index == 0)
+        {
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.Children.Add(new TextBlock
+            {
+                Text = "技能平台中没有已启用的划词技能。",
+                Foreground = FamoUI.Br("Famo.Ink2"),
+            });
+        }
+        return FamoUI.Card("技能", FamoUI.RowFull(grid));
     }
 
     private FrameworkElement BuildActions()
@@ -91,7 +158,6 @@ public sealed class AiConversationWindow : Window
         };
         var clear = new Button { Content = "清空" };
         clear.Click += (_, _) => Clear();
-
         row.Children.Add(_send);
         row.Children.Add(copy);
         row.Children.Add(copyAndClose);
@@ -101,6 +167,11 @@ public sealed class AiConversationWindow : Window
 
     private async Task SendAsync()
     {
+        if (_selectedText is not null && !App.Settings.Ai.AskAnythingSkillEnabled)
+        {
+            SetStatus("任意提问已在技能平台关闭。");
+            return;
+        }
         string question = _prompt.Text;
         _send.IsEnabled = false;
         SetStatus("正在发送...");

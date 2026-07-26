@@ -20,6 +20,10 @@ struct RuntimeSnapshot {
   Correlation correlation;
   Composition composition;
   UiState ui_state;
+  // Runtime-process-only target captured when the focused snapshot is
+  // published. It is deliberately outside UiState, whose v1 wire size must
+  // remain compatible with an older installed runtime during upgrade.
+  uintptr_t source_window = 0;
   uint64_t composition_sequence = 0;
   uint64_t ui_sequence = 0;
   uint64_t revision = 0;

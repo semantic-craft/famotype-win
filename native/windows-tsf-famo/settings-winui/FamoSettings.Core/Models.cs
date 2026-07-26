@@ -9,7 +9,7 @@ namespace Famo.Settings.Core;
 /// </summary>
 public sealed class FamoSettings
 {
-    public const int CurrentVersion = 3;
+    public const int CurrentVersion = 4;
 
     public int Version { get; set; } = CurrentVersion;
     public AppearanceSettings Appearance { get; set; } = new();
@@ -19,16 +19,27 @@ public sealed class FamoSettings
     public ConvenienceSettings Convenience { get; set; } = new();
     public ClipboardSettings Clipboard { get; set; } = new();
     public AiSettings Ai { get; set; } = new();
+    public HotKeySettings HotKeys { get; set; } = new();
+}
+
+/// <summary>显式功能召唤热键。空串表示未设置；仅接受至少两个 Ctrl/Alt/Shift 修饰键 + A-Z。</summary>
+public sealed class HotKeySettings
+{
+    public string QuickPhrasePanel { get; set; } = string.Empty;
+    public string SelectionToolbox { get; set; } = string.Empty;
 }
 
 /// <summary>AI 全局设置（AI 助手页 + 技能平台页共用）。云端 AI 默认关闭，只在用户主动触发的功能中读取。
-/// 划词菜单总开关 + 4 个内置技能各自开关默认全部开启（受信任内置技能，无导入信任边界）。</summary>
+/// 划词工具箱总开关 + 7 个动作各自开关默认全部开启（受信任内置技能，无导入信任边界）。</summary>
 public sealed class AiSettings
 {
     public bool CloudEnabled { get; set; }
 
     /// <summary>划词菜单总开关：关闭后任意技能菜单项点击都提示「划词菜单已关闭」，不再逐个检查具体技能开关。</summary>
     public bool SelectionMenuEnabled { get; set; } = true;
+
+    /// <summary>任意提问动作开关。</summary>
+    public bool AskAnythingSkillEnabled { get; set; } = true;
 
     /// <summary>AI 润色选中技能开关。</summary>
     public bool PolishSkillEnabled { get; set; } = true;
@@ -39,8 +50,11 @@ public sealed class AiSettings
     /// <summary>辅助检索技能开关。</summary>
     public bool ResearchAssistSkillEnabled { get; set; } = true;
 
-    /// <summary>公文排版技能开关。</summary>
-    public bool DocumentFormattingSkillEnabled { get; set; } = true;
+    /// <summary>规范排版技能开关。</summary>
+    public bool PublishFormattingSkillEnabled { get; set; } = true;
+
+    /// <summary>划词翻译技能开关。</summary>
+    public bool TranslationSkillEnabled { get; set; } = true;
 
     /// <summary>提示词优化技能开关。</summary>
     public bool PromptOptimizeSkillEnabled { get; set; } = true;
@@ -172,18 +186,18 @@ public sealed class AppearanceSettings
     /// <summary>候选格式：full(标签+候选+注释) / no_comment(标签+候选) / candidate_only(仅候选)。</summary>
     public string CandidateFormat { get; set; } = "full";
 
-    /// <summary>候选排列：horizontal / vertical。</summary>
-    public string Orientation { get; set; } = "horizontal";
+    /// <summary>候选排列：auto / horizontal / vertical / scroll（主行 + 1–2 行可点后页）。</summary>
+    public string Orientation { get; set; } = "auto";
 
     public bool InlinePreedit { get; set; }
 
     /// <summary>候选窗内显示原始输入串与可移动光标；独立于宿主内嵌预编辑。</summary>
     public bool ShowPreedit { get; set; } = true;
 
-    /// <summary>横排候选条下方只读预览后页；默认关闭。</summary>
+    /// <summary>旧版“预览后页”迁移键；v4 起由 Orientation=scroll 表示卷轴。</summary>
     public bool PreviewPages { get; set; }
 
-    /// <summary>后页预览行数，范围 1–2。</summary>
+    /// <summary>卷轴后页行数，范围 1–2。</summary>
     public int PreviewRows { get; set; } = 2;
 
     /// <summary>内嵌候选预览：光标处显示当前候选词的实际文字，而非拼音本身；区别于 InlinePreedit
@@ -207,7 +221,7 @@ public sealed class EngineSettings
 {
     public List<SchemaEntry> SchemaList { get; set; } = new();
 
-    /// <summary>一屏候选词数，范围 1–30（出厂 8）。</summary>
+    /// <summary>一屏候选词数，范围 3–9（出厂 8；数字键可直接选词）。</summary>
     public int PageSize { get; set; } = 8;
 
     public FuzzyPinyinSettings FuzzyPinyin { get; set; } = new();

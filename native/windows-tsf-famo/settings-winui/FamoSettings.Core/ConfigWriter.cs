@@ -42,10 +42,10 @@ public static class ConfigWriter
         yaml = SetScalar(yaml, "label_format", Quote(labelFormat));
         yaml = SetScalar(yaml, "label_font_point", labelPoint);
         yaml = SetScalar(yaml, "comment_font_point", commentPoint);
-        yaml = SetScalar(yaml, "horizontal", a.Orientation == "horizontal" ? "true" : "false");
+        yaml = SetScalar(yaml, "horizontal", a.Orientation != "vertical" ? "true" : "false");
         yaml = SetScalar(yaml, "inline_preedit", a.InlinePreedit ? "true" : "false");
         yaml = SetScalar(yaml, "show_preedit", a.ShowPreedit ? "true" : "false");
-        yaml = SetScalar(yaml, "preview_pages", a.PreviewPages ? "true" : "false");
+        yaml = SetScalar(yaml, "preview_pages", a.Orientation == "scroll" || a.PreviewPages ? "true" : "false");
         yaml = SetScalar(yaml, "preview_rows", Math.Clamp(a.PreviewRows, 1, 2).ToString(CultureInfo.InvariantCulture));
         yaml = SetScalar(yaml, "preedit_type", a.InlineCandidatePreview ? "preview" : "composition");
         yaml = SetScalar(yaml, "corner_radius", a.Layout.CornerRadius.ToString(CultureInfo.InvariantCulture));
@@ -98,10 +98,11 @@ public static class ConfigWriter
         sb.Append("  label_format: ").Append(Quote(labelFormat)).Append('\n');
         sb.Append("  label_font_point: ").Append(labelPoint).Append('\n');
         sb.Append("  comment_font_point: ").Append(commentPoint).Append('\n');
-        sb.Append("  horizontal: ").Append(a.Orientation == "horizontal" ? "true" : "false").Append('\n');
+        sb.Append("  horizontal: ").Append(a.Orientation != "vertical" ? "true" : "false").Append('\n');
+        sb.Append("  orientation: ").Append(a.Orientation).Append('\n');
         sb.Append("  inline_preedit: ").Append(a.InlinePreedit ? "true" : "false").Append('\n');
         sb.Append("  show_preedit: ").Append(a.ShowPreedit ? "true" : "false").Append('\n');
-        sb.Append("  preview_pages: ").Append(a.PreviewPages ? "true" : "false").Append('\n');
+        sb.Append("  preview_pages: ").Append(a.Orientation == "scroll" || a.PreviewPages ? "true" : "false").Append('\n');
         sb.Append("  preview_rows: ").Append(Math.Clamp(a.PreviewRows, 1, 2)).Append('\n');
         sb.Append("  preedit_type: ").Append(a.InlineCandidatePreview ? "preview" : "composition").Append('\n');
         sb.Append("  corner_radius: ").Append(Int(a.Layout.CornerRadius)).Append('\n');
@@ -240,7 +241,7 @@ public static class ConfigWriter
                 sb.Append("    - schema: ").Append(e.Id).Append('\n');
             }
         }
-        sb.Append("  menu/page_size: ").Append(settings.Engine.PageSize.ToString(CultureInfo.InvariantCulture)).Append('\n');
+        sb.Append("  menu/page_size: ").Append(Math.Clamp(settings.Engine.PageSize, 3, 9).ToString(CultureInfo.InvariantCulture)).Append('\n');
 
         // 固定项（必随每次生成，避免覆盖 seed 丢失）：
         //   去 F4/Ctrl+` 方案选单（switcher/hotkeys 置空，无方案概念，切换走 WinUI + select_schema）。

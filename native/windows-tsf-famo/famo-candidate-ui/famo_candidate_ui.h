@@ -34,7 +34,8 @@ typedef enum FamoCandidateUiResult {
 typedef enum FamoLayoutType {
   FAMO_LAYOUT_VERTICAL = 0,      // candidates stacked top→bottom
   FAMO_LAYOUT_HORIZONTAL = 1,    // candidates laid left→right
-  FAMO_LAYOUT_VERTICAL_TEXT = 2  // vertical-text: columns right→left, glyphs T→B
+  FAMO_LAYOUT_VERTICAL_TEXT = 2, // vertical-text: columns right→left, glyphs T→B
+  FAMO_LAYOUT_AUTO = 3           // host resolves from the live Rime _vertical option
 } FamoLayoutType;
 
 // Integer pixel rect (device pixels after DPI scaling). left/top inclusive,

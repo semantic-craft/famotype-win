@@ -10,11 +10,13 @@ public sealed class AiPage : UserControl
 {
     private static readonly AiProviderPreset[] Presets =
     {
-        new("DeepSeek", "DeepSeek", "https://api.deepseek.com/chat/completions", "deepseek-v4-flash"),
-        new("OpenAI", "OpenAI", "https://api.openai.com/v1/chat/completions", "gpt-5.5"),
-        new("Google Gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3-flash"),
+        new("阿里云百炼", "阿里云百炼", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.6-flash"),
+        new("火山引擎 · 豆包 Seed", "火山引擎 · 豆包 Seed", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-seed-2-1-turbo-260628"),
         new("小米 MiMo", "小米 MiMo", "https://api.xiaomimimo.com/v1/chat/completions", "mimo-v2.5"),
-        new("火山引擎 · 豆包 Seed", "火山引擎 · 豆包 Seed", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-seed-2-0-lite-260428"),
+        new("DeepSeek", "DeepSeek", "https://api.deepseek.com/v1/chat/completions", "deepseek-v4-flash"),
+        new("MiniMax", "MiniMax", "https://api.minimaxi.com/v1/chat/completions", "MiniMax-M2.7-highspeed"),
+        new("Google Gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3.5-flash-lite"),
+        new("OpenAI", "OpenAI", "https://api.openai.com/v1/chat/completions", "chat-latest"),
         new("+ 自定义（OpenAI 兼容）", "自定义 OpenAI 兼容", "", ""),
     };
 

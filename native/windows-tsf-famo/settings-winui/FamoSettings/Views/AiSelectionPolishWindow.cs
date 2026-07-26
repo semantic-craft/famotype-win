@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Famo.Settings.Core.Ai;
+using Famo.Settings.Core.Insertion;
 using Famo.Settings.Core.Legal;
 using Famo.Settings.Core.Selection;
 using Famo.Settings.Interop;
@@ -11,13 +12,14 @@ using Windows.ApplicationModel.DataTransfer;
 
 namespace Famo.Settings.Views;
 
-/// <summary>AI 润色选中：显式捕获当前选中文本，结果只展示/复制，不自动改写目标应用。</summary>
+/// <summary>单个划词技能的独立窗口。</summary>
 public sealed class AiSelectionPolishWindow : Window
 {
     private readonly AiProviderProfileStore _providerStore = new();
     private readonly ISecretStore _secretStore = new WindowsCredentialSecretStore();
     private readonly SelectedTextCaptureService _captureService;
     private readonly AiSelectionSkillDefinition _skill;
+    private readonly ITextInsertionService? _replacement;
 
     private TextBlock _status = null!;
     private TextBox _selection = null!;
@@ -36,8 +38,16 @@ public sealed class AiSelectionPolishWindow : Window
     }
 
     public AiSelectionPolishWindow(AiSelectionSkillDefinition skill)
+        : this(skill, null)
+    {
+    }
+
+    public AiSelectionPolishWindow(
+        AiSelectionSkillDefinition skill,
+        ITextInsertionService? replacement)
     {
         _skill = skill;
+        _replacement = replacement;
         Title = skill.Title;
         _captureService = new SelectedTextCaptureService(
             new WindowsFocusedTextSelectionReader(),
@@ -47,6 +57,45 @@ public sealed class AiSelectionPolishWindow : Window
         BuildContent();
     }
 
+    public void LoadCapturedSelection(string selectedText)
+    {
+        ++_generation;
+        _candidateList.Children.Clear();
+        _clarifications.Clear();
+        if (!AiSelectionSkills.IsEnabled(App.Settings, _skill.Id))
+        {
+            _capturedText = null;
+            _selection.Text = "";
+            SetStatus("该技能已在技能平台关闭。");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(selectedText))
+        {
+            _capturedText = null;
+            _selection.Text = "";
+            SetStatus("未选中文本。");
+            return;
+        }
+        _capturedText = selectedText;
+        _selection.Text = selectedText;
+        SetStatus("已从划词工具箱传入当前选区。");
+    }
+
+    public void LoadCapturedSelection(SelectedTextCaptureResult result)
+    {
+        if (result.Status == SelectedTextCaptureStatus.Success && result.Text is not null)
+        {
+            LoadCapturedSelection(result.Text);
+            return;
+        }
+        ++_generation;
+        _candidateList.Children.Clear();
+        _clarifications.Clear();
+        _capturedText = null;
+        _selection.Text = "";
+        SetStatus(UserMessage(result));
+    }
+
     public async Task CaptureSelectionBeforeActivationAsync()
     {
         int my = ++_generation;
@@ -54,11 +103,6 @@ public sealed class AiSelectionPolishWindow : Window
         _capturedText = null;
         _clarifications.Clear();
 
-        if (!App.Settings.Ai.SelectionMenuEnabled)
-        {
-            SetStatus("划词菜单已关闭，可到「技能平台」重新开启。");
-            return;
-        }
         if (!AiSelectionSkills.IsEnabled(App.Settings, _skill.Id))
         {
             SetStatus("该技能已在设置中关闭，可到「技能平台」重新开启。");
@@ -198,7 +242,7 @@ public sealed class AiSelectionPolishWindow : Window
             Background = FamoUI.Br("Famo.Bg"),
         };
         var sp = new StackPanel();
-        sp.Children.Add(FamoUI.PaneHeader(_skill.Title, "只处理你这次明确选中的文本；结果显示在本窗口，可手动复制。"));
+        sp.Children.Add(FamoUI.PaneHeader(_skill.Title, "只处理你这次明确选中的文本；可复制结果，改写型技能也可确认替换原选区。"));
 
         _status = new TextBlock
         {
@@ -264,11 +308,35 @@ public sealed class AiSelectionPolishWindow : Window
             var copy = new Button { Content = "复制" };
             copy.Click += (_, _) => CopyCandidate(candidate);
 
+            var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+            actions.Children.Add(copy);
+            if (_replacement is not null && CanReplaceSelection())
+            {
+                var replace = new Button { Content = "确认替换原选区" };
+                replace.Click += async (_, _) => await ReplaceCandidateAsync(candidate, replace);
+                actions.Children.Add(replace);
+            }
+
             var panel = new StackPanel { Spacing = 8 };
             panel.Children.Add(text);
-            panel.Children.Add(copy);
+            panel.Children.Add(actions);
             _candidateList.Children.Add(panel);
         }
+    }
+
+    private bool CanReplaceSelection() =>
+        _skill.Id is "polish" or "publish-formatting" or "prompt-optimize";
+
+    private async Task ReplaceCandidateAsync(string text, Button button)
+    {
+        if (_replacement is null) return;
+        button.IsEnabled = false;
+        TextInsertionResult result = await _replacement.InsertAsync(text, CancellationToken.None);
+        SetStatus(result.Message);
+        if (result.Success)
+            Close();
+        else
+            button.IsEnabled = true;
     }
 
     private FrameworkElement BuildJumpRow()

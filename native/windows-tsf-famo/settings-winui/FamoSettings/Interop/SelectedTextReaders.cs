@@ -5,6 +5,91 @@ using Windows.ApplicationModel.DataTransfer;
 
 namespace Famo.Settings.Interop;
 
+public sealed class WindowsUiAutomationSelectionAnchor
+{
+    private static readonly Guid CUIAutomationClsid = new("ff48dba4-60ef-4201-aa87-54103eef594e");
+    private const int UIA_TextPatternId = 10014;
+    private readonly object _automation;
+    private readonly object _originalRange;
+    private readonly int[] _runtimeId;
+
+    private WindowsUiAutomationSelectionAnchor(
+        object automation,
+        object originalRange,
+        int[] runtimeId,
+        string text)
+    {
+        _automation = automation;
+        _originalRange = originalRange;
+        _runtimeId = runtimeId;
+        Text = text;
+    }
+
+    public string Text { get; }
+
+    public static Task<WindowsUiAutomationSelectionAnchor?> CaptureAsync(
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            Type? automationType = Type.GetTypeFromCLSID(CUIAutomationClsid);
+            dynamic automation = automationType is null ? null! : Activator.CreateInstance(automationType)!;
+            if (automation is null) return Task.FromResult<WindowsUiAutomationSelectionAnchor?>(null);
+            dynamic element = automation.GetFocusedElement();
+            if (element is null || (bool)element.CurrentIsPassword)
+                return Task.FromResult<WindowsUiAutomationSelectionAnchor?>(null);
+            dynamic ranges = element.GetCurrentPattern(UIA_TextPatternId).GetSelection();
+            if ((int)ranges.Length != 1)
+                return Task.FromResult<WindowsUiAutomationSelectionAnchor?>(null);
+            dynamic range = ranges.GetElement(0);
+            string text = (range.GetText(-1) as string) ?? string.Empty;
+            Array runtimeId = (Array)element.GetRuntimeId();
+            if (string.IsNullOrWhiteSpace(text) || runtimeId.Length == 0)
+                return Task.FromResult<WindowsUiAutomationSelectionAnchor?>(null);
+            int[] identity = runtimeId.Cast<object>().Select(Convert.ToInt32).ToArray();
+            return Task.FromResult<WindowsUiAutomationSelectionAnchor?>(
+                new(automation, range.Clone(), identity, text));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return Task.FromResult<WindowsUiAutomationSelectionAnchor?>(null);
+        }
+    }
+
+    public Task<string?> VerifyAndReselectAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            dynamic automation = _automation;
+            dynamic element = automation.GetFocusedElement();
+            if (element is null || (bool)element.CurrentIsPassword)
+                return Task.FromResult<string?>(null);
+            Array runtimeId = (Array)element.GetRuntimeId();
+            int[] identity = runtimeId.Cast<object>().Select(Convert.ToInt32).ToArray();
+            if (!_runtimeId.SequenceEqual(identity)) return Task.FromResult<string?>(null);
+
+            dynamic ranges = element.GetCurrentPattern(UIA_TextPatternId).GetSelection();
+            if ((int)ranges.Length != 1) return Task.FromResult<string?>(null);
+            dynamic current = ranges.GetElement(0);
+            dynamic original = _originalRange;
+            if ((int)current.CompareEndpoints(0, original, 0) != 0 ||
+                (int)current.CompareEndpoints(1, original, 1) != 0)
+                return Task.FromResult<string?>(null);
+            string text = (current.GetText(-1) as string) ?? string.Empty;
+            if (!string.Equals(text, Text, StringComparison.Ordinal))
+                return Task.FromResult<string?>(null);
+            original.Select();
+            return Task.FromResult<string?>(text);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return Task.FromResult<string?>(null);
+        }
+    }
+}
+
 public sealed class WindowsFocusedTextSelectionReader : IFocusedTextSelectionReader
 {
     private static readonly Guid CUIAutomationClsid = new("ff48dba4-60ef-4201-aa87-54103eef594e");

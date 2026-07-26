@@ -89,6 +89,22 @@ bool WaitForVisibility(bool visible, WindowProbe *result = nullptr) {
   return false;
 }
 
+bool PreviewRowsMapToPageAndCandidateKeys() {
+  FamoLayoutResult layout{};
+  layout.preview_candidate_count = 3;
+  layout.preview_candidates[0].bounds = {10, 20, 30, 40};
+  layout.preview_candidates[1].bounds = {30, 20, 50, 40};
+  layout.preview_candidates[2].bounds = {10, 40, 30, 60};
+  PreviewSelection selection;
+  CHECK(PreviewSelectionAt(layout, 35, 25, 2, &selection));
+  CHECK(selection.pages_forward == 1 && selection.candidate_offset == 1);
+  CHECK(PreviewSelectionAt(layout, 15, 45, 2, &selection));
+  CHECK(selection.pages_forward == 2 && selection.candidate_offset == 0);
+  CHECK(!PreviewSelectionAt(layout, 5, 5, 2, &selection));
+  CHECK(!PreviewSelectionAt(layout, 15, 25, 10, &selection));
+  return true;
+}
+
 template <typename Predicate>
 bool WaitForCounters(const CandidateWindow &window, Predicate predicate) {
   for (int attempt = 0; attempt < 1000; ++attempt) {
@@ -497,7 +513,8 @@ bool HangingUiDoesNotDelayEngine() {
 } // namespace
 
 int main() {
-  if (!PrewarmCompletesBeforeReturn() ||
+  if (!PreviewRowsMapToPageAndCandidateKeys() ||
+      !PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
       !InlineHostPreeditStillShowsPanelHeader() ||
       !HealthyWindowAndHideRules() ||

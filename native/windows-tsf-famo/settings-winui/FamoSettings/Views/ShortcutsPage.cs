@@ -1,7 +1,10 @@
+using System.Runtime.InteropServices;
 using Famo.Settings.Core;
 using Famo.Settings.Theming;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
+using Windows.System;
 
 namespace Famo.Settings.Views;
 
@@ -14,8 +17,19 @@ public sealed class ShortcutsPage : UserControl
     public ShortcutsPage()
     {
         var sp = new StackPanel();
-        sp.Children.Add(FamoUI.PaneHeader("快捷键设置", "输入法全局热键。改完会重建索引（约 1–3 秒）。"));
-        sp.Children.Add(FamoUI.Banner(true, "本页设置需刷新配置生效"));
+        sp.Children.Add(FamoUI.PaneHeader("快捷键设置", "功能召唤热键立即应用；输入键位改动会部署 Rime 配置。"));
+        sp.Children.Add(FamoUI.Banner(true, "功能召唤立即保存；输入键位需刷新配置"));
+
+        sp.Children.Add(FamoUI.Card("功能召唤",
+            HotKeyRow("快捷短语面板", "在任意输入方案下直接打开可搜索的快捷短语面板。",
+                () => App.Settings.HotKeys.QuickPhrasePanel,
+                value => App.Settings.HotKeys.QuickPhrasePanel = value,
+                () => App.Settings.HotKeys.SelectionToolbox,
+                divider: false),
+            HotKeyRow("划词工具箱", "选中文字后召唤工具箱；双击 Alt 仍是平行入口。",
+                () => App.Settings.HotKeys.SelectionToolbox,
+                value => App.Settings.HotKeys.SelectionToolbox = value,
+                () => App.Settings.HotKeys.QuickPhrasePanel)));
 
         sp.Children.Add(FamoUI.Card("中英文状态切换",
             FamoUI.Row("Shift 切换中英文", "左右 Shift 上屏当前编码并切到英文；关闭后两侧 Shift 都不切换。",
@@ -55,6 +69,114 @@ public sealed class ShortcutsPage : UserControl
             succeeded: "热键配置已部署生效。",
             failedPrefix: "热键配置应用失败");
     }
+
+    private FrameworkElement HotKeyRow(
+        string title,
+        string description,
+        Func<string> current,
+        Action<string> changed,
+        Func<string> counterpart,
+        bool divider = true)
+    {
+        var controls = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        var record = new Button { Content = DisplayHotKey(current()) };
+        var clear = new Button { Content = "清除", IsEnabled = !string.IsNullOrEmpty(current()) };
+        bool recording = false;
+
+        void StopRecording(string? hint = null)
+        {
+            recording = false;
+            record.Content = hint ?? DisplayHotKey(current());
+        }
+
+        record.Click += (_, _) =>
+        {
+            if (recording)
+            {
+                StopRecording();
+                return;
+            }
+            recording = true;
+            record.Content = "请按快捷键…";
+            record.Focus(FocusState.Programmatic);
+        };
+        record.LostFocus += (_, _) =>
+        {
+            if (recording) StopRecording();
+        };
+        record.KeyDown += (_, e) =>
+        {
+            if (!recording) return;
+            e.Handled = true;
+            if (e.Key == VirtualKey.Escape)
+            {
+                StopRecording();
+                return;
+            }
+            if (e.Key is VirtualKey.Control or VirtualKey.Menu or VirtualKey.Shift
+                or VirtualKey.LeftWindows or VirtualKey.RightWindows)
+            {
+                return;
+            }
+
+            int key = (int)e.Key;
+            string? binding = HotKeyBinding.Create(
+                (char)key,
+                IsKeyDown(VK_CONTROL),
+                IsKeyDown(VK_MENU),
+                IsKeyDown(VK_SHIFT));
+            if (binding is null)
+            {
+                record.Content = "需两个修饰键 + 字母";
+                return;
+            }
+            if (string.Equals(binding, counterpart(), StringComparison.Ordinal))
+            {
+                record.Content = "已被另一功能占用";
+                return;
+            }
+
+            changed(binding);
+            ApplyGlobalHotKeys();
+            clear.IsEnabled = true;
+            StopRecording();
+        };
+        clear.Click += (_, _) =>
+        {
+            changed(string.Empty);
+            ApplyGlobalHotKeys();
+            clear.IsEnabled = false;
+            StopRecording();
+        };
+
+        controls.Children.Add(clear);
+        controls.Children.Add(record);
+        return FamoUI.Row(title, description, controls, divider);
+    }
+
+    private void ApplyGlobalHotKeys()
+    {
+        ReloadResult result = App.SaveAndApplyInstant();
+        App.ReportReloadResult(
+            result,
+            _applyStatus,
+            pending: "功能召唤热键已保存，正在应用…",
+            running: "正在应用功能召唤热键…",
+            succeeded: "功能召唤热键已生效。",
+            failedPrefix: "功能召唤热键应用失败");
+    }
+
+    private static string DisplayHotKey(string value) =>
+        string.IsNullOrEmpty(value) ? "点击录制" : value;
+
+    private static bool IsKeyDown(int virtualKey) => (GetKeyState(virtualKey) & 0x8000) != 0;
+
+    private const int VK_SHIFT = 0x10;
+    private const int VK_CONTROL = 0x11;
+    private const int VK_MENU = 0x12;
+
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int nVirtKey);
 
     private static StackPanel KeyToggle(bool isOn, Action<bool> changed, params string[] keys)
     {

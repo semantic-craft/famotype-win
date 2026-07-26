@@ -75,6 +75,7 @@ bool ParseHostBehaviorFlags(std::string_view text, uint32_t *flags) {
                                                     "label_font_point",
                                                     "comment_font_point",
                                                     "horizontal",
+                                                    "orientation",
                                                     "inline_preedit",
                                                     "show_preedit",
                                                     "preview_pages",

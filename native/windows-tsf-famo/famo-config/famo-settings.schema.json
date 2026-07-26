@@ -10,7 +10,7 @@
     "version": {
       "description": "store schema 版本，便于后续迁移。",
       "type": "integer",
-      "const": 3
+      "const": 4
     },
 
     "appearance": {
@@ -69,11 +69,11 @@
           "x-famo-target": { "file": "famo-style.yaml", "key": "style/label_format + style/label_font_point + style/comment_font_point" }
         },
         "orientation": {
-          "description": "候选排列。horizontal=横排 / vertical=竖排。映射 style/horizontal(true=横排,false=竖排)。",
+          "description": "候选排列。auto=自动 / horizontal=横排 / vertical=竖排 / scroll=卷轴。卷轴为横排主行加一至两行可点后页。",
           "type": "string",
-          "enum": ["horizontal", "vertical"],
+          "enum": ["auto", "horizontal", "vertical", "scroll"],
           "x-famo-bucket": "instant",
-          "x-famo-target": { "file": "famo-style.yaml", "key": "style/horizontal" }
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/orientation" }
         },
         "inlinePreedit": {
           "description": "内嵌预编辑：拼音直接显示在输入处。映射 famo-style.yaml style/inline_preedit，由 native TSF host 消费。",
@@ -88,13 +88,13 @@
           "x-famo-target": { "file": "famo-style.yaml", "key": "style/show_preedit" }
         },
         "previewPages": {
-          "description": "横排紧凑候选条下方只读预览后续一至两页。",
+          "description": "v3 及更早版本的后页预览迁移键；v4 起由 orientation=scroll 表示卷轴。",
           "type": "boolean",
           "x-famo-bucket": "instant",
           "x-famo-target": { "file": "famo-style.yaml", "key": "style/preview_pages" }
         },
         "previewRows": {
-          "description": "后页预览行数。",
+          "description": "卷轴后页行数。",
           "type": "integer",
           "minimum": 1,
           "maximum": 2,
@@ -179,8 +179,8 @@
         "pageSize": {
           "description": "一屏候选词个数。映射 default.custom.yaml/menu/page_size(出厂 8；rime-ice 上游默认 5)。注意：若某方案 schema 自带 menu/page_size 会就近覆盖本全局值。",
           "type": "integer",
-          "minimum": 1,
-          "maximum": 30,
+          "minimum": 3,
+          "maximum": 9,
           "x-famo-bucket": "deploy",
           "x-famo-target": { "file": "default.custom.yaml", "key": "menu/page_size" }
         },
@@ -385,6 +385,12 @@
           "x-famo-bucket": "local",
           "x-famo-target": { "file": "famo-settings.json", "key": "ai/selectionMenuEnabled" }
         },
+        "askAnythingSkillEnabled": {
+          "description": "任意提问动作开关，出厂开。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/askAnythingSkillEnabled" }
+        },
         "polishSkillEnabled": {
           "description": "AI 润色选中技能开关，出厂开。可选(向后兼容旧 store)。",
           "type": "boolean",
@@ -403,17 +409,41 @@
           "x-famo-bucket": "local",
           "x-famo-target": { "file": "famo-settings.json", "key": "ai/researchAssistSkillEnabled" }
         },
-        "documentFormattingSkillEnabled": {
-          "description": "公文排版技能开关，出厂开。可选(向后兼容旧 store)。",
+        "publishFormattingSkillEnabled": {
+          "description": "规范排版技能开关，出厂开。可选(向后兼容旧 store)。",
           "type": "boolean",
           "x-famo-bucket": "local",
-          "x-famo-target": { "file": "famo-settings.json", "key": "ai/documentFormattingSkillEnabled" }
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/publishFormattingSkillEnabled" }
+        },
+        "translationSkillEnabled": {
+          "description": "划词翻译技能开关，出厂开。可选(向后兼容旧 store)。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/translationSkillEnabled" }
         },
         "promptOptimizeSkillEnabled": {
           "description": "提示词优化技能开关，出厂开。可选(向后兼容旧 store)。",
           "type": "boolean",
           "x-famo-bucket": "local",
           "x-famo-target": { "file": "famo-settings.json", "key": "ai/promptOptimizeSkillEnabled" }
+        }
+      }
+    },
+
+    "hotKeys": {
+      "description": "功能召唤热键。默认未设置；格式为至少两个 Ctrl/Alt/Shift 修饰键加 A-Z。",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "quickPhrasePanel": {
+          "type": "string",
+          "pattern": "^(?:|Ctrl\\+Alt\\+(?:Shift\\+)?[A-Z]|Ctrl\\+Shift\\+[A-Z]|Alt\\+Shift\\+[A-Z])$",
+          "x-famo-bucket": "local"
+        },
+        "selectionToolbox": {
+          "type": "string",
+          "pattern": "^(?:|Ctrl\\+Alt\\+(?:Shift\\+)?[A-Z]|Ctrl\\+Shift\\+[A-Z]|Alt\\+Shift\\+[A-Z])$",
+          "x-famo-bucket": "local"
         }
       }
     },

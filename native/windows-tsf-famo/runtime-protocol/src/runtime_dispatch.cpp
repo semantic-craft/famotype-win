@@ -210,6 +210,13 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
       return Reply(request, Status::EngineError);
   }
 
+  const FamoUtf8String vertical_option{sizeof(FamoUtf8String), "_vertical", 9};
+  int32_t rime_vertical = 0;
+  if (engine_.api().get_option(session.context, &vertical_option,
+                               &rime_vertical) == FAMO_ENGINE_OK &&
+      rime_vertical != 0)
+    composition.state_flags |= kHostRimeVertical;
+
   // macOS parity: optional, read-only preview of the following one or two
   // candidate pages. The engine iterator does not move the live page/highlight;
   // any unsupported/error path simply leaves the preview empty.

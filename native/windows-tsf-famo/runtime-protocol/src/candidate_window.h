@@ -3,9 +3,19 @@
 #include <memory>
 #include <thread>
 
+#include "../../famo-candidate-ui/famo_candidate_ui.h"
 #include "famo_runtime_service.h"
 
 namespace famo::runtime {
+
+struct PreviewSelection {
+  uint32_t pages_forward = 0;
+  uint32_t candidate_offset = 0;
+};
+
+bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
+                        uint32_t page_size,
+                        PreviewSelection *selection) noexcept;
 
 class CandidateWindow final : public RuntimeSnapshotSink {
 public:
