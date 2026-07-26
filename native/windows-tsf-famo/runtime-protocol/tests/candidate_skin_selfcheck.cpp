@@ -131,6 +131,9 @@ int main() {
   std::ofstream(root / "famo-style.yaml")
       << "style:\n  margin_x: 10\n  margin_x: 11\n";
   CHECK(!LoadCandidateSkin(root.string(), &skin));
+  std::ofstream(root / "famo-style.yaml")
+      << "style:\n  font_point: nan\n";
+  CHECK(!LoadCandidateSkin(root.string(), &skin));
   std::filesystem::remove_all(root);
   std::printf("candidate_skin_selfcheck: OK\n");
   return 0;

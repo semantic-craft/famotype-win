@@ -45,7 +45,7 @@
 | `appearance.skin` | `weasel.custom.yaml` | `style/color_scheme`（亮色用 `<skin>`） | 即时 | reload |
 | `appearance.appearanceMode` | `weasel.custom.yaml` | `style/color_scheme` ↔ `style/color_scheme_dark`（system=亮/暗自动；light=`<skin>`；dark=`<skin>_dark`） | 即时 | reload |
 
-四款皮肤(配色块在 `weasel.custom.yaml` 的 `preset_color_schemes/*`；色值为 **Weasel BGR `0xBBGGRR`**，与 mac 端同一真相源 `shared/skins/colors.md`)：
+七款皮肤(配色块在 `weasel.custom.yaml` 的 `preset_color_schemes/*`；色值为 **Weasel BGR `0xBBGGRR`**，与 mac 端同一真相源 `shared/skins/colors.md`)：
 
 | skin | color_scheme（亮 / 暗） | 中文名 | 品牌 accent（亮 / 暗，原 RGB） |
 |---|---|---|---|

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -116,7 +117,8 @@ bool ParseFloat(std::string_view value, float low, float high, float *result) {
   char *end = nullptr;
   errno = 0;
   const float parsed = std::strtof(text.c_str(), &end);
-  if (errno || end != text.c_str() + text.size() || parsed < low ||
+  if (errno || end != text.c_str() + text.size() || !std::isfinite(parsed) ||
+      parsed < low ||
       parsed > high)
     return false;
   *result = parsed;
