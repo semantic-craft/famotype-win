@@ -45,8 +45,10 @@ public sealed class SettingsStore
             FamoSettings loaded = JsonSerializer.Deserialize<FamoSettings>(json, JsonOptions)
                 ?? throw new InvalidDataException($"无法解析设置文件：{FilePath}");
             using JsonDocument doc = JsonDocument.Parse(json);
+            EnsureMigrationInputs(loaded);
             MigrateLegacyFuzzy(doc.RootElement, loaded);
             migrated = MigrateSettingsVersion(doc.RootElement, loaded);
+            ValidateOrThrow(loaded, FilePath);
             return loaded;
         });
         if (migrated) Save(loaded);
@@ -61,6 +63,13 @@ public sealed class SettingsStore
             : 1;
 
         bool changed = false;
+        if (!root.TryGetProperty("engine", out JsonElement engine)
+            || engine.ValueKind != JsonValueKind.Object
+            || !engine.TryGetProperty("schemaList", out _))
+        {
+            settings.Engine.SchemaList = CreateDefault().Engine.SchemaList;
+            changed = true;
+        }
         if (oldVersion < 2 && settings.Appearance.InlinePreedit)
         {
             settings.Appearance.InlinePreedit = false;
@@ -83,6 +92,7 @@ public sealed class SettingsStore
             changed = true;
         }
         if (oldVersion < 4 && root.TryGetProperty("ai", out JsonElement ai)
+            && ai.ValueKind == JsonValueKind.Object
             && ai.TryGetProperty("documentFormattingSkillEnabled", out JsonElement legacyFormatting)
             && legacyFormatting.ValueKind is JsonValueKind.True or JsonValueKind.False)
         {
@@ -103,6 +113,15 @@ public sealed class SettingsStore
         return changed;
     }
 
+    private static void EnsureMigrationInputs(FamoSettings settings)
+    {
+        if (settings.Appearance is null || settings.Engine is null
+            || settings.Appearance.Layout is null)
+        {
+            throw new InvalidDataException("设置文件的 appearance、engine 与 appearance.layout 不能为 null");
+        }
+    }
+
     /// <summary>
     /// 旧版 3 组合模糊音（zh_ch_sh / an_en_in / l_n_f_h_r_l）→ 新版 9 独立对的迁移。
     /// System.Text.Json 静默丢弃未知键，旧文件升级后这 9 项会全默认 false（丢设置）。
@@ -111,10 +130,13 @@ public sealed class SettingsStore
     /// </summary>
     private static void MigrateLegacyFuzzy(JsonElement root, FamoSettings settings)
     {
-        if (!root.TryGetProperty("engine", out JsonElement engine)) return;
-        if (!engine.TryGetProperty("fuzzyPinyin", out JsonElement fz)) return;
+        if (!root.TryGetProperty("engine", out JsonElement engine)
+            || engine.ValueKind != JsonValueKind.Object) return;
+        if (!engine.TryGetProperty("fuzzyPinyin", out JsonElement fz)
+            || fz.ValueKind != JsonValueKind.Object) return;
 
-        FuzzyPinyinSettings f = settings.Engine.FuzzyPinyin;
+        FuzzyPinyinSettings f = settings.Engine.FuzzyPinyin
+            ?? throw new InvalidDataException("设置文件的 engine.fuzzyPinyin 不能为 null");
         if (fz.TryGetProperty("zh_ch_sh", out JsonElement zcs) && zcs.ValueKind == JsonValueKind.True)
         { f.ZhZ = true; f.ChC = true; f.ShS = true; }
         if (fz.TryGetProperty("an_en_in", out JsonElement aei) && aei.ValueKind == JsonValueKind.True)
@@ -126,11 +148,22 @@ public sealed class SettingsStore
     /// <summary>写回设置（原子写：先写临时文件再替换，避免半写损坏）。</summary>
     public void Save(FamoSettings settings)
     {
+        ValidateOrThrow(settings, FilePath);
         string dir = Path.GetDirectoryName(FilePath)!;
         Directory.CreateDirectory(dir);
 
         string json = JsonSerializer.Serialize(settings, JsonOptions);
         SafeJsonFile.WriteAtomic(FilePath, json);
+    }
+
+    private static void ValidateOrThrow(FamoSettings settings, string path)
+    {
+        SchemaValidationResult result = SchemaValidator.Validate(settings);
+        if (!result.IsValid)
+        {
+            throw new InvalidDataException(
+                $"设置文件不符合 schema：{path}{Environment.NewLine}{string.Join(Environment.NewLine, result.Errors)}");
+        }
     }
 
     /// <summary>由内置 famo-settings.default.json 反序列化出一份默认设置。</summary>
