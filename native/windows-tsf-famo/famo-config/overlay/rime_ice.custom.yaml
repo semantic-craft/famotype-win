@@ -20,13 +20,13 @@
 patch:
   switches:
     - name: ascii_mode
-      states: [ 中, Ａ ]
+      states: [ 中, 英 ]
     - name: ascii_punct                  # 中英标点
       states: [ ¥, $ ]
     - name: traditionalization
       states: [ 简, 繁 ]
     - name: emoji
-      states: [ 💀, 😄 ]
+      states: [ 👍, 😄 ]
       reset: 0                            # 法墨出厂：emoji 关（rime-ice 默认 1）
     - name: full_shape
       states: [ 半角, 全角 ]

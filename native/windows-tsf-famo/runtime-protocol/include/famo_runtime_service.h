@@ -60,8 +60,8 @@ public:
   ControlError ExecuteControl(Command command);
   // Flip a boolean engine option on every live session and republish, so the
   // tray reflects the new status_flags now instead of on the next keystroke.
-  // Deliberately does not touch options_: that map is the config-derived
-  // overlay, while these toggles are runtime state the schema owns per session.
+  // Also updates the in-memory overlay so sessions opened after the click
+  // inherit the runtime toggle; it does not rewrite the config file.
   bool SetOption(std::string_view name, bool value);
   RuntimeReadiness readiness() const noexcept;
   uint64_t engine_generation() const noexcept;
@@ -108,6 +108,7 @@ private:
   ControlError ReloadStyle();
   ControlError ReloadOptions();
   ControlError SelectSchema();
+  ControlError ResetUserDictionary();
 
   std::timed_mutex mutex_;
   std::mutex ui_sessions_mutex_;
@@ -117,6 +118,7 @@ private:
   std::map<SessionKey, std::shared_ptr<UiSessionState>> ui_sessions_;
   std::map<std::string, bool> options_;
   std::string selected_schema_;
+  std::wstring engine_path_;
   std::string data_root_;
   std::shared_ptr<const RuntimeStyleState> style_state_ =
       std::make_shared<const RuntimeStyleState>();

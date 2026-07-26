@@ -56,7 +56,7 @@ public sealed class QuickPhraseStoreTests : IDisposable
     }
 
     [Fact]
-    public void BuildTableDb_WritesHeaderCodeAndVCodeRows()
+    public void BuildTableDb_WritesBareCodesWithoutVCodeRows()
     {
         var entries = new[]
         {
@@ -66,12 +66,12 @@ public sealed class QuickPhraseStoreTests : IDisposable
 
         string table = QuickPhraseStore.BuildTableDb(entries);
 
-        Assert.Contains("#@/db_name famo_quick_send", table);
-        Assert.Contains("#@/db_type tabledb", table);
+        Assert.Contains("#@/db_name\tfamo_quick_send", table);
+        Assert.Contains("#@/db_type\ttabledb", table);
         Assert.Contains("法墨常用短语\tfmcs\t100000", table);
-        Assert.Contains("法墨常用短语\tvfmcs\t100000", table);
         Assert.Contains("作者按\tzz\t100000", table);
-        Assert.Contains("作者按\tvzz\t100000", table);
+        Assert.DoesNotContain("\t`fmcs\t", table);
+        Assert.DoesNotContain("\tvfmcs\t", table);
         Assert.DoesNotContain("#@/db_name\tfamo_quick_send.txt", table);
     }
 
@@ -90,7 +90,7 @@ public sealed class QuickPhraseStoreTests : IDisposable
         Assert.True(table.IndexOf("法墨常用短语\tfmcs\t100000", StringComparison.Ordinal)
             < table.IndexOf("作者按\tzz\t100000", StringComparison.Ordinal));
         Assert.DoesNotContain("旧短语", table);
-        Assert.Contains("法墨常用短语\tvfmcs\t100000", table);
+        Assert.DoesNotContain("\tvfmcs\t", table);
     }
 
     [Fact]
@@ -103,6 +103,11 @@ public sealed class QuickPhraseStoreTests : IDisposable
 
         Assert.True(File.Exists(_table));
         Assert.Contains("法墨常用短语\tfmcs\t100000", File.ReadAllText(_table));
+
+        DateTime before = File.GetLastWriteTimeUtc(_table);
+        Thread.Sleep(20);
+        Assert.False(store.WriteTableDb(_table));
+        Assert.Equal(before, File.GetLastWriteTimeUtc(_table));
     }
 }
 
@@ -119,9 +124,9 @@ public sealed class QuickPhraseRimePatchTests
         Assert.Contains("table_translator@famo_quick_send", once);
         Assert.Contains("user_dict: famo_quick_send", once);
         Assert.Contains("dictionary: \"\"", once);
-        Assert.Contains("enable_completion: true", once);
+        Assert.Contains("enable_completion: false", once);
         Assert.Contains("enable_sentence: false", once);
-        Assert.Contains("initial_quality: 100", once);
+        Assert.Contains("initial_quality: 99", once);
         Assert.Single(System.Text.RegularExpressions.Regex.Matches(twice, "table_translator@famo_quick_send"));
     }
 

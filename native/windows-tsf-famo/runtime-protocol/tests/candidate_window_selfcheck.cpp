@@ -149,6 +149,35 @@ bool HiddenHighDpiStateDoesNotDelayFirstVisible() {
   return true;
 }
 
+bool InlineHostPreeditStillShowsPanelHeader() {
+  CandidateWindow window;
+  CHECK(window.Start());
+  CHECK(window.Prewarm());
+  auto shown = VisibleSnapshot(30);
+  shown->revision = 1;
+  shown->composition.state_flags |= kHostInlinePreedit;
+  shown->composition.preedit_cursor_pos = 2;
+  window.Publish(shown);
+  WindowProbe probe;
+  CHECK(WaitForVisibility(true, &probe));
+  const LONG shown_height = probe.rect.bottom - probe.rect.top;
+  const uint64_t full_before = window.counters().full;
+
+  FamoSkin hidden_skin = FamoSkinDefault();
+  hidden_skin.show_preedit = 0;
+  auto hidden_style = std::make_shared<const RuntimeStyleState>(
+      RuntimeStyleState{0, std::make_shared<const FamoSkin>(hidden_skin)});
+  window.ActivateStyle(hidden_style);
+  CHECK(WaitForCounters(window, [&](CandidateWindow::Counters counters) {
+    return counters.full > full_before;
+  }));
+  probe = Probe();
+  const LONG hidden_height = probe.rect.bottom - probe.rect.top;
+  window.Stop();
+  CHECK(shown_height > hidden_height);
+  return true;
+}
+
 bool HealthyWindowAndHideRules() {
   CandidateWindow window;
   CHECK(window.Start());
@@ -470,6 +499,7 @@ bool HangingUiDoesNotDelayEngine() {
 int main() {
   if (!PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
+      !InlineHostPreeditStillShowsPanelHeader() ||
       !HealthyWindowAndHideRules() ||
       !FirstVisibleBudgetAfterPrewarm() ||
       !FastPathsAndDeviceRecoveryAreObservable() ||

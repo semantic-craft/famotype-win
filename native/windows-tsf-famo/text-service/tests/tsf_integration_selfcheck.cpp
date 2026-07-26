@@ -183,6 +183,13 @@ bool HealthyRoundtrip(TextServiceModule *module, const wchar_t *runtime_path) {
               eaten == FALSE);
         CHECK(SUCCEEDED(key_sink->OnKeyUp(context, 'N', 0, &eaten)) &&
               eaten == FALSE);
+        CHECK(TestKey(key_sink, context, VK_SHIFT, true));
+        CHECK(SendKey(key_sink, context, VK_SHIFT, false));
+        CHECK(SUCCEEDED(
+            key_sink->OnTestKeyUp(context, VK_SHIFT, 0, &eaten)) &&
+              eaten == TRUE);
+        CHECK(SUCCEEDED(key_sink->OnKeyUp(context, VK_SHIFT, 0, &eaten)) &&
+              eaten == TRUE);
         CHECK(TestKey(key_sink, context, VK_F12, false));
         CHECK(SendKey(key_sink, context, VK_F12, false));
         CHECK(store->text() == L"\x5c3c\x597d");
@@ -734,6 +741,77 @@ bool ReactivationRejectsOldGeneration(TextServiceModule *module,
   return true;
 }
 
+bool ForegroundFocusRecyclesRuntimeConnection(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 3));
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> first;
+  ComPtr<ITfTextInputProcessorEx> second;
+  ComPtr<ITfKeyEventSink> first_keys;
+  ComPtr<ITfKeyEventSink> second_keys;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        first.put())));
+  CHECK(SUCCEEDED(first->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(first_keys.put()))));
+  auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(first_keys.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SUCCEEDED(first_keys->OnSetFocus(FALSE)));
+
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        second.put())));
+  CHECK(SUCCEEDED(second->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(second_keys.put()))));
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(second_keys.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SUCCEEDED(second_keys->OnSetFocus(FALSE)));
+  CHECK(SUCCEEDED(first_keys->OnSetFocus(TRUE)));
+
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(first_keys.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SendKey(first_keys.get(), target.context.get(), 'N', true));
+  CHECK(target.store->text() == L"n");
+
+  second_keys.reset();
+  CHECK(SUCCEEDED(second->Deactivate()));
+  second.reset();
+  first_keys.reset();
+  CHECK(SUCCEEDED(first->Deactivate()));
+  first.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  CHECK(runtime.Finish());
+  return true;
+}
+
 bool AllTextStoreChecks(const wchar_t *module_path,
                         const wchar_t *runtime_path) {
   ScopedCom com;
@@ -755,6 +833,7 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(TransientWarmupUnavailableRetriesSameFocus(&module, runtime_path));
   CHECK(ExhaustedWarmupRetriesOnNextKeySameFocus(&module, runtime_path));
   CHECK(ReactivationRejectsOldGeneration(&module, runtime_path));
+  CHECK(ForegroundFocusRecyclesRuntimeConnection(&module, runtime_path));
   CHECK(module.CanUnload());
   return true;
 }

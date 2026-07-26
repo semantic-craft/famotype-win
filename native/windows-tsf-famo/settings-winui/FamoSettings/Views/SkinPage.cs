@@ -9,13 +9,19 @@ using Windows.UI;
 
 namespace Famo.Settings.Views;
 
-/// <summary>皮肤外观（皮）—— 即时桶：4 学院皮肤 + 外观模式 + 候选窗预览。</summary>
+/// <summary>皮肤外观（皮）—— 即时桶：7 学院皮肤 + 外观模式 + 候选窗预览。</summary>
 public sealed class SkinPage : UserControl
 {
     private static AppearanceSettings A => App.Settings.Appearance;
 
-    private static readonly (string Id, string Name)[] Skins =
-        { ("shenda", "荔园红"), ("stanford", "胡佛红"), ("wuda", "珞珈青"), ("xiada", "嘉庚蓝") };
+    private static readonly (string Id, string Name, string Swatch)[] Skins =
+    {
+        ("shenda", "荔园红", "A82C53"), ("stanford", "胡佛红", "8C1515"),
+        ("wuda", "珞珈青", "2A8367"), ("xiada", "嘉庚蓝", "1D4A8C"),
+        ("illinois", "香槟橙（藏蓝）", "FF5F05"),
+        ("illinoisflame", "香槟橙（燃橙）", "C24A00"),
+        ("nyu", "纽约紫", "57068C"),
+    };
 
     private readonly StackPanel _skinRow = new() { Orientation = Orientation.Horizontal, Spacing = 12 };
     private readonly TextBlock _applyStatus;
@@ -23,7 +29,7 @@ public sealed class SkinPage : UserControl
     public SkinPage()
     {
         var sp = new StackPanel();
-        sp.Children.Add(FamoUI.PaneHeader("皮肤外观", "四款学院皮肤，明暗跟随系统。整窗与候选窗共用同一套调色板，切换即时重绘。"));
+        sp.Children.Add(FamoUI.PaneHeader("皮肤外观", "七款学院皮肤，明暗跟随系统。整窗与候选窗共用同一套调色板，切换即时重绘。"));
         sp.Children.Add(FamoUI.Banner(false, "皮肤 / 明暗切换实时重绘整窗与候选窗"));
 
         BuildSkinCards();
@@ -36,7 +42,7 @@ public sealed class SkinPage : UserControl
                 {
                     A.AppearanceMode = i switch { 1 => "light", 2 => "dark", _ => "system" };
                     ApplyInstant();
-                    BuildSkinCards(); // 明暗换 → swatch 取对应明暗 accent
+                    BuildSkinCards(); // 明暗换后刷新选中态笔刷
                 }), divider: false)));
 
         sp.Children.Add(FamoUI.Card("候选窗预览", FamoUI.RowFull(FamoPreview.Build())));
@@ -57,11 +63,10 @@ public sealed class SkinPage : UserControl
     private void BuildSkinCards()
     {
         _skinRow.Children.Clear();
-        bool dark = FamoTheme.IsDark;
-        foreach ((string id, string name) in Skins)
+        foreach ((string id, string name, string swatch) in Skins)
         {
             bool sel = id == A.Skin;
-            Color accent = FamoTheme.Token(id, dark, 0);
+            Color accent = FamoTheme.Hex(swatch);
             var sw = new Border
             {
                 Width = 46, Height = 46, CornerRadius = new CornerRadius(12),

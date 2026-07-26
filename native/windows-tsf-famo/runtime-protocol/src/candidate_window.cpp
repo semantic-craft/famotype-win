@@ -46,6 +46,7 @@ bool SameCompositionExceptSelection(const Composition &left,
          left.schema_id == right.schema_id &&
          left.schema_name == right.schema_name &&
          left.candidates == right.candidates &&
+         left.preview_candidates == right.preview_candidates &&
          left.page_index == right.page_index &&
          left.page_size == right.page_size &&
          left.state_flags == right.state_flags &&
@@ -77,10 +78,21 @@ public:
       adapted.flags = candidate.flags;
       candidates_.push_back(adapted);
     }
+    preview_candidates_.reserve(source.preview_candidates.size());
+    for (const Candidate &candidate : source.preview_candidates) {
+      FamoCandidate adapted{};
+      adapted.size = static_cast<uint32_t>(sizeof(adapted));
+      adapted.text = ViewString(candidate.text);
+      adapted.comment = ViewString(candidate.comment);
+      adapted.label = ViewString(candidate.label);
+      adapted.quality = candidate.quality;
+      adapted.flags = candidate.flags;
+      preview_candidates_.push_back(adapted);
+    }
     view_.size = static_cast<uint32_t>(sizeof(view_));
-    view_.preedit = ViewString((source.state_flags & kHostInlinePreedit) != 0
-                                   ? std::string_view{}
-                                   : std::string_view(source.preedit));
+    // The panel receives raw preedit/caret in both host-inline modes. Its own
+    // show_preedit preference alone decides whether the editable header appears.
+    view_.preedit = ViewString(source.preedit);
     view_.commit = ViewString(source.commit);
     view_.commit_preview = ViewString(source.commit_preview);
     view_.schema_id = ViewString(source.schema_id);
@@ -99,9 +111,16 @@ public:
   }
 
   const FamoCompositionView *get() const { return &view_; }
+  const FamoCandidate *preview_candidates() const {
+    return preview_candidates_.data();
+  }
+  uint32_t preview_candidate_count() const {
+    return static_cast<uint32_t>(preview_candidates_.size());
+  }
 
 private:
   std::vector<FamoCandidate> candidates_;
+  std::vector<FamoCandidate> preview_candidates_;
   FamoCompositionView view_{};
 };
 
@@ -519,6 +538,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     input.dpi = dpi;
     input.measure = &FamoTextMeasure;
     input.measure_user = resources;
+    input.preview_candidates = view.preview_candidates();
+    input.preview_candidate_count = view.preview_candidate_count();
+    input.preview_page_size = snapshot->composition.page_size;
     FamoLayoutResult layout{};
     const bool selection_only =
         stable_presentation &&

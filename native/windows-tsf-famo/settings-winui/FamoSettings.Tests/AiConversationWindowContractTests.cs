@@ -15,6 +15,9 @@ public sealed class AiConversationWindowContractTests
         Assert.Contains("WindowsCredentialSecretStore", window);
         Assert.Contains("SendAsync", window);
         Assert.Contains("复制结果", window);
+        Assert.Contains("复制并关闭", window);
+        Assert.Contains("_selectedText", window);
+        Assert.Contains("FocusState.Programmatic", window);
         Assert.Contains("清空", window);
         Assert.Contains("Clipboard.SetContent", window);
 
@@ -32,6 +35,9 @@ public sealed class AiConversationWindowContractTests
         Assert.Contains("_aiConversationWindow", app);
         Assert.Contains("IsAiChatPage", app);
         Assert.Contains("ShowAiConversation", app);
+        Assert.Contains("ShowAiConversationForSelection", app);
+        Assert.Contains("BuildSelectionCaptureService().CaptureAsync", app);
+        Assert.Contains("TryMigrateQuickPhraseArtifacts", app);
         Assert.Contains("\"ai-chat\"", app);
     }
 

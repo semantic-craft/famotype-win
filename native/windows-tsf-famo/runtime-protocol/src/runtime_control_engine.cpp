@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <set>
@@ -139,6 +140,56 @@ bool ReadSelectedSchema(std::string_view root, std::string *schema) {
   return true;
 }
 
+constexpr std::wstring_view kUserDatabaseSuffix = L".userdb";
+
+std::vector<std::filesystem::path>
+UserDatabases(const std::filesystem::path &root) {
+  std::vector<std::filesystem::path> result;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it(root, ec), end;
+       !ec && it != end; it.increment(ec)) {
+    const std::wstring name = it->path().filename().wstring();
+    if (it->is_directory(ec) && !ec && name.size() > kUserDatabaseSuffix.size() &&
+        name.ends_with(kUserDatabaseSuffix))
+      result.push_back(it->path());
+  }
+  if (ec)
+    result.clear();
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+std::filesystem::path UserDictionaryBackup(const std::filesystem::path &root) {
+  SYSTEMTIME now{};
+  GetLocalTime(&now);
+  wchar_t timestamp[32]{};
+  swprintf_s(timestamp, std::size(timestamp), L"%04u%02u%02u-%02u%02u%02u-%03u",
+             now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+             now.wSecond, now.wMilliseconds);
+  return root / L".famo-backup" /
+         (std::wstring(L"userdb-reset-") + timestamp);
+}
+
+bool CopyDirectory(const std::filesystem::path &source,
+                   const std::filesystem::path &destination) {
+  std::error_code ec;
+  std::filesystem::copy(source, destination,
+                        std::filesystem::copy_options::recursive, ec);
+  return !ec;
+}
+
+bool RestoreUserDatabases(const std::vector<std::filesystem::path> &databases,
+                          const std::filesystem::path &backup) {
+  bool restored = true;
+  for (const auto &database : databases) {
+    std::error_code ec;
+    std::filesystem::remove_all(database, ec);
+    if (ec || !CopyDirectory(backup / database.filename(), database))
+      restored = false;
+  }
+  return restored;
+}
+
 } // namespace
 
 bool RuntimeService::ApplyOptionsLocked(
@@ -180,6 +231,8 @@ bool RuntimeService::SetOption(std::string_view name, bool value) {
     Publish(session, true);
     applied = true;
   }
+  if (applied)
+    options_[std::string(name)] = value;
   return applied;
 }
 
@@ -309,6 +362,82 @@ RuntimeService::InitializeControlState(uint32_t empty_root_behavior_flags) {
   return result;
 }
 
+ControlError RuntimeService::ResetUserDictionary() {
+  std::filesystem::path root;
+  if (!Utf8Path(data_root_, L"", &root))
+    return ControlError::Config;
+  const auto databases = UserDatabases(root);
+  if (databases.empty())
+    return ControlError::None;
+
+  const RuntimeReadiness before =
+      readiness_.exchange(RuntimeReadiness::Maintenance);
+  if (before != RuntimeReadiness::Ready) {
+    readiness_.store(before);
+    return ControlError::Runtime;
+  }
+
+  std::lock_guard lock(mutex_);
+  std::lock_guard ui_lock(ui_sessions_mutex_);
+  for (auto &[key, session] : sessions_) {
+    (void)key;
+    Publish(session, false);
+    if (session.context)
+      engine_.api().destroy_context(session.context);
+  }
+  sessions_.clear();
+  ui_sessions_.clear();
+  clients_.clear();
+  engine_.Unload();
+
+  const auto backup = UserDictionaryBackup(root);
+  std::error_code ec;
+  std::filesystem::create_directories(backup, ec);
+  bool backed_up = !ec;
+  for (const auto &database : databases) {
+    if (!backed_up || !CopyDirectory(database, backup / database.filename())) {
+      backed_up = false;
+      break;
+    }
+  }
+
+  bool removed = backed_up;
+  if (backed_up) {
+    for (const auto &database : databases) {
+      std::filesystem::remove_all(database, ec);
+      if (ec) {
+        removed = false;
+        break;
+      }
+    }
+    if (!removed)
+      RestoreUserDatabases(databases, backup);
+  }
+
+  const int32_t load_rc = engine_.Load(engine_path_.c_str(), data_root_.c_str());
+  if (load_rc != FAMO_ENGINE_OK || !engine_.AbiRunnable()) {
+    if (load_rc == FAMO_ENGINE_OK)
+      engine_.Unload();
+    readiness_.store(RuntimeReadiness::Unavailable);
+    return ControlError::Engine;
+  }
+  if (!backed_up || !removed) {
+    readiness_.store(RuntimeReadiness::Ready);
+    return ControlError::Runtime;
+  }
+
+  const FamoUtf8String schema = EngineString(selected_schema_);
+  FamoUtf8String deploy_error{};
+  deploy_error.size = static_cast<uint32_t>(sizeof(deploy_error));
+  if (engine_.api().deploy_schema(&schema, &deploy_error) != FAMO_ENGINE_OK) {
+    readiness_.store(RuntimeReadiness::Unavailable);
+    return ControlError::Engine;
+  }
+  engine_generation_.fetch_add(1);
+  readiness_.store(RuntimeReadiness::Ready);
+  return ControlError::None;
+}
+
 ControlError RuntimeService::ExecuteControl(Command command) {
   if (!IsControlOperation(command))
     return ControlError::InvalidOperation;
@@ -334,6 +463,8 @@ ControlError RuntimeService::ExecuteControl(Command command) {
     return ReloadOptions();
   if (command == Command::ControlSelectSchema)
     return SelectSchema();
+  if (command == Command::ControlResetUserDictionary)
+    return ResetUserDictionary();
   if (command == Command::ControlShutdown) {
     readiness_.store(RuntimeReadiness::Stopping);
     return ControlError::None;

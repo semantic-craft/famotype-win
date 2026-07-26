@@ -75,7 +75,7 @@ public sealed class KeyboardPage : UserControl
             }));
 
         sp.Children.Add(FamoUI.Card("输入方式",
-            FamoUI.Row("方式", "拼音输入、双拼输入、五笔输入；切换后立即应用到当前会话。",
+            FamoUI.Row("方式", "拼音与双拼基于雾凇拼音 rime-ice，五笔基于极点五笔 86；切换后立即应用到当前会话。",
                 FamoUI.SegBar(Labels(Methods), methodIdx, OnMethodChanged), divider: false),
             _doublePinyinRow,
             _wubiSchemeRow));

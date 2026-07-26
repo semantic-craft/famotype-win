@@ -93,8 +93,8 @@ constexpr Toggle kToggles[] = {
      "中"},
     {kCmdAsciiPunct, FAMO_STATUS_ASCII_PUNCT, "ascii_punct", L"英文标点", ".",
      "。"},
-    {kCmdSimplification, FAMO_STATUS_SIMPLIFIED, "simplification", L"简体字",
-     "简", "繁"},
+    {kCmdSimplification, FAMO_STATUS_SIMPLIFIED, "traditionalization",
+     L"简体字", "简", "繁"},
     {kCmdFullShape, FAMO_STATUS_FULL_SHAPE, "full_shape", L"全角", "全", "半"},
 };
 static_assert(sizeof(kToggles) / sizeof(kToggles[0]) == kStatusBarButtonCount,
@@ -288,6 +288,18 @@ std::string StatusBarSchemaGlyph(std::string_view name) {
   return FirstUtf8Char(name);
 }
 
+std::string StatusBarSchemaSwitchTarget(
+    std::string_view current_schema, std::string_view previous_schema,
+    const std::vector<std::string> &schema_list) {
+  if (!previous_schema.empty() && previous_schema != current_schema)
+    return std::string(previous_schema);
+  for (const std::string &id : schema_list) {
+    if (id != current_schema)
+      return id;
+  }
+  return {};
+}
+
 namespace {
 
 bool Inside(const StatusBarLayout::Button &button, int x, int y) {
@@ -332,6 +344,17 @@ bool StatusBarHitsSchema(const StatusBarLayout &layout, int x, int y) {
 
 const char *StatusBarOption(int index) {
   return InRange(index) ? kToggles[index].option : nullptr;
+}
+
+const char *StatusBarSecondaryOption(int index) {
+  return index == 2 ? "zh_trad" : nullptr;
+}
+
+bool StatusBarNextOptionValue(uint32_t status_flags, int index) {
+  if (!InRange(index))
+    return false;
+  const bool on = (status_flags & kToggles[index].status_flag) != 0;
+  return index == 2 ? on : !on;
 }
 
 bool StatusBarButtonOn(uint32_t status_flags, int index) {
@@ -452,7 +475,7 @@ struct StatusUi::State {
   std::wstring data_root;  // set before the thread starts, read-only after
 
   // Written by the engine thread, read by the UI thread.
-  std::atomic<uint32_t> status_flags{0};
+  std::atomic<uint32_t> status_flags{FAMO_STATUS_SIMPLIFIED};
   std::atomic<HWND> window{nullptr};
   std::atomic<bool> ready{false};
   std::atomic<uint64_t> icon_registrations{0};
@@ -590,11 +613,15 @@ Promote PromoteTrayIcon() {
 }
 
 void RunCommand(StatusUi::State *state, UINT command) {
-  for (const Toggle &toggle : kToggles) {
+  for (int index = 0; index < kStatusBarButtonCount; ++index) {
+    const Toggle &toggle = kToggles[index];
     if (command != toggle.command)
       continue;
-    const bool next = (state->status_flags.load() & toggle.status_flag) == 0;
+    const bool next =
+        StatusBarNextOptionValue(state->status_flags.load(), index);
     state->service->SetOption(toggle.option, next);
+    if (const char *secondary = StatusBarSecondaryOption(index))
+      state->service->SetOption(secondary, next);
     return;
   }
   if (command == kCmdSettings) {
@@ -683,6 +710,12 @@ void SwitchSchema(StatusUi::State *state, HWND window, const std::string &id) {
     if (state->service->ExecuteControl(Command::ControlSelectSchema) !=
         ControlError::None)
       return;
+    try {
+      state->schema.store(std::make_shared<const SchemaState>(
+          SchemaState{id, SchemaDisplayName(state, id)}));
+    } catch (...) {
+      return;
+    }
     PostMessageW(window, kSchemaSwitched, 0, 0);
   });
 }
@@ -691,17 +724,12 @@ void SwitchSchema(StatusUi::State *state, HWND window, const std::string &id) {
 // first list entry that is not the current one, so a fresh profile still
 // switches instead of doing nothing.
 void SwitchToPreviousSchema(StatusUi::State *state, HWND window) {
-  if (!state->previous_schema.empty()) {
-    SwitchSchema(state, window, state->previous_schema);
-    return;
-  }
   std::shared_ptr<const SchemaState> current = CurrentSchema(state);
-  for (const std::string &id : SchemaList(state)) {
-    if (!current || id != current->id) {
-      SwitchSchema(state, window, id);
-      return;
-    }
-  }
+  const std::string target = StatusBarSchemaSwitchTarget(
+      current ? current->id : std::string_view(), state->previous_schema,
+      SchemaList(state));
+  if (!target.empty())
+    SwitchSchema(state, window, target);
 }
 
 void ShowSchemaMenu(StatusUi::State *state, HWND window) {
@@ -995,6 +1023,7 @@ LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
     state->pending_previous.clear();
     StatusBarSavePosition(state->bar_state_path, state->bar_x, state->bar_y,
                           state->previous_schema);
+    PaintBar(state);
     return 0;
   case WM_DPICHANGED: {
     state->bar_dpi = HIWORD(wparam) ? HIWORD(wparam) : GetDpiForWindow(window);
@@ -1223,8 +1252,8 @@ void StatusUi::Publish(
   bool changed = state_->status_flags.exchange(flags) != flags;
   // Same gate for the schema: a defocused publish clears schema_id too, and
   // acting on that would blank the segment on every focus change. This is the
-  // only writer of the displayed schema -- a click never sets it optimistically,
-  // so a switch the engine rejected leaves the segment on what is really live.
+  // authoritative source for external changes. A status-bar click also updates
+  // this state, but only after the engine confirms the switch.
   const std::string &id = snapshot->composition.schema_id;
   std::shared_ptr<const SchemaState> current = state_->schema.load();
   if (!id.empty() && (!current || current->id != id ||

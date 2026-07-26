@@ -89,11 +89,17 @@ public sealed class CandidateFormatTests
     {
         FamoSettings settings = SettingsStore.CreateDefault();
         Assert.False(settings.Appearance.InlinePreedit);
+        Assert.True(settings.Appearance.ShowPreedit);
+        Assert.False(settings.Appearance.PreviewPages);
+        Assert.Equal(2, settings.Appearance.PreviewRows);
         Assert.False(settings.Appearance.InlineCandidatePreview);
 
         using JsonDocument defaults = JsonDocument.Parse(SettingsStore.DefaultSettingsJson);
         JsonElement appearanceDefaults = defaults.RootElement.GetProperty("appearance");
         Assert.False(appearanceDefaults.GetProperty("inlinePreedit").GetBoolean());
+        Assert.True(appearanceDefaults.GetProperty("showPreedit").GetBoolean());
+        Assert.False(appearanceDefaults.GetProperty("previewPages").GetBoolean());
+        Assert.Equal(2, appearanceDefaults.GetProperty("previewRows").GetInt32());
         Assert.False(appearanceDefaults.GetProperty("inlineCandidatePreview").GetBoolean());
 
         string schemaText = File.ReadAllText(RepoFile("native/windows-tsf-famo/famo-config/famo-settings.schema.json"));
@@ -105,6 +111,15 @@ public sealed class CandidateFormatTests
             appearanceSchema.GetProperty("required").EnumerateArray().Select(x => x.GetString()));
         Assert.Contains(
             "inlineCandidatePreview",
+            appearanceSchema.GetProperty("required").EnumerateArray().Select(x => x.GetString()));
+        Assert.Contains(
+            "showPreedit",
+            appearanceSchema.GetProperty("required").EnumerateArray().Select(x => x.GetString()));
+        Assert.Contains(
+            "previewPages",
+            appearanceSchema.GetProperty("required").EnumerateArray().Select(x => x.GetString()));
+        Assert.Contains(
+            "previewRows",
             appearanceSchema.GetProperty("required").EnumerateArray().Select(x => x.GetString()));
 
         JsonElement inlinePreedit = appearanceSchema
@@ -153,6 +168,27 @@ public sealed class CandidateFormatTests
     }
 
     [Fact]
+    public void NativeStyleOverlay_MapsPanelPreeditAndPreviewIndependently()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Appearance.InlinePreedit = true;
+        settings.Appearance.ShowPreedit = false;
+        settings.Appearance.PreviewPages = true;
+        settings.Appearance.PreviewRows = 1;
+
+        string overlay = ConfigWriter.BuildStyleOverlay(settings);
+        string baseline = ConfigWriter.BuildWeaselCustom(settings);
+
+        foreach (string yaml in new[] { overlay, baseline })
+        {
+            Assert.Contains("inline_preedit: true", yaml);
+            Assert.Contains("show_preedit: false", yaml);
+            Assert.Contains("preview_pages: true", yaml);
+            Assert.Contains("preview_rows: 1", yaml);
+        }
+    }
+
+    [Fact]
     public void CandidatePage_RefreshesLivePreviewAfterEveryInstantHandler()
     {
         string page = File.ReadAllText(
@@ -165,6 +201,9 @@ public sealed class CandidateFormatTests
         Assert.Equal(instantCalls, refreshCalls);
         Assert.Contains("_previewHost.Content = FamoPreview.Build();", page);
         Assert.Contains("A.InlineCandidatePreview", page);
+        Assert.Contains("A.ShowPreedit", page);
+        Assert.Contains("A.PreviewPages", page);
+        Assert.Contains("A.PreviewRows", page);
     }
 
     [Fact]

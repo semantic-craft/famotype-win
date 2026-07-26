@@ -118,6 +118,7 @@ private:
   void SessionWorkerMain();
   void ScheduleSession(ContextEntry *entry, SessionWarmupReason reason);
   void ApplySessionResult();
+  void DisconnectRuntimeIfIdle();
   void ReportTiming(const char *operation,
                     std::chrono::milliseconds elapsed,
                     const runtime::Correlation &identity,

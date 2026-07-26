@@ -47,6 +47,7 @@ bool RuntimeService::Start(const wchar_t *engine_path, const char *data_root,
     return false;
   }
   data_root_ = data_root ? data_root : "";
+  engine_path_ = engine_path ? engine_path : L"";
   started_ = true;
   engine_generation_.store(1);
   return true;
@@ -76,6 +77,7 @@ void RuntimeService::Stop() {
   clients_.clear();
   options_.clear();
   selected_schema_.clear();
+  engine_path_.clear();
   data_root_.clear();
   style_state_ = std::make_shared<const RuntimeStyleState>();
   engine_.Unload();

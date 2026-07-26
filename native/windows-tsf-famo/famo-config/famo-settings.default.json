@@ -8,6 +8,9 @@
     "candidateFormat": "full",
     "orientation": "horizontal",
     "inlinePreedit": false,
+    "showPreedit": true,
+    "previewPages": false,
+    "previewRows": 2,
     "inlineCandidatePreview": false,
     "layout": {
       "cornerRadius": 13,

@@ -65,8 +65,15 @@ public sealed class CandidatePage : UserControl
         sp.Children.Add(pageSizeStatusRow);
 
         sp.Children.Add(FamoUI.Card("候选行为",
-            FamoUI.Row("内嵌预编辑", "开=拼音直接显示在输入处（光标内嵌）；关=拼音显示在候选窗顶部。",
+            FamoUI.Row("内嵌预编辑", "开=拼音同时显示在输入处；候选窗输入串由下一项独立控制。",
                 FamoUI.Pill(A.InlinePreedit, v => { A.InlinePreedit = v; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); }), divider: false),
+            FamoUI.Row("候选窗显示输入串", "显示原始字母、活动音节和可用左右键移动的光标。",
+                FamoUI.Pill(A.ShowPreedit, v => { A.ShowPreedit = v; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); })),
+            FamoUI.Row("预览后页", "横排候选条下方淡显后面一/两页；无序号、不可点，翻页键行为不变。",
+                FamoUI.Pill(A.PreviewPages, v => { A.PreviewPages = v; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); })),
+            FamoUI.Row("预览行数", "预览后续一页或两页。",
+                FamoUI.SegBar(new[] { "1 行", "2 行" }, Math.Clamp(A.PreviewRows, 1, 2) - 1,
+                    i => { A.PreviewRows = i + 1; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); })),
             FamoUI.Row("内嵌候选预览", "开=光标处显示当前候选词的实际文字；关=光标处显示拼音本身（区别于内嵌预编辑，那是控制显示的位置，这个控制显示的内容）。",
                 FamoUI.Pill(A.InlineCandidatePreview, v => { A.InlineCandidatePreview = v; ReloadResult result = App.SaveAndApplyInstant(); ReportInstantResult(result); RefreshPreview(); }))));
 

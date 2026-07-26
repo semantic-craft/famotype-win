@@ -19,20 +19,24 @@
       "additionalProperties": false,
       "required": [
         "skin", "appearanceMode", "fontFace", "fontPoint", "candidateFormat",
-        "orientation", "inlinePreedit", "inlineCandidatePreview", "layout"
+        "orientation", "inlinePreedit", "showPreedit", "previewPages",
+        "previewRows", "inlineCandidatePreview", "layout"
       ],
       "properties": {
         "skin": {
-          "description": "学院皮肤。映射 famo-style.yaml style/color_scheme。荔园红=shenda(默认,深大红品牌色) / 胡佛红=stanford / 珞珈青=wuda / 嘉庚蓝=xiada。",
+          "description": "学院皮肤。映射 famo-style.yaml style/color_scheme。荔园红=shenda(默认) / 胡佛红=stanford / 珞珈青=wuda / 嘉庚蓝=xiada / 香槟橙(藏蓝)=illinois / 香槟橙(燃橙)=illinoisflame / 纽约紫=nyu。",
           "type": "string",
-          "enum": ["shenda", "stanford", "wuda", "xiada"],
+          "enum": ["shenda", "stanford", "wuda", "xiada", "illinois", "illinoisflame", "nyu"],
           "x-famo-bucket": "instant",
           "x-famo-target": { "file": "famo-style.yaml", "key": "style/color_scheme" },
           "x-famo-skin-labels": {
             "shenda": "荔园红 · 深圳大学",
             "stanford": "胡佛红 · 斯坦福大学",
             "wuda": "珞珈青 · 武汉大学",
-            "xiada": "嘉庚蓝 · 厦门大学"
+            "xiada": "嘉庚蓝 · 厦门大学",
+            "illinois": "香槟橙（藏蓝） · 伊利诺伊大学",
+            "illinoisflame": "香槟橙（燃橙） · 伊利诺伊大学",
+            "nyu": "纽约紫 · 纽约大学"
           }
         },
         "appearanceMode": {
@@ -76,6 +80,26 @@
           "type": "boolean",
           "x-famo-bucket": "instant",
           "x-famo-target": { "file": "famo-style.yaml", "key": "style/inline_preedit" }
+        },
+        "showPreedit": {
+          "description": "候选窗显示原始输入串、活动音节与可移动光标；独立于宿主内嵌预编辑。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/show_preedit" }
+        },
+        "previewPages": {
+          "description": "横排紧凑候选条下方只读预览后续一至两页。",
+          "type": "boolean",
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/preview_pages" }
+        },
+        "previewRows": {
+          "description": "后页预览行数。",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2,
+          "x-famo-bucket": "instant",
+          "x-famo-target": { "file": "famo-style.yaml", "key": "style/preview_rows" }
         },
         "inlineCandidatePreview": {
           "description": "内嵌候选预览：光标处显示当前候选词的实际文字。映射 famo-style.yaml style/preedit_type。",

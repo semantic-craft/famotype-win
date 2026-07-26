@@ -56,7 +56,7 @@ public sealed class SkillsPage : UserControl
             SkillRow(AiSelectionSkills.PromptOptimize, "把选中的草稿提示词补齐意图/目标/约束/产出形态四要素；信息不足时先反问再定稿。",
                 App.Settings.Ai.PromptOptimizeSkillEnabled,
                 v => { App.Settings.Ai.PromptOptimizeSkillEnabled = v; App.Store.Save(App.Settings); }),
-            FamoUI.Row("AI 对话", "打开任意提问窗口；只发送你在窗口里主动输入的内容。",
+            FamoUI.Row("任意提问", "全部划词技能的兜底：从划词入口可对选中文本改写、排版、翻译、拟回复或提问；这里打开普通对话。",
                 FamoUI.ActionButton("打开", App.ShowAiConversation)));
         sp.Children.Add(builtInSkills);
 

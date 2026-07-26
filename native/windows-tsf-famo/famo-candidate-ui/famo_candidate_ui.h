@@ -119,6 +119,16 @@ typedef struct FamoSkin {
   // paint would make bitmap_smoke's pixel assertions depend on the test
   // machine's accessibility settings.
   int32_t caret_width;
+
+  // Secondary surface token (`card2`). Appended for size-negotiated compatibility;
+  // status-bar callers built against an older struct fall back to deriving it.
+  uint32_t card2_color;
+
+  // Candidate-panel additions. Appended so older callers keep their existing
+  // layout; absent fields default to show-preedit on and preview off.
+  uint32_t show_preedit;
+  uint32_t preview_pages;
+  uint32_t preview_rows;  // clamped to 1..2
 } FamoSkin;
 
 // Compiled-in neutral default skin (Vertical, opaque dark-on-light).
@@ -158,6 +168,12 @@ typedef struct FamoLayoutInput {
   // Text measurement seam (see above). NULL → deterministic monospace fallback.
   FamoMeasureTextFn measure;
   void* measure_user;
+
+  // Read-only candidates from the following one or two pages. They are laid
+  // out only under a horizontal compact row; labels/comments are ignored.
+  const FamoCandidate* preview_candidates;
+  uint32_t preview_candidate_count;
+  uint32_t preview_page_size;
 } FamoLayoutInput;
 
 // Per-candidate rect bundle. All rects are in the popup's content coordinate
@@ -172,6 +188,7 @@ typedef struct FamoCandidateRects {
 } FamoCandidateRects;
 
 #define FAMO_MAX_LAID_CANDIDATES 32u
+#define FAMO_MAX_PREVIEW_CANDIDATES 64u
 
 typedef struct FamoLayoutResult {
   uint32_t size;
@@ -195,6 +212,9 @@ typedef struct FamoLayoutResult {
 
   uint32_t candidate_count;  // #laid candidates (<= FAMO_MAX_LAID_CANDIDATES)
   FamoCandidateRects candidates[FAMO_MAX_LAID_CANDIDATES];
+
+  uint32_t preview_candidate_count;
+  FamoCandidateRects preview_candidates[FAMO_MAX_PREVIEW_CANDIDATES];
 
   // Preedit selection/caret converted to UTF-16 wchar offsets (research §3.3.3:
   // ABI carries UTF-8 byte offsets; the current UI indexes preedit by wchar).
@@ -270,7 +290,7 @@ int32_t FamoCandidateUiPaint(const FamoCompositionView* view,
 typedef struct FamoStatusBarButton {
   FamoRect bounds;     // bar-local device px
   const char* label;   // NUL-terminated UTF-8; NULL/empty draws no glyph
-  uint32_t on;         // option currently enabled -> highlighted styling
+  uint32_t on;         // option currently enabled; label carries the idle state
   uint32_t hover;
   uint32_t pressed;
 } FamoStatusBarButton;
@@ -286,8 +306,8 @@ typedef struct FamoStatusBarSpec {
 // Paint the bar onto a 32-bit top-down premultiplied-alpha memory DC sized
 // bar_size, as the design system's segmented control: a round-rect trough with
 // its hairline border, the buttons tiled across it as segments sharing edges
-// (only the outermost corners rounded), an accent fill on each enabled segment
-// and a hairline divider between two plain neighbours. `buttons` must be in
+// (only the outermost corners rounded), a transient accent fill while pressed,
+// and a hairline divider between two idle neighbours. `buttons` must be in
 // left-to-right order and inset from the trough edge — the first segment's left
 // inset is what the segment corner radius is derived from.
 //

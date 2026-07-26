@@ -7,7 +7,7 @@ namespace Famo.Settings.Theming;
 
 /// <summary>
 /// 法墨皮肤主题系统（对标 macOS「Claude Design」8-token 调色板）。
-/// 4 皮肤 × 明暗 × 8 token（accent/accentDeep/onAccent/card/card2/ink/ink2/ink3）+ 派生中性色
+/// 7 皮肤 × 明暗 × 8 token（accent/accentDeep/onAccent/card/card2/ink/ink2/ink3）+ 派生中性色
 /// （line/line2/hover/knob/onAccent20）。把命名 <see cref="SolidColorBrush"/> 注入
 /// Application.Resources，换肤/明暗时**原地改 Color**，使全窗控件实时重绘（StaticResource 复用同一笔刷对象）。
 /// </summary>
@@ -28,6 +28,15 @@ public static class FamoTheme
         ["xiada"] = (
             new[] { "1D4A8C", "123061", "F8FAFC", "F8FAFC", "EFF2F7", "242A36", "5C6A81", "8898AF" },
             new[] { "4879C5", "1D4A8C", "0F141C", "212429", "1B1E22", "E6EAF0", "98A4B8", "66758A" }),
+        ["illinois"] = (
+            new[] { "13294B", "CC4A00", "FF7A2E", "FCF4E9", "FBE7D4", "13294B", "6E5A3A", "9A8A6E" },
+            new[] { "FF7A2E", "13294B", "13294B", "1E2334", "262E44", "ECE6DC", "9AA0B0", "6A7185" }),
+        ["illinoisflame"] = (
+            new[] { "C24A00", "9A3A00", "FFF4E8", "FDF6EC", "F6E9D4", "3A2A1B", "7B6248", "AB9174" },
+            new[] { "FF6E24", "C24A00", "2B1707", "241A12", "2C2117", "F1E5D7", "B49C85", "7F6C59" }),
+        ["nyu"] = (
+            new[] { "57068C", "3F0567", "FBF9FE", "FBF9FE", "F2ECF9", "2A2333", "655B79", "958BAC" },
+            new[] { "A274DA", "57068C", "15101F", "242029", "1D1A25", "EAE5F1", "A99EBB", "786C8C" }),
     };
 
     // 8 token brush 键 + 派生键。值在 EnsureBrushes 创建一次，Apply 时改 Color。

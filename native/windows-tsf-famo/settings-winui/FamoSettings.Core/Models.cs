@@ -158,7 +158,7 @@ public sealed class SwitchSettings
 /// <summary>即时桶(instant) —— 写 famo-style.yaml，候选窗轻量 reload。</summary>
 public sealed class AppearanceSettings
 {
-    /// <summary>学院皮肤：shenda(荔园红,默认) / stanford / wuda / xiada。</summary>
+    /// <summary>学院皮肤：shenda(荔园红,默认) / stanford / wuda / xiada / illinois / illinoisflame / nyu。</summary>
     public string Skin { get; set; } = "shenda";
 
     /// <summary>明暗模式：system / light / dark。</summary>
@@ -176,6 +176,15 @@ public sealed class AppearanceSettings
     public string Orientation { get; set; } = "horizontal";
 
     public bool InlinePreedit { get; set; }
+
+    /// <summary>候选窗内显示原始输入串与可移动光标；独立于宿主内嵌预编辑。</summary>
+    public bool ShowPreedit { get; set; } = true;
+
+    /// <summary>横排候选条下方只读预览后页；默认关闭。</summary>
+    public bool PreviewPages { get; set; }
+
+    /// <summary>后页预览行数，范围 1–2。</summary>
+    public int PreviewRows { get; set; } = 2;
 
     /// <summary>内嵌候选预览：光标处显示当前候选词的实际文字，而非拼音本身；区别于 InlinePreedit
     /// （只控制预编辑显示的位置，不控制显示的内容）。映射 style/preedit_type：false=composition/true=preview。</summary>

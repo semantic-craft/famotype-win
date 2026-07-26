@@ -181,13 +181,13 @@ public static class FamoUI
     }
 
     // ── 二次确认对话框（用于删除等不可逆操作）──
-    public static async Task<bool> Confirm(XamlRoot root, string title, string message)
+    public static async Task<bool> Confirm(XamlRoot root, string title, string message, string primaryButtonText = "删除")
     {
         var dialog = new ContentDialog
         {
             Title = title,
             Content = new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap },
-            PrimaryButtonText = "删除",
+            PrimaryButtonText = primaryButtonText,
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Close,
             XamlRoot = root,
