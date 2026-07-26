@@ -1,0 +1,35 @@
+# famo-candidate-fixtures-v1
+meta	version	1
+# skin	id	display_name	mode	accent	accent_deep	on_accent	card	card2	ink	ink2	ink3
+skin	shenda	荔园红	light	#A82C53	#8E2447	#FBF9F5	#FBF9F5	#F3EFE7	#2A2622	#6B6A64	#9A9387
+skin	shenda	荔园红	dark	#E06A8E	#C24E72	#1A1816	#262321	#211E1C	#ECE4D8	#A89E90	#766D62
+skin	stanford	胡佛红	light	#8C1515	#820000	#FBFBFC	#FBFBFC	#F1F2F4	#2E2D29	#53565A	#8A8D90
+skin	stanford	胡佛红	dark	#B83A4B	#8C1515	#F2F2F0	#26282C	#212327	#E8EAED	#9DA1A6	#6C7075
+skin	wuda	珞珈青	light	#2A8367	#1F6B52	#F9FAF8	#F8FBF9	#EFF2EE	#282D2A	#565F5A	#8A938E
+skin	wuda	珞珈青	dark	#3CA081	#2A8367	#121413	#212423	#1C1E1D	#E5EAE7	#98A19C	#66706B
+skin	xiada	嘉庚蓝	light	#1D4A8C	#123061	#F8FAFC	#F8FAFC	#EFF2F7	#242A36	#5C6A81	#8898AF
+skin	xiada	嘉庚蓝	dark	#4879C5	#1D4A8C	#0F141C	#212429	#1B1E22	#E6EAF0	#98A4B8	#66758A
+# snapshot	id	form	interaction	preedit	selection_start_bytes	selection_end_bytes	caret_bytes	page_index	page_size	has_prev	has_next	highlighted_index	hovered_index	schema_id
+snapshot	compact-selected	compact	selected	ni hao	0	2	6	0	5	0	1	0	-1	rime_ice
+candidate	compact-selected	0	1	你好	nǐ hǎo	0		personal
+candidate	compact-selected	1	2	拟好		0		personal
+candidate	compact-selected	2	3	你号		0		personal
+candidate	compact-selected	3	4	泥豪		0		personal
+snapshot	compact-hover	compact	hover	hover	0	0	5	0	5	0	1	0	2	rime_ice
+candidate	compact-hover	0	1	候选		0		personal
+candidate	compact-hover	1	2	后选		0		personal
+candidate	compact-hover	2	3	悬停项	鼠标经过映射为高亮	0		rule
+snapshot	expanded-legal-source	expanded	selected	gen ju	0	3	6	0	5	0	1	1	-1	rime_ice
+candidate	expanded-legal-source	0	1	根据	gēn jù	0		personal
+candidate	expanded-legal-source	1	2	《民法典》第五百零九条	合同履行应当遵循诚信原则	1	《中华人民共和国民法典》第五百零九条	verified
+candidate	expanded-legal-source	2	3	依据		0		rule
+snapshot	vertical-paging	vertical	neutral	fa lv	0	0	5	1	5	1	1	2	-1	rime_ice
+candidate	vertical-paging	0	1	法律	fǎ lǜ	0		personal
+candidate	vertical-paging	1	2	法率		0		personal
+candidate	vertical-paging	2	3	法理	jurisprudence	0		project
+snapshot	long-content	expanded	selected	commercial secret evidence	0	10	26	0	5	0	0	0	-1	rime_ice
+candidate	long-content	0	1	商业秘密侵权纠纷中的证据保全与行为保全	用于验证长候选和长注释不会被静默截断或破坏布局	0		personal
+candidate	long-content	1	2	最高人民法院知识产权法庭	较长来源说明与候选正文保持清晰层级	1	合成测试来源，不对应真实案件	rule
+snapshot	emoji-astral	compact	selected	emoji	0	0	5	0	5	0	0	0	-1	rime_ice
+candidate	emoji-astral	0	1	👋🏽	wave + skin tone, astral sequence	0		personal
+candidate	emoji-astral	1	2	😀法律⚖️	emoji 与 CJK 混排	0		ai

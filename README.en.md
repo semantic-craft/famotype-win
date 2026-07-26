@@ -43,7 +43,7 @@ is your call.
   T9.
 - **A modern settings panel** — sidebar navigation with single-character badges plus grouped cards,
   instead of YAML.
-- **Four collegiate skins** — light/dark aware, switchable instantly.
+- **Seven collegiate skins** — light/dark aware, switchable instantly.
 - **Two-tier apply** — skins, fonts and horizontal/vertical layout take effect immediately; schema
   and fuzzy-pinyin changes deploy asynchronously, with no restart.
 - **Candidate window that respects the system** — DPI, theme and high-contrast changes explicitly

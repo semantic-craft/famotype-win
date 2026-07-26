@@ -117,14 +117,19 @@ copy_base() {
 # rime-ice 只携带 emoji OpenCC 数据；s2t/s2hk 是前端通常预装的标准数据。
 # 法墨使用自足 data_root，必须显式带入，否则开关会变成“状态已繁、候选仍简”。
 overlay_opencc_standard() {
-  mkdir -p "${PAYLOAD_DIR}/opencc"
+  local opencc_dir="${PAYLOAD_DIR}/opencc"
+  [ ! -L "${opencc_dir}" ] || die "拒绝 OpenCC 符号链接目录"
+  mkdir -p -- "${opencc_dir}"
+  [ -d "${opencc_dir}" ] || die "OpenCC 目标不是目录"
   for f in s2t.json s2hk.json STCharacters.ocd2 STPhrases.ocd2 HKVariants.ocd2 LICENSE; do
     [ -f "${OPENCC_STANDARD_DIR}/${f}" ] || die "缺少 OpenCC 标准数据：opencc-standard/${f}"
+    local name="${f}"
     if [ "${f}" = LICENSE ]; then
-      cp "${OPENCC_STANDARD_DIR}/${f}" "${PAYLOAD_DIR}/opencc/OpenCC.LICENSE"
-    else
-      cp "${OPENCC_STANDARD_DIR}/${f}" "${PAYLOAD_DIR}/opencc/${f}"
+      name=OpenCC.LICENSE
     fi
+    local destination="${opencc_dir}/${name}"
+    rm -f -- "${destination}"
+    cp -- "${OPENCC_STANDARD_DIR}/${f}" "${destination}"
   done
   log "OpenCC 标准简繁数据已叠加（s2t + s2hk）。"
 }

@@ -29,6 +29,21 @@ public sealed class ReleaseIdentityGuardContractTests
         Assert.Contains("小狼毫", assemble);
     }
 
+    [Fact]
+    public void AssemblePayload_ReownsOpenCcOverlayDestinations()
+    {
+        string assemble = File.ReadAllText(RepoFile("native/windows-tsf-famo/famo-config/assemble-payload.sh"));
+        int start = assemble.IndexOf("overlay_opencc_standard()", StringComparison.Ordinal);
+        int end = assemble.IndexOf("strip_law_layer()", start, StringComparison.Ordinal);
+        string overlay = assemble[start..end];
+
+        Assert.Contains("[ ! -L \"${opencc_dir}\" ]", overlay);
+        Assert.Contains("rm -f -- \"${destination}\"", overlay);
+        Assert.True(
+            overlay.IndexOf("rm -f -- \"${destination}\"", StringComparison.Ordinal) <
+            overlay.IndexOf("cp -- \"${OPENCC_STANDARD_DIR}/${f}\" \"${destination}\"", StringComparison.Ordinal));
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;

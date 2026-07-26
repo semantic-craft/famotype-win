@@ -319,12 +319,11 @@ begin
   RegQueryStringValue(HKLM64, BrandKey, 'ProfileTool', PreviousProfileTool);
   RegQueryStringValue(HKLM64, BrandKey, 'ActiveVersion', PreviousVersion);
   RegQueryStringValue(HKLM64, BrandKey, 'Identity', PreviousIdentity);
-  { Prefer the machine-scoped registration; fall back to HKCU so upgrades from
-    builds that still registered per-user find their previous host. }
-  if not RegQueryStringValue(HKLM64,
-    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', PreviousHost) then
-    RegQueryStringValue(HKCU,
-      'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', PreviousHost);
+  { Elevated lifecycle code must only consume machine-scoped registration.
+    The verified new profile tool removes legacy HKCU shadows during register. }
+  PreviousHost := '';
+  RegQueryStringValue(HKLM64,
+    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', PreviousHost);
   if (PreviousTarget = '') and (PreviousHost <> '') then
     PreviousTarget := ExtractFileDir(PreviousHost);
   if (PreviousProfileTool = '') and (PreviousTarget <> '') and

@@ -833,33 +833,23 @@ int32_t StatusBarPaintImpl(const FamoStatusBarSpec* spec, const FamoSkin* skin,
         i == 0 || spec->buttons[i - 1].bounds.right != button.bounds.left;
     const bool last = i + 1 == spec->button_count ||
                       spec->buttons[i + 1].bounds.left != button.bounds.right;
-    // The current state is already carried by the label (中/英, 简/繁, ...).
-    // Reserve the accent fill for the transient mouse-down feedback so it never
-    // remains parked behind an enabled option.
-    const bool accent = button.pressed != 0;
-    const uint32_t fill_color =
-        accent ? skin->hilited_back_color : skin->back_color;
-    const uint32_t label_color =
-        accent ? skin->hilited_text_color : skin->text_color;
+    // The current state is already carried by the label (中/英, 简/繁, ...), so
+    // clicking never needs the skin accent behind it.
+    const uint32_t fill_color = skin->back_color;
+    const uint32_t label_color = skin->text_color;
     if (Opaque(fill_color)) {
       brush->SetColor(ToColorF(fill_color));
       FillSegment(rt, brush, cell, segment_r, first, last);
     }
     if (!Opaque(label_color)) continue;
-    // Scrim tuned per fill: an ink scrim on a light card reads much stronger
-    // than an onAccent scrim on the accent, so the accent side gets more.
     if (button.pressed || button.hover) {
-      const float scrim = accent ? 0.30f : 0.10f;
-      brush->SetColor(WithAlpha(label_color, scrim));
+      brush->SetColor(WithAlpha(label_color, 0.10f));
       FillSegment(rt, brush, cell, segment_r, first, last);
     }
     brush->SetColor(ToColorF(label_color));
     DrawCenteredLabel(res, rt, brush, button.bounds, button.label);
-    // Hairline between two plain neighbours that actually touch. An accent fill
-    // already separates itself, so a divider beside one would just dirty the
-    // edge, and a gap needs no divider drawn across it.
-    if (!last && !accent && !spec->buttons[i + 1].pressed &&
-        Opaque(skin->border_color)) {
+    // Hairline between neighbours that actually touch; a gap needs no divider.
+    if (!last && Opaque(skin->border_color)) {
       const float line = (std::max)(1.0f, border);
       const float trim = static_cast<float>(Scale(7, dpi));
       brush->SetColor(ToColorF(skin->border_color));

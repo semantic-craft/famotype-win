@@ -212,6 +212,19 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void InnoSetup_DoesNotTrustPerUserComPathForElevatedPreviousHost()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int snapshot = Position(iss, "procedure SnapshotPreviousState");
+        int next = Position(iss, "function CountFiles", snapshot);
+        string body = iss[snapshot..next].Replace("\r\n", "\n");
+
+        Assert.Contains("PreviousHost := '';", body);
+        Assert.Contains("RegQueryStringValue(HKLM64", body);
+        Assert.DoesNotContain("RegQueryStringValue(HKCU,\n      'Software\\Classes\\CLSID\\'", body);
+    }
+
+    [Fact]
     public void InnoSetup_LoadedLegacyHostEntersCoherentPendingReboot()
     {
         string iss = InstallerText("famo-setup.iss");

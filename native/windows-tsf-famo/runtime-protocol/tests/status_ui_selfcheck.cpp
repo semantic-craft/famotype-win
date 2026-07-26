@@ -427,12 +427,14 @@ bool BarPaintProducesVisiblePixels() {
     CHECK(std::abs(dy) <= 1.5);
   }
 
-  // Mouse-down still gets the accent feedback, and releasing returns to idle.
+  // Mouse-down stays neutral too: state is communicated by the label alone.
   buttons[2].pressed = 1u;
   surface.Clear();
   CHECK(FamoStatusBarPaint(&spec, &skin, resources, surface.dc()) == FAMO_UI_OK);
-  CHECK(at((layout.buttons[2].left + layout.buttons[2].right) / 2,
-           layout.buttons[2].top + 1) != fill);
+  const uint32_t pressed_fill =
+      at((layout.buttons[2].left + layout.buttons[2].right) / 2,
+         layout.buttons[2].top + 1);
+  CHECK(pressed_fill != skin.hilited_back_color);
   buttons[2].pressed = 0u;
   FamoTextResourcesDestroy(resources);
 

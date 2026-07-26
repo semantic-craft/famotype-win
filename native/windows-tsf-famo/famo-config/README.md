@@ -20,9 +20,9 @@
 |---|---|
 | `famo-settings.schema.json` | Famo 设置 store 的 JSON Schema（draft 2020-12）。描述 `%LOCALAPPDATA%\Famo\famo-settings.json`。每字段标 `x-famo-bucket`(instant/deploy) + `x-famo-target`(目标文件+键)。 |
 | `famo-settings.default.json` | 出厂默认实例(已对 schema 校验通过)。skin=shenda、appearanceMode=system、page_size=8、emoji=false、横排、候选窗输入串+光标开、后页预览关、schema 首项 rime_ice(雾凇拼音优先)。 |
-| `CONFIG-MAPPING.md` | store 字段 → 目标文件 → 具体键 → 桶 → 生效动作 的总表；四皮肤色值(BGR)。与设计稿 `design/settings/FamoWindowsIME.html` §3 ①②③④ 一一对应。 |
+| `CONFIG-MAPPING.md` | store 字段 → 目标文件 → 具体键 → 桶 → 生效动作 的总表；七皮肤色值(BGR)。与设计稿 `design/settings/FamoWindowsIME.html` §3 ①②③④ 一一对应。 |
 | `overlay/default.custom.yaml` | 法墨方案补丁：`schema_list`(rime_ice 雾凇全套 + wubi86_jidian 极点五笔 4 变体，共 13 方案，雾凇优先) + `menu/page_size: 8`。 |
-| `overlay/weasel.custom.yaml` | 候选窗外观 + 四皮肤(默认荔园红 shenda + `color_scheme_dark` 暗色跟随)。 |
+| `overlay/weasel.custom.yaml` | 候选窗外观 + 七皮肤(默认荔园红 shenda + `color_scheme_dark` 暗色跟随)。 |
 | `overlay/rime_ice.custom.yaml` | 方案层出厂锚定：emoji 关（patch `switches`，仅翻 emoji reset）；模糊音出厂全关。tone_display 已下线（rime-ice 无此开关）。 |
 | `assemble-payload.sh` | 把 rime-ice 全套 + KyleBing 极点五笔 + overlay 组装到 `payload/`。 |
 | `payload/`、`.cache/` | 构建产物 / 克隆缓存，**gitignore**，由脚本生成。 |
