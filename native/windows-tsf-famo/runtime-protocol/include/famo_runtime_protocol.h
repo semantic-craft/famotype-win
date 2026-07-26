@@ -70,6 +70,8 @@ enum class ControlError : uint32_t {
   Config = 3,
   Engine = 4,
   Runtime = 5,
+  UserDictionaryEnumeration = 6,
+  UserDictionaryRollback = 7,
 };
 
 enum class RuntimeReadiness : uint32_t {

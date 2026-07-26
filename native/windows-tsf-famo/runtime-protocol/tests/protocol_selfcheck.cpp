@@ -171,6 +171,12 @@ int main() {
   ControlResult decoded_control;
   CHECK(DecodeControlResult(payload, &decoded_control, &error));
   CHECK(decoded_control == control);
+  control.state = ControlState::Failed;
+  control.error = ControlError::UserDictionaryRollback;
+  control.retryable = false;
+  CHECK(EncodeControlResult(control, &payload, &error));
+  CHECK(DecodeControlResult(payload, &decoded_control, &error));
+  CHECK(decoded_control == control);
   payload.push_back(0);
   CHECK(!DecodeControlResult(payload, &decoded_control, &error));
 

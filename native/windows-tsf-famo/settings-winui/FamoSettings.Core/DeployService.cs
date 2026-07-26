@@ -71,6 +71,8 @@ public static class DeployService
     public const string SelectSchemaArgs = "--control select-schema";
 
     private const string ReleaseRuntimeExe = "FamoRuntime.exe";
+    private const int UserDictionaryEnumerationExit = 16;
+    private const int UserDictionaryRollbackExit = 17;
     private static readonly TimeSpan ControlTimeout = TimeSpan.FromMinutes(2);
     private static readonly object QueueGate = new();
     private static readonly Dictionary<string, QueuedReload> PendingReloads = new();
@@ -312,9 +314,13 @@ public static class DeployService
             elapsed.Stop();
             if (exitCode != 0)
             {
-                string error = $"runtime control failed: {reload.Command}, exit={exitCode}";
-                RememberFailure(reload.RequestId, reload.Args, reload.BaseDirectory);
-                SetSnapshot(new DeployQueueSnapshot(DeployQueueStatus.Failed, reload.Command, error, true)
+                bool retryAvailable = exitCode != UserDictionaryRollbackExit;
+                string error = ControlFailureMessage(reload, exitCode);
+                if (retryAvailable)
+                {
+                    RememberFailure(reload.RequestId, reload.Args, reload.BaseDirectory);
+                }
+                SetSnapshot(new DeployQueueSnapshot(DeployQueueStatus.Failed, reload.Command, error, retryAvailable)
                 {
                     RequestId = reload.RequestId,
                 });
@@ -342,6 +348,16 @@ public static class DeployService
             FailureLogger(error);
         }
     }
+
+    private static string ControlFailureMessage(QueuedReload reload, int exitCode) =>
+        (reload.Args, exitCode) switch
+        {
+            (ResetUserDictionaryArgs, UserDictionaryEnumerationExit) =>
+                "无法读取用户词典目录（权限或磁盘错误）；未删除任何词典。",
+            (ResetUserDictionaryArgs, UserDictionaryRollbackExit) =>
+                "删除中断且从 .famo-backup 恢复失败；用户词典可能不完整，请保留备份并打开配置目录检查。",
+            _ => $"runtime control failed: {reload.Command}, exit={exitCode}",
+        };
 
     private static void SetSnapshot(DeployQueueSnapshot snapshot)
     {

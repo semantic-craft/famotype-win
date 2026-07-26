@@ -151,7 +151,9 @@ int wmain(int argc, wchar_t **argv) {
                 static_cast<unsigned>(result.error), result.retryable ? 1u : 0u,
                 static_cast<unsigned>(result.readiness),
                 static_cast<unsigned long long>(result.engine_generation));
-    return result.state == ControlState::Succeeded ? 0 : 4;
+    return result.state == ControlState::Succeeded
+               ? 0
+               : 10 + static_cast<int>(result.error);
   }
   if (endpoint_suffix == kDefaultRuntimeEndpointSuffix &&
       !ProductionInstallAllowed(ModuleDirectory(), true)) {
