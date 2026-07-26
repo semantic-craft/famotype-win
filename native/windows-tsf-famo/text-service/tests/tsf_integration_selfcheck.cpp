@@ -38,6 +38,17 @@ private:
   HRESULT result_;
 };
 
+class ScopedEnvironment {
+public:
+  ScopedEnvironment(const char *name, const char *value) : name_(name) {
+    _putenv_s(name, value);
+  }
+  ~ScopedEnvironment() { _putenv_s(name_.c_str(), ""); }
+
+private:
+  std::string name_;
+};
+
 bool TestKey(ITfKeyEventSink *sink, ITfContext *context, WPARAM key,
              bool expected_eaten) {
   BOOL eaten = FALSE;
@@ -212,6 +223,40 @@ bool DisabledInlinePreeditStaysOutOfHost(TextServiceModule *module,
         CHECK(store->text().empty());
         CHECK(SendKey(key_sink, context, '2', true));
         CHECK(store->text() == L"\x5c3c");
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool InlinePreeditPreservesUtf16Selection(TextServiceModule *module,
+                                          const wchar_t *runtime_path) {
+  ScopedEnvironment offsets("FAMO_TEST_PREEDIT_OFFSETS", "1");
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(store->text() == L"abcd");
+        CHECK(store->selection().acpStart == 2 &&
+              store->selection().acpEnd == 2);
+
+        CHECK(SendKey(key_sink, context, 'B', true));
+        CHECK(store->text() == L"abcdef");
+        CHECK(store->selection().acpStart == 1 &&
+              store->selection().acpEnd == 4);
+
+        CHECK(SendKey(key_sink, context, 'C', true));
+        CHECK(store->text() == L"\u4f60" L"A" L"\u597d");
+        CHECK(store->selection().acpStart == 2 &&
+              store->selection().acpEnd == 2);
+
+        CHECK(SendKey(key_sink, context, 'D', true));
+        CHECK(store->text() == L"\xd83d\xde00" L"A");
+        CHECK(store->selection().acpStart == 2 &&
+              store->selection().acpEnd == 2);
         return true;
       });
   const bool runtime_finished = runtime.Finish();
@@ -847,6 +892,7 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(MissingRuntimeFailsOpen(&module));
   CHECK(HealthyRoundtrip(&module, runtime_path));
   CHECK(DisabledInlinePreeditStaysOutOfHost(&module, runtime_path));
+  CHECK(InlinePreeditPreservesUtf16Selection(&module, runtime_path));
   CHECK(FaultFailsOpen(&module, runtime_path, L"engine-hang"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"disconnect"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"malformed"));

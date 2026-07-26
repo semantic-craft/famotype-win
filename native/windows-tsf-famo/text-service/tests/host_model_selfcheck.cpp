@@ -156,6 +156,22 @@ bool UtfConversionIsStrict() {
   CHECK(famo::tsf::Utf8ToUtf16("\xe4\xbd\xa0\xe5\xa5\xbd", &output));
   CHECK(output == L"\u4f60\u597d");
   CHECK(!famo::tsf::Utf8ToUtf16("\xff", &output));
+
+  famo::tsf::Utf16Preedit preedit;
+  CHECK(famo::tsf::Utf8PreeditToUtf16("abcd", 0, 0, 2, &preedit));
+  CHECK(preedit.selection_start == 0 && preedit.selection_end == 0 &&
+        preedit.cursor == 2);
+  CHECK(famo::tsf::Utf8PreeditToUtf16("abcdef", 1, 4, 4, &preedit));
+  CHECK(preedit.selection_start == 1 && preedit.selection_end == 4 &&
+        preedit.cursor == 4);
+  CHECK(famo::tsf::Utf8PreeditToUtf16("\xe4\xbd\xa0" "A", 0, 0, 4,
+                                      &preedit));
+  CHECK(preedit.text == L"\u4f60" L"A" && preedit.cursor == 2);
+  CHECK(famo::tsf::Utf8PreeditToUtf16("\xf0\x9f\x98\x80" "A", 0, 0, 4,
+                                      &preedit));
+  CHECK(preedit.text == L"\xd83d\xde00" L"A" && preedit.cursor == 2);
+  CHECK(!famo::tsf::Utf8PreeditToUtf16("\xe4\xbd\xa0", 0, 0, 1,
+                                       &preedit));
   return true;
 }
 

@@ -116,7 +116,36 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
               FamoCompositionView* out) {
   std::memset(out, 0, sizeof(*out));
   out->size = static_cast<uint32_t>(sizeof(FamoCompositionView));
-  out->preedit = Dup(buffer);
+  std::string preedit = buffer;
+  uint32_t selection_start = 0;
+  uint32_t selection_end = static_cast<uint32_t>(buffer.size());
+  uint32_t cursor = selection_end;
+  if (!Environment("FAMO_TEST_PREEDIT_OFFSETS").empty() && !buffer.empty()) {
+    switch (buffer.size()) {
+      case 1:
+        preedit = "abcd";
+        selection_end = 0;
+        cursor = 2;
+        break;
+      case 2:
+        preedit = "abcdef";
+        selection_start = 1;
+        selection_end = 4;
+        cursor = 4;
+        break;
+      case 3:
+        preedit = "\xe4\xbd\xa0" "A" "\xe5\xa5\xbd";
+        selection_end = 0;
+        cursor = 4;
+        break;
+      default:
+        preedit = "\xf0\x9f\x98\x80" "A";
+        selection_end = 0;
+        cursor = 4;
+        break;
+    }
+  }
+  out->preedit = Dup(preedit);
   out->commit = Dup(commit);
 
   std::vector<std::string> cands = CandidatesFor(buffer);
@@ -126,16 +155,16 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
   out->page_size = multipage ? 1u : out->candidate_count;
 
   uint32_t flags = 0;
-  if (!buffer.empty()) flags |= FAMO_COMPOSITION_HAS_PREEDIT;
+  if (!preedit.empty()) flags |= FAMO_COMPOSITION_HAS_PREEDIT;
   if (!commit.empty()) flags |= FAMO_COMPOSITION_HAS_COMMIT;
   if (out->candidate_count) flags |= FAMO_COMPOSITION_HAS_CANDIDATES;
   if (handled) flags |= FAMO_COMPOSITION_HANDLED;
   out->state_flags = flags;
 
   // v1.1 deterministic fields (exercise size negotiation + free_view teardown).
-  out->preedit_sel_start = 0;
-  out->preedit_sel_end = static_cast<uint32_t>(buffer.size());
-  out->preedit_cursor_pos = static_cast<uint32_t>(buffer.size());
+  out->preedit_sel_start = selection_start;
+  out->preedit_sel_end = selection_end;
+  out->preedit_cursor_pos = cursor;
   out->commit_preview = Dup(buffer.empty() ? std::string() : CandidatesFor(buffer).front());
   out->schema_id = Dup("test");
   out->schema_name = Dup("Test Engine");

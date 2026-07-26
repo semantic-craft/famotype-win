@@ -39,6 +39,39 @@ HRESULT SelectRangeEnd(TfEditCookie cookie, ITfContext *context,
   return context->SetSelection(cookie, 1, &selection);
 }
 
+HRESULT SelectPreeditRange(TfEditCookie cookie, ITfContext *context,
+                           ITfRange *range, const Utf16Preedit &preedit) {
+  uint32_t start = preedit.selection_start;
+  uint32_t end = preedit.selection_end;
+  if (start == end)
+    start = end = preedit.cursor;
+  if (start > end || end > preedit.text.size())
+    return E_INVALIDARG;
+
+  ComPtr<ITfRange> selected;
+  HRESULT result = range->Clone(selected.put());
+  if (FAILED(result))
+    return result;
+  result = selected->Collapse(cookie, TF_ANCHOR_START);
+  if (FAILED(result))
+    return result;
+  LONG moved = 0;
+  result = selected->ShiftEnd(cookie, static_cast<LONG>(end), &moved, nullptr);
+  if (FAILED(result) || moved != static_cast<LONG>(end))
+    return FAILED(result) ? result : E_FAIL;
+  result = selected->ShiftStart(cookie, static_cast<LONG>(start), &moved, nullptr);
+  if (FAILED(result) || moved != static_cast<LONG>(start))
+    return FAILED(result) ? result : E_FAIL;
+
+  TF_SELECTION selection{};
+  selection.range = selected.get();
+  selection.style.ase = start == end
+                            ? TF_AE_NONE
+                            : (preedit.cursor <= start ? TF_AE_START : TF_AE_END);
+  selection.style.fInterimChar = FALSE;
+  return context->SetSelection(cookie, 1, &selection);
+}
+
 HRESULT ReplaceRange(TfEditCookie cookie, ITfContext *context, ITfRange *range,
                      std::wstring_view text) {
   const HRESULT result =
@@ -166,9 +199,12 @@ HRESULT CompositionController::Apply(ITfContext *context, TfClientId client_id,
   if (!context)
     return E_INVALIDARG;
   CompositionPlan plan;
-  if (!Utf8ToUtf16(composition.commit, &plan.commit) ||
-      !Utf8ToUtf16(composition.preedit, &plan.preedit))
+  if (!Utf8ToUtf16(composition.commit, &plan.commit))
     return E_INVALIDARG;
+  plan.preedit = composition.preedit;
+  plan.preedit_selection_start = composition.preedit_sel_start;
+  plan.preedit_selection_end = composition.preedit_sel_end;
+  plan.preedit_cursor = composition.preedit_cursor_pos;
   plan.behavior_flags = composition.state_flags;
   auto *session =
       new (std::nothrow) ApplyEditSession(this, context, std::move(plan), sink);
@@ -218,6 +254,11 @@ HRESULT CompositionController::ApplyInSession(TfEditCookie cookie,
                                               ITfContext *context,
                                               const CompositionPlan &plan,
                                               ITfCompositionSink *sink) {
+  Utf16Preedit preedit;
+  if (!Utf8PreeditToUtf16(plan.preedit, plan.preedit_selection_start,
+                          plan.preedit_selection_end, plan.preedit_cursor,
+                          &preedit))
+    return E_INVALIDARG;
   ComPtr<ITfRange> selection;
   HRESULT result = CurrentSelection(cookie, context, &selection);
   if (FAILED(result))
@@ -286,7 +327,7 @@ HRESULT CompositionController::ApplyInSession(TfEditCookie cookie,
       return S_OK;
   }
 
-  if (plan.preedit.empty()) {
+  if (preedit.text.empty()) {
     if (composition_) {
       if (!plan.commit.empty()) {
         // SetText already committed the replacement. If the first
@@ -324,7 +365,11 @@ HRESULT CompositionController::ApplyInSession(TfEditCookie cookie,
   result = composition_->GetRange(range.put());
   if (FAILED(result))
     return result;
-  return ReplaceRange(cookie, context, range.get(), plan.preedit);
+  result = ReplaceRange(cookie, context, range.get(), preedit.text);
+  if (FAILED(result))
+    return result;
+  (void)SelectPreeditRange(cookie, context, range.get(), preedit);
+  return S_OK;
 }
 
 ArrowInjectionResult CompositionController::InjectArrow(WORD key,
