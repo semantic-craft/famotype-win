@@ -71,7 +71,7 @@ public sealed class AiPage : UserControl
             _deepSeekModelRow,
             FamoUI.Row("名称", "显示在 AI 对话和菜单状态里。", _displayName),
             FamoUI.Row("Endpoint", "必须是 HTTPS，或本机 HTTP 调试地址。", _endpoint),
-            FamoUI.Row("模型", "按供应商文档填写模型 ID。", _model),
+            FamoUI.Row("模型", "必填；按供应商文档填写模型 ID。", _model),
             FamoUI.Row("API Key", "保存到 Windows Credential Manager；不会写入 JSON。", _apiKey),
             FamoUI.RowFull(BuildProviderActions(), divider: true)));
 
@@ -220,7 +220,7 @@ public sealed class AiPage : UserControl
         });
         info.Children.Add(new TextBlock
         {
-            Text = (string.IsNullOrWhiteSpace(profile.Model) ? "默认模型" : profile.Model) + " · " + profile.Endpoint,
+            Text = (string.IsNullOrWhiteSpace(profile.Model) ? "缺少模型" : profile.Model) + " · " + profile.Endpoint,
             FontSize = 12,
             FontFamily = FamoUI.Mono,
             Foreground = FamoUI.Br("Famo.Ink2"),

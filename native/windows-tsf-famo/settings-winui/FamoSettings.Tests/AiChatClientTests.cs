@@ -105,6 +105,32 @@ public sealed class AiChatClientTests : IDisposable
     }
 
     [Fact]
+    public async Task SendAsync_WhenPersistedModelIsEmpty_DoesNotTouchNetwork()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        var store = new AiProviderProfileStore(_file);
+        store.Save([new AiProviderProfile
+        {
+            Id = "legacy",
+            DisplayName = "Legacy provider",
+            Endpoint = "https://api.example.test/v1/chat/completions",
+            Model = " ",
+            SecretName = "ai-provider:legacy",
+            IsDefault = true,
+        }]);
+        _secrets.SetSecret("ai-provider:legacy", "sk-secret");
+        var handler = new CaptureHandler(_ => throw new InvalidOperationException("network should not be called"));
+        var client = new AiChatClient(settings, store, _secrets, new HttpClient(handler));
+
+        InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => client.SendAsync("hello", CancellationToken.None));
+
+        Assert.Contains("模型 ID", ex.Message);
+        Assert.Equal(0, handler.Calls);
+    }
+
+    [Fact]
     public async Task SendAsync_MapsHttpFailureToActionableError()
     {
         FamoSettings settings = SettingsStore.CreateDefault();
