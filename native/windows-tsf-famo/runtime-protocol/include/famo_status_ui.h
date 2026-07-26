@@ -211,6 +211,10 @@ public:
   // Latest mode the icon and menu check marks are drawn from.
   uint32_t status_flags() const noexcept;
 
+  // The status UI can stay alive while the global shortcut hook is degraded.
+  bool keyboard_hook_ready() const noexcept;
+  uint32_t keyboard_hook_error() const noexcept;
+
   // Opaque, defined in status_ui.cpp. Public only so the window procedure and
   // menu helpers living in that file's anonymous namespace can name it.
   struct State;
