@@ -112,6 +112,7 @@ public static class Program
         ConfigWriter.WriteStyleOverlay(settings, FamoPaths.FamoDir);
         ConfigWriter.WriteOptionsOverlay(settings, FamoPaths.FamoDir);
         ConfigWriter.WriteSelectSchema(settings, FamoPaths.FamoDir);
+        ConfigWriter.WriteDeployBucket(settings, FamoPaths.FamoDir);
     }
 
     /// <summary>注册单实例 key。本实例为主 → 订阅 Activated 返 false；否则写 handoff + 重定向返 true。</summary>

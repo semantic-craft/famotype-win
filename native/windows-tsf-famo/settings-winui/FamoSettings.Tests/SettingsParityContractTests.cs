@@ -6,6 +6,16 @@ namespace Famo.Settings.Tests;
 public sealed class SettingsParityContractTests
 {
     [Fact]
+    public void KeyboardPage_HidesSchemaSpecificCardsWhenTheyCannotApply()
+    {
+        string page = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings/Views/KeyboardPage.cs"));
+
+        Assert.Contains("_wubiCard.Visibility = M.Method == \"wubi\"", page);
+        Assert.Contains("_fuzzyCard.Visibility = M.Method == \"pinyin\"", page);
+    }
+
+    [Fact]
     public void DefaultStateControls_WriteOptionsOverlayAndReplayOnNewSessions()
     {
         // SwitchesPage.cs was deleted (unreachable orphan); these controls are a 100%
