@@ -131,6 +131,18 @@ public sealed class QuickPhraseRimePatchTests
     }
 
     [Fact]
+    public void RimeIceCustom_WithFuzzyRules_IsByteIdempotent()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Engine.FuzzyPinyin.ZhZ = true;
+
+        string once = ConfigWriter.BuildRimeIceCustom(settings);
+        string twice = ConfigWriter.BuildRimeIceCustom(settings, once);
+
+        Assert.Equal(once, twice);
+    }
+
+    [Fact]
     public void WubiCustom_DoesNotInjectBareQuickSendTranslator()
     {
         FamoSettings settings = SettingsStore.CreateDefault();

@@ -14,6 +14,15 @@ namespace Famo.Settings.Core;
 /// </summary>
 public static class ConfigWriter
 {
+    private const string FuzzyBegin = "  # >>> famo-fuzzy >>>（设置面板生成，请勿手改）";
+    private const string FuzzyEnd = "  # <<< famo-fuzzy <<<";
+    private static readonly Regex FuzzyBlockRx =
+        new(@"[ \t]*#\s*>>> famo-fuzzy >>>.*?#\s*<<< famo-fuzzy <<<[^\n]*\r?\n?",
+            RegexOptions.Singleline | RegexOptions.Compiled);
+    private static readonly Regex LegacyFuzzyBlockRx =
+        new(@"[ \t]*# 模糊音（设置面板勾选，追加到既有 algebra 末尾）\r?\n[ \t]*""speller/algebra/\+"":\r?\n(?:[ \t]*- derive/[^\r\n]*(?:\r?\n|$))+",
+            RegexOptions.Compiled);
+
     /// <summary>
     /// 由 store 生成 weasel.custom.yaml 文本（基于 baseYaml 模板做定点替换）。
     /// baseYaml 为 null 时用内置 overlay 模板。
@@ -328,6 +337,8 @@ public static class ConfigWriter
 
         // 仅改 emoji 块内的 reset（按 name 定位，避开其它 switch 的 reset）。
         yaml = SetSwitchReset(yaml, "emoji", e.EmojiEnabled ? 1 : 0);
+        yaml = FuzzyBlockRx.Replace(yaml, "");
+        yaml = LegacyFuzzyBlockRx.Replace(yaml, "");
 
         // 模糊音：9 独立对，各自 gated 追加 speller/algebra/+（锚定 derive，逐字段镜像
         // macOS FamoRimePatchBuilder.fuzzyAlgebraDerives；n/l、f/h、an/ang、en/eng、in/ing 双向发两条）。
@@ -345,12 +356,13 @@ public static class ConfigWriter
 
         if (rules.Count > 0)
         {
+            yaml = QuickSendBlockRx.Replace(yaml, "").TrimEnd('\r', '\n') + "\n";
             var sb = new System.Text.StringBuilder();
-            if (!yaml.EndsWith("\n")) sb.Append('\n');
-            sb.Append("\n  # 模糊音（设置面板勾选，追加到既有 algebra 末尾）\n");
+            sb.Append('\n').Append(FuzzyBegin).Append('\n');
             sb.Append("  \"speller/algebra/+\":\n");
             foreach ((string rule, string note) in rules)
                 sb.Append("    - ").Append(rule).Append("  # ").Append(note).Append('\n');
+            sb.Append(FuzzyEnd).Append('\n');
             yaml += sb.ToString();
         }
         return AppendQuickSendBlock(yaml);

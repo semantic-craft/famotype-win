@@ -75,6 +75,13 @@ int main() {
   tiny.size = 4; // caller struct too small to hold the v1 table
   CHECK(create(FAMO_ENGINE_ABI_VERSION, &tiny) ==
         FAMO_ENGINE_E_INVALID_ARGUMENT);
+
+  FamoEngineApi v12;
+  std::memset(&v12, 0, sizeof(v12));
+  v12.size = static_cast<uint32_t>(offsetof(FamoEngineApi, peek_candidates));
+  CHECK(create(FAMO_ENGINE_ABI_VERSION, &v12) == FAMO_ENGINE_OK);
+  CHECK(v12.size == static_cast<uint32_t>(offsetof(FamoEngineApi, peek_candidates)));
+  CHECK(v12.change_page != nullptr);
   ::FreeLibrary(mod);
 
   // --- Positive roundtrip through the host loader ---

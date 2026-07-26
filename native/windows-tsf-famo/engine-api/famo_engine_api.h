@@ -8,8 +8,9 @@
 // fields to FamoCompositionView and functions to FamoEngineApi; both are
 // size-negotiated, so a v1.0 host/engine and a v1.1 one interoperate at v1.0.
 // v1.2 appends FamoCandidate::label and FamoCompositionView::is_last_page (the
-// FamoCandidateUI render inputs), same append-only/size-negotiated discipline.
-#define FAMO_ENGINE_ABI_MINOR 2u
+// FamoCandidateUI render inputs); v1.3 appends peek_candidates. Both follow the
+// same append-only/size-negotiated discipline.
+#define FAMO_ENGINE_ABI_MINOR 3u
 
 #if defined(_WIN32)
 #define FAMO_ENGINE_CALL __stdcall

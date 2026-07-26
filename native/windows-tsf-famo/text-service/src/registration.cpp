@@ -88,21 +88,28 @@ HRESULT RegisterComServer() {
     return HRESULT_FROM_WIN32(GetLastError());
   const std::wstring root = ComKey();
   HRESULT result = SetString(HKEY_LOCAL_MACHINE, root, nullptr, kProfileName);
-  if (FAILED(result))
+  if (FAILED(result)) {
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str());
     return result;
+  }
   result = SetString(HKEY_LOCAL_MACHINE, root + L"\\InprocServer32", nullptr,
                      module);
-  if (FAILED(result))
+  if (FAILED(result)) {
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str());
     return result;
+  }
   result = SetString(HKEY_LOCAL_MACHINE, root + L"\\InprocServer32",
                      L"ThreadingModel", L"Apartment");
-  if (FAILED(result))
+  if (FAILED(result)) {
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str());
     return result;
+  }
   const LSTATUS removed =
       RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str());
-  return removed == ERROR_SUCCESS || removed == ERROR_FILE_NOT_FOUND
-             ? S_OK
-             : HRESULT_FROM_WIN32(removed);
+  if (removed == ERROR_SUCCESS || removed == ERROR_FILE_NOT_FOUND)
+    return S_OK;
+  RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str());
+  return HRESULT_FROM_WIN32(removed);
 }
 
 void UnregisterComServer() {

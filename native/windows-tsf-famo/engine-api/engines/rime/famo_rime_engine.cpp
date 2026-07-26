@@ -407,27 +407,34 @@ extern "C" FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL
 FamoCreateEngineApi(uint32_t requested_abi_version, FamoEngineApi* out_api) {
   if (requested_abi_version != FAMO_ENGINE_ABI_VERSION)
     return FAMO_ENGINE_E_UNSUPPORTED_ABI;
-  if (!out_api || out_api->size < static_cast<uint32_t>(sizeof(FamoEngineApi)))
+  if (!out_api)
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  const uint32_t caller_size = out_api->size;
+  if (caller_size < static_cast<uint32_t>(offsetof(FamoEngineApi, get_status)))
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
 
-  out_api->abi_version = FAMO_ENGINE_ABI_VERSION;
-  out_api->size = static_cast<uint32_t>(sizeof(FamoEngineApi));
-  out_api->get_info = &ReGetInfo;
-  out_api->initialize = &ReInitialize;
-  out_api->shutdown = &ReShutdown;
-  out_api->create_context = &ReCreateContext;
-  out_api->destroy_context = &ReDestroyContext;
-  out_api->process_key = &ReProcessKey;
-  out_api->select_candidate = &ReSelectCandidate;
-  out_api->set_option = &ReSetOption;
-  out_api->deploy_schema = &ReDeploySchema;
-  out_api->free_view = &ReFreeView;
-  out_api->get_status = &ReGetStatus;
-  out_api->get_option = &ReGetOption;
-  out_api->commit_composition = &ReCommitComposition;
-  out_api->clear_composition = &ReClearComposition;
-  out_api->highlight_candidate = &ReHighlightCandidate;
-  out_api->change_page = &ReChangePage;
-  out_api->peek_candidates = &RePeekCandidates;
+  FamoEngineApi api{};
+  api.size = caller_size < static_cast<uint32_t>(sizeof(api))
+                 ? caller_size
+                 : static_cast<uint32_t>(sizeof(api));
+  api.abi_version = FAMO_ENGINE_ABI_VERSION;
+  api.get_info = &ReGetInfo;
+  api.initialize = &ReInitialize;
+  api.shutdown = &ReShutdown;
+  api.create_context = &ReCreateContext;
+  api.destroy_context = &ReDestroyContext;
+  api.process_key = &ReProcessKey;
+  api.select_candidate = &ReSelectCandidate;
+  api.set_option = &ReSetOption;
+  api.deploy_schema = &ReDeploySchema;
+  api.free_view = &ReFreeView;
+  api.get_status = &ReGetStatus;
+  api.get_option = &ReGetOption;
+  api.commit_composition = &ReCommitComposition;
+  api.clear_composition = &ReClearComposition;
+  api.highlight_candidate = &ReHighlightCandidate;
+  api.change_page = &ReChangePage;
+  api.peek_candidates = &RePeekCandidates;
+  std::memcpy(out_api, &api, api.size);
   return FAMO_ENGINE_OK;
 }

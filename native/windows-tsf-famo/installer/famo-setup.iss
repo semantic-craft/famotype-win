@@ -324,6 +324,8 @@ begin
   PreviousHost := '';
   RegQueryStringValue(HKLM64,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', PreviousHost);
+  if (PreviousHost = '') and (PreviousTarget <> '') and (PreviousManifest <> '') then
+    PreviousHost := AddBackslash(PreviousTarget) + 'FamoTextService.dll';
   if (PreviousTarget = '') and (PreviousHost <> '') then
     PreviousTarget := ExtractFileDir(PreviousHost);
   if (PreviousProfileTool = '') and (PreviousTarget <> '') and
