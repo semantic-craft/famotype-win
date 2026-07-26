@@ -19,7 +19,7 @@ public sealed class TsfRegistrationAuditContractTests
             "HKLM COM registration",
             "per-user COM override absent",
             "FamoProfileTool verifies",
-            "check-disabled",
+            "check-absent",
             "PendingReboot",
             "keyboard category",
             "Win+Space visibility",

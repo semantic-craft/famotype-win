@@ -638,6 +638,32 @@ bool TransientWarmupUnavailableRetriesSameFocus(
   return passed && runtime_finished;
 }
 
+bool TimedOutWarmupReconnectsSameFocus(TextServiceModule *module,
+                                       const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"open-session-hang", 0, 2));
+  const bool passed = RunTextStoreSession(
+      module,
+      [](ITfKeyEventSink *key_sink, ITfContext *context, FakeTextStore *store,
+         ITfTextInputProcessorEx *, ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(TestKey(key_sink, context, 'N', false));
+        const auto ready_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        while (!TestKey(key_sink, context, 'N', true) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+          PumpMessages();
+          Sleep(5);
+        }
+        CHECK(std::chrono::steady_clock::now() < ready_deadline);
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(store->text() == L"n");
+        return true;
+      },
+      nullptr, false);
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
 bool ExhaustedWarmupRetriesOnNextKeySameFocus(
     TextServiceModule *module, const wchar_t *runtime_path) {
   RuntimeProcess runtime;
@@ -719,7 +745,7 @@ bool ReactivationRejectsOldGeneration(TextServiceModule *module,
       IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
   CHECK(TestKey(key_sink.get(), target.context.get(), 'N', false));
   const auto ready_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
   while (!TestKey(key_sink.get(), target.context.get(), 'N', true) &&
          std::chrono::steady_clock::now() < ready_deadline) {
     Sleep(5);
@@ -831,6 +857,7 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(FocusChurnRejectsObsoleteWarmup(&module, runtime_path));
   CHECK(PushPopReschedulesSupersededWarmup(&module, runtime_path));
   CHECK(TransientWarmupUnavailableRetriesSameFocus(&module, runtime_path));
+  CHECK(TimedOutWarmupReconnectsSameFocus(&module, runtime_path));
   CHECK(ExhaustedWarmupRetriesOnNextKeySameFocus(&module, runtime_path));
   CHECK(ReactivationRejectsOldGeneration(&module, runtime_path));
   CHECK(ForegroundFocusRecyclesRuntimeConnection(&module, runtime_path));

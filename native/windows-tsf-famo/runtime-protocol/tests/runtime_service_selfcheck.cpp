@@ -184,7 +184,7 @@ int main() {
   Frame open = Request(Command::OpenSession, 1);
   CHECK(EncodeOpenSession("test", &open.payload, &error));
   CHECK(service.Dispatch(open).status == Status::Ok);
-  CHECK(service.Dispatch(open).status == Status::StaleRequest);
+  CHECK(service.Dispatch(open).status == Status::Ok);
 
   std::ofstream(data_root / "famo-options.yaml")
       << "options:\n  ascii_mode: false\noutside: true\n";

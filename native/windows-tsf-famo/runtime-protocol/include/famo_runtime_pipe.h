@@ -37,7 +37,7 @@ constexpr std::chrono::milliseconds kHardCallDeadline{50};
 // Session creation is an activation/control-path operation and may perform the
 // first librime context allocation. It remains strictly bounded, but does not
 // consume the tighter per-key callback budget.
-constexpr std::chrono::milliseconds kSessionOpenDeadline{150};
+constexpr std::chrono::milliseconds kSessionOpenDeadline{1000};
 
 enum class ServerFault {
   None,

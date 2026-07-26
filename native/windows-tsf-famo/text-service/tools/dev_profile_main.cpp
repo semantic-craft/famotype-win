@@ -403,7 +403,7 @@ int wmain(int argc, wchar_t **argv) {
   if (argc != 2) {
     std::fwprintf(
         stderr,
-        L"usage: FamoProfileTool register|register-disabled|enable|disable|activate|check|check-disabled|is-active|switch-away|start-runtime|unregister|loaded <dll>\n");
+        L"usage: FamoProfileTool register|register-disabled|enable|disable|activate|check|check-disabled|check-absent|is-active|switch-away|start-runtime|unregister|loaded <dll>\n");
     return 2;
   }
   const std::wstring_view command(argv[1]);
@@ -471,6 +471,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     WaitForRegistrationVisibility(false);
   } else if (command != L"check" && command != L"check-disabled" &&
+             command != L"check-absent" &&
              command != L"is-active") {
     return 2;
   }
@@ -499,6 +500,8 @@ int wmain(int argc, wchar_t **argv) {
                active ? L"yes" : L"no");
   if (command == L"is-active")
     return active ? 0 : 1;
+  if (command == L"check-absent")
+    return !registry && !profile && !category && !active ? 0 : 1;
   if (command == L"switch-away")
     return registry && profile && category && !active ? 0 : 1;
   if (command == L"register-disabled" || command == L"check-disabled" ||

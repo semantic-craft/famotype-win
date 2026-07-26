@@ -188,7 +188,7 @@ public sealed class InstallerContractTests
         {
             Assert.Contains(api, tool);
         }
-        foreach (string command in new[] { "register-disabled", "check-disabled", "enable", "disable", "loaded <dll>" })
+        foreach (string command in new[] { "register-disabled", "check-disabled", "check-absent", "enable", "disable", "loaded <dll>" })
         {
             Assert.Contains(command, tool);
         }
@@ -244,8 +244,9 @@ public sealed class InstallerContractTests
             Assert.Contains(value, iss);
         }
         Assert.Contains("'loaded ' + AddQuotes(PreviousHost)", iss);
-        Assert.Contains("RegisterTargetDisabled(TransactionTarget)", iss);
-        Assert.Contains("'check-disabled'", iss);
+        Assert.DoesNotContain("RegisterTargetDisabled(TransactionTarget)",
+            iss[pending..Position(iss, "procedure StartRuntimeAsOriginalUser", pending)]);
+        Assert.Contains("'check-absent'", iss);
         Assert.Contains("RegDeleteValue(HKLM64, RunKey, 'FamoRuntime')", iss);
         int clearRuntimeRun = Position(iss, "RegDeleteValue(HKLM64, RunKey, 'FamoRuntime')", pending);
         int verifyPending = Position(iss, "VerifyPendingInstall;", pending);
@@ -272,9 +273,9 @@ public sealed class InstallerContractTests
         Assert.Contains("LoadPendingState(PendingId)", iss);
         Assert.DoesNotContain("restartreplace", completePendingBody, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("'activate', False", iss);
-        Assert.Contains("RunAndRequire(ProfileTool(TransactionTarget), 'enable', False)", completePendingBody);
+        Assert.Contains("RegisterTarget(TransactionTarget)", completePendingBody);
         Assert.DoesNotContain("pending profile activation failed", completePendingBody);
-        Assert.DoesNotContain("RegisterTarget(TransactionTarget)", completePendingBody);
+        Assert.DoesNotContain("RegisterTargetDisabled(TransactionTarget)", completePendingBody);
     }
 
     [Fact]

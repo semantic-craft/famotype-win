@@ -10,6 +10,7 @@
 #include <shlobj.h>
 
 #include "candidate_window.h"
+#include "famo_install_state.h"
 #include "famo_runtime_control.h"
 #include "famo_runtime_identity.h"
 #include "famo_runtime_pipe.h"
@@ -151,6 +152,11 @@ int wmain(int argc, wchar_t **argv) {
                 static_cast<unsigned>(result.readiness),
                 static_cast<unsigned long long>(result.engine_generation));
     return result.state == ControlState::Succeeded ? 0 : 4;
+  }
+  if (endpoint_suffix == kDefaultRuntimeEndpointSuffix &&
+      !ProductionInstallAllowed(ModuleDirectory(), true)) {
+    std::fprintf(stderr, "runtime install state is not active\n");
+    return 3;
   }
   const bool root_ready = CreateDirectoryW(data_root.c_str(), nullptr) != FALSE ||
                           GetLastError() == ERROR_ALREADY_EXISTS;

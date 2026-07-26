@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "famo_guids.h"
+#include "famo_install_state.h"
 #include "module_state.h"
 
 namespace famo::tsf {
@@ -226,6 +227,8 @@ bool TextService::ConnectRuntime(const runtime::Correlation &identity) {
       ModuleDirectory() + L"\\" + runtime_executable_name_;
   std::chrono::milliseconds deadline{500};
   if (runtime_executable_name_ == L"FamoRuntime.exe") {
+    if (!runtime::ProductionInstallAllowed(ModuleDirectory()))
+      return false;
     if (!WaitNamedPipeW(endpoint.name.c_str(), 0) &&
         GetLastError() == ERROR_FILE_NOT_FOUND) {
       std::wstring command = L"\"" + expected + L"\"";
@@ -486,6 +489,10 @@ void TextService::SessionWorkerMain() {
            ready && attempt < kSessionOpenAttempts &&
            !session_worker_stop_.load();
            ++attempt) {
+        if (runtime_port_.state() != runtime::ChannelState::Ready)
+          ready = ConnectRuntime(request->identity);
+        if (!ready)
+          break;
         const std::shared_ptr<const runtime::Correlation> desired =
             desired_session_.load();
         if (!desired || *desired != request->identity) {
@@ -505,12 +512,16 @@ void TextService::SessionWorkerMain() {
           opened = true;
           break;
         }
-        if (result.status != runtime::Status::Unavailable) {
+        const bool retryable =
+            result.status == runtime::Status::Unavailable ||
+            result.status == runtime::Status::Timeout;
+        if (!retryable) {
           runtime_port_.Poison();
           break;
         }
-        if (attempt + 1 >= kSessionOpenAttempts ||
-            runtime_port_.state() != runtime::ChannelState::Ready) {
+        if (result.status == runtime::Status::Timeout)
+          runtime_port_.Poison();
+        if (attempt + 1 >= kSessionOpenAttempts) {
           break;
         }
         std::unique_lock retry_lock(session_retry_mutex_);

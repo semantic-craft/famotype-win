@@ -20,7 +20,7 @@
 
 任何阶段失败都按反向顺序停止新 runtime、反注册新 profile、恢复旧注册/激活/runtime，并删除未就绪目标。对外终态只有 `Ready`、`RolledBack`、`PendingReboot` 和 `NotInstalled`。
 
-如果注册表指向的旧 `FamoTextService.dll` 仍被任一宿主进程加载，安装器不会形成新旧混用的 `Ready`：它记录旧 DLL 的路径、SHA-256 和文件版本，切离旧输入法，注册但禁用已验证的新 profile，移除用户 TIP 和 runtime 自启，然后进入 `PendingReboot`。保留安装器通过 HKLM RunOnce 以同一 `TransactionId` 在重启后继续；只有旧 DLL 已卸载、manifest/COM/profile/runtime 全部回读成功才转为 `Ready`。继续失败时保持禁用的 `PendingReboot`，不会反复自启。
+如果注册表指向的旧 `FamoTextService.dll` 仍被任一宿主进程加载，安装器不会形成新旧混用的 `Ready`：它记录旧 DLL 的路径、SHA-256 和文件版本，切离并反注册旧输入法，保持稳定 COM/profile 未注册，移除用户 TIP 和 runtime 自启，然后进入 `PendingReboot`。保留安装器通过 HKLM RunOnce 以同一 `TransactionId` 在重启后继续；只有旧 DLL 已卸载后才注册新 profile，并在 manifest/COM/profile/runtime 全部回读成功后转为 `Ready`。继续失败时恢复为未注册的 `PendingReboot`，不会反复自启。
 
 等待重启期间可用 `Test-FamoHealth.ps1` 和 `Test-FamoTsfRegistration.ps1` 验证安全终态。若决定放弃升级，以管理员身份运行注册表 `ResumeInstaller` 指向的文件：
 
@@ -54,6 +54,6 @@
 ## 验证
 
 - `Test-FamoHealth.ps1` 检查事务终态、Stable identity、完整 manifest、COM/profile、精确 runtime 路径和有界 control pipe；`PendingReboot` 还要求 runtime 缺席且 RunOnce 与同一事务一致。
-- `Test-FamoTsfRegistration.ps1` 检查 HKCU COM、profile/category、激活状态、current-user TIP 和 stable/development 隔离；`PendingReboot` 要求 profile 禁用、未激活且 TIP 不可见。
+- `Test-FamoTsfRegistration.ps1` 检查 HKCU COM、profile/category、激活状态、current-user TIP 和 stable/development 隔离；`PendingReboot` 要求 COM/profile 未注册、未激活且 TIP 不可见。
 - `smoke-harness.ps1` 在当前电脑的一个提权 PowerShell 会话中执行一次安装/修复与健康检查，不创建 VM、证据包或应用矩阵。
 - 本机手动复现范围见 `smoke_test.md`；跨版本发行认证须另行批准且不阻断开发。

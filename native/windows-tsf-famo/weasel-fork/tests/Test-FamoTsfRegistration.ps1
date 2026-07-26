@@ -75,22 +75,26 @@ if ($machineComPresent) {
   $threadingModel = [string]$com.GetValue('ThreadingModel')
 }
 $expectedDll = if ($target) { Join-Path $target 'FamoTextService.dll' } else { '' }
-$comOk = $machineComPresent -and -not $userComPresent -and (Same-Path $inprocDll $expectedDll) -and $threadingModel -eq 'Apartment'
+$comOk = if ($isPending) {
+  -not $machineComPresent -and -not $userComPresent
+} else {
+  $machineComPresent -and -not $userComPresent -and (Same-Path $inprocDll $expectedDll) -and $threadingModel -eq 'Apartment'
+}
 Add-Audit 'TSF-COM' 'HKLM COM registration; per-user COM override absent' ($notInstalled -or [bool]$comOk) `
   'The machine COM registration must point to the active transaction and no legacy HKCU key may shadow it.' `
-  "HKLM COM=$expectedDll; ThreadingModel=Apartment; HKCU override absent" `
+  $(if ($isPending) { 'HKLM/HKCU COM registration absent' } else { "HKLM COM=$expectedDll; ThreadingModel=Apartment; HKCU override absent" }) `
   $(if ($notInstalled) { 'absent with clean uninstall' } else { "COM=$inprocDll; ThreadingModel=$threadingModel; userOverride=$userComPresent" })
 
 $profileOutput = ''
 $profileExit = -1
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
-  $profileCommand = if ($isPending) { 'check-disabled' } else { 'check' }
+  $profileCommand = if ($isPending) { 'check-absent' } else { 'check' }
   $profileOutput = (& $profileTool $profileCommand 2>&1 | Out-String).Trim()
   $profileExit = $LASTEXITCODE
 }
 Add-Audit 'TSF-PROFILE' 'profile registration' ($notInstalled -or $profileExit -eq 0) `
   'FamoProfileTool verifies registry, Simplified Chinese profile, expected enabled state, and keyboard category.' `
-  $(if ($isPending) { 'registry=present profile=present enabled=no category=present' } else { 'registry=present profile=present enabled=yes category=present' }) `
+  $(if ($isPending) { 'registry=absent profile=absent category=absent' } else { 'registry=present profile=present enabled=yes category=present' }) `
   $(if ($notInstalled) { 'absent with clean uninstall' } else { "command=$profileCommand; exit=$profileExit; $profileOutput" })
 
 $profileActive = $false

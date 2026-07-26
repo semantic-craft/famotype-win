@@ -152,14 +152,18 @@ if ($machineComPresent) {
   $registeredDll = [string]$com.GetValue('')
   $threadingModel = [string]$com.GetValue('ThreadingModel')
 }
-$comOk = $machineComPresent -and -not $userComPresent -and (Same-Path $registeredDll (Join-Path $target 'FamoTextService.dll')) -and $threadingModel -eq 'Apartment'
+$comOk = if ($isPending) {
+  -not $machineComPresent -and -not $userComPresent
+} else {
+  $machineComPresent -and -not $userComPresent -and (Same-Path $registeredDll (Join-Path $target 'FamoTextService.dll')) -and $threadingModel -eq 'Apartment'
+}
 Add-Check 'H4' 'S0' ($notInstalled -or [bool]$comOk) `
   $(if ($notInstalled) { 'COM registration absent' } else { "HKLM COM=$registeredDll; ThreadingModel=$threadingModel; HKCU override=$userComPresent" })
 
 $profileOutput = ''
 $profileExit = -1
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
-  $profileCommand = if ($isPending) { 'check-disabled' } else { 'check' }
+  $profileCommand = if ($isPending) { 'check-absent' } else { 'check' }
   $profileOutput = (& $profileTool $profileCommand 2>&1 | Out-String).Trim()
   $profileExit = $LASTEXITCODE
 }
