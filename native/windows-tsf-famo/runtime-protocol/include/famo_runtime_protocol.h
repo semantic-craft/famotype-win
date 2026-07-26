@@ -44,6 +44,7 @@ enum class Command : uint16_t {
   ControlStatus = 15,
   ControlShutdown = 16,
   ControlResetUserDictionary = 17,
+  SelectCandidateAbsolute = 18,
 };
 
 enum class Status : uint32_t {
@@ -176,6 +177,17 @@ struct ControlResult {
   bool operator==(const ControlResult &) const = default;
 };
 
+inline constexpr wchar_t kPreviewSelectionWindowClass[] =
+    L"FamoTsfPreviewSelectionWindow";
+constexpr uint64_t kPreviewSelectionCopyDataId = 0x314c45534f4d4146ull;
+
+struct PreviewSelectionRequest {
+  Correlation correlation;
+  uint64_t composition_sequence = 0;
+  uint32_t absolute_index = 0;
+  uint32_t reserved = 0;
+};
+
 uint32_t Crc32(std::span<const uint8_t> bytes);
 bool IsValidUtf8(std::string_view text);
 bool PeekFrameSize(std::span<const uint8_t> header, uint32_t *size,
@@ -195,6 +207,13 @@ bool DecodeKeyEvent(std::span<const uint8_t> payload, KeyEvent *key,
 bool EncodeCandidateIndex(uint32_t index, std::vector<uint8_t> *payload);
 bool DecodeCandidateIndex(std::span<const uint8_t> payload, uint32_t *index,
                           std::string *error);
+bool EncodeAbsoluteCandidateSelection(uint32_t index,
+                                      uint64_t composition_sequence,
+                                      std::vector<uint8_t> *payload);
+bool DecodeAbsoluteCandidateSelection(std::span<const uint8_t> payload,
+                                      uint32_t *index,
+                                      uint64_t *composition_sequence,
+                                      std::string *error);
 bool EncodePageDirection(bool backward, std::vector<uint8_t> *payload);
 bool DecodePageDirection(std::span<const uint8_t> payload, bool *backward,
                          std::string *error);

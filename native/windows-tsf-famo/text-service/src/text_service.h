@@ -128,6 +128,9 @@ private:
   void CloseEntry(ContextEntry *entry);
   HRESULT HandleKey(ITfContext *context, WPARAM key, LPARAM key_data,
                     bool down, bool test_only, BOOL *eaten);
+  bool HandlePreviewSelection(const runtime::PreviewSelectionRequest &request);
+  HRESULT ApplyRuntimeComposition(ContextEntry *entry,
+                                  const runtime::Composition &composition);
   void RecoverConnection();
   void UpdateCandidates(ContextEntry *entry,
                         const runtime::Composition &composition);
@@ -169,7 +172,6 @@ private:
   std::mutex session_retry_mutex_;
   std::condition_variable session_retry_wake_;
   HWND recovery_window_ = nullptr;
-  WNDPROC recovery_previous_proc_ = nullptr;
   bool recovery_message_posted_ = false;
 };
 

@@ -9,7 +9,7 @@ namespace {
 
 bool KnownCommand(uint16_t value) {
   return value >= static_cast<uint16_t>(Command::Hello) &&
-         value <= static_cast<uint16_t>(Command::ControlShutdown);
+         value <= static_cast<uint16_t>(Command::SelectCandidateAbsolute);
 }
 
 bool KnownStatus(uint32_t value) {
@@ -197,6 +197,34 @@ bool DecodeCandidateIndex(std::span<const uint8_t> payload, uint32_t *index,
   if (!reader.U32(index)) {
     if (error)
       *error = "invalid candidate index payload";
+    return false;
+  }
+  return Finish(reader, error);
+}
+
+bool EncodeAbsoluteCandidateSelection(uint32_t index,
+                                      uint64_t composition_sequence,
+                                      std::vector<uint8_t> *payload) {
+  if (!payload || composition_sequence == 0)
+    return false;
+  Writer writer;
+  writer.U32(index);
+  writer.U64(composition_sequence);
+  *payload = writer.Take();
+  return true;
+}
+
+bool DecodeAbsoluteCandidateSelection(std::span<const uint8_t> payload,
+                                      uint32_t *index,
+                                      uint64_t *composition_sequence,
+                                      std::string *error) {
+  if (!index || !composition_sequence)
+    return false;
+  Reader reader(payload);
+  if (!reader.U32(index) || !reader.U64(composition_sequence) ||
+      *composition_sequence == 0) {
+    if (error)
+      *error = "invalid absolute candidate selection payload";
     return false;
   }
   return Finish(reader, error);

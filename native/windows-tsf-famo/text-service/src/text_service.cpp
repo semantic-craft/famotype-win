@@ -328,23 +328,22 @@ void TextService::StopSessionWorker() {
 }
 
 bool TextService::StartRecoveryWindow() {
-  HWND window = CreateWindowExW(0, L"STATIC", nullptr, 0, 0, 0, 0, 0,
-                                HWND_MESSAGE, nullptr, ModuleHandle(), nullptr);
+  WNDCLASSW window_class{};
+  window_class.lpfnWndProc = &TextService::RecoveryWindowProc;
+  window_class.hInstance = ModuleHandle();
+  window_class.lpszClassName = runtime::kPreviewSelectionWindowClass;
+  if (!RegisterClassW(&window_class) &&
+      GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    return false;
+  const std::wstring title = std::to_wstring(runtime_client_id_);
+  HWND window = CreateWindowExW(
+      0, runtime::kPreviewSelectionWindowClass, title.c_str(), 0, 0, 0, 0, 0,
+      HWND_MESSAGE, nullptr, ModuleHandle(), this);
   if (!window)
     return false;
-  SetWindowLongPtrW(window, GWLP_USERDATA,
-                    reinterpret_cast<LONG_PTR>(this));
-  SetLastError(ERROR_SUCCESS);
-  const LONG_PTR previous = SetWindowLongPtrW(
-      window, GWLP_WNDPROC,
-      reinterpret_cast<LONG_PTR>(&TextService::RecoveryWindowProc));
-  if (previous == 0 && GetLastError() != ERROR_SUCCESS) {
-    SetWindowLongPtrW(window, GWLP_USERDATA, 0);
-    DestroyWindow(window);
-    return false;
-  }
+  CHANGEFILTERSTRUCT filter{sizeof(filter)};
+  ChangeWindowMessageFilterEx(window, WM_COPYDATA, MSGFLT_ALLOW, &filter);
   recovery_window_ = window;
-  recovery_previous_proc_ = reinterpret_cast<WNDPROC>(previous);
   recovery_message_posted_ = false;
   return true;
 }
@@ -354,7 +353,6 @@ void TextService::StopRecoveryWindow() {
   if (recovery_window_)
     DestroyWindow(recovery_window_);
   recovery_window_ = nullptr;
-  recovery_previous_proc_ = nullptr;
 }
 
 void TextService::PostRecoveryWork() {
@@ -384,22 +382,36 @@ void TextService::ProcessRecoveryWork() {
 LRESULT CALLBACK TextService::RecoveryWindowProc(HWND window, UINT message,
                                                  WPARAM wparam,
                                                  LPARAM lparam) {
+  if (message == WM_NCCREATE) {
+    const auto *create = reinterpret_cast<const CREATESTRUCTW *>(lparam);
+    SetWindowLongPtrW(window, GWLP_USERDATA,
+                      reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+  }
   auto *service = reinterpret_cast<TextService *>(
       GetWindowLongPtrW(window, GWLP_USERDATA));
   if (!service)
     return DefWindowProcW(window, message, wparam, lparam);
-  WNDPROC previous = service->recovery_previous_proc_;
   if (message == kRecoveryMessage) {
     service->ProcessRecoveryWork();
     return 0;
   }
+  if (message == WM_COPYDATA) {
+    const auto *copy = reinterpret_cast<const COPYDATASTRUCT *>(lparam);
+    if (!copy || copy->dwData != runtime::kPreviewSelectionCopyDataId ||
+        copy->cbData != sizeof(runtime::PreviewSelectionRequest) ||
+        !copy->lpData)
+      return FALSE;
+    return service->HandlePreviewSelection(
+               *static_cast<const runtime::PreviewSelectionRequest *>(
+                   copy->lpData))
+               ? TRUE
+               : FALSE;
+  }
   if (message == WM_NCDESTROY) {
     SetWindowLongPtrW(window, GWLP_USERDATA, 0);
     service->recovery_window_ = nullptr;
-    service->recovery_previous_proc_ = nullptr;
   }
-  return previous ? CallWindowProcW(previous, window, message, wparam, lparam)
-                  : DefWindowProcW(window, message, wparam, lparam);
+  return DefWindowProcW(window, message, wparam, lparam);
 }
 
 void TextService::ScheduleSession(ContextEntry *entry,

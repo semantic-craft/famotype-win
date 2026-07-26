@@ -31,6 +31,7 @@ using CreateFn = int32_t(FAMO_ENGINE_CALL *)(uint32_t, FamoEngineApi *);
 
 const char kNi[] = "\xE4\xBD\xA0"; // 你
 const char kNiSecond[] = "\xE5\xB0\xBC"; // 尼
+const char kNiThird[] = "\xE6\xB3\xA5"; // 泥
 
 FamoUtf8String Str(const char *s) {
   FamoUtf8String v;
@@ -125,6 +126,18 @@ int main() {
   host.FreeView(&preview);
   host.FreeView(&view);
   CHECK(view.preedit.data == nullptr); // free_view zeroed the view
+
+  CHECK(host.CanSelectCandidateAbsolute());
+  FamoCompositionView absolute;
+  CHECK(host.api().select_candidate_absolute(ctx, 2, &absolute) ==
+        FAMO_ENGINE_OK);
+  CHECK(Eq(absolute.commit, kNiThird));
+  host.FreeView(&absolute);
+
+  CHECK(host.api().process_key(ctx, &kn, &view) == FAMO_ENGINE_OK);
+  host.FreeView(&view);
+  CHECK(host.api().process_key(ctx, &ki, &view) == FAMO_ENGINE_OK);
+  host.FreeView(&view);
 
   FamoCompositionView sel;
   CHECK(host.api().select_candidate(ctx, 0, &sel) == FAMO_ENGINE_OK);

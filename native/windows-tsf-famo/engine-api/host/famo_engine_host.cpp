@@ -129,6 +129,13 @@ bool FamoEngineHost::AbiRunnable() const {
 
 bool FamoEngineHost::CanPeekCandidates() const {
   return module_ &&
-         api_.size >= static_cast<uint32_t>(sizeof(FamoEngineApi)) &&
+         api_.size >= static_cast<uint32_t>(
+                          offsetof(FamoEngineApi, select_candidate_absolute)) &&
          api_.peek_candidates;
+}
+
+bool FamoEngineHost::CanSelectCandidateAbsolute() const {
+  return module_ &&
+         api_.size >= static_cast<uint32_t>(sizeof(FamoEngineApi)) &&
+         api_.select_candidate_absolute;
 }

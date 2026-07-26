@@ -40,6 +40,7 @@ class FamoEngineHost {
   bool AbiRunnable() const;
 
   bool CanPeekCandidates() const;
+  bool CanSelectCandidateAbsolute() const;
 
   // Release a view the engine filled. Always route view teardown through here.
   int32_t FreeView(FamoCompositionView* view);

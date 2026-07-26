@@ -401,6 +401,20 @@ int32_t FAMO_ENGINE_CALL RePeekCandidates(FamoEngineContext* context,
   return FAMO_ENGINE_OK;
 }
 
+int32_t FAMO_ENGINE_CALL ReSelectCandidateAbsolute(
+    FamoEngineContext* context, uint32_t index,
+    FamoCompositionView* out_view) {
+  if (!context || !out_view || !g_rime)
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  const bool handled =
+      g_rime->select_candidate(context->session, static_cast<size_t>(index));
+  const int32_t rc =
+      FillFromSession(context->session, out_view, /*consume_commit=*/false);
+  if (rc == FAMO_ENGINE_OK && handled)
+    out_view->state_flags |= FAMO_COMPOSITION_HANDLED;
+  return rc;
+}
+
 }  // namespace
 
 extern "C" FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL
@@ -435,6 +449,7 @@ FamoCreateEngineApi(uint32_t requested_abi_version, FamoEngineApi* out_api) {
   api.highlight_candidate = &ReHighlightCandidate;
   api.change_page = &ReChangePage;
   api.peek_candidates = &RePeekCandidates;
+  api.select_candidate_absolute = &ReSelectCandidateAbsolute;
   std::memcpy(out_api, &api, api.size);
   return FAMO_ENGINE_OK;
 }

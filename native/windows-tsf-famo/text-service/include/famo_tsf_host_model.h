@@ -40,6 +40,8 @@ public:
 
   bool TestKey(const HostKey &key) const;
   KeyPlan PlanKey(const HostKey &key);
+  std::optional<runtime::Correlation>
+  PlanAbsoluteCandidate(uint64_t composition_sequence);
   std::optional<runtime::Correlation> PlanUiState();
   std::optional<runtime::Correlation> PlanClose();
   bool AcceptReply(const runtime::Correlation &reply) const;
@@ -60,6 +62,7 @@ private:
   runtime::Composition displayed_;
   uint64_t next_sequence_ = 1;
   uint64_t pending_sequence_ = 0;
+  uint64_t displayed_sequence_ = 0;
   bool recovery_emitted_ = false;
 };
 

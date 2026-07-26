@@ -128,37 +128,30 @@ struct WindowNotifications {
   HANDLE update_event = nullptr;
   std::atomic<uint64_t> *system_generation = nullptr;
   FamoLayoutResult layout{};
+  PreviewSelectionRequest selection_request{};
+  uint32_t page_index = 0;
   uint32_t page_size = 0;
   int shadow_margin = 0;
   HWND foreground_window = nullptr;
 };
 
-bool SendPreviewSelectionKeys(const PreviewSelection &selection,
-                              HWND expected_foreground) {
-  if (!expected_foreground || GetForegroundWindow() != expected_foreground)
+bool SendPreviewSelection(const PreviewSelectionRequest &request) {
+  if (request.correlation.client_id == 0 ||
+      request.composition_sequence == 0)
     return false;
-  std::vector<INPUT> input;
-  input.reserve((selection.pages_forward + 1) * 2);
-  const auto append_key = [&input](WORD key) {
-    INPUT down{};
-    down.type = INPUT_KEYBOARD;
-    down.ki.wVk = key;
-    input.push_back(down);
-    INPUT up = down;
-    up.ki.dwFlags = KEYEVENTF_KEYUP;
-    input.push_back(up);
-  };
-  for (uint32_t page = 0; page < selection.pages_forward; ++page)
-    append_key(VK_NEXT);
-  append_key(static_cast<WORD>('1' + selection.candidate_offset));
-  const UINT sent = SendInput(static_cast<UINT>(input.size()), input.data(),
-                              sizeof(INPUT));
-  if (sent != input.size()) {
-    for (size_t i = 1; i < input.size(); i += 2)
-      SendInput(1, &input[i], sizeof(INPUT));
+  const std::wstring title = std::to_wstring(request.correlation.client_id);
+  HWND target = FindWindowExW(HWND_MESSAGE, nullptr,
+                              kPreviewSelectionWindowClass, title.c_str());
+  if (!target)
     return false;
-  }
-  return true;
+  COPYDATASTRUCT data{static_cast<ULONG_PTR>(kPreviewSelectionCopyDataId),
+                      static_cast<DWORD>(sizeof(request)),
+                      const_cast<PreviewSelectionRequest *>(&request)};
+  DWORD_PTR handled = 0;
+  return SendMessageTimeoutW(target, WM_COPYDATA, 0,
+                             reinterpret_cast<LPARAM>(&data),
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &handled) != 0 &&
+         handled != 0;
 }
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
@@ -183,19 +176,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     PreviewSelection selection;
     const int x = static_cast<int16_t>(LOWORD(lparam));
     const int y = static_cast<int16_t>(HIWORD(lparam));
-    const bool modifier_down =
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
-    if (notifications && !modifier_down && notifications->foreground_window &&
-        notifications->foreground_window == GetForegroundWindow() &&
+    if (notifications &&
         PreviewSelectionAt(notifications->layout,
                            x - notifications->shadow_margin,
                            y - notifications->shadow_margin,
+                           notifications->page_index,
                            notifications->page_size, &selection)) {
-      SendPreviewSelectionKeys(selection, notifications->foreground_window);
+      PreviewSelectionRequest request = notifications->selection_request;
+      request.absolute_index = selection.absolute_index;
+      SendPreviewSelection(request);
       return 0;
     }
   }
@@ -268,11 +257,9 @@ bool PrewarmRenderer(FamoTextResources *resources, const FamoSkin *skin,
 } // namespace
 
 bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
-                        uint32_t page_size,
+                        uint32_t page_index, uint32_t page_size,
                         PreviewSelection *selection) noexcept {
   if (!selection || page_size == 0)
-    return false;
-  if (page_size > 9)
     return false;
   const uint32_t count = (std::min)(layout.preview_candidate_count,
                                     uint32_t{FAMO_MAX_PREVIEW_CANDIDATES});
@@ -281,11 +268,11 @@ bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
     if (x < bounds.left || x >= bounds.right || y < bounds.top ||
         y >= bounds.bottom)
       continue;
-    const uint32_t offset = i % page_size;
-    if (offset >= 9)
+    const uint64_t absolute =
+        (static_cast<uint64_t>(page_index) + 1) * page_size + i;
+    if (absolute > UINT32_MAX)
       return false;
-    selection->pages_forward = i / page_size + 1;
-    selection->candidate_offset = offset;
+    selection->absolute_index = static_cast<uint32_t>(absolute);
     return true;
   }
   return false;
@@ -727,6 +714,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     } else {
       state->submitted_visible = true;
       notifications.layout = layout;
+      notifications.selection_request =
+          {snapshot->correlation, snapshot->composition_sequence, 0, 0};
+      notifications.page_index = snapshot->composition.page_index;
       notifications.page_size = snapshot->composition.page_size;
       notifications.shadow_margin = margin;
       notifications.foreground_window = frame_foreground;

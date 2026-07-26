@@ -89,19 +89,21 @@ bool WaitForVisibility(bool visible, WindowProbe *result = nullptr) {
   return false;
 }
 
-bool PreviewRowsMapToPageAndCandidateKeys() {
+bool PreviewRowsMapToAbsoluteCandidateIndexes() {
   FamoLayoutResult layout{};
   layout.preview_candidate_count = 3;
   layout.preview_candidates[0].bounds = {10, 20, 30, 40};
   layout.preview_candidates[1].bounds = {30, 20, 50, 40};
   layout.preview_candidates[2].bounds = {10, 40, 30, 60};
   PreviewSelection selection;
-  CHECK(PreviewSelectionAt(layout, 35, 25, 2, &selection));
-  CHECK(selection.pages_forward == 1 && selection.candidate_offset == 1);
-  CHECK(PreviewSelectionAt(layout, 15, 45, 2, &selection));
-  CHECK(selection.pages_forward == 2 && selection.candidate_offset == 0);
-  CHECK(!PreviewSelectionAt(layout, 5, 5, 2, &selection));
-  CHECK(!PreviewSelectionAt(layout, 15, 25, 10, &selection));
+  CHECK(PreviewSelectionAt(layout, 35, 25, 0, 2, &selection));
+  CHECK(selection.absolute_index == 3);
+  CHECK(PreviewSelectionAt(layout, 15, 45, 0, 2, &selection));
+  CHECK(selection.absolute_index == 4);
+  CHECK(PreviewSelectionAt(layout, 15, 25, 4, 2, &selection));
+  CHECK(selection.absolute_index == 10);
+  CHECK(!PreviewSelectionAt(layout, 5, 5, 0, 2, &selection));
+  CHECK(!PreviewSelectionAt(layout, 15, 25, 0, 0, &selection));
   return true;
 }
 
@@ -520,7 +522,7 @@ bool HangingUiDoesNotDelayEngine() {
 } // namespace
 
 int main() {
-  if (!PreviewRowsMapToPageAndCandidateKeys() ||
+  if (!PreviewRowsMapToAbsoluteCandidateIndexes() ||
       !PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
       !InlineHostPreeditStillShowsPanelHeader() ||

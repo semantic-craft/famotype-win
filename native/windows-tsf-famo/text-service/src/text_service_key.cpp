@@ -35,6 +35,15 @@ constexpr uint32_t kRimeF1 = 0xffbe;
 constexpr uint32_t kRimeReleaseMask = 1u << 30;
 constexpr UINT kToUnicodeNoStateChange = 1u << 2;
 
+bool SameSession(const runtime::Correlation &left,
+                 const runtime::Correlation &right) {
+  return left.client_id == right.client_id &&
+         left.activation_generation == right.activation_generation &&
+         left.connection_generation == right.connection_generation &&
+         left.session_id == right.session_id &&
+         left.session_generation == right.session_generation;
+}
+
 uint32_t SpecialKey(WPARAM key, LPARAM key_data) {
   const bool extended = (key_data & (1ll << 24)) != 0;
   const uint32_t scan_code = static_cast<uint32_t>((key_data >> 16) & 0xff);
@@ -139,6 +148,90 @@ HostKey TextService::MakeKey(WPARAM key, LPARAM key_data, bool down,
           static_cast<uint32_t>(GetMessageTime())};
 }
 
+HRESULT TextService::ApplyRuntimeComposition(
+    ContextEntry *entry, const runtime::Composition &composition) {
+  if (!entry || !entry->context)
+    return E_INVALIDARG;
+  runtime::Composition host_composition = composition;
+  if ((composition.state_flags & runtime::kHostInlinePreedit) == 0) {
+    host_composition.preedit.clear();
+    host_composition.preedit_sel_start = 0;
+    host_composition.preedit_sel_end = 0;
+    host_composition.preedit_cursor_pos = 0;
+  } else if ((composition.state_flags & runtime::kHostCandidatePreview) != 0 &&
+             !composition.commit_preview.empty()) {
+    host_composition.preedit = composition.commit_preview;
+    host_composition.preedit_sel_start = 0;
+    host_composition.preedit_sel_end =
+        static_cast<uint32_t>(host_composition.preedit.size());
+    host_composition.preedit_cursor_pos = host_composition.preedit_sel_end;
+  }
+  return entry->composition.Apply(
+      entry->context.get(), client_id_, host_composition,
+      static_cast<ITfCompositionSink *>(this));
+}
+
+bool TextService::HandlePreviewSelection(
+    const runtime::PreviewSelectionRequest &selection) {
+  if (!OnActivationThread() || selection.reserved != 0)
+    return false;
+  ContextEntry *entry = nullptr;
+  for (auto &owned : contexts_) {
+    if (owned->ui_state.focused &&
+        SameSession(owned->state.session_identity(), selection.correlation)) {
+      entry = owned.get();
+      break;
+    }
+  }
+  if (!entry)
+    return false;
+  const auto correlation =
+      entry->state.PlanAbsoluteCandidate(selection.composition_sequence);
+  if (!correlation)
+    return false;
+
+  runtime::Frame request;
+  request.command = runtime::Command::SelectCandidateAbsolute;
+  request.correlation = *correlation;
+  if (!runtime::EncodeAbsoluteCandidateSelection(
+          selection.absolute_index, selection.composition_sequence,
+          &request.payload)) {
+    entry->state.CompleteUnhandled();
+    return false;
+  }
+  runtime::CallResult result =
+      runtime_port_.Call(std::move(request), runtime::kHardCallDeadline);
+  if (result.status == runtime::Status::StaleRequest ||
+      result.status == runtime::Status::InvalidFrame ||
+      result.status == runtime::Status::Unavailable ||
+      result.status == runtime::Status::EngineError) {
+    entry->state.CompleteUnhandled();
+    return false;
+  }
+  if (result.status != runtime::Status::Ok ||
+      !entry->state.AcceptReply(result.reply.correlation)) {
+    RecoverConnection();
+    return false;
+  }
+  runtime::Composition composition;
+  std::string error;
+  if (!runtime::DecodeComposition(result.reply.payload, &composition, &error)) {
+    RecoverConnection();
+    return false;
+  }
+  if (!composition.handled) {
+    entry->state.CompleteUnhandled();
+    return false;
+  }
+  if (FAILED(ApplyRuntimeComposition(entry, composition))) {
+    RecoverConnection();
+    return false;
+  }
+  entry->state.ApplySucceeded(composition);
+  UpdateCandidates(entry, composition);
+  return true;
+}
+
 HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
                                LPARAM key_data, bool down, bool test_only,
                                BOOL *eaten) {
@@ -216,23 +309,7 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
     entry->composition.ObserveUnhandledKey(key, down);
     return S_OK;
   }
-  runtime::Composition host_composition = composition;
-  if ((composition.state_flags & runtime::kHostInlinePreedit) == 0) {
-    host_composition.preedit.clear();
-    host_composition.preedit_sel_start = 0;
-    host_composition.preedit_sel_end = 0;
-    host_composition.preedit_cursor_pos = 0;
-  } else if ((composition.state_flags & runtime::kHostCandidatePreview) != 0 &&
-             !composition.commit_preview.empty()) {
-    host_composition.preedit = composition.commit_preview;
-    host_composition.preedit_sel_start = 0;
-    host_composition.preedit_sel_end =
-        static_cast<uint32_t>(host_composition.preedit.size());
-    host_composition.preedit_cursor_pos = host_composition.preedit_sel_end;
-  }
-  const HRESULT applied = entry->composition.Apply(
-      context, client_id_, host_composition,
-      static_cast<ITfCompositionSink *>(this));
+  const HRESULT applied = ApplyRuntimeComposition(entry, composition);
   if (FAILED(applied)) {
     RecoverConnection();
     return S_OK;

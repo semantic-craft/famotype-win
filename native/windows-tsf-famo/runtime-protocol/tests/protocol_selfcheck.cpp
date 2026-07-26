@@ -165,6 +165,14 @@ int main() {
   CHECK(DecodeKeyEvent(payload, &decoded_key, &error));
   CHECK(decoded_key == key);
 
+  CHECK(EncodeAbsoluteCandidateSelection(17, 99, &payload));
+  uint32_t absolute_index = 0;
+  uint64_t composition_sequence = 0;
+  CHECK(DecodeAbsoluteCandidateSelection(payload, &absolute_index,
+                                         &composition_sequence, &error));
+  CHECK(absolute_index == 17 && composition_sequence == 99);
+  CHECK(!EncodeAbsoluteCandidateSelection(17, 0, &payload));
+
   ControlResult control{42, ControlState::Running, ControlError::None, false,
                         RuntimeReadiness::Maintenance, 7};
   CHECK(EncodeControlResult(control, &payload, &error));
@@ -189,11 +197,15 @@ int main() {
   CHECK(IsControlOperation(Command::ControlDeploy));
   CHECK(IsControlOperation(Command::ControlResetUserDictionary));
   CHECK(!IsControlOperation(Command::ControlStatus));
-  source.command = Command::ControlShutdown;
+  source.command = Command::ControlResetUserDictionary;
   source.payload.clear();
   CHECK(EncodeFrame(source, &bytes, &error));
   CHECK(DecodeFrame(bytes, &parsed, &error));
-  CHECK(parsed.command == Command::ControlShutdown);
+  CHECK(parsed.command == Command::ControlResetUserDictionary);
+  source.command = Command::SelectCandidateAbsolute;
+  CHECK(EncodeFrame(source, &bytes, &error));
+  CHECK(DecodeFrame(bytes, &parsed, &error));
+  CHECK(parsed.command == Command::SelectCandidateAbsolute);
 
   std::printf("protocol_selfcheck: OK\n");
   return 0;

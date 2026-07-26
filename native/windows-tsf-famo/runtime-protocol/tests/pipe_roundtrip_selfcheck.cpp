@@ -50,13 +50,15 @@ std::wstring EnginePath() {
 
 bool SpawnRuntime(std::wstring_view suffix, std::wstring_view fault,
                   PROCESS_INFORMATION *process, int connections = 2,
-                  bool parallel = true) {
+                  bool parallel = true, int preview_rows = 0) {
   std::wstring command = L"\"" + RuntimePath() + L"\" --endpoint-suffix " +
                          std::wstring(suffix) + L" --fault " +
                          std::wstring(fault) + L" --connections " +
                          std::to_wstring(connections);
   if (parallel)
     command += L" --parallel";
+  if (preview_rows > 0)
+    command += L" --preview-rows " + std::to_wstring(preview_rows);
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   return CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
@@ -205,6 +207,78 @@ bool NormalRoundtrip() {
   CHECK(!composition.handled);
 
   Frame close = Request(Command::CloseSession, generation, 106);
+  CHECK(port.Call(std::move(close), kHardCallDeadline).status == Status::Ok);
+  port.Stop();
+  CHECK(FinishRuntime(&process));
+  return true;
+}
+
+bool AbsolutePreviewSelectionRoundtrip() {
+  const std::wstring suffix =
+      L"absolute-preview-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+  PROCESS_INFORMATION process{};
+  const bool spawned = SpawnRuntime(suffix, L"none", &process, 2, true, 2);
+  CHECK(spawned);
+
+  PipeRuntimePort port;
+  constexpr uint64_t generation = 201;
+  CHECK(port.Connect(endpoint, RuntimePath(), Hello(generation).correlation,
+                     std::chrono::seconds(2), &error));
+  Frame open = Request(Command::OpenSession, generation, 1);
+  CHECK(EncodeOpenSession("test", &open.payload, &error));
+  CHECK(port.Call(std::move(open), kSessionOpenDeadline).status == Status::Ok);
+
+  Composition composition;
+  for (uint64_t sequence = 2; sequence <= 3; ++sequence) {
+    Frame key = Request(Command::ProcessKey, generation, sequence);
+    const uint32_t letter = sequence == 2 ? 'N' : 'I';
+    CHECK(EncodeKeyEvent({letter, 0, 0, 1, sequence}, &key.payload));
+    CallResult result = port.Call(std::move(key), kHardCallDeadline);
+    CHECK(result.status == Status::Ok);
+    CHECK(DecodeComposition(result.reply.payload, &composition, &error));
+  }
+  CHECK(composition.page_size == 1);
+  CHECK(composition.is_last_page == 0);
+
+  Frame stale = Request(Command::SelectCandidateAbsolute, generation, 4);
+  CHECK(EncodeAbsoluteCandidateSelection(1, 2, &stale.payload));
+  const CallResult stale_result =
+      port.Call(std::move(stale), kHardCallDeadline);
+  CHECK(stale_result.status == Status::StaleRequest);
+  Frame out_of_range =
+      Request(Command::SelectCandidateAbsolute, generation, 5);
+  CHECK(EncodeAbsoluteCandidateSelection(3, 3, &out_of_range.payload));
+  CHECK(port.Call(std::move(out_of_range), kHardCallDeadline).status ==
+        Status::InvalidFrame);
+
+  Frame page_two =
+      Request(Command::SelectCandidateAbsolute, generation, 6);
+  CHECK(EncodeAbsoluteCandidateSelection(1, 3, &page_two.payload));
+  CallResult selected = port.Call(std::move(page_two), kHardCallDeadline);
+  CHECK(selected.status == Status::Ok);
+  CHECK(DecodeComposition(selected.reply.payload, &composition, &error));
+  CHECK(composition.commit == "\xe5\xb0\xbc");
+
+  for (uint64_t sequence = 7; sequence <= 8; ++sequence) {
+    Frame key = Request(Command::ProcessKey, generation, sequence);
+    const uint32_t letter = sequence == 7 ? 'N' : 'I';
+    CHECK(EncodeKeyEvent({letter, 0, 0, 1, sequence}, &key.payload));
+    selected = port.Call(std::move(key), kHardCallDeadline);
+    CHECK(selected.status == Status::Ok);
+    CHECK(DecodeComposition(selected.reply.payload, &composition, &error));
+  }
+  Frame page_three =
+      Request(Command::SelectCandidateAbsolute, generation, 9);
+  CHECK(EncodeAbsoluteCandidateSelection(2, 8, &page_three.payload));
+  selected = port.Call(std::move(page_three), kHardCallDeadline);
+  CHECK(selected.status == Status::Ok);
+  CHECK(DecodeComposition(selected.reply.payload, &composition, &error));
+  CHECK(composition.commit == "\xe6\xb3\xa5");
+
+  Frame close = Request(Command::CloseSession, generation, 10);
   CHECK(port.Call(std::move(close), kHardCallDeadline).status == Status::Ok);
   port.Stop();
   CHECK(FinishRuntime(&process));
@@ -736,7 +810,8 @@ bool StopRetiresInFlightOffControlPath() {
 } // namespace
 
 int main() {
-  if (!NormalRoundtrip() || !WrongPeerRejected() ||
+  if (!NormalRoundtrip() || !AbsolutePreviewSelectionRoundtrip() ||
+      !WrongPeerRejected() ||
       !ConnectFailureIsOffHotPath() ||
       !OptionalUiPipeDoesNotDelayPrimaryReadiness() || !ConcurrentClients() ||
       !ConcurrentRuntimeClients() ||

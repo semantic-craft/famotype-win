@@ -75,6 +75,7 @@ void ContextState::Open(const runtime::Correlation &session_identity) {
   identity_.sequence = 0;
   displayed_ = {};
   pending_sequence_ = 0;
+  displayed_sequence_ = 0;
   recovery_emitted_ = false;
   phase_ = ContextPhase::Ready;
 }
@@ -140,6 +141,18 @@ KeyPlan ContextState::PlanKey(const HostKey &key) {
   return plan;
 }
 
+std::optional<runtime::Correlation>
+ContextState::PlanAbsoluteCandidate(uint64_t composition_sequence) {
+  if (phase_ != ContextPhase::Ready || pending_sequence_ != 0 ||
+      composition_sequence == 0 ||
+      composition_sequence != displayed_sequence_)
+    return std::nullopt;
+  runtime::Correlation correlation = identity_;
+  correlation.sequence = next_sequence_++;
+  pending_sequence_ = correlation.sequence;
+  return correlation;
+}
+
 std::optional<runtime::Correlation> ContextState::PlanUiState() {
   if (phase_ != ContextPhase::Ready || pending_sequence_ != 0)
     return std::nullopt;
@@ -175,6 +188,7 @@ void ContextState::ApplySucceeded(
   if (phase_ != ContextPhase::Ready || pending_sequence_ == 0)
     return;
   displayed_ = composition;
+  displayed_sequence_ = pending_sequence_;
   pending_sequence_ = 0;
 }
 
