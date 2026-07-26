@@ -28,15 +28,19 @@ public sealed class AiSelectionPolishWindowContractTests
     }
 
     [Fact]
-    public void Toolbox_RoutesEveryConcreteActionToItsIndependentWindow()
+    public void Toolbox_KeepsTranslationAndResearchInlineButRoutesOtherSkillsToIndependentWindows()
     {
         string toolbox = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AiConversationWindow.cs"));
         string app = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/App.xaml.cs"));
 
         Assert.Contains("Grid.SetRow", toolbox);
         Assert.Contains("Grid.SetColumn", toolbox);
+        Assert.Contains("skill.Id is \"translation\" or \"research-assist\"", toolbox);
+        Assert.Contains("RunToolboxSkillAsync", toolbox);
+        Assert.Contains("_turns.Add", toolbox);
+        Assert.Contains("可继续追问或选择其他技能", toolbox);
         Assert.Contains("App.ShowAiSelectionSkill(skill, _selectedText!, _replacement)", toolbox);
-        Assert.DoesNotContain("RunToolboxSkillAsync", toolbox);
+        Assert.Contains("Close();", toolbox);
         Assert.Contains("任意提问", toolbox);
         Assert.Contains("ShowCapturedAiSelectionSkillAsync", app);
         Assert.Contains("LoadCapturedSelection", app);
