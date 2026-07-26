@@ -242,6 +242,23 @@ bool RuntimeService::CopyView(const FamoCompositionView &view,
   return true;
 }
 
+bool RuntimeService::ReadStatusLocked(FamoEngineContext *context,
+                                      Composition *target) {
+  if (!context || !target)
+    return false;
+  FamoCompositionView view{};
+  if (engine_.api().get_status(context, &view) != FAMO_ENGINE_OK)
+    return false;
+  Composition composition;
+  std::string error;
+  const bool copied = CopyView(view, &composition, &error);
+  const int32_t free_rc = engine_.FreeView(&view);
+  if (!copied || free_rc != FAMO_ENGINE_OK)
+    return false;
+  *target = std::move(composition);
+  return true;
+}
+
 void RuntimeService::InvalidateConnection(uint64_t client_id,
                                           uint64_t activation_generation,
                                           uint64_t connection_generation) {
