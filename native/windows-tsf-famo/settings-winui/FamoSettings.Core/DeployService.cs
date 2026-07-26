@@ -58,6 +58,9 @@ public static class DeployService
     /// <summary>部署桶（方案/词典/模糊音）参数：重建 prism。</summary>
     public const string DeployArgs = "--control deploy";
 
+    /// <summary>显式维护动作：备份并清空 Rime 学习数据，再重载引擎。</summary>
+    public const string ResetUserDictionaryArgs = "--control reset-user-dictionary";
+
     /// <summary>即时外观②参数：令运行中的 server 重读 famo-style.yaml 覆盖层并重绘，零部署。</summary>
     public const string ReloadStyleArgs = "--control reload-style";
 
@@ -72,7 +75,7 @@ public static class DeployService
     private static readonly object QueueGate = new();
     private static readonly Dictionary<string, QueuedReload> PendingReloads = new();
     private static readonly Dictionary<long, RetryReload> FailedReloads = new();
-    private static readonly string[] DrainOrder = [DeployArgs, ReloadOptionsArgs, ReloadStyleArgs, SelectSchemaArgs];
+    private static readonly string[] DrainOrder = [ResetUserDictionaryArgs, DeployArgs, ReloadOptionsArgs, ReloadStyleArgs, SelectSchemaArgs];
     private static readonly Action<string> ProductionFailureLogger = message => FamoLog.Append(message);
     private static readonly Action<string, string, TimeSpan, string> ProductionTimingLogger =
         (component, operation, elapsed, status) => FamoTimingLog.Append(component, operation, elapsed, status);
@@ -190,6 +193,9 @@ public static class DeployService
     /// </summary>
     public static ReloadResult SelectSchema(string? baseDirectory = null) =>
         Run(SelectSchemaArgs, baseDirectory);
+
+    public static ReloadResult ResetUserDictionary(string? baseDirectory = null) =>
+        Run(ResetUserDictionaryArgs, baseDirectory);
 
     /// <summary>解析 runtime 后以给定参数排队拉起 control client；找不到/失败不抛。</summary>
     private static ReloadResult Run(string args, string? baseDirectory)

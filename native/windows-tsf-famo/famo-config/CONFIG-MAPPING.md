@@ -45,7 +45,7 @@
 | `appearance.skin` | `weasel.custom.yaml` | `style/color_scheme`（亮色用 `<skin>`） | 即时 | reload |
 | `appearance.appearanceMode` | `weasel.custom.yaml` | `style/color_scheme` ↔ `style/color_scheme_dark`（system=亮/暗自动；light=`<skin>`；dark=`<skin>_dark`） | 即时 | reload |
 
-四款皮肤(配色块在 `weasel.custom.yaml` 的 `preset_color_schemes/*`；色值为 **Weasel BGR `0xBBGGRR`**，与 mac 端同一真相源 `shared/skins/colors.md`)：
+七款皮肤(配色块在 `weasel.custom.yaml` 的 `preset_color_schemes/*`；色值为 **Weasel BGR `0xBBGGRR`**，与 mac 端同一真相源 `shared/skins/colors.md`)：
 
 | skin | color_scheme（亮 / 暗） | 中文名 | 品牌 accent（亮 / 暗，原 RGB） |
 |---|---|---|---|
@@ -66,6 +66,9 @@
 | `appearance.fontPoint` | `weasel.custom.yaml` | `style/font_point` | 即时 | reload |
 | `appearance.orientation` | `weasel.custom.yaml` | `style/horizontal`（horizontal→true / vertical→false） | 即时 | reload |
 | `appearance.inlinePreedit` | `famo-style.yaml` | `style/inline_preedit` | 即时 | `--control reload-style` → native TSF host |
+| `appearance.showPreedit` | `famo-style.yaml` | `style/show_preedit`（候选窗输入串 + 光标，独立于 inline_preedit） | 即时 | `--control reload-style` → candidate layout |
+| `appearance.previewPages` | `famo-style.yaml` | `style/preview_pages` | 即时 | `--control reload-style` → librime 只读候选迭代 |
+| `appearance.previewRows` | `famo-style.yaml` | `style/preview_rows`（1–2） | 即时 | `--control reload-style` → candidate layout |
 | `appearance.inlineCandidatePreview` | `famo-style.yaml` | `style/preedit_type`（composition/preview） | 即时 | `--control reload-style` → native TSF host |
 | `appearance.layout.cornerRadius` | `weasel.custom.yaml` | `style/layout/corner_radius` | 即时 | reload |
 | `appearance.layout.borderWidth` | `weasel.custom.yaml` | `style/layout/border_width` | 即时 | reload |
@@ -148,6 +151,6 @@
 | `wubi86_jidian.custom.yaml` | 配置写入层(部署桶) | 五笔专属（码提示/空码清码/单字候选/z反查）；不注入字母快捷短语 translator |
 | `famo-options.yaml` | 配置写入层(即时开关桶) | 默认输入态/中英标点/全半角/简繁(+zh_trad)/emoji → set_option 即时 |
 | `quick-phrases.json` | 快捷短语页 | 编辑态 store，编码唯一、保存时规范化 |
-| `famo_quick_send.txt` | 快捷短语页 | RIME tabledb，`db_name=famo_quick_send`，供拼音短码候选引用；五笔用 `quick-phrase-picker` 显式面板插入，后续单键唤起优先反引号/专门热键，不用 `;` 或 `/` |
+| `famo_quick_send.txt` | 快捷短语页 | RIME tabledb，`db_name=famo_quick_send`；编辑态与派生表都用裸码，关闭补全后仅完整编码命中；五笔用 `quick-phrase-picker` 显式面板插入 |
 
 > 形态甲：以上全部落 `%LOCALAPPDATA%\Famo`，**不碰** `%AppData%\Rime`(ADR-0004)。

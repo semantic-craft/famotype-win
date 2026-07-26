@@ -61,6 +61,17 @@ public class SchemaValidationTests
         Assert.False(result.IsValid);
     }
 
+    [Theory]
+    [InlineData("illinois")]
+    [InlineData("illinoisflame")]
+    [InlineData("nyu")]
+    public void MacParitySkinEnum_PassesSchema(string skin)
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Appearance.Skin = skin;
+        Assert.True(SchemaValidator.Validate(settings).IsValid);
+    }
+
     [Fact]
     public void MissingRequiredField_FailsSchema()
     {

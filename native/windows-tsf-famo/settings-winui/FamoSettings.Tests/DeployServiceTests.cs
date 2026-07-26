@@ -106,6 +106,15 @@ public class DeployServiceTests
     }
 
     [Fact]
+    public void BuildCommand_ResetUserDictionary_AppendsDedicatedControlArg()
+    {
+        string cmd = DeployService.BuildCommand(
+            @"C:\Program Files\Famo\FamoRuntime.exe", DeployService.ResetUserDictionaryArgs);
+
+        Assert.Equal(@"""C:\Program Files\Famo\FamoRuntime.exe"" --control reset-user-dictionary", cmd);
+    }
+
+    [Fact]
     public void ReloadStyle_WhenRuntimeMissing_ReturnsNotStarted_NoThrow()
     {
         ClearEnv();

@@ -33,6 +33,7 @@ public class SettingsStoreTests : IDisposable
         Assert.True(File.Exists(_file)); // 首启 seed 落盘
         Assert.Equal(FamoSettings.CurrentVersion, settings.Version);
         Assert.Equal("shenda", settings.Appearance.Skin);
+        Assert.Equal("auto", settings.Appearance.Orientation);
         Assert.Equal(8, settings.Engine.PageSize);
         Assert.False(settings.Engine.EmojiEnabled);          // 出厂 emoji 关
         Assert.Equal("rime_ice", settings.Engine.SchemaList[0].Id); // 出厂雾凇拼音优先
@@ -127,14 +128,16 @@ public class SettingsStoreTests : IDisposable
         Assert.True(settings.Ai.PolishSkillEnabled);
         Assert.True(settings.Ai.SourceCheckSkillEnabled);
         Assert.True(settings.Ai.ResearchAssistSkillEnabled);
-        Assert.True(settings.Ai.DocumentFormattingSkillEnabled);
+        Assert.True(settings.Ai.AskAnythingSkillEnabled);
+        Assert.True(settings.Ai.PublishFormattingSkillEnabled);
+        Assert.True(settings.Ai.TranslationSkillEnabled);
         Assert.False(settings.Ai.CloudEnabled); // 未受影响的既有默认值
     }
 
     [Fact]
     public void Load_OldSettingsFileMissingAiToggles_DefaultsAllTrue()
     {
-        // 旧版设置文件形态：只有 cloudEnabled，缺 5 个新字段。
+        // 旧版设置文件形态：只有 cloudEnabled，缺当前动作开关。
         Directory.CreateDirectory(_dir);
         File.WriteAllText(_file, """
         {
@@ -148,7 +151,62 @@ public class SettingsStoreTests : IDisposable
         Assert.True(ai.PolishSkillEnabled);
         Assert.True(ai.SourceCheckSkillEnabled);
         Assert.True(ai.ResearchAssistSkillEnabled);
-        Assert.True(ai.DocumentFormattingSkillEnabled);
+        Assert.True(ai.AskAnythingSkillEnabled);
+        Assert.True(ai.PublishFormattingSkillEnabled);
+        Assert.True(ai.TranslationSkillEnabled);
+    }
+
+    [Fact]
+    public void Load_V3PreviewPages_MigratesToScrollOrientation()
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(_file, """
+        {
+          "version": 3,
+          "appearance": { "orientation": "horizontal", "previewPages": true }
+        }
+        """);
+
+        FamoSettings settings = new SettingsStore(_file).Load();
+        Assert.Equal("scroll", settings.Appearance.Orientation);
+        Assert.False(settings.Appearance.PreviewPages);
+        Assert.Contains("\"orientation\": \"scroll\"", File.ReadAllText(_file));
+    }
+
+    [Fact]
+    public void Load_V3DocumentFormattingToggle_MigratesToPublishFormatting()
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(_file, """
+        {
+          "version": 3,
+          "ai": { "documentFormattingSkillEnabled": false }
+        }
+        """);
+
+        FamoSettings settings = new SettingsStore(_file).Load();
+        Assert.False(settings.Ai.PublishFormattingSkillEnabled);
+        string persisted = File.ReadAllText(_file);
+        Assert.Contains("\"publishFormattingSkillEnabled\": false", persisted);
+        Assert.DoesNotContain("documentFormattingSkillEnabled", persisted);
+    }
+
+    [Theory]
+    [InlineData(1, 3)]
+    [InlineData(30, 9)]
+    public void Load_LegacyPageSize_ClampsToSelectableRange(int legacy, int expected)
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(_file, $$"""
+        {
+          "version": 3,
+          "engine": { "pageSize": {{legacy}} }
+        }
+        """);
+
+        FamoSettings settings = new SettingsStore(_file).Load();
+        Assert.Equal(expected, settings.Engine.PageSize);
+        Assert.Contains($"\"pageSize\": {expected}", File.ReadAllText(_file));
     }
 
     [Fact]
@@ -169,7 +227,7 @@ public class SettingsStoreTests : IDisposable
         Assert.Contains("inline_preedit: false", ConfigWriter.BuildWeaselCustom(settings));
 
         string persisted = File.ReadAllText(_file);
-        Assert.Contains("\"version\": 3", persisted);
+        Assert.Contains("\"version\": 4", persisted);
         Assert.Contains("\"inlinePreedit\": false", persisted);
     }
 

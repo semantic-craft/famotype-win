@@ -50,6 +50,8 @@ public sealed class InstallerContractTests
         {
             Assert.Contains(resource, script);
         }
+        Assert.Contains("-p:Version=$AppVersion", script);
+        Assert.Contains("-p:InformationalVersion=$AppVersion", script);
         Assert.Contains("if ($LASTEXITCODE -ne 0) { throw 'ISCC 编译失败。' }", script);
     }
 
@@ -130,6 +132,20 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void InnoSetup_ResumeStartsRuntimeThroughNativeDesktopTokenBroker()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int start = Position(iss, "procedure StartRuntimeAsOriginalUser");
+        int seed = Position(iss, "procedure InstallUserState", start);
+        string startBody = iss[start..seed];
+
+        Assert.Contains("if ResumeMode then", startBody);
+        Assert.Contains("RunAndRequire(ProfileTool(TransactionTarget), 'start-runtime', False)", startBody);
+        Assert.DoesNotContain("Shell.Application", startBody);
+        Assert.DoesNotContain("FindWindowSW", startBody);
+    }
+
+    [Fact]
     public void InnoSetup_RollsBackInReverseOrder()
     {
         string iss = InstallerText("famo-setup.iss");
@@ -181,6 +197,34 @@ public sealed class InstallerContractTests
         Assert.Contains("loaded", selfcheck);
         Assert.Contains("if (!ProfileActive())", tool);
         Assert.Contains("return S_OK;", tool);
+    }
+
+    [Fact]
+    public void NativeRegistration_RemovesLegacyPerUserComOverrideOnRegister()
+    {
+        string source = RepoText("native/windows-tsf-famo/text-service/src/registration.cpp");
+        int register = Position(source, "HRESULT RegisterComServer()");
+        int unregister = Position(source, "void UnregisterComServer()", register);
+        string registerBody = source[register..unregister];
+
+        Assert.Contains("RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str())", registerBody);
+        Assert.Contains("ERROR_FILE_NOT_FOUND", registerBody);
+        Assert.Contains("RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str())", registerBody);
+    }
+
+    [Fact]
+    public void InnoSetup_DoesNotTrustPerUserComPathForElevatedPreviousHost()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int snapshot = Position(iss, "procedure SnapshotPreviousState");
+        int next = Position(iss, "function CountFiles", snapshot);
+        string body = iss[snapshot..next].Replace("\r\n", "\n");
+
+        Assert.Contains("PreviousHost := '';", body);
+        Assert.Contains("RegQueryStringValue(HKLM64", body);
+        Assert.Contains("(PreviousTarget <> '') and (PreviousManifest <> '')", body);
+        Assert.Contains("PreviousHost := AddBackslash(PreviousTarget) + 'FamoTextService.dll';", body);
+        Assert.DoesNotContain("RegQueryStringValue(HKCU,\n      'Software\\Classes\\CLSID\\'", body);
     }
 
     [Fact]

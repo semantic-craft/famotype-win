@@ -30,7 +30,25 @@ public sealed class AboutPage : UserControl
 
         sp.Children.Add(FamoUI.Card("维护与诊断",
             FamoUI.Row("配置底座", "当前生效的拼音 / 五笔底座。", FamoUI.Value("rime-ice · 极点五笔"), divider: false),
-            FamoUI.Row("配置目录", "法墨独立目录，不影响其他输入法配置；点右侧路径在资源管理器中打开。", OpenFolderValue(FamoPaths.FamoDir))));
+            FamoUI.Row("配置目录", "法墨独立目录，不影响其他输入法配置；点右侧路径在资源管理器中打开。", OpenFolderValue(FamoPaths.FamoDir)),
+            FamoUI.Row("用户词典", "清空输入习惯与自造词学习记录；方案、皮肤、快捷短语和词库不受影响。",
+                FamoUI.ActionButton("重置…", async () =>
+                {
+                    bool confirmed = await FamoUI.Confirm(
+                        XamlRoot,
+                        "重置用户词典？",
+                        "法墨会忘掉你上屏过哪些词及其排序。原词典会先完整备份到配置目录下的 .famo-backup；此操作不影响方案、皮肤、快捷短语或词库。",
+                        "重置");
+                    if (!confirmed) return;
+                    ReloadResult reset = DeployService.ResetUserDictionary();
+                    App.ReportReloadResult(
+                        reset,
+                        statusText,
+                        pending: "已请求重置用户词典。",
+                        running: "正在备份并重置用户词典…",
+                        succeeded: "用户词典已重置；原词典已备份到 .famo-backup。",
+                        failedPrefix: "重置用户词典失败");
+                }))));
 
         sp.Children.Add(FamoUI.FilledButton("刷新配置", "", () =>
         {

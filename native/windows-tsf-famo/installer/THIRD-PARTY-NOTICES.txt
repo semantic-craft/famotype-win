@@ -13,7 +13,9 @@ SBOM.spdx.json.
 License: BSD-3-Clause
 Upstream: https://github.com/rime/librime
 Use: rime.dll and the engine ABI used by FamoRimeEngine.dll. The binary includes
-or links components such as OpenCC (Apache-2.0), google-glog (BSD-3-Clause),
+or links components such as OpenCC (Apache-2.0); Famo also distributes OpenCC's
+standard s2t/s2hk conversion configs and dictionaries under data/opencc. Other
+linked components include google-glog (BSD-3-Clause),
 LevelDB (BSD-3-Clause), marisa-trie (BSD-2-Clause/LGPL-2.1), yaml-cpp (MIT),
 Boost (BSL-1.0), Lua 5.4.8 (MIT), and UTF-8 helper libraries (MIT/BSD families).
 

@@ -118,6 +118,7 @@ HRESULT TextService::CaptureLayout(ITfContext *context, ITfContextView *view,
   }
   HWND window = nullptr;
   view->GetWnd(&window);
+  window = window ? GetAncestor(window, GA_ROOT) : nullptr;
   const UINT dpi = window ? GetDpiForWindow(window) : GetDpiForSystem();
   entry->ui_state.caret = {caret.left, caret.top, caret.right, caret.bottom};
   const RECT &work = monitor_info.rcWork;

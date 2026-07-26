@@ -98,7 +98,7 @@ int main() {
   UiState decoded_ui_state;
   CHECK(DecodeUiState(payload, &decoded_ui_state, &error));
   CHECK(decoded_ui_state == ui_state);
-  payload.back() = 0x80;
+  payload[39] = 0x80;
   CHECK(!DecodeUiState(payload, &decoded_ui_state, &error));
   UiState invalid_ui_state = ui_state;
   invalid_ui_state.caret.right = invalid_ui_state.caret.left - 1;
@@ -171,6 +171,7 @@ int main() {
   CHECK(!EncodeControlOperationId(0, &payload));
 
   CHECK(IsControlOperation(Command::ControlDeploy));
+  CHECK(IsControlOperation(Command::ControlResetUserDictionary));
   CHECK(!IsControlOperation(Command::ControlStatus));
   source.command = Command::ControlShutdown;
   source.payload.clear();

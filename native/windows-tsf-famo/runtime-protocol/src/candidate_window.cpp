@@ -46,6 +46,7 @@ bool SameCompositionExceptSelection(const Composition &left,
          left.schema_id == right.schema_id &&
          left.schema_name == right.schema_name &&
          left.candidates == right.candidates &&
+         left.preview_candidates == right.preview_candidates &&
          left.page_index == right.page_index &&
          left.page_size == right.page_size &&
          left.state_flags == right.state_flags &&
@@ -77,10 +78,21 @@ public:
       adapted.flags = candidate.flags;
       candidates_.push_back(adapted);
     }
+    preview_candidates_.reserve(source.preview_candidates.size());
+    for (const Candidate &candidate : source.preview_candidates) {
+      FamoCandidate adapted{};
+      adapted.size = static_cast<uint32_t>(sizeof(adapted));
+      adapted.text = ViewString(candidate.text);
+      adapted.comment = ViewString(candidate.comment);
+      adapted.label = ViewString(candidate.label);
+      adapted.quality = candidate.quality;
+      adapted.flags = candidate.flags;
+      preview_candidates_.push_back(adapted);
+    }
     view_.size = static_cast<uint32_t>(sizeof(view_));
-    view_.preedit = ViewString((source.state_flags & kHostInlinePreedit) != 0
-                                   ? std::string_view{}
-                                   : std::string_view(source.preedit));
+    // The panel receives raw preedit/caret in both host-inline modes. Its own
+    // show_preedit preference alone decides whether the editable header appears.
+    view_.preedit = ViewString(source.preedit);
     view_.commit = ViewString(source.commit);
     view_.commit_preview = ViewString(source.commit_preview);
     view_.schema_id = ViewString(source.schema_id);
@@ -99,16 +111,55 @@ public:
   }
 
   const FamoCompositionView *get() const { return &view_; }
+  const FamoCandidate *preview_candidates() const {
+    return preview_candidates_.data();
+  }
+  uint32_t preview_candidate_count() const {
+    return static_cast<uint32_t>(preview_candidates_.size());
+  }
 
 private:
   std::vector<FamoCandidate> candidates_;
+  std::vector<FamoCandidate> preview_candidates_;
   FamoCompositionView view_{};
 };
 
 struct WindowNotifications {
   HANDLE update_event = nullptr;
   std::atomic<uint64_t> *system_generation = nullptr;
+  FamoLayoutResult layout{};
+  uint32_t page_size = 0;
+  int shadow_margin = 0;
+  HWND foreground_window = nullptr;
 };
+
+bool SendPreviewSelectionKeys(const PreviewSelection &selection,
+                              HWND expected_foreground) {
+  if (!expected_foreground || GetForegroundWindow() != expected_foreground)
+    return false;
+  std::vector<INPUT> input;
+  input.reserve((selection.pages_forward + 1) * 2);
+  const auto append_key = [&input](WORD key) {
+    INPUT down{};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wVk = key;
+    input.push_back(down);
+    INPUT up = down;
+    up.ki.dwFlags = KEYEVENTF_KEYUP;
+    input.push_back(up);
+  };
+  for (uint32_t page = 0; page < selection.pages_forward; ++page)
+    append_key(VK_NEXT);
+  append_key(static_cast<WORD>('1' + selection.candidate_offset));
+  const UINT sent = SendInput(static_cast<UINT>(input.size()), input.data(),
+                              sizeof(INPUT));
+  if (sent != input.size()) {
+    for (size_t i = 1; i < input.size(); i += 2)
+      SendInput(1, &input[i], sizeof(INPUT));
+    return false;
+  }
+  return true;
+}
 
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
                             LPARAM lparam) {
@@ -124,6 +175,28 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
       notifications->system_generation->fetch_add(1,
                                                   std::memory_order_relaxed);
       SetEvent(notifications->update_event);
+    }
+  }
+  if (message == WM_LBUTTONUP) {
+    auto *notifications = reinterpret_cast<WindowNotifications *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    PreviewSelection selection;
+    const int x = static_cast<int16_t>(LOWORD(lparam));
+    const int y = static_cast<int16_t>(HIWORD(lparam));
+    const bool modifier_down =
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+        (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+    if (notifications && !modifier_down && notifications->foreground_window &&
+        notifications->foreground_window == GetForegroundWindow() &&
+        PreviewSelectionAt(notifications->layout,
+                           x - notifications->shadow_margin,
+                           y - notifications->shadow_margin,
+                           notifications->page_size, &selection)) {
+      SendPreviewSelectionKeys(selection, notifications->foreground_window);
+      return 0;
     }
   }
   if (message == WM_MOUSEACTIVATE)
@@ -193,6 +266,30 @@ bool PrewarmRenderer(FamoTextResources *resources, const FamoSkin *skin,
 }
 
 } // namespace
+
+bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
+                        uint32_t page_size,
+                        PreviewSelection *selection) noexcept {
+  if (!selection || page_size == 0)
+    return false;
+  if (page_size > 9)
+    return false;
+  const uint32_t count = (std::min)(layout.preview_candidate_count,
+                                    uint32_t{FAMO_MAX_PREVIEW_CANDIDATES});
+  for (uint32_t i = 0; i < count; ++i) {
+    const FamoRect &bounds = layout.preview_candidates[i].bounds;
+    if (x < bounds.left || x >= bounds.right || y < bounds.top ||
+        y >= bounds.bottom)
+      continue;
+    const uint32_t offset = i % page_size;
+    if (offset >= 9)
+      return false;
+    selection->pages_forward = i / page_size + 1;
+    selection->candidate_offset = offset;
+    return true;
+  }
+  return false;
+}
 
 struct CandidateWindow::State {
   explicit State(Fault injected_fault) : fault(injected_fault) {
@@ -327,6 +424,16 @@ void CandidateWindow::Publish(
   std::shared_ptr<State> state = state_;
   if (!state || !snapshot)
     return;
+  try {
+    auto targeted = std::make_shared<RuntimeSnapshot>(*snapshot);
+    targeted->source_window = snapshot->ui_state.focused
+                                  ? reinterpret_cast<uintptr_t>(
+                                        GetForegroundWindow())
+                                  : 0;
+    snapshot = std::move(targeted);
+  } catch (...) {
+    // Rendering remains best effort, but an unbound frame is never clickable.
+  }
   std::shared_ptr<const RuntimeSnapshot> current =
       state->latest.load(std::memory_order_acquire);
   for (;;) {
@@ -406,8 +513,16 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       resources_warmed = false;
     }
     const FamoSkin &configured_skin = active_skin ? *active_skin : fallback_skin;
-    FamoSkin high_contrast_skin = configured_skin;
-    const FamoSkin *skin = &configured_skin;
+    FamoSkin resolved_skin = configured_skin;
+    if (resolved_skin.layout_type == FAMO_LAYOUT_AUTO) {
+      const bool vertical = snapshot &&
+          (snapshot->composition.state_flags & kHostRimeVertical) != 0;
+      resolved_skin.layout_type =
+          vertical ? FAMO_LAYOUT_VERTICAL : FAMO_LAYOUT_HORIZONTAL;
+      resolved_skin.min_width = vertical ? 76 : 210;
+    }
+    FamoSkin high_contrast_skin = resolved_skin;
+    const FamoSkin *skin = &resolved_skin;
     const bool high_contrast = ApplySystemHighContrast(&high_contrast_skin);
     if (high_contrast)
       skin = &high_contrast_skin;
@@ -472,7 +587,8 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         presented_snapshot && presented_presentation == active_presentation &&
         presented_dpi == dpi &&
         presented_high_contrast == high_contrast &&
-        presented_system_generation == current_system_generation;
+        presented_system_generation == current_system_generation &&
+        snapshot->source_window == presented_snapshot->source_window;
     if (stable_presentation &&
         snapshot->composition == presented_snapshot->composition &&
         snapshot->ui_state == presented_snapshot->ui_state) {
@@ -519,6 +635,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     input.dpi = dpi;
     input.measure = &FamoTextMeasure;
     input.measure_user = resources;
+    input.preview_candidates = view.preview_candidates();
+    input.preview_candidate_count = view.preview_candidate_count();
+    input.preview_page_size = snapshot->composition.page_size;
     FamoLayoutResult layout{};
     const bool selection_only =
         stable_presentation &&
@@ -580,13 +699,29 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     if (state->latest.load(std::memory_order_acquire) != snapshot) {
       continue;
     }
+    HWND frame_foreground =
+        reinterpret_cast<HWND>(snapshot->source_window);
+    if (frame_foreground && GetForegroundWindow() != frame_foreground) {
+      ShowWindow(window, SW_HIDE);
+      presented_snapshot.reset();
+      continue;
+    }
     if (state->fault == Fault::Submit ||
         !SubmitLayered(window, surface, layout.origin_x - margin,
                        layout.origin_y - margin)) {
       ShowWindow(window, SW_HIDE);
       presented_snapshot.reset();
+    } else if (frame_foreground &&
+               GetForegroundWindow() != frame_foreground) {
+      ShowWindow(window, SW_HIDE);
+      notifications.foreground_window = nullptr;
+      presented_snapshot.reset();
     } else {
       state->submitted_visible = true;
+      notifications.layout = layout;
+      notifications.page_size = snapshot->composition.page_size;
+      notifications.shadow_margin = margin;
+      notifications.foreground_window = frame_foreground;
       presented_snapshot = snapshot;
       presented_presentation = active_presentation;
       presented_layout = layout;

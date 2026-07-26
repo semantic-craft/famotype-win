@@ -89,6 +89,22 @@ bool WaitForVisibility(bool visible, WindowProbe *result = nullptr) {
   return false;
 }
 
+bool PreviewRowsMapToPageAndCandidateKeys() {
+  FamoLayoutResult layout{};
+  layout.preview_candidate_count = 3;
+  layout.preview_candidates[0].bounds = {10, 20, 30, 40};
+  layout.preview_candidates[1].bounds = {30, 20, 50, 40};
+  layout.preview_candidates[2].bounds = {10, 40, 30, 60};
+  PreviewSelection selection;
+  CHECK(PreviewSelectionAt(layout, 35, 25, 2, &selection));
+  CHECK(selection.pages_forward == 1 && selection.candidate_offset == 1);
+  CHECK(PreviewSelectionAt(layout, 15, 45, 2, &selection));
+  CHECK(selection.pages_forward == 2 && selection.candidate_offset == 0);
+  CHECK(!PreviewSelectionAt(layout, 5, 5, 2, &selection));
+  CHECK(!PreviewSelectionAt(layout, 15, 25, 10, &selection));
+  return true;
+}
+
 template <typename Predicate>
 bool WaitForCounters(const CandidateWindow &window, Predicate predicate) {
   for (int attempt = 0; attempt < 1000; ++attempt) {
@@ -146,6 +162,35 @@ bool HiddenHighDpiStateDoesNotDelayFirstVisible() {
               elapsed_ms);
   window.Stop();
   CHECK(elapsed_ms <= 50.0);
+  return true;
+}
+
+bool InlineHostPreeditStillShowsPanelHeader() {
+  CandidateWindow window;
+  CHECK(window.Start());
+  CHECK(window.Prewarm());
+  auto shown = VisibleSnapshot(30);
+  shown->revision = 1;
+  shown->composition.state_flags |= kHostInlinePreedit;
+  shown->composition.preedit_cursor_pos = 2;
+  window.Publish(shown);
+  WindowProbe probe;
+  CHECK(WaitForVisibility(true, &probe));
+  const LONG shown_height = probe.rect.bottom - probe.rect.top;
+  const uint64_t full_before = window.counters().full;
+
+  FamoSkin hidden_skin = FamoSkinDefault();
+  hidden_skin.show_preedit = 0;
+  auto hidden_style = std::make_shared<const RuntimeStyleState>(
+      RuntimeStyleState{0, std::make_shared<const FamoSkin>(hidden_skin)});
+  window.ActivateStyle(hidden_style);
+  CHECK(WaitForCounters(window, [&](CandidateWindow::Counters counters) {
+    return counters.full > full_before;
+  }));
+  probe = Probe();
+  const LONG hidden_height = probe.rect.bottom - probe.rect.top;
+  window.Stop();
+  CHECK(shown_height > hidden_height);
   return true;
 }
 
@@ -468,8 +513,10 @@ bool HangingUiDoesNotDelayEngine() {
 } // namespace
 
 int main() {
-  if (!PrewarmCompletesBeforeReturn() ||
+  if (!PreviewRowsMapToPageAndCandidateKeys() ||
+      !PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
+      !InlineHostPreeditStillShowsPanelHeader() ||
       !HealthyWindowAndHideRules() ||
       !FirstVisibleBudgetAfterPrewarm() ||
       !FastPathsAndDeviceRecoveryAreObservable() ||

@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -26,6 +27,62 @@
 using namespace famo::runtime;
 
 namespace {
+
+bool DoubleAltRequiresTwoShortCleanTaps() {
+  AltDoubleTapDetector detector;
+  CHECK(!detector.Process(true, true, 100));
+  CHECK(!detector.Process(true, false, 200));
+  CHECK(!detector.Process(true, true, 400));
+  CHECK(detector.Process(true, false, 450));
+
+  CHECK(!detector.Process(true, true, 1000));
+  CHECK(!detector.Process(true, false, 1600));
+  CHECK(!detector.Process(true, true, 1700));
+  CHECK(!detector.Process(true, false, 1750));
+
+  CHECK(!detector.Process(true, true, 2300));
+  CHECK(!detector.Process(true, false, 2350));
+  CHECK(!detector.Process(false, true, 2400));
+  CHECK(!detector.Process(true, true, 2450));
+  CHECK(!detector.Process(true, false, 2500));
+  return true;
+}
+
+bool GlobalHotKeysAcceptOnlyRestrictedCanonicalBindings() {
+  GlobalHotKeyBinding binding;
+  CHECK(ParseGlobalHotKeyBinding("Ctrl+Alt+J", &binding));
+  CHECK((binding.modifiers & MOD_CONTROL) != 0);
+  CHECK((binding.modifiers & MOD_ALT) != 0);
+  CHECK(binding.virtual_key == 'J');
+  CHECK(GlobalHotKeyBindingMatches(binding, 'J', true, true, false, false));
+  CHECK(!GlobalHotKeyBindingMatches(binding, 'J', true, true, true, false));
+  CHECK(!GlobalHotKeyBindingMatches(binding, 'J', true, true, false, true));
+  CHECK(!ParseGlobalHotKeyBinding("Ctrl+J", &binding));
+  CHECK(!ParseGlobalHotKeyBinding("Win+Alt+J", &binding));
+  CHECK(!ParseGlobalHotKeyBinding("Ctrl+Ctrl+J", &binding));
+  CHECK(!ParseGlobalHotKeyBinding("Ctrl+Alt+1", &binding));
+  return true;
+}
+
+bool ToolboxPolicyMatchesGestureAndRecordedHotKeySemantics() {
+  const std::string enabled =
+      R"({"ai":{"cloudEnabled":true,"selectionMenuEnabled":true}})";
+  CHECK(ToolboxPolicyAllows(enabled, true));
+  CHECK(ToolboxPolicyAllows(enabled, false));
+
+  const std::string menu_disabled =
+      R"({"ai":{"cloudEnabled":true,"selectionMenuEnabled":false}})";
+  CHECK(!ToolboxPolicyAllows(menu_disabled, true));
+  CHECK(ToolboxPolicyAllows(menu_disabled, false));
+
+  CHECK(!ToolboxPolicyAllows(
+      R"({"ai":{"cloudEnabled":false,"selectionMenuEnabled":true}})",
+      false));
+  CHECK(!ToolboxPolicyAllows(
+      R"({"ai":{"cloudEnabled":true,"askAnythingSkillEnabled":false,"polishSkillEnabled":false,"sourceCheckSkillEnabled":false,"researchAssistSkillEnabled":false,"publishFormattingSkillEnabled":false,"translationSkillEnabled":false,"promptOptimizeSkillEnabled":false}})",
+      false));
+  return true;
+}
 
 struct WindowSearch {
   const wchar_t *class_name;
@@ -77,6 +134,7 @@ bool TrayReregistersAfterTaskbarCreated() {
   RuntimeService service;
   std::atomic<bool> running{true};
   StatusUi ui(&service, &running);
+  CHECK(ui.status_flags() == FAMO_STATUS_SIMPLIFIED);
   CHECK(ui.Start());
   CHECK(WaitFor(ui, 1));
 
@@ -141,6 +199,21 @@ bool SetOptionReportsHonestly() {
   RuntimeService service;
   CHECK(OpenSessionOn(&service));
   CHECK(service.SetOption("ascii_mode", true));
+
+  // A status-bar toggle is global runtime state: a later text field must
+  // inherit it instead of silently returning to the config default.
+  _putenv_s("FAMO_TEST_FAIL_OPTION", "ascii_mode");
+  Frame hello;
+  hello.command = Command::Hello;
+  hello.correlation = {21, 22, 23, 0, 0, 0};
+  CHECK(service.Dispatch(hello).status == Status::Ok);
+  Frame open;
+  open.command = Command::OpenSession;
+  open.correlation = {21, 22, 23, 24, 25, 1};
+  std::string error;
+  CHECK(EncodeOpenSession("test", &open.payload, &error));
+  CHECK(service.Dispatch(open).status == Status::EngineError);
+  _putenv_s("FAMO_TEST_FAIL_OPTION", "");
   service.Stop();
 
   _putenv_s("FAMO_TEST_FAIL_OPTION", "ascii_mode");
@@ -189,7 +262,7 @@ bool BarHitTestMapsToOptions() {
   CHECK(StatusBarHitTest(layout, layout.width, layout.height) < 0);
 
   static const char *const expected[] = {"ascii_mode", "ascii_punct",
-                                         "simplification", "full_shape"};
+                                         "traditionalization", "full_shape"};
   static_assert(std::size(expected) == kStatusBarButtonCount, "one per button");
   for (int index = 0; index < kStatusBarButtonCount; ++index) {
     const StatusBarLayout::Button &button = layout.buttons[index];
@@ -199,9 +272,17 @@ bool BarHitTestMapsToOptions() {
     const int y = (button.top + button.bottom) / 2;
     CHECK(StatusBarHitTest(layout, x, y) == index);
     CHECK(std::string_view(StatusBarOption(index)) == expected[index]);
+    if (index == 2)
+      CHECK(std::string_view(StatusBarSecondaryOption(index)) == "zh_trad");
+    else
+      CHECK(StatusBarSecondaryOption(index) == nullptr);
   }
   CHECK(StatusBarOption(-1) == nullptr);
   CHECK(StatusBarOption(kStatusBarButtonCount) == nullptr);
+  CHECK(StatusBarNextOptionValue(0, 0));
+  CHECK(!StatusBarNextOptionValue(FAMO_STATUS_ASCII_MODE, 0));
+  CHECK(!StatusBarNextOptionValue(0, 2));
+  CHECK(StatusBarNextOptionValue(FAMO_STATUS_SIMPLIFIED, 2));
   // Only the trough inset is drag surface. The segments abut, so the shared
   // edge belongs to the segment on its right rather than falling in a gap.
   CHECK(StatusBarHitTest(layout, 0, layout.height / 2) < 0);
@@ -318,8 +399,8 @@ bool BarPaintProducesVisiblePixels() {
                              bounds.bottom};
     buttons[index].label = StatusBarLabel(0, index);
   }
-  // Enable 简/繁, leaving 。 plain: the centroid checks below read ink by
-  // darkness, which only holds on a card fill, not on the accent.
+  // Enable 简/繁, leaving 。 plain: the label carries the idle state, so both
+  // still use the card fill and the centroid checks can read ink by darkness.
   buttons[2].on = 1u;
   FamoStatusBarSpec spec{};
   spec.size = static_cast<uint32_t>(sizeof(spec));
@@ -329,7 +410,6 @@ bool BarPaintProducesVisiblePixels() {
   spec.buttons = buttons;
   const int32_t painted =
       FamoStatusBarPaint(&spec, &skin, resources, surface.dc());
-  FamoTextResourcesDestroy(resources);
   CHECK(painted == FAMO_UI_OK);
 
   auto *bitmap = static_cast<HBITMAP>(GetCurrentObject(surface.dc(), OBJ_BITMAP));
@@ -345,15 +425,22 @@ bool BarPaintProducesVisiblePixels() {
   CHECK((at(0, 0) >> 24) == 0);
   const uint32_t trough = at(layout.width / 2, 1);
   CHECK((trough >> 24) == 0xffu);
+  CHECK(trough == skin.card2_color);
   // Segment fill sampled above the glyph; the trough must be distinguishable
   // from it or the segmented control reads as one flat slab.
   const uint32_t fill = at((layout.buttons[0].left + layout.buttons[0].right) / 2,
                            layout.buttons[0].top + 1);
   CHECK((fill >> 24) == 0xffu);
   CHECK(fill != trough);
-  // The enabled segment carries the accent fill, not the card.
+  // Enabled state must not leave a persistent accent block behind the label.
   CHECK(at((layout.buttons[2].left + layout.buttons[2].right) / 2,
-           layout.buttons[2].top + 1) != fill);
+            layout.buttons[2].top + 1) == fill);
+
+  FamoSkin legacy = skin;
+  legacy.size = static_cast<uint32_t>(offsetof(FamoSkin, card2_color));
+  surface.Clear();
+  CHECK(FamoStatusBarPaint(&spec, &legacy, resources, surface.dc()) == FAMO_UI_OK);
+  CHECK(at(layout.width / 2, 1) == 0xFFF0EEEAu);
 
   // Glyph ink is the skin's dark text color; card, trough and divider are all
   // light, so a luminance threshold isolates the glyph without knowing which.
@@ -396,12 +483,21 @@ bool BarPaintProducesVisiblePixels() {
     CHECK(std::abs(dy) <= 1.5);
   }
 
-  // The trough has no skin token and is derived from back_color. Deriving it by
-  // blending toward border_color survives a light skin but inverts on a dark one
-  // (lighter where the design system's card2 is darker), so paint a dark skin
-  // and require the same direction and a real separation there too.
+  // Mouse-down stays neutral too: state is communicated by the label alone.
+  buttons[2].pressed = 1u;
+  surface.Clear();
+  CHECK(FamoStatusBarPaint(&spec, &skin, resources, surface.dc()) == FAMO_UI_OK);
+  const uint32_t pressed_fill =
+      at((layout.buttons[2].left + layout.buttons[2].right) / 2,
+         layout.buttons[2].top + 1);
+  CHECK(pressed_fill != skin.hilited_back_color);
+  buttons[2].pressed = 0u;
+  FamoTextResourcesDestroy(resources);
+
+  // A dark skin must use its exact card2 token too.
   FamoSkin dark = skin;
   dark.back_color = 0xFF262321u;         // shenda dark card
+  dark.card2_color = 0xFF211E1Cu;        // shenda dark card2
   dark.text_color = 0xFFECE4D8u;         // ink
   dark.hilited_back_color = 0xFFE06A8Eu; // accent
   dark.hilited_text_color = 0xFF1A1816u; // onAccent
@@ -416,6 +512,7 @@ bool BarPaintProducesVisiblePixels() {
     return (((p >> 16) & 0xff) + ((p >> 8) & 0xff) + (p & 0xff)) / 3;
   };
   const uint32_t dark_trough = at(layout.width / 2, 1);
+  CHECK(dark_trough == dark.card2_color);
   const uint32_t dark_fill = at((layout.buttons[0].left + layout.buttons[0].right) / 2,
                                 layout.buttons[0].top + 1);
   CHECK(dark_trough != dark_fill);
@@ -560,6 +657,20 @@ bool SchemaGlyphNamesTheInputMethod() {
   CHECK(StatusBarSchemaGlyph("仓颉") == "仓");
   CHECK(StatusBarSchemaGlyph("Bopomofo") == "B");
   CHECK(StatusBarSchemaGlyph("").empty());
+  return true;
+}
+
+// A stale previous-schema value equal to the live schema used to make every
+// click a silent no-op. A click must still select another available schema.
+bool SchemaClickAlwaysHasADifferentTarget() {
+  const std::vector<std::string> schemas = {"rime_ice", "wubi86_jidian"};
+  CHECK(StatusBarSchemaSwitchTarget("rime_ice", "wubi86_jidian", schemas) ==
+        "wubi86_jidian");
+  CHECK(StatusBarSchemaSwitchTarget("rime_ice", "rime_ice", schemas) ==
+        "wubi86_jidian");
+  CHECK(StatusBarSchemaSwitchTarget("wubi86_jidian", "", schemas) ==
+        "rime_ice");
+  CHECK(StatusBarSchemaSwitchTarget("rime_ice", "", {"rime_ice"}).empty());
   return true;
 }
 
@@ -710,8 +821,12 @@ bool DumpBarFrame() {
 } // namespace
 
 int main() {
-  if (!SchemaListParsesFromDefaultYaml() || !SchemaNameParsesFromSchemaYaml() ||
+  if (!DoubleAltRequiresTwoShortCleanTaps() ||
+      !GlobalHotKeysAcceptOnlyRestrictedCanonicalBindings() ||
+      !ToolboxPolicyMatchesGestureAndRecordedHotKeySemantics() ||
+      !SchemaListParsesFromDefaultYaml() || !SchemaNameParsesFromSchemaYaml() ||
       !SchemaGlyphNamesTheInputMethod() ||
+      !SchemaClickAlwaysHasADifferentTarget() ||
       !PreviousSchemaPersistsBesidePosition() ||
       !SchemaSegmentRoutesItsOwnRightClick())
     return 1;

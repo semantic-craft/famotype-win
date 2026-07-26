@@ -16,16 +16,15 @@ public sealed class SkillsPageParityContractTests
             File.ReadAllText(RepoFile("native/windows-tsf-famo/weasel-fork/features/language-bar-menu.patch"));
 
         Assert.Contains("技能平台", page);
-        Assert.Contains("划词菜单", page);
-        Assert.Contains("启用划词菜单", page);
+        Assert.Contains("划词工具箱", page);
+        Assert.Contains("启用划词工具箱", page);
         Assert.Contains("辅助功能权限", page);
         Assert.Contains("内置技能", page);
-        Assert.Contains("AI 对话", page);
-        Assert.Contains("App.ShowAiConversation", page);
+        Assert.Contains("快速双击 Alt", page);
         Assert.Contains("AiSelectionSkills.Polish", page);
         Assert.Contains("AiSelectionSkills.SourceCheck", page);
         Assert.Contains("AiSelectionSkills.ResearchAssist", page);
-        Assert.Contains("AI 润色选中", skills);
+        Assert.Contains("润色", skills);
         Assert.Contains("ai-polish", skills);
         Assert.Contains("来源核验", skills);
         Assert.Contains("ai-source-check", skills);
@@ -66,25 +65,39 @@ public sealed class SkillsPageParityContractTests
         Assert.Contains("普通输入", page);
         Assert.Contains("App.Settings.Ai.CloudEnabled", page);
 
-        int selectionMenuIdx = page.IndexOf("划词菜单", StringComparison.Ordinal);
+        int selectionMenuIdx = page.IndexOf("划词工具箱", StringComparison.Ordinal);
         int cloudCardIdx = page.IndexOf("云端 AI（全局）", StringComparison.Ordinal);
         int builtInIdx = page.IndexOf("内置技能", StringComparison.Ordinal);
         Assert.True(selectionMenuIdx >= 0, "missing 划词菜单 card");
         Assert.True(cloudCardIdx > selectionMenuIdx, "云端 AI（全局）must come after 划词菜单");
         Assert.True(builtInIdx > cloudCardIdx, "内置技能 must come after 云端 AI（全局）");
 
-        // 4 个内置技能各自有真实开关，且都真的落盘（不是纯内存态，避免 Inert Settings Controls 反模式）。
+        // 当前 7 个动作各自有真实开关，且都真的落盘。
+        Assert.Contains("App.Settings.Ai.AskAnythingSkillEnabled", page);
         Assert.Contains("App.Settings.Ai.PolishSkillEnabled", page);
         Assert.Contains("App.Settings.Ai.SourceCheckSkillEnabled", page);
         Assert.Contains("App.Settings.Ai.ResearchAssistSkillEnabled", page);
-        Assert.Contains("App.Settings.Ai.DocumentFormattingSkillEnabled", page);
-        Assert.Contains("AiSelectionSkills.DocumentFormatting", page);
+        Assert.Contains("App.Settings.Ai.PublishFormattingSkillEnabled", page);
+        Assert.Contains("App.Settings.Ai.TranslationSkillEnabled", page);
+        Assert.Contains("AiSelectionSkills.PublishFormatting", page);
+        Assert.Contains("AiSelectionSkills.Translation", page);
         Assert.Contains("App.Store.Save(App.Settings)", page);
 
-        // 第 4 个内置技能：公文排版。
-        Assert.Contains("公文排版", skills);
-        Assert.Contains("ai-document-formatting", skills);
-        Assert.Contains("document-formatting", skills);
+        int ask = page.IndexOf("SkillRow(\"任意提问\"", StringComparison.Ordinal);
+        int source = page.IndexOf("SkillRow(AiSelectionSkills.SourceCheck", StringComparison.Ordinal);
+        int research = page.IndexOf("SkillRow(AiSelectionSkills.ResearchAssist", StringComparison.Ordinal);
+        int formatting = page.IndexOf("SkillRow(AiSelectionSkills.PublishFormatting", StringComparison.Ordinal);
+        int translation = page.IndexOf("SkillRow(AiSelectionSkills.Translation", StringComparison.Ordinal);
+        int polish = page.IndexOf("SkillRow(AiSelectionSkills.Polish", StringComparison.Ordinal);
+        int prompt = page.IndexOf("SkillRow(AiSelectionSkills.PromptOptimize", StringComparison.Ordinal);
+        Assert.True(ask < source && source < research && research < formatting &&
+                    formatting < translation && translation < polish && polish < prompt,
+            "技能平台顺序必须与当前 macOS 一致");
+
+        Assert.Contains("规范排版", skills);
+        Assert.Contains("ai-publish-formatting", skills);
+        Assert.Contains("划词翻译", skills);
+        Assert.Contains("ai-translation", skills);
 
         // 第 5 个内置技能：提示词优化（对齐 macOS FamoPromptOptimizer 的两态契约）。
         Assert.Contains("App.Settings.Ai.PromptOptimizeSkillEnabled", page);

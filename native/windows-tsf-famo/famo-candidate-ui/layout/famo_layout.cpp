@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 
 #include "../famo_candidate_ui.h"
 
@@ -178,6 +179,14 @@ bool CommentVisible(const FamoSkin& sk, const FamoCandidate& c) {
 bool PrevVisible(const FamoSkin& sk) { return (sk.prevpage_color >> 24) != 0u; }
 bool NextVisible(const FamoSkin& sk) { return (sk.nextpage_color >> 24) != 0u; }
 
+bool ShowPreedit(const FamoSkin& sk) {
+  return sk.size < offsetof(FamoSkin, preview_pages) || sk.show_preedit != 0;
+}
+
+bool PreviewPages(const FamoSkin& sk) {
+  return sk.size >= offsetof(FamoSkin, preview_rows) && sk.preview_pages != 0;
+}
+
 // Symmetric drop-shadow margin (device px): wide enough to hold the gaussian blur
 // spread (~radius each side) plus the shadow offset. 0 when the shadow is off
 // (transparent shadow_color or non-positive radius) — then the buffer == content
@@ -193,16 +202,26 @@ int32_t ShadowMargin(const FamoSkin& sk, uint32_t dpi) {
 
 // Measure one candidate's label/text/comment advances (device px).
 struct CandExtent {
-  int32_t label_w, text_w, comment_w;
+  int32_t label_w, label_h, text_w, comment_w;
   bool has_label, has_comment;
 };
 
 CandExtent MeasureCand(const FamoSkin& sk, const FamoLayoutInput& in,
-                       const FamoCandidate& c) {
+                       const FamoCandidate& c, bool vertical = false) {
   CandExtent e;
   std::memset(&e, 0, sizeof(e));
   if (c.label.data && c.label.length_bytes > 0) {
-    e.label_w = MeasureText(in, 0, sk.label_font, c.label);
+    if (vertical) {
+      std::string label(c.label.data, c.label.length_bytes);
+      label.push_back('.');
+      const FamoUtf8String dotted{sizeof(FamoUtf8String), label.data(),
+                                  static_cast<uint32_t>(label.size())};
+      e.label_w = MeasureText(in, 1, sk.text_font, dotted);
+      e.label_h = FontHeight(sk.text_font, in.dpi);
+    } else {
+      e.label_w = MeasureText(in, 0, sk.label_font, c.label);
+      e.label_h = FontHeight(sk.label_font, in.dpi);
+    }
     e.has_label = true;
   }
   e.text_w = MeasureText(in, 1, sk.text_font, c.text);
@@ -223,7 +242,7 @@ int32_t CandInlineWidth(const Metrics& m, const CandExtent& e) {
 
 int32_t CandRowHeight(const Metrics& m, const CandExtent& e) {
   int32_t h = m.text_h;
-  if (e.has_label && m.label_h > h) h = m.label_h;
+  if (e.has_label && e.label_h > h) h = e.label_h;
   if (e.has_comment && m.comment_h > h) h = m.comment_h;
   return h;
 }
@@ -238,7 +257,7 @@ int32_t PlaceRowInline(const Metrics& m, const CandExtent& e, int32_t x,
     return FamoRect{x0, y0, x0 + w, y0 + h};
   };
   if (e.has_label) {
-    out->label = centered(x, e.label_w, m.label_h);
+    out->label = centered(x, e.label_w, e.label_h);
     x += e.label_w + m.label_spacing;
   } else {
     out->label = EmptyRect();
@@ -277,7 +296,8 @@ int32_t LayoutBand(const FamoSkin& sk, const FamoLayoutInput& in, const Metrics&
   *preedit_out = EmptyRect();
   *aux_out = EmptyRect();
 
-  bool has_preedit = view.preedit.data && view.preedit.length_bytes > 0;
+  bool has_preedit = ShowPreedit(sk) && view.preedit.data &&
+                     view.preedit.length_bytes > 0;
   if (has_preedit) {
     int32_t w = MeasureText(in, 1, sk.text_font, view.preedit);
     *preedit_out = FamoRect{x0, y, x0 + w, y + m.text_h};
@@ -303,7 +323,8 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
                                          const FamoLayoutInput* input,
                                          FamoLayoutResult* out) {
   if (!view || !skin || !input || !out) return FAMO_UI_E_INVALID_ARGUMENT;
-  if (skin->size < sizeof(FamoSkin) || input->size < sizeof(FamoLayoutInput))
+  if (skin->size < offsetof(FamoSkin, show_preedit) ||
+      input->size < offsetof(FamoLayoutInput, preview_candidates))
     return FAMO_UI_E_INVALID_ARGUMENT;
 
   std::memset(out, 0, sizeof(*out));
@@ -313,7 +334,11 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
   const FamoLayoutInput& in = *input;
   const Metrics m = ScaleMetrics(sk, in);
 
-  const int32_t x0 = m.margin_x;
+  const int32_t panel_margin_x =
+      sk.layout_type == FAMO_LAYOUT_HORIZONTAL
+          ? m.margin_x
+          : (std::max)(1, m.margin_x / 2);
+  const int32_t x0 = panel_margin_x;
   const int32_t y0 = m.margin_y;
 
   // Preedit/aux band first (common to all families).
@@ -383,7 +408,50 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     if (list_w > max_content_w) max_content_w = list_w;
     int32_t list_bottom = list_top + row_h + 2 * m.hpad_y;
 
-    int32_t content_w = max_content_w + 2 * m.margin_x;
+    const bool preview_available =
+        PreviewPages(sk) &&
+        in.size >= offsetof(FamoLayoutInput, preview_page_size) +
+                       sizeof(in.preview_page_size) &&
+        in.preview_candidates && in.preview_candidate_count > 0 &&
+        in.preview_page_size > 0;
+    if (preview_available) {
+      const uint32_t max_preview = (std::min)(
+          in.preview_candidate_count,
+          static_cast<uint32_t>(FAMO_MAX_PREVIEW_CANDIDATES));
+      const uint32_t wanted_rows =
+          sk.size >= sizeof(FamoSkin) ? (std::min)(2u, (std::max)(1u, sk.preview_rows))
+                                      : 2u;
+      const uint32_t count = static_cast<uint32_t>((std::min)(
+          static_cast<uint64_t>(max_preview),
+          static_cast<uint64_t>(in.preview_page_size) * wanted_rows));
+      int32_t preview_y = list_bottom + m.cand_spacing;
+      for (uint32_t base = 0; base < count; base += in.preview_page_size) {
+        int32_t preview_x = x0;
+        const uint32_t row_end =
+            (std::min)(count, base + in.preview_page_size);
+        for (uint32_t i = base; i < row_end; ++i) {
+          const FamoCandidate& candidate = in.preview_candidates[i];
+          const int32_t text_w =
+              MeasureText(in, 1, sk.text_font, candidate.text);
+          FamoCandidateRects& rect = out->preview_candidates[i];
+          rect.bounds = {preview_x, preview_y,
+                         preview_x + text_w + 2 * m.hpad_x,
+                         preview_y + m.text_h + 2 * m.hpad_y};
+          rect.text = {preview_x + m.hpad_x, preview_y + m.hpad_y,
+                       preview_x + m.hpad_x + text_w,
+                       preview_y + m.hpad_y + m.text_h};
+          preview_x = rect.bounds.right + m.cand_spacing;
+        }
+        const int32_t preview_w = preview_x - x0 - m.cand_spacing;
+        if (preview_w > max_content_w)
+          max_content_w = preview_w;
+        preview_y += m.text_h + 2 * m.hpad_y + m.cand_spacing;
+      }
+      out->preview_candidate_count = count;
+      list_bottom = preview_y - m.cand_spacing;
+    }
+
+    int32_t content_w = max_content_w + 2 * panel_margin_x;
     int32_t content_h = list_bottom + m.margin_y;
     out->content_size = ClampSize(m, content_w, content_h);
   } else {
@@ -392,20 +460,29 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     // Vertical, so the rect set is shared here — the render pass rotates glyphs.)
     int32_t y = list_top;
     int32_t list_w = 0;
+    const int32_t row_spacing = 0;  // macOS vertical full-width rows abut
+    const int32_t row_pad_x = m.hpad_x + Scale(2, in.dpi);
     for (uint32_t i = 0; i < n; ++i) {
-      CandExtent e = MeasureCand(sk, in, view->candidates[i]);
+      CandExtent e = MeasureCand(sk, in, view->candidates[i], true);
       int32_t row_h = CandRowHeight(m, e);
       int32_t inline_w = CandInlineWidth(m, e);
-      int32_t bw = inline_w + 2 * m.hpad_x;
+      int32_t bw = inline_w + 2 * row_pad_x;
       int32_t bh = row_h + 2 * m.hpad_y;
       out->candidates[i].bounds = FamoRect{x0, y, x0 + bw, y + bh};
-      PlaceRowInline(m, e, x0 + m.hpad_x, y + m.hpad_y, row_h, &out->candidates[i]);
+      PlaceRowInline(m, e, x0 + row_pad_x, y + m.hpad_y, row_h,
+                     &out->candidates[i]);
       if (static_cast<int32_t>(i) == hl) out->highlight = out->candidates[i].bounds;
       if (bw > list_w) list_w = bw;
       y += bh;
-      if (i + 1 < n) y += m.cand_spacing;
+      if (i + 1 < n) y += row_spacing;
     }
     if (list_w > max_content_w) max_content_w = list_w;
+    const int32_t full_row_width = max_content_w;
+    for (uint32_t i = 0; i < n; ++i) {
+      out->candidates[i].bounds.right = x0 + full_row_width;
+      if (static_cast<int32_t>(i) == hl)
+        out->highlight = out->candidates[i].bounds;
+    }
 
     // Page affordances stack below the list on their own row (prev then next).
     int32_t page_row_top = y;
@@ -426,7 +503,7 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
       y = page_row_top + ph;
     }
 
-    int32_t content_w = max_content_w + 2 * m.margin_x;
+    int32_t content_w = max_content_w + 2 * panel_margin_x;
     int32_t content_h = y + m.margin_y;
     out->content_size = ClampSize(m, content_w, content_h);
   }
@@ -434,7 +511,7 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
   // Status-icon slot (top-right of the panel) when the skin reserves one.
   if (m.status_icon > 0) {
     int32_t s = m.status_icon;
-    int32_t right = out->content_size.cx - m.margin_x;
+    int32_t right = out->content_size.cx - panel_margin_x;
     out->status_icon = FamoRect{right - s, m.margin_y, right, m.margin_y + s};
   }
 

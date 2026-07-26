@@ -132,8 +132,8 @@ static int check_shadow() {
   CHECK(FamoCandidateUiPaint(&v, &sk, &in, &out, res, dib.dc) == FAMO_UI_OK);
   GdiFlush();
 
-  // content bg still at the margin-shifted content origin (left inner strip).
-  CHECK(Rgb(dib.At(sm + sk.margin_x / 2, sm + cy / 2)) == Rgb(sk.back_color));
+  // content bg still lands inside the shadow margin, above the full-width rows.
+  CHECK(Rgb(dib.At(sm + cx / 2, sm + sk.margin_y / 2)) == Rgb(sk.back_color));
   // shadow bled into the left margin ring (some non-transparent pixel there).
   bool shadow_here = false;
   for (int x = 1; x < sm && !shadow_here; ++x)
@@ -367,8 +367,9 @@ int main() {
 
   auto at = [&](int x, int y) -> uint32_t { return px[static_cast<size_t>(y) * cx + x]; };
 
-  // (d) panel background: the left margin strip (x < margin_x) is pure back_color.
-  CHECK(Rgb(at(sk.margin_x / 2, cy / 2)) == Rgb(sk.back_color));
+  // (d) panel background: the top margin, above the full-width rows, is pure
+  // back_color.
+  CHECK(Rgb(at(cx / 2, sk.margin_y / 2)) == Rgb(sk.back_color));
 
   // (a) highlight fill: top padding strip of the highlighted row (above the text).
   const FamoRect hb = out.highlight;

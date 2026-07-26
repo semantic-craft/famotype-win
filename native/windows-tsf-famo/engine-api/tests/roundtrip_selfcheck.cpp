@@ -30,6 +30,7 @@ namespace {
 using CreateFn = int32_t(FAMO_ENGINE_CALL *)(uint32_t, FamoEngineApi *);
 
 const char kNi[] = "\xE4\xBD\xA0"; // 你
+const char kNiSecond[] = "\xE5\xB0\xBC"; // 尼
 
 FamoUtf8String Str(const char *s) {
   FamoUtf8String v;
@@ -74,6 +75,13 @@ int main() {
   tiny.size = 4; // caller struct too small to hold the v1 table
   CHECK(create(FAMO_ENGINE_ABI_VERSION, &tiny) ==
         FAMO_ENGINE_E_INVALID_ARGUMENT);
+
+  FamoEngineApi v12;
+  std::memset(&v12, 0, sizeof(v12));
+  v12.size = static_cast<uint32_t>(offsetof(FamoEngineApi, peek_candidates));
+  CHECK(create(FAMO_ENGINE_ABI_VERSION, &v12) == FAMO_ENGINE_OK);
+  CHECK(v12.size == static_cast<uint32_t>(offsetof(FamoEngineApi, peek_candidates)));
+  CHECK(v12.change_page != nullptr);
   ::FreeLibrary(mod);
 
   // --- Positive roundtrip through the host loader ---
@@ -108,6 +116,13 @@ int main() {
   CHECK((view.state_flags & FAMO_COMPOSITION_HAS_CANDIDATES) != 0);
   CHECK(view.candidates != nullptr);
   CHECK(Eq(view.candidates[0].text, kNi)); // 你 is the default candidate
+  CHECK(host.CanPeekCandidates());
+  FamoCompositionView preview;
+  CHECK(host.api().peek_candidates(ctx, 1, 2, &preview) == FAMO_ENGINE_OK);
+  CHECK(preview.candidate_count == 2);
+  CHECK(Eq(preview.candidates[0].text, kNiSecond));
+  CHECK(Eq(preview.candidates[0].label, "2"));
+  host.FreeView(&preview);
   host.FreeView(&view);
   CHECK(view.preedit.data == nullptr); // free_view zeroed the view
 

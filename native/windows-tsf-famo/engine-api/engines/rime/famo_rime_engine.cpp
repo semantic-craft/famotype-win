@@ -75,7 +75,10 @@ void FillStatus(RimeSessionId session, FamoCompositionView* out) {
   if (status.is_disabled) f |= FAMO_STATUS_DISABLED;
   if (status.is_full_shape) f |= FAMO_STATUS_FULL_SHAPE;
   if (status.is_ascii_punct) f |= FAMO_STATUS_ASCII_PUNCT;
-  if (status.is_simplified) f |= FAMO_STATUS_SIMPLIFIED;
+  const bool traditional =
+      g_rime->get_option(session, "traditionalization") ||
+      g_rime->get_option(session, "zh_trad");
+  if (!traditional) f |= FAMO_STATUS_SIMPLIFIED;
   out->status_flags = f;
   g_rime->free_status(&status);
 }
@@ -270,6 +273,14 @@ int32_t FAMO_ENGINE_CALL ReSetOption(FamoEngineContext* context, const FamoUtf8S
   if (!context || !name || !name->data || !g_rime) return FAMO_ENGINE_E_INVALID_ARGUMENT;
   const std::string opt = AsStd(name);
   g_rime->set_option(context->session, opt.c_str(), value ? True : False);
+  if (value && (opt == "traditionalization" || opt == "zh_trad")) {
+    // Load OpenCC off the 50 ms TSF key path without disturbing active input.
+    const char* input = g_rime->get_input(context->session);
+    if (!input || !*input) {
+      g_rime->process_key(context->session, 'a', 0);
+      g_rime->clear_composition(context->session);
+    }
+  }
   return FAMO_ENGINE_OK;
 }
 
@@ -345,32 +356,85 @@ int32_t FAMO_ENGINE_CALL ReChangePage(FamoEngineContext* context, int32_t backwa
   return FAMO_ENGINE_OK;
 }
 
+int32_t FAMO_ENGINE_CALL RePeekCandidates(FamoEngineContext* context,
+                                          uint32_t index, uint32_t count,
+                                          FamoCompositionView* out_view) {
+  if (!context || !out_view || !g_rime || count > 64)
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  std::memset(out_view, 0, sizeof(*out_view));
+  out_view->size = static_cast<uint32_t>(sizeof(FamoCompositionView));
+  if (count == 0 || !RIME_API_AVAILABLE(g_rime, candidate_list_from_index) ||
+      !RIME_API_AVAILABLE(g_rime, candidate_list_next) ||
+      !RIME_API_AVAILABLE(g_rime, candidate_list_end))
+    return FAMO_ENGINE_OK;
+
+  RimeCandidateListIterator iterator{};
+  if (!g_rime->candidate_list_from_index(context->session, &iterator,
+                                          static_cast<int>(index)))
+    return FAMO_ENGINE_OK;
+  auto* candidates = static_cast<FamoCandidate*>(
+      g_host.alloc(sizeof(FamoCandidate) * count));
+  if (!candidates) {
+    g_rime->candidate_list_end(&iterator);
+    return FAMO_ENGINE_E_RUNTIME;
+  }
+
+  uint32_t size = 0;
+  while (size < count && g_rime->candidate_list_next(&iterator)) {
+    FamoCandidate& candidate = candidates[size];
+    std::memset(&candidate, 0, sizeof(candidate));
+    candidate.size = static_cast<uint32_t>(sizeof(FamoCandidate));
+    candidate.text = DupC(iterator.candidate.text);
+    candidate.comment = DupC(iterator.candidate.comment);
+    const char digit[2] = {
+        static_cast<char>('0' + ((index + size + 1) % 10)), '\0'};
+    candidate.label = DupC(digit);
+    ++size;
+  }
+  g_rime->candidate_list_end(&iterator);
+  if (size == 0) {
+    g_host.free(candidates);
+    return FAMO_ENGINE_OK;
+  }
+  out_view->candidates = candidates;
+  out_view->candidate_count = size;
+  return FAMO_ENGINE_OK;
+}
+
 }  // namespace
 
 extern "C" FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL
 FamoCreateEngineApi(uint32_t requested_abi_version, FamoEngineApi* out_api) {
   if (requested_abi_version != FAMO_ENGINE_ABI_VERSION)
     return FAMO_ENGINE_E_UNSUPPORTED_ABI;
-  if (!out_api || out_api->size < static_cast<uint32_t>(sizeof(FamoEngineApi)))
+  if (!out_api)
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  const uint32_t caller_size = out_api->size;
+  if (caller_size < static_cast<uint32_t>(offsetof(FamoEngineApi, get_status)))
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
 
-  out_api->abi_version = FAMO_ENGINE_ABI_VERSION;
-  out_api->size = static_cast<uint32_t>(sizeof(FamoEngineApi));
-  out_api->get_info = &ReGetInfo;
-  out_api->initialize = &ReInitialize;
-  out_api->shutdown = &ReShutdown;
-  out_api->create_context = &ReCreateContext;
-  out_api->destroy_context = &ReDestroyContext;
-  out_api->process_key = &ReProcessKey;
-  out_api->select_candidate = &ReSelectCandidate;
-  out_api->set_option = &ReSetOption;
-  out_api->deploy_schema = &ReDeploySchema;
-  out_api->free_view = &ReFreeView;
-  out_api->get_status = &ReGetStatus;
-  out_api->get_option = &ReGetOption;
-  out_api->commit_composition = &ReCommitComposition;
-  out_api->clear_composition = &ReClearComposition;
-  out_api->highlight_candidate = &ReHighlightCandidate;
-  out_api->change_page = &ReChangePage;
+  FamoEngineApi api{};
+  api.size = caller_size < static_cast<uint32_t>(sizeof(api))
+                 ? caller_size
+                 : static_cast<uint32_t>(sizeof(api));
+  api.abi_version = FAMO_ENGINE_ABI_VERSION;
+  api.get_info = &ReGetInfo;
+  api.initialize = &ReInitialize;
+  api.shutdown = &ReShutdown;
+  api.create_context = &ReCreateContext;
+  api.destroy_context = &ReDestroyContext;
+  api.process_key = &ReProcessKey;
+  api.select_candidate = &ReSelectCandidate;
+  api.set_option = &ReSetOption;
+  api.deploy_schema = &ReDeploySchema;
+  api.free_view = &ReFreeView;
+  api.get_status = &ReGetStatus;
+  api.get_option = &ReGetOption;
+  api.commit_composition = &ReCommitComposition;
+  api.clear_composition = &ReClearComposition;
+  api.highlight_candidate = &ReHighlightCandidate;
+  api.change_page = &ReChangePage;
+  api.peek_candidates = &RePeekCandidates;
+  std::memcpy(out_api, &api, api.size);
   return FAMO_ENGINE_OK;
 }

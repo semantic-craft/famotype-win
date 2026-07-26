@@ -51,6 +51,33 @@ public sealed class TextInsertionTests
         Assert.Null(clipboard.Restored);
     }
 
+    [Fact]
+    public async Task VerifiedInsertAsync_InsertsOnlyWhenOriginalSelectionIsStillSelected()
+    {
+        var inner = new FakeTextInsertionService();
+        var service = new SelectionVerifiedInsertionService(
+            "original", _ => Task.FromResult<string?>("original"), inner);
+
+        TextInsertionResult result = await service.InsertAsync("replacement", CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("replacement", inner.InsertedText);
+    }
+
+    [Fact]
+    public async Task VerifiedInsertAsync_RejectsChangedSelectionWithoutInserting()
+    {
+        var inner = new FakeTextInsertionService();
+        var service = new SelectionVerifiedInsertionService(
+            "original", _ => Task.FromResult<string?>("changed"), inner);
+
+        TextInsertionResult result = await service.InsertAsync("replacement", CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Contains("原选区已变化", result.Message);
+        Assert.Null(inner.InsertedText);
+    }
+
     private sealed class FakeClipboard : IClipboardTextBridge
     {
         private readonly ClipboardTextSnapshot _snapshot;
@@ -95,6 +122,17 @@ public sealed class TextInsertionTests
             SendCount++;
             if (ThrowOnSend) throw new InvalidOperationException("paste failed");
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FakeTextInsertionService : ITextInsertionService
+    {
+        public string? InsertedText { get; private set; }
+
+        public Task<TextInsertionResult> InsertAsync(string text, CancellationToken cancellationToken)
+        {
+            InsertedText = text;
+            return Task.FromResult(TextInsertionResult.Ok());
         }
     }
 }
