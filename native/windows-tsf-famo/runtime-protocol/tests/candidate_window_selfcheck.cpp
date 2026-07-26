@@ -107,6 +107,43 @@ bool PreviewRowsMapToAbsoluteCandidateIndexes() {
   return true;
 }
 
+bool ScrollTransitionIsBoundedAndOptional() {
+  FamoLayoutResult previous{};
+  previous.content_size = {240, 96};
+  previous.shadow_margin = 12;
+  previous.candidate_count = 2;
+  previous.candidates[0].bounds = {8, 15, 58, 35};
+  previous.candidates[1].bounds = {64, 15, 114, 35};
+  previous.highlight = {8, 11, 58, 37};
+  previous.preview_candidate_count = 4;
+  previous.preview_candidates[0].bounds = {8, 40, 58, 60};
+  previous.preview_candidates[1].bounds = {64, 40, 114, 60};
+  previous.preview_candidates[2].bounds = {8, 65, 58, 85};
+  previous.preview_candidates[3].bounds = {64, 65, 114, 85};
+  FamoLayoutResult next = previous;
+
+  ScrollTransitionPlan plan;
+  CHECK(PlanScrollTransition(previous, next, 4, 5, true, &plan));
+  CHECK(plan.direction == 1);
+  CHECK(plan.row_step == 25);
+  CHECK(plan.clip.left == 0 && plan.clip.top == 11 &&
+        plan.clip.right == 240 && plan.clip.bottom == 85);
+  CHECK(ScrollTransitionOffset(0, plan.row_step) == 0);
+  const int32_t halfway = ScrollTransitionOffset(
+      kCandidateScrollTransitionMs / 2, plan.row_step);
+  CHECK(halfway > 0 && halfway < plan.row_step);
+  CHECK(ScrollTransitionOffset(kCandidateScrollTransitionMs, plan.row_step) ==
+        plan.row_step);
+
+  CHECK(PlanScrollTransition(previous, next, 5, 4, true, &plan));
+  CHECK(plan.direction == -1);
+  CHECK(!PlanScrollTransition(previous, next, 4, 5, false, &plan));
+  CHECK(!PlanScrollTransition(previous, next, 4, 6, true, &plan));
+  next.content_size.cy++;
+  CHECK(!PlanScrollTransition(previous, next, 4, 5, true, &plan));
+  return true;
+}
+
 template <typename Predicate>
 bool WaitForCounters(const CandidateWindow &window, Predicate predicate) {
   for (int attempt = 0; attempt < 1000; ++attempt) {
@@ -523,6 +560,7 @@ bool HangingUiDoesNotDelayEngine() {
 
 int main() {
   if (!PreviewRowsMapToAbsoluteCandidateIndexes() ||
+      !ScrollTransitionIsBoundedAndOptional() ||
       !PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
       !InlineHostPreeditStillShowsPanelHeader() ||

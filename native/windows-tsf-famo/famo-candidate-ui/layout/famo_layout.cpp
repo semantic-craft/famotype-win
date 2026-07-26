@@ -395,7 +395,6 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
       out->candidates[i].bounds = FamoRect{bx, list_top, bx + bw, list_top + bh};
       PlaceRowInline(m, e, bx + m.hpad_x, list_top + m.hpad_y, row_h,
                      &out->candidates[i]);
-      if (static_cast<int32_t>(i) == hl) out->highlight = out->candidates[i].bounds;
       x = bx + bw;
       if (i + 1 < n) x += m.cand_spacing;
     }
@@ -454,6 +453,17 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     int32_t content_w = max_content_w + 2 * panel_margin_x;
     int32_t content_h = list_bottom + m.margin_y;
     out->content_size = ClampSize(m, content_w, content_h);
+    if (hl >= 0 && static_cast<uint32_t>(hl) < n) {
+      out->highlight = out->candidates[hl].bounds;
+      // macOS lets the compact selection tint bleed into the row's outer
+      // padding without changing candidate hit-testing or panel size.
+      out->highlight.top =
+          (std::max)(0, out->highlight.top - Scale(4, in.dpi));
+      const int32_t bottom_bleed = Scale(preview_available ? 2 : 9, in.dpi);
+      out->highlight.bottom =
+          (std::min)(out->content_size.cy,
+                     out->highlight.bottom + bottom_bleed);
+    }
   } else {
     // Vertical + VerticalText: candidates stack top→bottom. (VerticalText differs
     // in glyph orientation at PAINT time, B5; its box geometry stacks like
