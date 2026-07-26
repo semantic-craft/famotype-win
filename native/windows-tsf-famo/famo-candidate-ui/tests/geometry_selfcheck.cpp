@@ -7,6 +7,7 @@
 // UTF-8 literals are explicit byte escapes so correctness does not depend on the
 // compiler's source charset.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -188,8 +189,17 @@ int RunFamily(FamoLayoutType type) {
     if (CheckCommon(out, 3)) return 1;
     CHECK(NonEmpty(out.preedit));                 // multibyte preedit band shown
     CHECK(NonEmpty(out.highlight));
-    // highlight == the highlighted candidate (index 1) bounds
-    CHECK(std::memcmp(&out.highlight, &out.candidates[1].bounds, sizeof(FamoRect)) == 0);
+    if (type == FAMO_LAYOUT_HORIZONTAL) {
+      CHECK(out.highlight.left == out.candidates[1].bounds.left);
+      CHECK(out.highlight.right == out.candidates[1].bounds.right);
+      CHECK(out.highlight.top == out.candidates[1].bounds.top - 4);
+      CHECK(out.highlight.bottom ==
+            (std::min)(out.content_size.cy,
+                       out.candidates[1].bounds.bottom + 9));
+    } else {
+      CHECK(std::memcmp(&out.highlight, &out.candidates[1].bounds,
+                        sizeof(FamoRect)) == 0);
+    }
     CHECK(NonEmpty(out.prev_page));               // page_index>0 → "<"
     CHECK(NonEmpty(out.next_page));               // !is_last_page → ">"
 
@@ -215,7 +225,15 @@ int RunFamily(FamoLayoutType type) {
     if (CheckCommon(out, 3)) return 1;
     CHECK(IsEmpty(out.prev_page));                // page_index==0 → no "<"
     CHECK(IsEmpty(out.next_page));                // is_last_page → no ">"
-    CHECK(std::memcmp(&out.highlight, &out.candidates[0].bounds, sizeof(FamoRect)) == 0);
+    if (type == FAMO_LAYOUT_HORIZONTAL) {
+      CHECK(out.highlight.top == out.candidates[0].bounds.top - 4);
+      CHECK(out.highlight.bottom ==
+            (std::min)(out.content_size.cy,
+                       out.candidates[0].bounds.bottom + 9));
+    } else {
+      CHECK(std::memcmp(&out.highlight, &out.candidates[0].bounds,
+                        sizeof(FamoRect)) == 0);
+    }
   }
 
   return 0;
@@ -355,6 +373,8 @@ int RunPreeditAndPreview() {
   CHECK(shown.preview_candidate_count == 4);
   CHECK(shown.preview_candidates[2].bounds.top >
         shown.preview_candidates[0].bounds.top);
+  CHECK(shown.highlight.top == shown.candidates[0].bounds.top - 4);
+  CHECK(shown.highlight.bottom == shown.candidates[0].bounds.bottom + 2);
 
   skin.show_preedit = 0;
   FamoLayoutResult hidden{};

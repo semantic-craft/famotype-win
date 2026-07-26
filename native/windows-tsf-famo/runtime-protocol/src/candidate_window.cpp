@@ -278,6 +278,119 @@ bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
   return false;
 }
 
+bool PlanScrollTransition(const FamoLayoutResult &previous,
+                          const FamoLayoutResult &next,
+                          uint32_t previous_page, uint32_t next_page,
+                          bool animations_enabled,
+                          ScrollTransitionPlan *plan) noexcept {
+  if (!plan)
+    return false;
+  *plan = {};
+  int32_t direction = 0;
+  if (next_page > previous_page && next_page - previous_page == 1)
+    direction = 1;
+  else if (previous_page > next_page && previous_page - next_page == 1)
+    direction = -1;
+  if (!animations_enabled || direction == 0 ||
+      previous.candidate_count == 0 || next.candidate_count == 0 ||
+      previous.preview_candidate_count == 0 ||
+      next.preview_candidate_count == 0 ||
+      previous.content_size.cx != next.content_size.cx ||
+      previous.content_size.cy != next.content_size.cy ||
+      previous.shadow_margin != next.shadow_margin)
+    return false;
+
+  const FamoRect &previous_main = previous.candidates[0].bounds;
+  const FamoRect &next_main = next.candidates[0].bounds;
+  const FamoRect &previous_preview = previous.preview_candidates[0].bounds;
+  const FamoRect &next_preview = next.preview_candidates[0].bounds;
+  const FamoRect &previous_last =
+      previous.preview_candidates[previous.preview_candidate_count - 1].bounds;
+  const FamoRect &next_last =
+      next.preview_candidates[next.preview_candidate_count - 1].bounds;
+  const int32_t row_step = next_preview.top - next_main.top;
+  const int32_t clip_top = (std::min)(next_main.top, next.highlight.top);
+  if (row_step <= 0 || previous_preview.top - previous_main.top != row_step ||
+      previous_main.top != next_main.top ||
+      previous_last.bottom != next_last.bottom ||
+      clip_top != (std::min)(previous_main.top, previous.highlight.top) ||
+      next_last.bottom <= clip_top + row_step)
+    return false;
+
+  plan->clip = {0, clip_top, next.content_size.cx, next_last.bottom};
+  plan->row_step = row_step;
+  plan->direction = direction;
+  return true;
+}
+
+int32_t ScrollTransitionOffset(uint32_t elapsed_ms,
+                               int32_t row_step) noexcept {
+  if (row_step <= 0 || elapsed_ms == 0)
+    return 0;
+  if (elapsed_ms >= kCandidateScrollTransitionMs)
+    return row_step;
+  const double progress =
+      static_cast<double>(elapsed_ms) / kCandidateScrollTransitionMs;
+  const double remaining = 1.0 - progress;
+  const double eased = 1.0 - remaining * remaining * remaining;
+  return (std::min)(row_step,
+                    static_cast<int32_t>(row_step * eased + 0.5));
+}
+
+namespace {
+
+bool SystemAnimationsEnabled() {
+  BOOL enabled = FALSE;
+  return SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0) &&
+         enabled != FALSE;
+}
+
+bool CopySurface(DibSurface *destination, const DibSurface &source) {
+  return destination && destination->Ensure(source.width(), source.height()) &&
+         BitBlt(destination->dc(), 0, 0, source.width(), source.height(),
+                source.dc(), 0, 0, SRCCOPY) != FALSE;
+}
+
+bool ComposeScrollFrame(DibSurface *destination, const DibSurface &previous,
+                        const DibSurface &next,
+                        const ScrollTransitionPlan &plan, int margin,
+                        int32_t offset) {
+  if (!CopySurface(destination, next))
+    return false;
+  const int32_t left = plan.clip.left + margin;
+  const int32_t top = plan.clip.top + margin;
+  const int32_t right = plan.clip.right + margin;
+  const int32_t bottom = plan.clip.bottom + margin;
+  const int32_t width = right - left;
+  const int32_t height = bottom - top;
+  const int saved = SaveDC(destination->dc());
+  if (saved == 0 || IntersectClipRect(destination->dc(), left, top, right,
+                                      bottom) == ERROR) {
+    if (saved != 0)
+      RestoreDC(destination->dc(), saved);
+    return false;
+  }
+  BOOL copied = FALSE;
+  if (plan.direction > 0) {
+    copied = BitBlt(destination->dc(), left, top - offset, width,
+                    plan.row_step, previous.dc(), left, top, SRCCOPY) &&
+             BitBlt(destination->dc(), left,
+                    top + plan.row_step - offset, width, height, next.dc(),
+                    left, top, SRCCOPY);
+  } else {
+    copied = BitBlt(destination->dc(), left,
+                    top - plan.row_step + offset, width, height, next.dc(),
+                    left, top, SRCCOPY) &&
+             BitBlt(destination->dc(), left,
+                    bottom - plan.row_step + offset, width, plan.row_step,
+                    previous.dc(), left, bottom - plan.row_step, SRCCOPY);
+  }
+  RestoreDC(destination->dc(), saved);
+  return copied != FALSE;
+}
+
+} // namespace
+
 struct CandidateWindow::State {
   explicit State(Fault injected_fault) : fault(injected_fault) {
     stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -451,6 +564,16 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
           ? nullptr
           : CreateCandidateWindow(&notifications);
   DibSurface surface;
+  DibSurface previous_surface;
+  DibSurface animation_surface;
+  struct ActiveScrollAnimation {
+    bool active = false;
+    uint64_t started_ms = 0;
+    ScrollTransitionPlan plan{};
+    FamoLayoutResult target_layout{};
+    int margin = 0;
+    HWND foreground_window = nullptr;
+  } animation;
   const FamoSkin fallback_skin = FamoSkinDefault();
   std::shared_ptr<const void> active_presentation;
   std::shared_ptr<const CandidateStylePresentation> active_style;
@@ -468,10 +591,54 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   uint64_t presented_system_generation = 0;
   HANDLE events[] = {state->stop_event, state->update_event};
   for (;;) {
+    DWORD timeout = INFINITE;
+    if (animation.active) {
+      const uint64_t elapsed = GetTickCount64() - animation.started_ms;
+      timeout = elapsed >= kCandidateScrollTransitionMs
+                    ? 0
+                    : (std::min)(DWORD{16}, static_cast<DWORD>(
+                                                   kCandidateScrollTransitionMs -
+                                                   elapsed));
+    }
     const DWORD wait =
-        MsgWaitForMultipleObjects(2, events, FALSE, INFINITE, QS_ALLINPUT);
+        MsgWaitForMultipleObjects(2, events, FALSE, timeout, QS_ALLINPUT);
     if (wait == WAIT_OBJECT_0)
       break;
+    if (wait == WAIT_TIMEOUT && animation.active) {
+      if (animation.foreground_window &&
+          GetForegroundWindow() != animation.foreground_window) {
+        ShowWindow(window, SW_HIDE);
+        animation.active = false;
+        presented_snapshot.reset();
+        continue;
+      }
+      const uint64_t elapsed = GetTickCount64() - animation.started_ms;
+      const bool complete = elapsed >= kCandidateScrollTransitionMs;
+      const DibSurface *frame = &surface;
+      if (!complete) {
+        const int32_t offset = ScrollTransitionOffset(
+            static_cast<uint32_t>(elapsed), animation.plan.row_step);
+        if (!ComposeScrollFrame(&animation_surface, previous_surface, surface,
+                                animation.plan, animation.margin, offset)) {
+          animation.active = false;
+          continue;
+        }
+        frame = &animation_surface;
+      }
+      if (!SubmitLayered(window, *frame,
+                         animation.target_layout.origin_x - animation.margin,
+                         animation.target_layout.origin_y - animation.margin)) {
+        ShowWindow(window, SW_HIDE);
+        animation.active = false;
+        presented_snapshot.reset();
+        continue;
+      }
+      if (complete) {
+        animation.active = false;
+        notifications.layout = animation.target_layout;
+      }
+      continue;
+    }
     if (wait == WAIT_OBJECT_0 + 2) {
       MSG message{};
       while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -482,6 +649,16 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     }
     if (wait != WAIT_OBJECT_0 + 1)
       break;
+    if (animation.active) {
+      animation.active = false;
+      notifications.layout = animation.target_layout;
+      if (!SubmitLayered(window, surface,
+                         animation.target_layout.origin_x - animation.margin,
+                         animation.target_layout.origin_y - animation.margin)) {
+        ShowWindow(window, SW_HIDE);
+        presented_snapshot.reset();
+      }
+    }
     if (state->fault == Fault::Hang) {
       Sleep(5000);
       continue;
@@ -645,8 +822,25 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       layout = presented_layout;
       layout.highlight = {};
       const uint32_t selected = snapshot->composition.highlighted_index;
-      if (selected < layout.candidate_count)
+      const uint32_t previous_selected =
+          presented_snapshot->composition.highlighted_index;
+      if (selected < layout.candidate_count &&
+          previous_selected < layout.candidate_count) {
+        const FamoRect previous_bounds =
+            layout.candidates[previous_selected].bounds;
+        const FamoRect selected_bounds = layout.candidates[selected].bounds;
+        layout.highlight = {
+            selected_bounds.left + presented_layout.highlight.left -
+                previous_bounds.left,
+            selected_bounds.top + presented_layout.highlight.top -
+                previous_bounds.top,
+            selected_bounds.right + presented_layout.highlight.right -
+                previous_bounds.right,
+            selected_bounds.bottom + presented_layout.highlight.bottom -
+                previous_bounds.bottom};
+      } else if (selected < layout.candidate_count) {
         layout.highlight = layout.candidates[selected].bounds;
+      }
       state->selection_only_count.fetch_add(1, std::memory_order_relaxed);
     } else {
       state->full_count.fetch_add(1, std::memory_order_relaxed);
@@ -658,9 +852,21 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         continue;
       }
     }
+    ScrollTransitionPlan transition{};
+    bool animate_scroll =
+        !selection_only && stable_presentation &&
+        snapshot->ui_state == presented_snapshot->ui_state &&
+        PlanScrollTransition(presented_layout, layout,
+                             presented_snapshot->composition.page_index,
+                             snapshot->composition.page_index,
+                             SystemAnimationsEnabled(), &transition);
     const int margin = std::max(0, layout.shadow_margin);
     const int width = layout.content_size.cx + margin * 2;
     const int height = layout.content_size.cy + margin * 2;
+    if (animate_scroll &&
+        (surface.width() != width || surface.height() != height ||
+         !CopySurface(&previous_surface, surface)))
+      animate_scroll = false;
     if (!surface.Ensure(width, height)) {
       ShowWindow(window, SW_HIDE);
       continue;
@@ -701,8 +907,16 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       presented_snapshot.reset();
       continue;
     }
+    const DibSurface *first_frame = &surface;
+    if (animate_scroll) {
+      if (ComposeScrollFrame(&animation_surface, previous_surface, surface,
+                             transition, margin, 0))
+        first_frame = &animation_surface;
+      else
+        animate_scroll = false;
+    }
     if (state->fault == Fault::Submit ||
-        !SubmitLayered(window, surface, layout.origin_x - margin,
+        !SubmitLayered(window, *first_frame, layout.origin_x - margin,
                        layout.origin_y - margin)) {
       ShowWindow(window, SW_HIDE);
       presented_snapshot.reset();
@@ -714,6 +928,8 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     } else {
       state->submitted_visible = true;
       notifications.layout = layout;
+      if (animate_scroll)
+        notifications.layout.preview_candidate_count = 0;
       notifications.selection_request =
           {snapshot->correlation, snapshot->composition_sequence, 0, 0};
       notifications.page_index = snapshot->composition.page_index;
@@ -726,6 +942,14 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       presented_dpi = dpi;
       presented_high_contrast = high_contrast;
       presented_system_generation = current_system_generation;
+      if (animate_scroll) {
+        animation.active = true;
+        animation.started_ms = GetTickCount64();
+        animation.plan = transition;
+        animation.target_layout = layout;
+        animation.margin = margin;
+        animation.foreground_window = frame_foreground;
+      }
     }
   }
   if (window)
