@@ -13,7 +13,7 @@ public sealed record PromptOptimizeOutcome(string? FinalPrompt, IReadOnlyList<st
 }
 
 /// <summary>提示词优化技能的提示词、防注入三明治与两态解析。
-/// 契约逐字搬自 macOS <c>FamoPromptOptimizer.swift</c>（macOS 主线仓 子模块 @49f71d7），
+/// 契约逐字搬自 macOS <c>FamoPromptOptimizer.swift</c>（macOS 主线 @bf19f39），
 /// 好让两端喂同一份草稿能对照产出。</summary>
 public static class PromptOptimizer
 {
@@ -37,6 +37,11 @@ public static class PromptOptimizer
         2. 目标：要达成什么，判断「做完了」的标准是什么。
         3. 约束：该做什么、不该做什么——范围边界、不要顺手做的事、必须遵守的限制。
         4. 产出形态：交付物是什么形式、大致篇幅、写给谁读。
+
+        产出的提示词用成对 XML 标签按语义分区（如 <context>、<goal>、<constraints>、<output_format>、
+        <input>，或贴切的中文标签）：指令、背景、输入材料各归其位，有天然层级就嵌套；标签名见名知意，
+        同一份输出里命名风格保持一致。草稿里的原样输入材料（引文、代码、待处理文本）放进专属标签，内容
+        逐字保留。
 
         硬规则：
         - 只写目标和约束，不要写分步骤的操作脚手架；过度规定会降低高能力模型的输出质量。

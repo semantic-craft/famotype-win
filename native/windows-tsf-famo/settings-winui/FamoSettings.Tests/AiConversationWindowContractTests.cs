@@ -37,6 +37,10 @@ public sealed class AiConversationWindowContractTests
         Assert.Contains("ShowAiConversation", app);
         Assert.Contains("ShowAiConversationForSelection", app);
         Assert.Contains("BuildSelectionCaptureService().CaptureAsync", app);
+        Assert.Contains("AiSelectionToolboxEligibility.RejectionReason", app);
+        Assert.Contains("Ask Anything skill disabled", app);
+        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(
+            app, @"ShowAiConversationForSelection\(\);").Count);
         Assert.Contains("TryMigrateQuickPhraseArtifacts", app);
         Assert.Contains("\"ai-chat\"", app);
     }

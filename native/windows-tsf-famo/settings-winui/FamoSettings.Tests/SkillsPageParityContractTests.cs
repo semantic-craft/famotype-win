@@ -103,6 +103,7 @@ public sealed class SkillsPageParityContractTests
         Assert.Contains("App.Settings.Ai.PromptOptimizeSkillEnabled", page);
         Assert.Contains("AiSelectionSkills.PromptOptimize", page);
         Assert.Contains("提示词优化", skills);
+        Assert.Contains("成对 XML 标签", page);
         Assert.Contains("ai-prompt-optimize", skills);
     }
 
