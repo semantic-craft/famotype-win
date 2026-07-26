@@ -207,6 +207,44 @@ public class SettingsStoreTests : IDisposable
         FamoSettings settings = new SettingsStore(_file).Load();
         Assert.Equal(expected, settings.Engine.PageSize);
         Assert.Contains($"\"pageSize\": {expected}", File.ReadAllText(_file));
+        Assert.True(SchemaValidator.Validate(settings).IsValid);
+    }
+
+    [Theory]
+    [InlineData("appearance", "skin", "\"harvard\"")]
+    [InlineData("appearance", "fontPoint", "99")]
+    public void Load_InvalidEnumOrRange_ThrowsAndBacksUpOriginal(
+        string section, string property, string value)
+    {
+        Directory.CreateDirectory(_dir);
+        string original = $$"""
+        {
+          "{{section}}": { "{{property}}": {{value}} }
+        }
+        """;
+        File.WriteAllText(_file, original);
+
+        InvalidDataException ex = Assert.Throws<InvalidDataException>(
+            () => new SettingsStore(_file).Load());
+
+        Assert.Contains("schema", ex.Message);
+        Assert.Equal(original, File.ReadAllText(_file));
+        Assert.Equal(original, File.ReadAllText(_file + ".bak"));
+    }
+
+    [Fact]
+    public void Save_InvalidSettings_LeavesExistingFileIntact()
+    {
+        var store = new SettingsStore(_file);
+        FamoSettings settings = store.Load();
+        string original = File.ReadAllText(_file);
+        settings.Appearance.Skin = "harvard";
+
+        InvalidDataException ex = Assert.Throws<InvalidDataException>(() => store.Save(settings));
+
+        Assert.Contains("schema", ex.Message);
+        Assert.Equal(original, File.ReadAllText(_file));
+        Assert.False(File.Exists(_file + ".tmp"));
     }
 
     [Fact]
