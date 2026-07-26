@@ -679,7 +679,7 @@ bool LateGenerationCannotReturn() {
   return true;
 }
 
-bool DuplicateReplyOpensCircuit() {
+bool DuplicateOpenSessionIsIdempotent() {
   const std::wstring suffix =
       L"duplicate-" + std::to_wstring(GetCurrentProcessId());
   PipeEndpoint endpoint;
@@ -695,9 +695,9 @@ bool DuplicateReplyOpensCircuit() {
   CHECK(port.Call(std::move(open), kHardCallDeadline).status == Status::Ok);
   Frame duplicate = Request(Command::OpenSession, 800, 1);
   CHECK(EncodeOpenSession("test", &duplicate.payload, &error));
-  CHECK(port.Call(std::move(duplicate), kHardCallDeadline).status ==
-        Status::Unavailable);
-  CHECK(port.state() == ChannelState::OpenCircuit);
+  CHECK(port.Call(std::move(duplicate), kSessionOpenDeadline).status ==
+        Status::Ok);
+  CHECK(port.state() == ChannelState::Ready);
   port.Stop();
   CHECK(FinishRuntime(&process));
   return true;
@@ -748,7 +748,7 @@ int main() {
       !FaultCheck(L"engine-hang", L"engine-hang", 520, false) ||
       !FaultCheck(L"malformed", L"malformed", 540, false) ||
       !FaultCheck(L"disconnect", L"disconnect", 550, false) ||
-      !LateGenerationCannotReturn() || !DuplicateReplyOpensCircuit() ||
+      !LateGenerationCannotReturn() || !DuplicateOpenSessionIsIdempotent() ||
       !StopRetiresInFlightOffControlPath()) {
     return 1;
   }

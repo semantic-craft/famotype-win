@@ -77,7 +77,7 @@ Frame RuntimeService::DispatchLocked(const Frame &request) {
                        c.session_generation};
   if (request.command == Command::OpenSession) {
     if (sessions_.contains(key))
-      return Reply(request, Status::StaleRequest);
+      return Reply(request, Status::Ok);
     std::string schema, error;
     if (!DecodeOpenSession(request.payload, &schema, &error))
       return Reply(request, Status::InvalidFrame);

@@ -12,10 +12,12 @@ if(MSVC)
 endif()
 
 add_library(famo_runtime_protocol STATIC
+  src/install_state.cpp
   src/protocol.cpp
   src/protocol_control.cpp
   src/utf8.cpp)
 target_include_directories(famo_runtime_protocol PUBLIC include)
+target_link_libraries(famo_runtime_protocol PUBLIC advapi32)
 
 add_library(famo_runtime_core STATIC
   src/runtime_state.cpp

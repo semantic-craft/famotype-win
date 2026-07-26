@@ -176,8 +176,14 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
       }
       break;
     }
-    if (inject && IsDelayedFault(fault))
-      Sleep(fault == ServerFault::OpenSessionDelay ? 100 : 250);
+    if (inject && IsDelayedFault(fault)) {
+      const auto delay = fault == ServerFault::OpenSessionDelay
+                             ? std::chrono::milliseconds(100)
+                         : fault == ServerFault::OpenSessionHang
+                             ? kSessionOpenDeadline + std::chrono::milliseconds(100)
+                             : std::chrono::milliseconds(250);
+      Sleep(static_cast<DWORD>(delay.count()));
+    }
     if (inject && fault == ServerFault::NoReply)
       break;
 

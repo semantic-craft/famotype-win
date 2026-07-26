@@ -1,5 +1,6 @@
 #include <cstdio>
 
+#include "famo_install_state.h"
 #include "famo_runtime_protocol.h"
 
 #define CHECK(x)                                                               \
@@ -14,6 +15,15 @@
 using namespace famo::runtime;
 
 int main() {
+  CHECK(InstallTargetAllowed(L"Ready", L"C:\\Program Files\\Famo\\v1\\",
+                             L"c:\\program files\\famo\\v1"));
+  CHECK(InstallTargetAllowed(L"Activating", L"C:\\Famo\\v2", L"C:\\Famo\\v2",
+                             true));
+  CHECK(!InstallTargetAllowed(L"Activating", L"C:\\Famo\\v2", L"C:\\Famo\\v2"));
+  CHECK(!InstallTargetAllowed(L"PendingReboot", L"C:\\Famo\\v2", L"C:\\Famo\\v2",
+                              true));
+  CHECK(!InstallTargetAllowed(L"Ready", L"C:\\Famo\\v1", L"C:\\Famo\\v2"));
+
   std::string error;
   std::vector<uint8_t> payload;
   CHECK(EncodeOpenSession("test", &payload, &error));

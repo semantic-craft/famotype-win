@@ -164,12 +164,6 @@ begin
     RunAndRequire(ProfileTool(Target), 'check', False);
 end;
 
-function RegisterTargetDisabled(const Target: String): Boolean;
-begin
-  Result := RunAndRequire(ProfileTool(Target), 'register-disabled', False) and
-    RunAndRequire(ProfileTool(Target), 'check-disabled', False);
-end;
-
 function UnregisterTarget(const Target: String): Boolean;
 begin
   Result := True;
@@ -581,13 +575,11 @@ var
   RegisteredDll, RunValue: String;
 begin
   VerifyPayloadOrFail;
-  if not RegQueryStringValue(HKLM64,
-    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) or
-    (CompareText(RegisteredDll,
-      AddBackslash(TransactionTarget) + 'FamoTextService.dll') <> 0) then
-    RaiseException('pending COM registration target mismatch');
-  if not RunAndRequire(ProfileTool(TransactionTarget), 'check-disabled', False) then
-    RaiseException('pending profile is not registered disabled');
+  if RegQueryStringValue(HKLM64,
+    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) then
+    RaiseException('pending COM registration must be absent');
+  if not RunAndRequire(ProfileTool(TransactionTarget), 'check-absent', False) then
+    RaiseException('pending profile registration must be absent');
   if RunExitCode(ProfileTool(TransactionTarget), 'is-active') <> 1 then
     RaiseException('pending profile remains active');
   if RegQueryStringValue(HKLM64, RunKey, 'FamoRuntime', RunValue) then
@@ -606,8 +598,6 @@ begin
     if not UnregisterPreviousRegistration then
       RaiseException('cannot unregister previous host before pending reboot');
   end;
-  if not RegisterTargetDisabled(TransactionTarget) then
-    RaiseException('cannot register pending profile disabled');
   RegistrationSwitched := True;
   RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
   VerifyPendingInstall;
@@ -730,26 +720,24 @@ end;
 
 procedure CompletePendingTransaction;
 var
-  EnableAttempt: Integer;
-  EnableOk: Boolean;
+  RegisterAttempt: Integer;
+  RegisterOk: Boolean;
 begin
   { The resume runs from RunOnce, early in logon -- the CTF/TSF services may
-    not be up yet, which is exactly how the 1.4.8 rollout died here on a real
-    machine (enable failed once, transaction went terminal). The per-user
-    enable is idempotent, so retry briefly instead of failing the whole
-    transaction on the first attempt. }
-  EnableOk := False;
-  for EnableAttempt := 1 to 5 do
+    not be up yet. Registration is idempotent, so retry briefly instead of
+    failing the whole transaction on the first attempt. }
+  RegisterOk := False;
+  for RegisterAttempt := 1 to 5 do
   begin
-    if RunAndRequire(ProfileTool(TransactionTarget), 'enable', False) then
+    if RegisterTarget(TransactionTarget) then
     begin
-      EnableOk := True;
+      RegisterOk := True;
       Break;
     end;
     Sleep(2000);
   end;
-  if not EnableOk then
-    RaiseException('pending profile enable failed');
+  if not RegisterOk then
+    RaiseException('pending profile registration failed');
   RegistrationSwitched := True;
   WriteActiveRegistry(TransactionTarget, 'Activating');
   FailIfRequested('after-resume-registration');
@@ -847,7 +835,8 @@ begin
   RunAndRequire(ProfileTool(TransactionTarget), 'switch-away', False);
   RunAndRequire(AddBackslash(TransactionTarget) +
     'settings\FamoSettings.exe', '--remove-input-tip', True);
-  RegisterTargetDisabled(TransactionTarget);
+  UnregisterTarget(TransactionTarget);
+  RunAndRequire(ProfileTool(TransactionTarget), 'check-absent', False);
   RegistrationSwitched := True;
   WritePendingRegistry;
   RegWriteStringValue(HKLM64, BrandKey, 'PendingReason',

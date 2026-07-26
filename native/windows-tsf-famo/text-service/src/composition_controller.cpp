@@ -288,6 +288,12 @@ HRESULT CompositionController::ApplyInSession(TfEditCookie cookie,
 
   if (plan.preedit.empty()) {
     if (composition_) {
+      if (!plan.commit.empty()) {
+        // SetText already committed the replacement. If the first
+        // EndComposition failed, retry ending without deleting that text.
+        (void)EndCurrent(cookie);
+        return S_OK;
+      }
       ComPtr<ITfRange> range;
       result = composition_->GetRange(range.put());
       if (FAILED(result))
