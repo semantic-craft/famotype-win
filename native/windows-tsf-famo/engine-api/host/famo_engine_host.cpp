@@ -34,6 +34,8 @@ bool TableComplete(const FamoEngineApi& a) {
 // pointers is loadable. The six v1.1 pointers live beyond this offset.
 const uint32_t kV1BaselineSize =
     static_cast<uint32_t>(offsetof(FamoEngineApi, get_status));
+const uint32_t kV11Size =
+    static_cast<uint32_t>(offsetof(FamoEngineApi, peek_candidates));
 
 }  // namespace
 
@@ -120,7 +122,13 @@ bool FamoEngineHost::AbiRunnable() const {
   // usable only if the engine's table both spans the v1.1 pointers and fills
   // them. A v1.0 engine fails one or the other -> caller falls back to legacy.
   return module_ &&
-         api_.size >= static_cast<uint32_t>(sizeof(FamoEngineApi)) &&
+         api_.size >= kV11Size &&
          api_.get_status && api_.get_option && api_.commit_composition &&
          api_.clear_composition && api_.highlight_candidate && api_.change_page;
+}
+
+bool FamoEngineHost::CanPeekCandidates() const {
+  return module_ &&
+         api_.size >= static_cast<uint32_t>(sizeof(FamoEngineApi)) &&
+         api_.peek_candidates;
 }

@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using Famo.Settings.Core;
 using Famo.Settings.Core.Ai;
+using Famo.Settings.Core.QuickPhrases;
 using Famo.Settings.Core.Selection;
 using Famo.Settings.Interop;
 using Famo.Settings.Theming;
@@ -101,13 +102,35 @@ public partial class App : Application
     /// <summary>显示 AI 对话窗口（懒建 + 复用），仅响应用户显式触发。</summary>
     public static void ShowAiConversation()
     {
+        ShowAiConversation(selectedText: null);
+    }
+
+    private static void ShowAiConversation(string? selectedText)
+    {
         ApplyTheme();
-        if (_aiConversationWindow is null)
+        if (_aiConversationWindow is null || selectedText is not null)
         {
-            _aiConversationWindow = new AiConversationWindow();
-            _aiConversationWindow.Closed += (_, _) => _aiConversationWindow = null;
+            _aiConversationWindow?.Close();
+            var window = new AiConversationWindow(selectedText);
+            _aiConversationWindow = window;
+            window.Closed += (_, _) =>
+            {
+                if (ReferenceEquals(_aiConversationWindow, window)) _aiConversationWindow = null;
+            };
         }
         _aiConversationWindow.Activate();
+    }
+
+    /// <summary>在窗口抢焦点前捕获明确选区；无选区时仍打开普通任意提问。</summary>
+    public static void ShowAiConversationForSelection()
+    {
+        _ = ShowAiConversationForSelectionAsync();
+    }
+
+    private static async Task ShowAiConversationForSelectionAsync()
+    {
+        SelectedTextCaptureResult result = await BuildSelectionCaptureService().CaptureAsync(CancellationToken.None);
+        ShowAiConversation(result.Status == SelectedTextCaptureStatus.Success ? result.Text : null);
     }
 
     /// <summary>显示提示词选择器。创建窗口前捕获当前前台窗口作为粘贴目标。</summary>
@@ -247,6 +270,7 @@ public partial class App : Application
         {
             FirstLaunchSeeder.SeedFromInstalledData(force: HasFlag(argv, "--force"));
             Settings = LoadSettingsOrFallback();
+            TryMigrateQuickPhraseArtifacts(triggerDeploy: false);
             TryWriteOverlays();
             Exit();
             return;
@@ -254,6 +278,7 @@ public partial class App : Application
 
         // 首启 seed：文件不存在则从内置默认落盘到 %LOCALAPPDATA%\Famo\famo-settings.json。
         Settings = LoadSettingsOrFallback();
+        TryMigrateQuickPhraseArtifacts(triggerDeploy: true);
 
         // 启动即把即时层（外观②/开关①覆盖层）与 store 同步落盘，使安装首启(--seed-only)后
         // server 也能在 AddSession 读到当前默认；纯写文件，不触发任何 reload/部署。
@@ -290,7 +315,7 @@ public partial class App : Application
         }
         if (IsAiChatPage(startPage))
         {
-            ShowAiConversation(); // 只显 AI 对话窗口；不打开设置主窗
+            ShowAiConversationForSelection(); // 先捕获明确选区，再显 AI 对话窗口
             return;
         }
         if (IsPromptPickerPage(startPage))
@@ -377,7 +402,7 @@ public partial class App : Application
             }
             if (IsAiChatPage(page))
             {
-                ShowAiConversation(); // AI 对话窗口：显式触发，不进入输入热路径
+                ShowAiConversationForSelection(); // 单实例深链同样先捕获选区
                 return;
             }
             if (IsPromptPickerPage(page))
@@ -682,6 +707,28 @@ public partial class App : Application
         catch
         {
             // 首启写覆盖层失败不应阻断启动；后续保存会再写。
+        }
+    }
+
+    /// <summary>升级时从 JSON 真相源重放快捷短语派生表与 Rime 补丁；内容一致则零写入。</summary>
+    private static void TryMigrateQuickPhraseArtifacts(bool triggerDeploy)
+    {
+        if (!File.Exists(FamoPaths.QuickPhrasesFile)) return;
+
+        try
+        {
+            bool tableChanged = new QuickPhraseStore().WriteTableDb();
+            string icePath = Path.Combine(FamoPaths.FamoDir, "rime_ice.custom.yaml");
+            string? currentIce = File.Exists(icePath) ? File.ReadAllText(icePath) : null;
+            bool patchChanged = currentIce != ConfigWriter.BuildRimeIceCustom(Settings, currentIce);
+            if (!tableChanged && !patchChanged) return;
+
+            ConfigWriter.WriteDeployBucket(Settings, FamoPaths.FamoDir);
+            if (triggerDeploy) DeployService.TriggerReload(ReloadKind.FullDeploy);
+        }
+        catch (Exception ex)
+        {
+            FamoLog.Append($"快捷短语派生物迁移失败：{ex.Message}");
         }
     }
 

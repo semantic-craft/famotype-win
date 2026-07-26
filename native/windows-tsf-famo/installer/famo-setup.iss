@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.4.8"
+  #define AppVersion  "1.5.3"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -319,8 +319,12 @@ begin
   RegQueryStringValue(HKLM64, BrandKey, 'ProfileTool', PreviousProfileTool);
   RegQueryStringValue(HKLM64, BrandKey, 'ActiveVersion', PreviousVersion);
   RegQueryStringValue(HKLM64, BrandKey, 'Identity', PreviousIdentity);
-  RegQueryStringValue(HKCU,
-    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', PreviousHost);
+  { Prefer the machine-scoped registration; fall back to HKCU so upgrades from
+    builds that still registered per-user find their previous host. }
+  if not RegQueryStringValue(HKLM64,
+    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', PreviousHost) then
+    RegQueryStringValue(HKCU,
+      'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', PreviousHost);
   if (PreviousTarget = '') and (PreviousHost <> '') then
     PreviousTarget := ExtractFileDir(PreviousHost);
   if (PreviousProfileTool = '') and (PreviousTarget <> '') and
@@ -576,7 +580,7 @@ var
   RegisteredDll, RunValue: String;
 begin
   VerifyPayloadOrFail;
-  if not RegQueryStringValue(HKCU,
+  if not RegQueryStringValue(HKLM64,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) or
     (CompareText(RegisteredDll,
       AddBackslash(TransactionTarget) + 'FamoTextService.dll') <> 0) then
@@ -617,9 +621,16 @@ end;
 procedure StartRuntimeAsOriginalUser;
 var
   ResultCode: Integer;
+  Runtime: String;
 begin
-  if not ExecAsOriginalUser(AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
-    '', '', SW_HIDE, ewNoWait, ResultCode) then
+  Runtime := AddBackslash(TransactionTarget) + 'FamoRuntime.exe';
+  if ResumeMode then
+  begin
+    if not RunAndRequire(ProfileTool(TransactionTarget), 'start-runtime', False) then
+      RaiseException('desktop user runtime start failed');
+  end
+  else if not ExecAsOriginalUser(Runtime, '', '', SW_HIDE, ewNoWait,
+    ResultCode) then
     RaiseException('runtime start failed');
   RuntimeStarted := True;
   Sleep(750);
@@ -628,6 +639,8 @@ end;
 procedure InstallUserState;
 var
   SeedArguments: String;
+  DeployAttempt: Integer;
+  DeployOk: Boolean;
 begin
   SeedArguments := '--seed-only';
   if (PreviousHost <> '') and not PreviousProfileActive then
@@ -635,8 +648,23 @@ begin
   if not RunAndRequire(AddBackslash(TransactionTarget) + 'settings\FamoSettings.exe',
     SeedArguments, True) then RaiseException('user seed failed');
   StartRuntimeAsOriginalUser;
-  if not RunAndRequire(AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
-    '--control deploy', True) then RaiseException('runtime deploy failed');
+  { First launch of freshly written binaries is slow (Defender scans them on
+    execute), so the runtime's control pipe may not be up 750ms after start.
+    One shot here killed a real 1.4.9 install; the control client is
+    idempotent, so retry briefly instead. }
+  DeployOk := False;
+  for DeployAttempt := 1 to 5 do
+  begin
+    if RunAndRequire(AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
+      '--control deploy', True) then
+    begin
+      DeployOk := True;
+      Break;
+    end;
+    Sleep(2000);
+  end;
+  if not DeployOk then
+    RaiseException('runtime deploy failed');
 end;
 
 procedure RollbackTransaction;
@@ -688,7 +716,9 @@ var
   RegisteredDll: String;
 begin
   VerifyPayloadOrFail;
-  if not RegQueryStringValue(HKCU,
+  { COM registration is machine-scoped since the HKLM re-registration fix --
+    an HKCU-only TIP never shows in the Win11 immersive switcher. }
+  if not RegQueryStringValue(HKLM64,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) then
     RaiseException('active COM registration missing');
   if CompareText(RegisteredDll, AddBackslash(TransactionTarget) + 'FamoTextService.dll') <> 0 then
@@ -698,8 +728,26 @@ begin
 end;
 
 procedure CompletePendingTransaction;
+var
+  EnableAttempt: Integer;
+  EnableOk: Boolean;
 begin
-  if not RunAndRequire(ProfileTool(TransactionTarget), 'enable', False) then
+  { The resume runs from RunOnce, early in logon -- the CTF/TSF services may
+    not be up yet, which is exactly how the 1.4.8 rollout died here on a real
+    machine (enable failed once, transaction went terminal). The per-user
+    enable is idempotent, so retry briefly instead of failing the whole
+    transaction on the first attempt. }
+  EnableOk := False;
+  for EnableAttempt := 1 to 5 do
+  begin
+    if RunAndRequire(ProfileTool(TransactionTarget), 'enable', False) then
+    begin
+      EnableOk := True;
+      Break;
+    end;
+    Sleep(2000);
+  end;
+  if not EnableOk then
     RaiseException('pending profile enable failed');
   RegistrationSwitched := True;
   WriteActiveRegistry(TransactionTarget, 'Activating');
@@ -985,7 +1033,9 @@ begin
   if not UnregisterTarget(ActiveTarget) then
     RaiseException('cannot unregister Famo profile');
   RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
-  if RegQueryStringValue(HKCU,
+  if RegQueryStringValue(HKLM64,
+    'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) or
+     RegQueryStringValue(HKCU,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) then
     RaiseException('dangling COM override after unregister');
   UninstallPrepared := True;

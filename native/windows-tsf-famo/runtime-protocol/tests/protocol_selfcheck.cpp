@@ -171,6 +171,7 @@ int main() {
   CHECK(!EncodeControlOperationId(0, &payload));
 
   CHECK(IsControlOperation(Command::ControlDeploy));
+  CHECK(IsControlOperation(Command::ControlResetUserDictionary));
   CHECK(!IsControlOperation(Command::ControlStatus));
   source.command = Command::ControlShutdown;
   source.payload.clear();

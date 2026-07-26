@@ -43,6 +43,8 @@ public class ConfigWriterDeployTests
 
         // emoji reset 0（法墨出厂关）。
         Assert.Matches(@"(?s)- name:\s*emoji\b.*?reset:\s*0", yaml);
+        Assert.Contains("states: [ 中, 英 ]", yaml);
+        Assert.Contains("states: [ 👍, 😄 ]", yaml);
         // tone_display 已下线，不应再有该 active switch（注释里提一句不算）。
         Assert.DoesNotMatch(@"name:\s*tone_display", yaml);
         // 无模糊音时不追加实际 derive 规则。

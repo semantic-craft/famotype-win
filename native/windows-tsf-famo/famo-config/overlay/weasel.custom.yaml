@@ -19,6 +19,9 @@ patch:
     comment_font_point: 15.2          # 即时桶：主字号 × 0.8（0=隐藏注释）
     horizontal: true                  # 即时桶：appearance.orientation（true=横排）
     inline_preedit: false             # 即时桶：appearance.inlinePreedit
+    show_preedit: true                # 候选窗输入串 + 可移动光标（独立于内嵌预编辑）
+    preview_pages: false              # 横排候选条预览后页
+    preview_rows: 2                   # 后页预览 1–2 行
     preedit_type: composition         # 即时桶：appearance.inlineCandidatePreview（composition=原样/preview=候选预览）
     layout:
       corner_radius: 13               # 即时桶：appearance.layout.cornerRadius

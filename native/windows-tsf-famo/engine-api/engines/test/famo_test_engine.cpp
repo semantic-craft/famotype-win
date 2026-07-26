@@ -8,6 +8,7 @@
 //
 // All memory returned in a FamoCompositionView is allocated with the host
 // allocator installed at initialize() and released symmetrically in free_view().
+#include <algorithm>
 #include <cstdint>
 #include <chrono>
 #include <cstdlib>
@@ -78,6 +79,30 @@ void HostFreeStr(FamoUtf8String* v) {
   }
 }
 
+void FillCandidates(const std::vector<std::string>& candidates, size_t start,
+                    size_t count, FamoCompositionView* out) {
+  if (!out || !g_host.alloc || start >= candidates.size() || count == 0)
+    return;
+  const size_t end = (std::min)(candidates.size(), start + count);
+  const size_t size = end - start;
+  auto* array = static_cast<FamoCandidate*>(
+      g_host.alloc(sizeof(FamoCandidate) * size));
+  if (!array)
+    return;
+  for (size_t i = 0; i < size; ++i) {
+    std::memset(&array[i], 0, sizeof(FamoCandidate));
+    array[i].size = static_cast<uint32_t>(sizeof(FamoCandidate));
+    array[i].text = Dup(candidates[start + i]);
+    array[i].comment = Dup("");
+    array[i].flags = i == 0 ? FAMO_CANDIDATE_FLAG_DEFAULT : 0u;
+    const char digit[2] = {
+        static_cast<char>('0' + ((start + i + 1) % 10)), '\0'};
+    array[i].label = Dup(digit);
+  }
+  out->candidates = array;
+  out->candidate_count = static_cast<uint32_t>(size);
+}
+
 // A static (non-owned) FamoUtf8String pointing at a literal, for get_info.
 FamoUtf8String Static(const char* s) {
   FamoUtf8String v;
@@ -95,27 +120,10 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
   out->commit = Dup(commit);
 
   std::vector<std::string> cands = CandidatesFor(buffer);
-  if (!cands.empty() && g_host.alloc) {
-    auto* arr = static_cast<FamoCandidate*>(
-        g_host.alloc(sizeof(FamoCandidate) * cands.size()));
-    if (arr) {
-      for (size_t i = 0; i < cands.size(); ++i) {
-        std::memset(&arr[i], 0, sizeof(FamoCandidate));
-        arr[i].size = static_cast<uint32_t>(sizeof(FamoCandidate));
-        arr[i].text = Dup(cands[i]);
-        arr[i].comment = Dup("");
-        arr[i].quality = 0;
-        arr[i].flags = (i == 0) ? FAMO_CANDIDATE_FLAG_DEFAULT : 0u;
-        // v1.2 label: deterministic 1..9,0 select digit (matches the RIME
-        // engine's (i+1)%10 fallback), so roundtrip_selfcheck can assert it.
-        const char digit[2] = {static_cast<char>('0' + (i + 1) % 10), '\0'};
-        arr[i].label = Dup(digit);
-      }
-      out->candidates = arr;
-      out->candidate_count = static_cast<uint32_t>(cands.size());
-      out->page_size = static_cast<uint32_t>(cands.size());
-    }
-  }
+  FillCandidates(cands, 0, cands.size(), out);
+  const bool multipage = !Environment("FAMO_TEST_MULTIPAGE").empty() &&
+                         out->candidate_count > 1;
+  out->page_size = multipage ? 1u : out->candidate_count;
 
   uint32_t flags = 0;
   if (!buffer.empty()) flags |= FAMO_COMPOSITION_HAS_PREEDIT;
@@ -132,7 +140,7 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
   out->schema_id = Dup("test");
   out->schema_name = Dup("Test Engine");
   out->status_flags = FAMO_STATUS_COMPOSING * (buffer.empty() ? 0u : 1u);
-  out->is_last_page = 1u;  // v1.2: deterministic single-page engine
+  out->is_last_page = multipage ? 0u : 1u;
 }
 
 }  // namespace
@@ -140,6 +148,7 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
 // Opaque context is a real struct inside the DLL; only UTF-8 crosses the ABI.
 struct FamoEngineContext {
   std::string buffer;
+  std::string pending_commit;
 };
 
 namespace {
@@ -187,13 +196,28 @@ int32_t FAMO_ENGINE_CALL TeProcessKey(FamoEngineContext* context,
                                       FamoCompositionView* out_view) {
   if (!context || !key || !out_view) return FAMO_ENGINE_E_INVALID_ARGUMENT;
 
-  // Only act on key-down; key-up reflects current composition unchanged.
+  // A Shift release is handled only when the host supplies librime's expanded
+  // release bit.  The TSF integration check uses this to guard the direct
+  // host-to-engine mapping (Weasel's IPC wire format uses bit 14 instead).
   if (key->is_key_down != 1) {
-    FillView(context->buffer, "", false, out_view);
+    constexpr uint32_t kRimeShiftLeft = 0xffe1;
+    constexpr uint32_t kRimeShiftRight = 0xffe2;
+    constexpr uint32_t kRimeReleaseMask = 1u << 30;
+    const bool handled =
+        (key->virtual_key == kRimeShiftLeft ||
+         key->virtual_key == kRimeShiftRight) &&
+        (key->modifiers & kRimeReleaseMask) != 0;
+    FillView(context->buffer, "", handled, out_view);
     return FAMO_ENGINE_OK;
   }
 
   const uint32_t vk = key->virtual_key;
+  if (vk == 0xff60 && !context->pending_commit.empty()) {
+    std::string commit = std::move(context->pending_commit);
+    FillView(context->buffer, commit, false, out_view);
+    return FAMO_ENGINE_OK;
+  }
+
   bool handled = false;
   if (vk >= 'a' && vk <= 'z') {
     context->buffer.push_back(static_cast<char>(vk));
@@ -234,6 +258,11 @@ int32_t FAMO_ENGINE_CALL TeSelectCandidate(FamoEngineContext* context, uint32_t 
   if (index >= cands.size()) return FAMO_ENGINE_E_INVALID_ARGUMENT;
   std::string commit = cands[index];
   context->buffer.clear();
+  if (!Environment("FAMO_TEST_DEFER_SELECTION_COMMIT").empty()) {
+    context->pending_commit = std::move(commit);
+    FillView(context->buffer, "", true, out_view);
+    return FAMO_ENGINE_OK;
+  }
   FillView(context->buffer, commit, true, out_view);
   return FAMO_ENGINE_OK;
 }
@@ -320,6 +349,17 @@ int32_t FAMO_ENGINE_CALL TeChangePage(FamoEngineContext* context, int32_t /*back
   return FAMO_ENGINE_OK;  // stub: single page
 }
 
+int32_t FAMO_ENGINE_CALL TePeekCandidates(FamoEngineContext* context,
+                                          uint32_t index, uint32_t count,
+                                          FamoCompositionView* out_view) {
+  if (!context || !out_view || count > 64)
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  std::memset(out_view, 0, sizeof(*out_view));
+  out_view->size = static_cast<uint32_t>(sizeof(FamoCompositionView));
+  FillCandidates(CandidatesFor(context->buffer), index, count, out_view);
+  return FAMO_ENGINE_OK;
+}
+
 }  // namespace
 
 extern "C" FAMO_ENGINE_EXPORT int32_t FAMO_ENGINE_CALL
@@ -347,5 +387,6 @@ FamoCreateEngineApi(uint32_t requested_abi_version, FamoEngineApi* out_api) {
   out_api->clear_composition = &TeClearComposition;
   out_api->highlight_candidate = &TeHighlightCandidate;
   out_api->change_page = &TeChangePage;
+  out_api->peek_candidates = &TePeekCandidates;
   return FAMO_ENGINE_OK;
 }

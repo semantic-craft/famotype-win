@@ -326,6 +326,51 @@ int RunOffsetConversion() {
   return 0;
 }
 
+int RunPreeditAndPreview() {
+  Cand main_source[2] = {{"1", kNiHao, nullptr},
+                         {"2", kMixed, nullptr}};
+  Cand preview_source[4] = {{nullptr, kEmoji, nullptr},
+                            {nullptr, kNiHao, nullptr},
+                            {nullptr, kMixed, nullptr},
+                            {nullptr, kCjkEmoji, nullptr}};
+  FamoCandidate main_candidates[2];
+  FamoCandidate preview_candidates[4];
+  FillCands(main_candidates, main_source, 2);
+  FillCands(preview_candidates, preview_source, 4);
+
+  FamoSkin skin = FamoSkinDefault();
+  skin.layout_type = FAMO_LAYOUT_HORIZONTAL;
+  skin.preview_pages = 1;
+  skin.preview_rows = 2;
+  FamoLayoutInput input =
+      MakeInput(R(400, 300, 402, 320), R(0, 0, 1920, 1080));
+  input.preview_candidates = preview_candidates;
+  input.preview_candidate_count = 4;
+  input.preview_page_size = 2;
+  FamoCompositionView view = MakeView(main_candidates, 2, 0, 0, 0);
+
+  FamoLayoutResult shown{};
+  CHECK(FamoCandidateUiLayout(&view, &skin, &input, &shown) == FAMO_UI_OK);
+  CHECK(NonEmpty(shown.preedit));
+  CHECK(shown.preview_candidate_count == 4);
+  CHECK(shown.preview_candidates[2].bounds.top >
+        shown.preview_candidates[0].bounds.top);
+
+  skin.show_preedit = 0;
+  FamoLayoutResult hidden{};
+  CHECK(FamoCandidateUiLayout(&view, &skin, &input, &hidden) == FAMO_UI_OK);
+  CHECK(IsEmpty(hidden.preedit));
+  CHECK(hidden.content_size.cy < shown.content_size.cy);
+
+  skin.layout_type = FAMO_LAYOUT_VERTICAL;
+  FamoLayoutResult vertical{};
+  CHECK(FamoCandidateUiLayout(&view, &skin, &input, &vertical) == FAMO_UI_OK);
+  CHECK(vertical.preview_candidate_count == 0);
+  CHECK(vertical.candidates[0].bounds.right ==
+        vertical.candidates[1].bounds.right);
+  return 0;
+}
+
 int RunArgGuards() {
   FamoSkin sk = FamoSkinDefault();
   FamoLayoutInput in = MakeInput(R(0, 0, 2, 20), R(0, 0, 1920, 1080));
@@ -350,6 +395,7 @@ int main() {
   if (RunFamily(FAMO_LAYOUT_VERTICAL_TEXT)) return 1;
   if (RunFlip()) return 1;
   if (RunOffsetConversion()) return 1;
+  if (RunPreeditAndPreview()) return 1;
   if (RunArgGuards()) return 1;
   std::printf("geometry_selfcheck: OK\n");
   return 0;

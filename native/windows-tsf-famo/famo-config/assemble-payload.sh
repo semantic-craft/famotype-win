@@ -13,6 +13,7 @@
 #                             带入 4 个 wubi 变体 (wubi86_jidian / _pinyin / _trad / _trad_pinyin)、
 #                             其反查依赖 pinyin_simp(.schema/.dict)、numbers.schema、各 wubi dict、
 #                             KyleBing lua（五笔反查自洽，不依赖 rime-ice）。无法学五笔。
+#   - BYVoid/OpenCC 1.1.9   : rime-ice/五笔简繁转换所需的标准配置和 ocd2 词典。Apache-2.0。
 #   - 法墨 overlay/         : 本仓 default.custom.yaml / weasel.custom.yaml / rime_ice.custom.yaml。GPLv3。
 #
 # lua 解析：rime-ice 与 KyleBing 均走 librime 的 `*函数名` 约定（lua_translator@*name 自动
@@ -32,6 +33,7 @@ PAYLOAD_DIR="${SCRIPT_DIR}/payload"
 CACHE_DIR="${SCRIPT_DIR}/.cache"
 ICE_DIR="${CACHE_DIR}/rime-ice"
 WUBI_DIR="${CACHE_DIR}/rime-wubi86-jidian"
+OPENCC_STANDARD_DIR="${SCRIPT_DIR}/opencc-standard"
 
 ICE_REPO="https://github.com/iDvel/rime-ice.git"
 ICE_REF="${ICE_REF:-main}"   # 可用环境变量钉住特定 tag/commit
@@ -110,6 +112,21 @@ copy_base() {
         -cf - . ) | ( cd "${PAYLOAD_DIR}" && tar -xf - )
 
   log "rime-ice 基座已落地($(find "${PAYLOAD_DIR}" -type f | wc -l | tr -d ' ') 文件)。"
+}
+
+# rime-ice 只携带 emoji OpenCC 数据；s2t/s2hk 是前端通常预装的标准数据。
+# 法墨使用自足 data_root，必须显式带入，否则开关会变成“状态已繁、候选仍简”。
+overlay_opencc_standard() {
+  mkdir -p "${PAYLOAD_DIR}/opencc"
+  for f in s2t.json s2hk.json STCharacters.ocd2 STPhrases.ocd2 HKVariants.ocd2 LICENSE; do
+    [ -f "${OPENCC_STANDARD_DIR}/${f}" ] || die "缺少 OpenCC 标准数据：opencc-standard/${f}"
+    if [ "${f}" = LICENSE ]; then
+      cp "${OPENCC_STANDARD_DIR}/${f}" "${PAYLOAD_DIR}/opencc/OpenCC.LICENSE"
+    else
+      cp "${OPENCC_STANDARD_DIR}/${f}" "${PAYLOAD_DIR}/opencc/${f}"
+    fi
+  done
+  log "OpenCC 标准简繁数据已叠加（s2t + s2hk）。"
 }
 
 # ── 3. 防御式剔除法学层(应为空操作)───────────────────────────────────────────
@@ -249,6 +266,9 @@ verify() {
            pinyin_simp.dict.yaml numbers.schema.yaml \
            lua/wubi86_jidian_date_translator.lua \
            wubi86-jidian.LICENSE \
+           opencc/s2t.json opencc/s2hk.json \
+           opencc/STCharacters.ocd2 opencc/STPhrases.ocd2 \
+           opencc/HKVariants.ocd2 opencc/OpenCC.LICENSE \
            default.custom.yaml weasel.custom.yaml rime_ice.custom.yaml; do
     if [ -f "${PAYLOAD_DIR}/${f}" ]; then
       log "  ✓ ${f}"
@@ -275,6 +295,7 @@ main() {
   fetch_rime_ice
   fetch_wubi
   copy_base
+  overlay_opencc_standard
   overlay_wubi
   ensure_wubi_pinyin_traditionalization
   strip_law_layer

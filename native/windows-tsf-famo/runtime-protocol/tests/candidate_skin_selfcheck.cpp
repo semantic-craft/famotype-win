@@ -31,6 +31,9 @@ int main() {
          "  comment_font_point: 11\n"
          "  horizontal: true\n"
          "  inline_preedit: true\n"
+         "  show_preedit: false\n"
+         "  preview_pages: true\n"
+         "  preview_rows: 1\n"
          "  preedit_type: preview\n"
          "  famo_auto_pair: true\n"
          "  famo_cjk_english_spacing: true\n"
@@ -46,17 +49,55 @@ int main() {
   CHECK(skin.text_font.point_size == 19.0f);
   CHECK(skin.round_corner == 9 && skin.border == 2);
   CHECK(skin.margin_x == 15 && skin.margin_y == 16);
+  CHECK(skin.show_preedit == 0 && skin.preview_pages == 1 &&
+        skin.preview_rows == 1);
   CHECK(skin.hilited_back_color == 0xff3ca081u);
   CHECK(skin.text_color == 0xff98a19cu);
   CHECK(skin.candidate_text_color == 0xffe5eae7u);
   CHECK(skin.label_color == 0xff98a19cu);
   CHECK(skin.comment_color == 0xff66706bu);
-  CHECK(skin.shadow_color == 0x73000000u);
+  CHECK(skin.shadow_color == 0x80000000u);
+
+  struct PaletteCase {
+    const char *name;
+    uint32_t accent, deep, card, card2, on_accent, ink, ink2, ink3;
+  };
+  const PaletteCase mac_parity[] = {
+      {"illinois", 0xff13294b, 0xffcc4a00, 0xfffcf4e9, 0xfffbe7d4,
+       0xffff7a2e, 0xff13294b, 0xff6e5a3a, 0xff9a8a6e},
+      {"illinois_dark", 0xffff7a2e, 0xff13294b, 0xff1e2334, 0xff262e44,
+       0xff13294b, 0xffece6dc, 0xff9aa0b0, 0xff6a7185},
+      {"illinoisflame", 0xffc24a00, 0xff9a3a00, 0xfffdf6ec,
+       0xfff6e9d4, 0xfffff4e8, 0xff3a2a1b, 0xff7b6248, 0xffab9174},
+      {"illinoisflame_dark", 0xffff6e24, 0xffc24a00, 0xff241a12,
+       0xff2c2117, 0xff2b1707, 0xfff1e5d7, 0xffb49c85, 0xff7f6c59},
+      {"nyu", 0xff57068c, 0xff3f0567, 0xfffbf9fe, 0xfff2ecf9,
+       0xfffbf9fe, 0xff2a2333, 0xff655b79, 0xff958bac},
+      {"nyu_dark", 0xffa274da, 0xff57068c, 0xff242029, 0xff1d1a25,
+       0xff15101f, 0xffeae5f1, 0xffa99ebb, 0xff786c8c},
+  };
+  for (const PaletteCase &p : mac_parity) {
+    std::ofstream(root / "famo-style.yaml")
+        << "style:\n  color_scheme: " << p.name << "\n";
+    CHECK(LoadCandidateSkin(root.string(), &skin));
+    CHECK(skin.hilited_back_color == p.accent);
+    CHECK(skin.border_color == ((p.deep & 0x00ffffffu) | 0x29000000u));
+    CHECK((skin.back_color & 0x00ffffffu) ==
+          (p.card & 0x00ffffffu));
+    CHECK((skin.back_color >> 24) == 0xb8u ||
+          (skin.back_color >> 24) == 0xffu);
+    CHECK(skin.card2_color == p.card2);
+    CHECK(skin.hilited_text_color == p.on_accent);
+    CHECK(skin.candidate_text_color == p.ink);
+    CHECK(skin.text_color == p.ink2);
+    CHECK(skin.comment_color == p.ink3);
+  }
 
   FamoSkin high_contrast = FamoSkinDefault();
   ApplyHighContrastPalette(&high_contrast, 0xff010203u, 0xfff1f2f3u,
                            0xff112233u, 0xffe1e2e3u);
   CHECK(high_contrast.back_color == 0xff010203u);
+  CHECK(high_contrast.card2_color == 0xff010203u);
   CHECK(high_contrast.text_color == 0xfff1f2f3u);
   CHECK(high_contrast.candidate_text_color == 0xfff1f2f3u);
   CHECK(high_contrast.label_color == 0xfff1f2f3u);

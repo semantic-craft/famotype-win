@@ -45,6 +45,11 @@ int StatusBarHitTest(const StatusBarLayout &layout, int x, int y);
 bool StatusBarHitsSchema(const StatusBarLayout &layout, int x, int y);
 // Engine option a button toggles; nullptr out of range.
 const char *StatusBarOption(int index);
+// The simplification segment fans out to the option used by Wubi schemas.
+const char *StatusBarSecondaryOption(int index);
+// Desired engine-option value after a click. Simplified status is the inverse
+// of the traditionalization options; the other flags match their options.
+bool StatusBarNextOptionValue(uint32_t status_flags, int index);
 // Whether a button draws enabled for these status flags.
 bool StatusBarButtonOn(uint32_t status_flags, int index);
 // The label a button draws: the state the option is currently IN (中 vs 英),
@@ -70,6 +75,11 @@ bool StatusBarParseSchemaName(std::istream &yaml, std::string_view id,
 // input method. Ordered keyword match, first hit wins, first character only as
 // a last resort.
 std::string StatusBarSchemaGlyph(std::string_view name);
+// Target for a single click on the schema segment: normally the previous
+// schema, or the first different schema when there is no usable previous one.
+std::string StatusBarSchemaSwitchTarget(
+    std::string_view current_schema, std::string_view previous_schema,
+    const std::vector<std::string> &schema_list);
 
 // ─── Floating status bar position persistence ────────────────────────────────
 // The bar's screen top-left, then the schema a single click on the segment

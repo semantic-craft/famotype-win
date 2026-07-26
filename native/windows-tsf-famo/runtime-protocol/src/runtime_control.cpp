@@ -196,6 +196,7 @@ bool ParseControlCommand(std::wstring_view value, Command *command) {
   else if (value == L"reload-options") *command = Command::ControlReloadOptions;
   else if (value == L"select-schema") *command = Command::ControlSelectSchema;
   else if (value == L"deploy") *command = Command::ControlDeploy;
+  else if (value == L"reset-user-dictionary") *command = Command::ControlResetUserDictionary;
   else if (value == L"shutdown") *command = Command::ControlShutdown;
   else return false;
   return true;

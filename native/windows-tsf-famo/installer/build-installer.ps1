@@ -8,7 +8,7 @@
 param(
   [string] $NativeOutput = '',
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.4.8',
+  [string] $AppVersion = '1.5.3',
   [ValidateSet('Stable')]
   [string] $Identity = 'Stable',
   [string] $Configuration = 'Release',
@@ -105,6 +105,10 @@ Need $PayloadDir '先生成 famo-config/payload。'
 foreach ($required in @('default.yaml', 'weasel.yaml', 'opencc')) {
   Need (Join-Path $PayloadDir $required) 'payload 必须自足，不再从 Weasel build 回填。'
 }
+foreach ($required in @('s2t.json', 's2hk.json', 'STCharacters.ocd2',
+    'STPhrases.ocd2', 'HKVariants.ocd2', 'OpenCC.LICENSE')) {
+  Need (Join-Path $PayloadDir "opencc\$required") 'payload 缺少简繁转换所需的 OpenCC 标准数据。'
+}
 foreach ($icon in @('famo_zh.ico', 'famo_ascii.ico')) {
   NeedSameFileHash (Join-Path $OverlayDir $icon) (Join-Path $PayloadDir $icon) 'payload 图标过期。'
 }
@@ -128,6 +132,7 @@ Need $SettingsProj '设置面板工程缺失。'
 $dotnet = Find-DotNetSdk
 & $dotnet publish $SettingsProj -c $Configuration -r win-x64 --self-contained `
   -p:WindowsAppSDKSelfContained=true -p:WindowsPackageType=None `
+  -p:Version=$AppVersion -p:InformationalVersion=$AppVersion `
   -o (Join-Path $PayloadStage 'settings') --nologo
 if ($LASTEXITCODE -ne 0) { throw 'dotnet publish 失败。' }
 

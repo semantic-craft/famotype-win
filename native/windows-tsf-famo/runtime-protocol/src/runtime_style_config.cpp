@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <charconv>
 #include <set>
 #include <string>
 
@@ -49,6 +50,20 @@ bool ParseBoolean(std::string_view value, bool *parsed) {
   return true;
 }
 
+bool ParsePreviewRows(std::string_view value, uint32_t *rows) {
+  value = Trim(value);
+  if (!rows)
+    return false;
+  uint32_t parsed = 0;
+  const auto result = std::from_chars(value.data(), value.data() + value.size(),
+                                      parsed);
+  if (result.ec != std::errc{} || result.ptr != value.data() + value.size() ||
+      parsed < 1 || parsed > 2)
+    return false;
+  *rows = parsed;
+  return true;
+}
+
 } // namespace
 
 bool ParseHostBehaviorFlags(std::string_view text, uint32_t *flags) {
@@ -61,6 +76,9 @@ bool ParseHostBehaviorFlags(std::string_view text, uint32_t *flags) {
                                                     "comment_font_point",
                                                     "horizontal",
                                                     "inline_preedit",
+                                                    "show_preedit",
+                                                    "preview_pages",
+                                                    "preview_rows",
                                                     "preedit_type",
                                                     "corner_radius",
                                                     "border_width",
@@ -112,6 +130,8 @@ bool ParseHostBehaviorFlags(std::string_view text, uint32_t *flags) {
           bit = kHostCjkEnglishSpacing;
         else if (key == "famo_cjk_number_spacing")
           bit = kHostCjkNumberSpacing;
+        else if (key == "preview_pages")
+          bit = kHostPreviewPages;
         if (bit != 0) {
           if (!ParseBoolean(value, &enabled))
             return false;
@@ -122,6 +142,15 @@ bool ParseHostBehaviorFlags(std::string_view text, uint32_t *flags) {
             return false;
           if (value == "preview")
             *flags |= kHostCandidatePreview;
+        } else if (key == "preview_rows") {
+          uint32_t rows = 0;
+          if (!ParsePreviewRows(value, &rows))
+            return false;
+          if (rows == 2)
+            *flags |= kHostPreviewRowsTwo;
+        } else if (key == "show_preedit") {
+          if (!ParseBoolean(value, &enabled))
+            return false;
         }
       }
     }

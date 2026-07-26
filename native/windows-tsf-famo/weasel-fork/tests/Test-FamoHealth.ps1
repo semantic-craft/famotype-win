@@ -7,7 +7,8 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 $brandKey = 'HKLM:\Software\Famo\InputMethod'
-$comKey = 'HKCU:\Software\Classes\CLSID\{54EAD76A-B864-4A6D-9C82-148E3352BEE7}\InprocServer32'
+$machineComKey = 'HKLM:\Software\Classes\CLSID\{54EAD76A-B864-4A6D-9C82-148E3352BEE7}\InprocServer32'
+$userComKey = 'HKCU:\Software\Classes\CLSID\{54EAD76A-B864-4A6D-9C82-148E3352BEE7}\InprocServer32'
 $tipKey = 'HKLM:\Software\Microsoft\CTF\TIP\{54EAD76A-B864-4A6D-9C82-148E3352BEE7}'
 $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runOnceKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
@@ -108,12 +109,13 @@ function Test-ControlPipe {
 }
 
 $brandPresent = Test-Path -LiteralPath $brandKey
-$comPresent = Test-Path -LiteralPath $comKey
+$machineComPresent = Test-Path -LiteralPath $machineComKey
+$userComPresent = Test-Path -LiteralPath $userComKey
 $tipPresent = Test-Path -LiteralPath $tipKey
 $runValue = [string](Get-ItemProperty -LiteralPath $runKey -Name FamoRuntime -ErrorAction SilentlyContinue).FamoRuntime
 $resumeValue = [string](Get-ItemProperty -LiteralPath $runOnceKey -Name FamoResumePending -ErrorAction SilentlyContinue).FamoResumePending
 $brand = if ($brandPresent) { Get-ItemProperty -LiteralPath $brandKey } else { $null }
-$notInstalled = -not $brandPresent -and -not $comPresent -and -not $tipPresent -and -not $runValue -and -not $resumeValue
+$notInstalled = -not $brandPresent -and -not $machineComPresent -and -not $userComPresent -and -not $tipPresent -and -not $runValue -and -not $resumeValue
 $installState = if ($brand) { [string]$brand.InstallState } else { 'NotInstalled' }
 $isPending = $installState -eq 'PendingReboot'
 $terminalStates = @('Ready', 'RolledBack', 'PendingReboot')
@@ -145,14 +147,14 @@ Add-Check 'H3b' 'S0' ([bool]$manifestResult.pass) ([string]$manifestResult.detai
 
 $registeredDll = ''
 $threadingModel = ''
-if ($comPresent) {
-  $com = Get-Item -LiteralPath $comKey
+if ($machineComPresent) {
+  $com = Get-Item -LiteralPath $machineComKey
   $registeredDll = [string]$com.GetValue('')
   $threadingModel = [string]$com.GetValue('ThreadingModel')
 }
-$comOk = $comPresent -and (Same-Path $registeredDll (Join-Path $target 'FamoTextService.dll')) -and $threadingModel -eq 'Apartment'
+$comOk = $machineComPresent -and -not $userComPresent -and (Same-Path $registeredDll (Join-Path $target 'FamoTextService.dll')) -and $threadingModel -eq 'Apartment'
 Add-Check 'H4' 'S0' ($notInstalled -or [bool]$comOk) `
-  $(if ($notInstalled) { 'HKCU COM override absent' } else { "COM=$registeredDll; ThreadingModel=$threadingModel" })
+  $(if ($notInstalled) { 'COM registration absent' } else { "HKLM COM=$registeredDll; ThreadingModel=$threadingModel; HKCU override=$userComPresent" })
 
 $profileOutput = ''
 $profileExit = -1

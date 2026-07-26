@@ -38,7 +38,8 @@ extern "C" FamoSkin FamoSkinDefault(void) {
   s.hilited_comment_color = 0xFFFBF9F5u;
   s.prevpage_color        = 0xFF9A9387u;
   s.nextpage_color        = 0xFF9A9387u;
-  s.shadow_color          = 0x29000000u;
+  s.shadow_color          = 0x38000000u;
+  s.card2_color           = 0xFFF3EFE7u;
 
   SetFace(&s.label_font,   "Segoe UI", 13.7f);
   SetFace(&s.text_font,    "Segoe UI", 19.0f);
@@ -56,8 +57,8 @@ extern "C" FamoSkin FamoSkinDefault(void) {
   s.border            = 1;
   s.shadow_radius     = 16;
   s.shadow_offset_x   = 0;
-  s.shadow_offset_y   = 7;
-  s.min_width         = 150;
+  s.shadow_offset_y   = 8;
+  s.min_width         = 76;  // vertical: base candidate size * 4 (macOS parity)
   s.min_height        = 0;
   s.max_width         = 0;  // unlimited
   s.max_height        = 0;
@@ -65,6 +66,9 @@ extern "C" FamoSkin FamoSkinDefault(void) {
   // 2px floor: 1px is the old hardcoded value and is thin enough to disappear on
   // high-DPI. The host overwrites this with SPI_GETCARETWIDTH when it has one.
   s.caret_width       = 2;
+  s.show_preedit      = 1;
+  s.preview_pages     = 0;
+  s.preview_rows      = 2;
 
   return s;
 }

@@ -67,12 +67,16 @@ public sealed class QuickPhraseStore
         Save(LoadOrThrow().Where(e => e.Code != normalizedCode));
     }
 
-    public void WriteTableDb(string? tablePath = null)
+    public bool WriteTableDb(string? tablePath = null)
     {
         string path = tablePath ?? FamoPaths.QuickSendTableFile;
+        string content = BuildTableDb(LoadOrThrow());
+        if (File.Exists(path) && File.ReadAllText(path) == content) return false;
+
         string dir = Path.GetDirectoryName(path)!;
         Directory.CreateDirectory(dir);
-        WriteAtomic(path, BuildTableDb(LoadOrThrow()));
+        WriteAtomic(path, content);
+        return true;
     }
 
     /// <summary>与 <see cref="Load"/> 相同，但读取/反序列化失败时直接抛出，不当作空短语库处理，
@@ -107,14 +111,13 @@ public sealed class QuickPhraseStore
         var sb = new System.Text.StringBuilder();
         sb.Append("# Rime table\n");
         sb.Append("# coding: utf-8\n");
-        sb.Append("#@/db_name famo_quick_send\n");
-        sb.Append("#@/db_type tabledb\n");
+        sb.Append("#@/db_name\tfamo_quick_send\n");
+        sb.Append("#@/db_type\ttabledb\n");
         sb.Append("# Famo quick-send phrases. Managed by 法墨输入法 settings.\n\n");
 
         foreach (QuickPhraseEntry entry in Normalized(entries, skipInvalid: false))
         {
             sb.Append(entry.Text).Append('\t').Append(entry.Code).Append('\t').Append(Weight).Append('\n');
-            sb.Append(entry.Text).Append('\t').Append('v').Append(entry.Code).Append('\t').Append(Weight).Append('\n');
         }
         return sb.ToString();
     }
