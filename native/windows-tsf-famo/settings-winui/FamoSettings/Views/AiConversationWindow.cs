@@ -47,7 +47,7 @@ public sealed class AiConversationWindow : Window
         var sp = new StackPanel();
         sp.Children.Add(FamoUI.PaneHeader(_selectedText is null ? "任意提问" : "划词工具箱", _selectedText is null
             ? "只处理你在这里主动发送的文本；不会读取普通输入候选。"
-            : "选择一个明确技能，或在下方任意提问；每个技能在独立窗口中运行。"));
+            : "翻译和辅助检索会留在本窗口，其他技能使用各自的确认窗口。"));
 
         _status = new TextBlock
         {
@@ -99,8 +99,9 @@ public sealed class AiConversationWindow : Window
         if (askEnabled)
         {
             sp.Children.Add(FamoUI.Card("任意提问", FamoUI.RowFull(_prompt), FamoUI.RowFull(BuildActions(), divider: true)));
-            sp.Children.Add(FamoUI.Card("回答", FamoUI.RowFull(_result)));
         }
+        if (askEnabled || _selectedText is not null)
+            sp.Children.Add(FamoUI.Card("回答", FamoUI.RowFull(_result)));
 
         root.Content = sp;
         Content = root;
@@ -124,8 +125,13 @@ public sealed class AiConversationWindow : Window
                 HorizontalAlignment = HorizontalAlignment.Stretch,
                 IsEnabled = App.Settings.Ai.CloudEnabled,
             };
-            button.Click += (_, _) =>
+            button.Click += async (_, _) =>
             {
+                if (skill.Id is "translation" or "research-assist")
+                {
+                    await RunToolboxSkillAsync(skill, button);
+                    return;
+                }
                 App.ShowAiSelectionSkill(skill, _selectedText!, _replacement);
                 Close();
             };
@@ -144,6 +150,29 @@ public sealed class AiConversationWindow : Window
             });
         }
         return FamoUI.Card("技能", FamoUI.RowFull(grid));
+    }
+
+    private async Task RunToolboxSkillAsync(AiSelectionSkillDefinition skill, Button button)
+    {
+        button.IsEnabled = false;
+        SetStatus(skill.RunningMessage);
+        try
+        {
+            var service = new AiSelectionSkillService(App.Settings, _providerStore, _secretStore);
+            AiSelectionSkillResult response = await service.RunAsync(skill, _selectedText!, CancellationToken.None);
+            string result = string.Join("\n\n", response.Candidates);
+            _result.Text = result;
+            _turns.Add(new AiChatTurn($"执行技能：{skill.Title}", result));
+            SetStatus($"{skill.Title}已由 {response.Model} 返回，可继续追问或选择其他技能。");
+        }
+        catch (Exception ex)
+        {
+            SetStatus(ex.Message);
+        }
+        finally
+        {
+            button.IsEnabled = App.Settings.Ai.CloudEnabled;
+        }
     }
 
     private FrameworkElement BuildActions()
