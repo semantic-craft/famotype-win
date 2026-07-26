@@ -179,7 +179,8 @@ void RuntimeControlService::WorkerMain() {
                          : ControlState::Failed;
       result.error = control_error;
       result.retryable = control_error != ControlError::None &&
-                         control_error != ControlError::InvalidOperation;
+                         control_error != ControlError::InvalidOperation &&
+                         control_error != ControlError::UserDictionaryRollback;
       result.readiness = runtime_->readiness();
       result.engine_generation = runtime_->engine_generation();
     }

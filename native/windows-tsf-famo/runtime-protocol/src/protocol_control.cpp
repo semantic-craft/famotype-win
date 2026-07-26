@@ -10,7 +10,7 @@ bool KnownControlState(uint32_t value) {
 }
 
 bool KnownControlError(uint32_t value) {
-  return value <= static_cast<uint32_t>(ControlError::Runtime);
+  return value <= static_cast<uint32_t>(ControlError::UserDictionaryRollback);
 }
 
 bool KnownReadiness(uint32_t value) {

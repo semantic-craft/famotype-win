@@ -142,21 +142,34 @@ bool ReadSelectedSchema(std::string_view root, std::string *schema) {
 
 constexpr std::wstring_view kUserDatabaseSuffix = L".userdb";
 
-std::vector<std::filesystem::path>
-UserDatabases(const std::filesystem::path &root) {
-  std::vector<std::filesystem::path> result;
+bool TestSwitch(const wchar_t *name) {
+  wchar_t value[2]{};
+  return GetEnvironmentVariableW(name, value,
+                                 static_cast<DWORD>(std::size(value))) > 0;
+}
+
+bool UserDatabases(const std::filesystem::path &root,
+                   std::vector<std::filesystem::path> *result) {
+  if (!result || TestSwitch(L"FAMO_TEST_USERDB_ENUMERATION_DENIED"))
+    return false;
+  result->clear();
   std::error_code ec;
   for (std::filesystem::directory_iterator it(root, ec), end;
        !ec && it != end; it.increment(ec)) {
     const std::wstring name = it->path().filename().wstring();
-    if (it->is_directory(ec) && !ec && name.size() > kUserDatabaseSuffix.size() &&
+    const bool directory = it->is_directory(ec);
+    if (ec)
+      break;
+    if (directory && name.size() > kUserDatabaseSuffix.size() &&
         name.ends_with(kUserDatabaseSuffix))
-      result.push_back(it->path());
+      result->push_back(it->path());
   }
-  if (ec)
-    result.clear();
-  std::sort(result.begin(), result.end());
-  return result;
+  if (ec) {
+    result->clear();
+    return false;
+  }
+  std::sort(result->begin(), result->end());
+  return true;
 }
 
 std::filesystem::path UserDictionaryBackup(const std::filesystem::path &root) {
@@ -181,11 +194,14 @@ bool CopyDirectory(const std::filesystem::path &source,
 bool RestoreUserDatabases(const std::vector<std::filesystem::path> &databases,
                           const std::filesystem::path &backup) {
   bool restored = true;
+  bool inject_failure = TestSwitch(L"FAMO_TEST_USERDB_RESTORE_FAILURE");
   for (const auto &database : databases) {
     std::error_code ec;
     std::filesystem::remove_all(database, ec);
-    if (ec || !CopyDirectory(backup / database.filename(), database))
+    if (ec || inject_failure ||
+        !CopyDirectory(backup / database.filename(), database))
       restored = false;
+    inject_failure = false;
   }
   return restored;
 }
@@ -368,7 +384,9 @@ ControlError RuntimeService::ResetUserDictionary() {
   std::filesystem::path root;
   if (!Utf8Path(data_root_, L"", &root))
     return ControlError::Config;
-  const auto databases = UserDatabases(root);
+  std::vector<std::filesystem::path> databases;
+  if (!UserDatabases(root, &databases))
+    return ControlError::UserDictionaryEnumeration;
   if (databases.empty())
     return ControlError::None;
 
@@ -404,16 +422,25 @@ ControlError RuntimeService::ResetUserDictionary() {
   }
 
   bool removed = backed_up;
+  bool restored = true;
   if (backed_up) {
+    int removed_count = 0;
+    const bool inject_partial_delete =
+        TestSwitch(L"FAMO_TEST_USERDB_PARTIAL_DELETE_FAILURE");
     for (const auto &database : databases) {
+      if (inject_partial_delete && removed_count == 1) {
+        removed = false;
+        break;
+      }
       std::filesystem::remove_all(database, ec);
       if (ec) {
         removed = false;
         break;
       }
+      ++removed_count;
     }
     if (!removed)
-      RestoreUserDatabases(databases, backup);
+      restored = RestoreUserDatabases(databases, backup);
   }
 
   const int32_t load_rc = engine_.Load(engine_path_.c_str(), data_root_.c_str());
@@ -422,6 +449,10 @@ ControlError RuntimeService::ResetUserDictionary() {
       engine_.Unload();
     readiness_.store(RuntimeReadiness::Unavailable);
     return ControlError::Engine;
+  }
+  if (!restored) {
+    readiness_.store(RuntimeReadiness::Ready);
+    return ControlError::UserDictionaryRollback;
   }
   if (!backed_up || !removed) {
     readiness_.store(RuntimeReadiness::Ready);

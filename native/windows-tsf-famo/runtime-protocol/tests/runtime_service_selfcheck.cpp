@@ -417,6 +417,32 @@ int main() {
         ControlError::None);
   CHECK(service.engine_generation() == generation_before_reset + 1);
 
+  std::filesystem::create_directories(data_root / "rime_ice.userdb");
+  std::filesystem::create_directories(data_root / "wubi86_jidian.userdb");
+  std::ofstream(data_root / "rime_ice.userdb" / "CURRENT") << "rime-marker";
+  std::ofstream(data_root / "wubi86_jidian.userdb" / "CURRENT") << "wubi-marker";
+  _putenv_s("FAMO_TEST_USERDB_ENUMERATION_DENIED", "1");
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::UserDictionaryEnumeration);
+  CHECK(std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root / "wubi86_jidian.userdb" / "CURRENT"));
+  _putenv_s("FAMO_TEST_USERDB_ENUMERATION_DENIED", "");
+
+  _putenv_s("FAMO_TEST_USERDB_PARTIAL_DELETE_FAILURE", "1");
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::Runtime);
+  CHECK(std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root / "wubi86_jidian.userdb" / "CURRENT"));
+
+  _putenv_s("FAMO_TEST_USERDB_RESTORE_FAILURE", "1");
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::UserDictionaryRollback);
+  CHECK(service.readiness() == RuntimeReadiness::Ready);
+  CHECK(!std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root / "wubi86_jidian.userdb" / "CURRENT"));
+  _putenv_s("FAMO_TEST_USERDB_PARTIAL_DELETE_FAILURE", "");
+  _putenv_s("FAMO_TEST_USERDB_RESTORE_FAILURE", "");
+
   Frame invalidated_key = Request(Command::ProcessKey, 4);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 1},
                        &invalidated_key.payload));
