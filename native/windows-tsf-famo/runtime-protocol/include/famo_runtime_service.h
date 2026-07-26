@@ -104,6 +104,8 @@ private:
                                Session &session);
   bool CopyView(const FamoCompositionView &view, Composition *composition,
                 std::string *error) const;
+  bool ReadStatusLocked(FamoEngineContext *context,
+                        Composition *composition);
   void Publish(const Session &session, bool visible) noexcept;
   bool ApplyOptionsLocked(FamoEngineContext *context,
                           const std::map<std::string, bool> &options) const;

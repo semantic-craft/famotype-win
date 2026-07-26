@@ -139,7 +139,11 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
   out->commit_preview = Dup(buffer.empty() ? std::string() : CandidatesFor(buffer).front());
   out->schema_id = Dup("test");
   out->schema_name = Dup("Test Engine");
-  out->status_flags = FAMO_STATUS_COMPOSING * (buffer.empty() ? 0u : 1u);
+  out->status_flags =
+      (Environment("FAMO_TEST_SIMPLIFIED").empty()
+           ? 0u
+           : static_cast<uint32_t>(FAMO_STATUS_SIMPLIFIED)) |
+      (FAMO_STATUS_COMPOSING * (buffer.empty() ? 0u : 1u));
   out->is_last_page = multipage ? 0u : 1u;
 }
 

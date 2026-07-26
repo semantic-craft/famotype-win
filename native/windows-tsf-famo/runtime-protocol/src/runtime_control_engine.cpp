@@ -220,14 +220,9 @@ bool RuntimeService::SetOption(std::string_view name, bool value) {
       continue;
     // set_option reports only success, so pull the new status back through a
     // view that consumes nothing -- the same refresh the thin session ops use.
-    FamoCompositionView view{};
-    if (engine_.api().get_status(session.context, &view) == FAMO_ENGINE_OK) {
-      Composition composition;
-      std::string error;
-      const bool copied = CopyView(view, &composition, &error);
-      if (engine_.FreeView(&view) == FAMO_ENGINE_OK && copied)
-        session.composition = std::move(composition);
-    }
+    Composition composition;
+    if (ReadStatusLocked(session.context, &composition))
+      session.composition = std::move(composition);
     Publish(session, true);
     applied = true;
   }
@@ -238,34 +233,41 @@ bool RuntimeService::SetOption(std::string_view name, bool value) {
 
 bool RuntimeService::ReplaceContextsLocked(
     std::string_view schema, const std::map<std::string, bool> &options) {
-  std::vector<std::pair<Session *, FamoEngineContext *>> replacements;
+  struct Replacement {
+    Session *session;
+    FamoEngineContext *context;
+    Composition composition;
+  };
+  std::vector<Replacement> replacements;
   replacements.reserve(sessions_.size());
   const FamoUtf8String engine_schema = EngineString(schema);
   for (auto &[key, session] : sessions_) {
     (void)key;
     FamoEngineContext *replacement = nullptr;
+    Composition composition;
     if (engine_.api().create_context(&engine_schema, &replacement) !=
             FAMO_ENGINE_OK ||
-        !replacement || !ApplyOptionsLocked(replacement, options)) {
+        !replacement || !ApplyOptionsLocked(replacement, options) ||
+        !ReadStatusLocked(replacement, &composition)) {
       if (replacement)
         engine_.api().destroy_context(replacement);
-      for (const auto &[ignored, context] : replacements) {
-        (void)ignored;
-        engine_.api().destroy_context(context);
-      }
+      for (const auto &built : replacements)
+        engine_.api().destroy_context(built.context);
       return false;
     }
-    replacements.emplace_back(&session, replacement);
+    replacements.push_back(
+        Replacement{&session, replacement, std::move(composition)});
   }
   {
     std::lock_guard ui_lock(ui_sessions_mutex_);
-    for (auto &[session, replacement] : replacements) {
-      Publish(*session, false);
-      if (session->context)
-        engine_.api().destroy_context(session->context);
-      session->context = replacement;
-      session->composition = {};
-      session->composition_sequence = session->last_sequence;
+    for (auto &replacement : replacements) {
+      if (replacement.session->context)
+        engine_.api().destroy_context(replacement.session->context);
+      replacement.session->context = replacement.context;
+      replacement.session->composition = std::move(replacement.composition);
+      replacement.session->composition_sequence =
+          replacement.session->last_sequence;
+      Publish(*replacement.session, true);
     }
   }
   return true;
