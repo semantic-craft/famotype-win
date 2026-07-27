@@ -223,7 +223,7 @@ int wmain(int argc, wchar_t **argv) {
   if (!status_ui.Start())
     std::fprintf(stderr, "tray icon setup failed\n");
   else if (!status_ui.keyboard_hook_ready())
-    std::fprintf(stderr, "global shortcut hook degraded: error=%lu\n",
+    std::fprintf(stderr, "global shortcut hook degraded: error=%u\n",
                  status_ui.keyboard_hook_error());
 
   std::vector<std::thread> servers;
