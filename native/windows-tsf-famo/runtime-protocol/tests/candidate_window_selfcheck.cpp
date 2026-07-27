@@ -286,9 +286,12 @@ bool HealthyWindowAndHideRules() {
                    "placement outside work area: window=(%ld,%ld,%ld,%ld) "
                    "work=(%ld,%ld,%ld,%ld) dpi=%u\n",
                    probe.rect.left, probe.rect.top, probe.rect.right,
-                   probe.rect.bottom, placement.work_area.left,
-                   placement.work_area.top, placement.work_area.right,
-                   placement.work_area.bottom, placement.dpi);
+                   probe.rect.bottom,
+                   static_cast<long>(placement.work_area.left),
+                   static_cast<long>(placement.work_area.top),
+                   static_cast<long>(placement.work_area.right),
+                   static_cast<long>(placement.work_area.bottom),
+                   placement.dpi);
     }
     CHECK(probe.rect.left >= placement.work_area.left - 64);
     CHECK(probe.rect.top >= placement.work_area.top - 64);
