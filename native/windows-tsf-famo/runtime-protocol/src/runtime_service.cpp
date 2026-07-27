@@ -176,6 +176,8 @@ void RuntimeService::Publish(const Session &session, bool visible) noexcept {
       snapshot->composition_sequence = session.composition_sequence;
       snapshot->style = style_state_;
       snapshot->revision = snapshot_revision_.fetch_add(1) + 1;
+      snapshot->mode_switch_sequence =
+          visible ? session.mode_switch_sequence : uint64_t{0};
       if (!visible) {
         snapshot->composition = {};
         snapshot->ui_state.focused = false;

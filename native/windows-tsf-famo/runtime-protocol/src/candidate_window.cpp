@@ -14,6 +14,18 @@
 namespace famo::runtime {
 namespace {
 
+constexpr uint32_t kModeIndicatorDurationMs = 700;
+constexpr int kModeIndicatorSize = 40;
+constexpr int kModeIndicatorInset = 3;
+constexpr wchar_t kCandidateWindowClassName[] = L"FamoRuntimeCandidateWindow";
+constexpr wchar_t kModeIndicatorClassName[] = L"FamoRuntimeModeIndicator";
+
+int ScaleDpi(int value, uint32_t dpi) {
+  if (dpi == 0)
+    dpi = 96;
+  return static_cast<int>((static_cast<int64_t>(value) * dpi + 48) / 96);
+}
+
 FamoUtf8String ViewString(std::string_view value) {
   return {static_cast<uint32_t>(sizeof(FamoUtf8String)), value.data(),
           static_cast<uint32_t>(value.size())};
@@ -190,11 +202,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
   }
   if (message == WM_MOUSEACTIVATE)
     return MA_NOACTIVATE;
+  if (message == WM_NCHITTEST && GetWindowLongPtrW(window, GWLP_USERDATA) == 0)
+    return HTTRANSPARENT;
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
-HWND CreateCandidateWindow(WindowNotifications *notifications) {
-  constexpr wchar_t kClassName[] = L"FamoRuntimeCandidateWindow";
+HWND CreateLayeredWindow(const wchar_t *class_name,
+                         WindowNotifications *notifications,
+                         bool click_through = false) {
   WNDCLASSW window_class{};
   window_class.lpfnWndProc = WindowProc;
   window_class.hInstance = GetModuleHandleW(nullptr);
@@ -203,15 +218,18 @@ HWND CreateCandidateWindow(WindowNotifications *notifications) {
   // panel until the pointer leaves it.
   window_class.hCursor =
       LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-  window_class.lpszClassName = kClassName;
+  window_class.lpszClassName = class_name;
   if (!RegisterClassW(&window_class) &&
       GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
     return nullptr;
   }
-  return CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
-                             WS_EX_TOPMOST,
-                         kClassName, L"", WS_POPUP, 0, 0, 1, 1, nullptr,
-                         nullptr, GetModuleHandleW(nullptr), notifications);
+  DWORD ex_style =
+      WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+  if (click_through)
+    ex_style |= WS_EX_TRANSPARENT;
+  return CreateWindowExW(ex_style, class_name, L"", WS_POPUP, 0, 0, 1, 1,
+                         nullptr, nullptr, GetModuleHandleW(nullptr),
+                         notifications);
 }
 
 bool MoveVisible(HWND window, int x, int y) {
@@ -224,6 +242,42 @@ bool ShouldShow(const RuntimeSnapshot &snapshot) {
   return ui.focused && ui.layout_available && ui.show_allowed &&
          snapshot.ui_sequence > snapshot.composition_sequence &&
          !snapshot.composition.candidates.empty();
+}
+
+bool ShowModeIndicator(HWND window, DibSurface *surface,
+                       FamoTextResources *resources, const FamoSkin *skin,
+                       const RuntimeSnapshot &snapshot) {
+  if (!window || !surface || !resources || !skin)
+    return false;
+  const uint32_t dpi = snapshot.ui_state.dpi;
+  const int size = ScaleDpi(kModeIndicatorSize, dpi);
+  const int inset = ScaleDpi(kModeIndicatorInset, dpi);
+  if (!surface->Ensure(size, size))
+    return false;
+  surface->Clear();
+  FamoStatusBarButton button{};
+  button.bounds = {inset, inset, size - inset, size - inset};
+  button.label = (snapshot.composition.status_flags & FAMO_STATUS_ASCII_MODE)
+                     ? "英"
+                     : "中";
+  FamoStatusBarSpec spec{};
+  spec.size = static_cast<uint32_t>(sizeof(spec));
+  spec.bar_size = {size, size};
+  spec.dpi = dpi;
+  spec.button_count = 1;
+  spec.buttons = &button;
+  if (FamoStatusBarPaint(&spec, skin, resources, surface->dc()) != FAMO_UI_OK)
+    return false;
+
+  const UiRect &caret = snapshot.ui_state.caret;
+  const UiRect &work = snapshot.ui_state.work_area;
+  const FamoRect caret_rect{caret.left, caret.top, caret.right, caret.bottom};
+  const FamoRect work_rect{work.left, work.top, work.right, work.bottom};
+  int32_t x = 0;
+  int32_t y = 0;
+  uint32_t flipped = 0;
+  FamoComputeAnchor(&caret_rect, &work_rect, {size, size}, &x, &y, &flipped);
+  return SubmitLayered(window, *surface, x, y);
 }
 
 bool PrewarmRenderer(FamoTextResources *resources, const FamoSkin *skin,
@@ -418,6 +472,7 @@ struct CandidateWindow::State {
   std::atomic<uint64_t> selection_only_count{0};
   std::atomic<uint64_t> full_count{0};
   std::atomic<uint64_t> device_recovery_count{0};
+  std::atomic<uint64_t> mode_indicator_count{0};
   bool device_loss_injected = false;
   bool submitted_visible = false;
   Fault fault;
@@ -506,7 +561,8 @@ CandidateWindow::Counters CandidateWindow::counters() const noexcept {
           state->anchor_only_count.load(std::memory_order_relaxed),
           state->selection_only_count.load(std::memory_order_relaxed),
           state->full_count.load(std::memory_order_relaxed),
-          state->device_recovery_count.load(std::memory_order_relaxed)};
+          state->device_recovery_count.load(std::memory_order_relaxed),
+          state->mode_indicator_count.load(std::memory_order_relaxed)};
 }
 
 void CandidateWindow::Stop() {
@@ -562,10 +618,15 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   HWND window =
       state->fault == Fault::Create
           ? nullptr
-          : CreateCandidateWindow(&notifications);
+          : CreateLayeredWindow(kCandidateWindowClassName, &notifications);
+  HWND mode_window =
+      state->fault == Fault::Create
+          ? nullptr
+          : CreateLayeredWindow(kModeIndicatorClassName, nullptr, true);
   DibSurface surface;
   DibSurface previous_surface;
   DibSurface animation_surface;
+  DibSurface mode_surface;
   struct ActiveScrollAnimation {
     bool active = false;
     uint64_t started_ms = 0;
@@ -574,6 +635,12 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     int margin = 0;
     HWND foreground_window = nullptr;
   } animation;
+  struct ActiveModeIndicator {
+    bool active = false;
+    uint64_t expires_ms = 0;
+    Correlation last_switch{};
+    HWND foreground_window = nullptr;
+  } mode_indicator;
   const FamoSkin fallback_skin = FamoSkinDefault();
   std::shared_ptr<const void> active_presentation;
   std::shared_ptr<const CandidateStylePresentation> active_style;
@@ -600,11 +667,31 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
                                                    kCandidateScrollTransitionMs -
                                                    elapsed));
     }
+    if (mode_indicator.active) {
+      const uint64_t now = GetTickCount64();
+      const DWORD remaining =
+          mode_indicator.expires_ms <= now
+              ? 0
+              : static_cast<DWORD>((std::min)(
+                    mode_indicator.expires_ms - now,
+                    static_cast<uint64_t>(MAXDWORD)));
+      timeout = timeout == INFINITE ? remaining : (std::min)(timeout, remaining);
+    }
     const DWORD wait =
         MsgWaitForMultipleObjects(2, events, FALSE, timeout, QS_ALLINPUT);
     if (wait == WAIT_OBJECT_0)
       break;
-    if (wait == WAIT_TIMEOUT && animation.active) {
+    if (wait == WAIT_TIMEOUT) {
+      const uint64_t now = GetTickCount64();
+      if (mode_indicator.active &&
+          (now >= mode_indicator.expires_ms ||
+           (mode_indicator.foreground_window &&
+            GetForegroundWindow() != mode_indicator.foreground_window))) {
+        ShowWindow(mode_window, SW_HIDE);
+        mode_indicator.active = false;
+      }
+      if (!animation.active)
+        continue;
       if (animation.foreground_window &&
           GetForegroundWindow() != animation.foreground_window) {
         ShowWindow(window, SW_HIDE);
@@ -742,6 +829,33 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       state->prewarm_succeeded.store(resources_warmed,
                                      std::memory_order_release);
       SetEvent(state->prewarm_complete_event);
+    }
+    if (mode_indicator.active &&
+        (!snapshot || !snapshot->ui_state.focused ||
+         (mode_indicator.foreground_window &&
+          GetForegroundWindow() != mode_indicator.foreground_window))) {
+      ShowWindow(mode_window, SW_HIDE);
+      mode_indicator.active = false;
+    }
+    if (mode_window && resources && snapshot &&
+        snapshot->mode_switch_sequence != 0 &&
+        snapshot->ui_sequence > snapshot->mode_switch_sequence &&
+        snapshot->ui_state.focused && snapshot->ui_state.layout_available) {
+      Correlation switch_id = snapshot->correlation;
+      switch_id.sequence = snapshot->mode_switch_sequence;
+      if (switch_id != mode_indicator.last_switch) {
+        mode_indicator.last_switch = switch_id;
+        HWND foreground = reinterpret_cast<HWND>(snapshot->source_window);
+        if ((!foreground || GetForegroundWindow() == foreground) &&
+            ShowModeIndicator(mode_window, &mode_surface, resources, skin,
+                              *snapshot)) {
+          mode_indicator.active = true;
+          mode_indicator.expires_ms =
+              GetTickCount64() + kModeIndicatorDurationMs;
+          mode_indicator.foreground_window = foreground;
+          state->mode_indicator_count.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
     }
     if (!window || !snapshot || !should_show) {
       if (window)
@@ -952,6 +1066,8 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       }
     }
   }
+  if (mode_window)
+    DestroyWindow(mode_window);
   if (window)
     DestroyWindow(window);
   FamoTextResourcesDestroy(resources);
