@@ -30,6 +30,8 @@ internal sealed class AiProviderChatCompletionClient
         _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(45) };
     }
 
+    internal void EnsureReady() => _ = ResolveDefault();
+
     public async Task<AiProviderChatCompletionResult> SendAsync(
         IReadOnlyList<AiProviderChatMessage> messages,
         CancellationToken cancellationToken,
@@ -40,15 +42,7 @@ internal sealed class AiProviderChatCompletionClient
             throw new InvalidOperationException("AI 请求缺少消息。");
         }
 
-        AiProviderProfile profile = _profiles.DefaultProfile()
-            ?? throw new InvalidOperationException("尚未配置 AI 供应商。");
-        if (string.IsNullOrWhiteSpace(profile.Model))
-        {
-            throw new InvalidOperationException("默认 AI 供应商缺少模型 ID，请先在设置中补全。");
-        }
-        string apiKey = _secrets.GetSecret(profile.SecretName)
-            ?? throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
-        Uri endpoint = ParseEndpoint(profile.Endpoint);
+        var (profile, apiKey, endpoint) = ResolveDefault();
 
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         ApplyAuth(request, profile, apiKey);
@@ -65,6 +59,18 @@ internal sealed class AiProviderChatCompletionClient
         }
 
         return new AiProviderChatCompletionResult(ParseAssistantText(json), profile.Id, profile.Model);
+    }
+
+    private (AiProviderProfile Profile, string ApiKey, Uri Endpoint) ResolveDefault()
+    {
+        AiProviderProfile profile = _profiles.DefaultProfile()
+            ?? throw new InvalidOperationException("尚未配置 AI 供应商。");
+        if (string.IsNullOrWhiteSpace(profile.Model))
+            throw new InvalidOperationException("默认 AI 供应商缺少模型 ID，请先在设置中补全。");
+        string? apiKey = _secrets.GetSecret(profile.SecretName);
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
+        return (profile, apiKey, ParseEndpoint(profile.Endpoint));
     }
 
     public async Task<AiProviderChatCompletionResult> SendSourceVerificationAsync(

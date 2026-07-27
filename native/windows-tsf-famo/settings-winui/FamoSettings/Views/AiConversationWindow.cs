@@ -217,7 +217,10 @@ public sealed class AiConversationWindow : Window
             _turns.Add(new AiChatTurn(question.Trim(), response.Text));
             _result.Text = response.Text;
             _prompt.Text = "";
-            SetStatus($"已由 {response.Model} 返回（第 {_turns.Count} 轮，可继续追问）。");
+            string route = response.SearchProvider is null
+                ? $"已由 {response.Model} 返回"
+                : $"联网 · {response.SearchProvider} · 已由 {response.Model} 作答";
+            SetStatus($"{route}（第 {_turns.Count} 轮，可继续追问）。");
         }
         catch (Exception ex)
         {
