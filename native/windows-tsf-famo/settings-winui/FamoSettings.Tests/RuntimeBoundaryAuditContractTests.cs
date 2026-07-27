@@ -97,8 +97,10 @@ public sealed class RuntimeBoundaryAuditContractTests
     {
         string source = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/text-service/src/composition_controller.cpp"));
-        int emptyPreedit = source.IndexOf("if (plan.preedit.empty())", StringComparison.Ordinal);
+        int emptyPreedit = source.IndexOf("if (preedit.text.empty())", StringComparison.Ordinal);
+        Assert.True(emptyPreedit >= 0);
         int nextPreedit = source.IndexOf("if (!composition_)", emptyPreedit, StringComparison.Ordinal);
+        Assert.True(nextPreedit > emptyPreedit);
         string branch = source[emptyPreedit..nextPreedit];
 
         int committed = branch.IndexOf("if (!plan.commit.empty())", StringComparison.Ordinal);
