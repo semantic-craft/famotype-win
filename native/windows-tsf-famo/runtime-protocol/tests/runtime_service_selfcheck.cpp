@@ -131,6 +131,18 @@ Frame Request(Command command, uint64_t sequence) {
 }
 
 int main() {
+  constexpr uint32_t kRimeShiftLeft = 0xffe1;
+  constexpr uint32_t kRimeShiftRight = 0xffe2;
+  CHECK(IsShiftModeSwitch({kRimeShiftLeft, 0, 0, 0, 1}, 0,
+                          FAMO_STATUS_ASCII_MODE));
+  CHECK(IsShiftModeSwitch({kRimeShiftRight, 0, 0, 0, 1},
+                          FAMO_STATUS_ASCII_MODE, 0));
+  CHECK(!IsShiftModeSwitch({kRimeShiftLeft, 0, 0, 1, 1}, 0,
+                           FAMO_STATUS_ASCII_MODE));
+  CHECK(!IsShiftModeSwitch({'A', 0, 0, 0, 1}, 0,
+                           FAMO_STATUS_ASCII_MODE));
+  CHECK(!IsShiftModeSwitch({kRimeShiftLeft, 0, 0, 0, 1}, 0, 0));
+
   const std::filesystem::path data_root =
       std::filesystem::temp_directory_path() /
       ("famo-runtime-service-" + std::to_string(GetCurrentProcessId()));

@@ -41,6 +41,7 @@ public:
     uint64_t selection_only = 0;
     uint64_t full = 0;
     uint64_t device_recovery = 0;
+    uint64_t mode_indicator = 0;
   };
 
   enum class Fault {

@@ -4,6 +4,17 @@
 #include <utility>
 
 namespace famo::runtime {
+
+bool IsShiftModeSwitch(const KeyEvent &key, uint32_t before_status,
+                       uint32_t after_status) noexcept {
+  constexpr uint32_t kRimeShiftLeft = 0xffe1;
+  constexpr uint32_t kRimeShiftRight = 0xffe2;
+  const bool shift =
+      key.virtual_key == kRimeShiftLeft || key.virtual_key == kRimeShiftRight;
+  return shift && key.is_key_down == 0 &&
+         ((before_status ^ after_status) & FAMO_STATUS_ASCII_MODE) != 0;
+}
+
 namespace {
 
 FamoUtf8String EngineString(const std::string &value) {
@@ -107,7 +118,7 @@ Frame RuntimeService::DispatchLocked(const Frame &request) {
     ui->latest.store(std::move(snapshot));
     sessions_.emplace(
         key, Session{context, c.sequence, c, std::move(composition), c.sequence,
-                     ui});
+                     0, ui});
     {
       std::lock_guard ui_lock(ui_sessions_mutex_);
       ui_sessions_[key] = std::move(ui);
@@ -151,10 +162,13 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
   Composition composition;
   bool composition_ready = false;
   bool candidate_selection_handled = false;
+  KeyEvent processed_key;
+  const uint32_t status_before_key = session.composition.status_flags;
   if (request.command == Command::ProcessKey) {
     KeyEvent value;
     if (!DecodeKeyEvent(request.payload, &value, &error))
       return Reply(request, Status::InvalidFrame);
+    processed_key = value;
     const FamoKeyEvent engine_key = EngineKey(value);
     rc = engine_.api().process_key(session.context, &engine_key, &view);
   } else if (request.command == Command::SelectCandidate ||
@@ -295,6 +309,10 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
   if (!EncodeComposition(composition, &reply.payload, &error))
     return Reply(request, Status::EngineError);
   session.correlation = c;
+  if (request.command == Command::ProcessKey &&
+      IsShiftModeSwitch(processed_key, status_before_key,
+                        composition.status_flags))
+    session.mode_switch_sequence = c.sequence;
   session.composition = std::move(composition);
   session.composition_sequence = c.sequence;
   Publish(session, true);

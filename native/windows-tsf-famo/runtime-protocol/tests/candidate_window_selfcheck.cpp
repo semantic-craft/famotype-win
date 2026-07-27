@@ -469,6 +469,52 @@ bool FastPathsAndDeviceRecoveryAreObservable() {
   return true;
 }
 
+bool ModeIndicatorRequiresFreshCaretAndDeduplicates() {
+  CandidateWindow window;
+  CHECK(window.Start());
+  CHECK(window.Prewarm());
+  auto stale = VisibleSnapshot(60);
+  stale->revision = 1;
+  stale->composition.candidates.clear();
+  stale->ui_state.show_allowed = false;
+  stale->composition.status_flags = FAMO_STATUS_ASCII_MODE;
+  stale->mode_switch_sequence = stale->ui_sequence;
+  window.Publish(stale);
+  Sleep(25);
+  CHECK(window.counters().mode_indicator == 0);
+
+  auto fresh = std::make_shared<RuntimeSnapshot>(*stale);
+  fresh->revision = 2;
+  fresh->correlation.sequence++;
+  fresh->ui_sequence++;
+  window.Publish(fresh);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.mode_indicator == 1;
+  }));
+
+  auto duplicate = std::make_shared<RuntimeSnapshot>(*fresh);
+  duplicate->revision = 3;
+  duplicate->correlation.sequence++;
+  duplicate->ui_sequence++;
+  window.Publish(duplicate);
+  Sleep(25);
+  CHECK(window.counters().mode_indicator == 1);
+
+  auto chinese = std::make_shared<RuntimeSnapshot>(*duplicate);
+  chinese->revision = 4;
+  chinese->correlation.sequence++;
+  chinese->composition_sequence = chinese->correlation.sequence;
+  chinese->mode_switch_sequence = chinese->composition_sequence;
+  chinese->ui_sequence = chinese->composition_sequence + 1;
+  chinese->composition.status_flags = 0;
+  window.Publish(chinese);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.mode_indicator == 2;
+  }));
+  window.Stop();
+  return true;
+}
+
 bool PaintFailureHidesWithoutBlockingEngine() {
   CandidateWindow window(CandidateWindow::Fault::PaintAfterVisible);
   CHECK(window.Start());
@@ -570,6 +616,7 @@ int main() {
       !HealthyWindowAndHideRules() ||
       !FirstVisibleBudgetAfterPrewarm() ||
       !FastPathsAndDeviceRecoveryAreObservable() ||
+      !ModeIndicatorRequiresFreshCaretAndDeduplicates() ||
       !PaintFailureHidesWithoutBlockingEngine() ||
       !FaultsNeverBlockPublisher() || !HangingUiDoesNotDelayEngine())
     return 1;

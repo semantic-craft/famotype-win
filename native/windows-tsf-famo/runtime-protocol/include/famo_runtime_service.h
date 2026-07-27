@@ -27,8 +27,15 @@ struct RuntimeSnapshot {
   uint64_t composition_sequence = 0;
   uint64_t ui_sequence = 0;
   uint64_t revision = 0;
+  // Sequence of the latest Shift release that actually changed ascii_mode.
+  // It remains on later revisions so the renderer can wait for a fresh caret
+  // without mistaking focus/session changes for a user toggle.
+  uint64_t mode_switch_sequence = 0;
   std::shared_ptr<const RuntimeStyleState> style;
 };
+
+bool IsShiftModeSwitch(const KeyEvent &key, uint32_t before_status,
+                       uint32_t after_status) noexcept;
 
 class RuntimeSnapshotSink {
 public:
@@ -90,6 +97,7 @@ private:
     Correlation correlation;
     Composition composition;
     uint64_t composition_sequence = 0;
+    uint64_t mode_switch_sequence = 0;
     std::shared_ptr<UiSessionState> ui;
   };
   struct ClientEpoch {
