@@ -23,6 +23,7 @@ public sealed class AiPageParityContractTests
         Assert.Contains("+ 自定义（OpenAI 兼容）", page);
         Assert.Contains("Chat · V4 Flash", page);
         Assert.Contains("Reasoner · V4 Pro", page);
+        Assert.Contains("任意提问 · 联网搜索", page);
 
         // 云端 AI（全局）卡已搬到 SkillsPage.cs（技能平台），AiPage.cs 只剩供应商配置。
         Assert.DoesNotContain("云端 AI（全局）", page);
@@ -31,6 +32,21 @@ public sealed class AiPageParityContractTests
         Assert.DoesNotContain("场景词库", page);
         Assert.DoesNotContain("术语", page);
         Assert.DoesNotContain("候选条数", page);
+    }
+
+    [Fact]
+    public void AiPage_WebSearchUsesDedicatedEndpointsAndCredentialSlots()
+    {
+        string page = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AiPage.cs"));
+        string search = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings.Core/Ai/WebSearchClient.cs"));
+
+        Assert.Contains("AskWebSearchEnabled", page);
+        Assert.Contains("搜索服务 API Key", page);
+        Assert.Contains("Windows Credential Manager", page);
+        Assert.Contains("https://open.feedcoopapi.com/search_api/global_search", search);
+        Assert.Contains("https://api.perplexity.ai/search", search);
+        Assert.Contains("famo.websearch.", search);
+        Assert.Contains("方舟模型 Key 在这里无效", search);
     }
 
     [Fact]

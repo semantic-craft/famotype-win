@@ -1,6 +1,10 @@
 namespace Famo.Settings.Core.Ai;
 
-public sealed record AiChatResult(string Text, string ProviderId, string Model);
+public sealed record AiChatResult(
+    string Text,
+    string ProviderId,
+    string Model,
+    string? SearchProvider = null);
 
 /// <summary>一轮已完成的问答，按序喂回后续请求（对齐 macOS issue #137 的多轮契约）。</summary>
 public sealed record AiChatTurn(string Question, string Answer);
@@ -13,6 +17,7 @@ public sealed class AiChatClient
 
     private readonly FamoSettings _settings;
     private readonly AiProviderChatCompletionClient _client;
+    private readonly WebSearchClient _webSearch;
 
     public AiChatClient(
         FamoSettings settings,
@@ -21,7 +26,9 @@ public sealed class AiChatClient
         HttpClient? http = null)
     {
         _settings = settings;
-        _client = new AiProviderChatCompletionClient(profiles, secrets, http);
+        HttpClient sharedHttp = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(45) };
+        _client = new AiProviderChatCompletionClient(profiles, secrets, sharedHttp);
+        _webSearch = new WebSearchClient(secrets, sharedHttp);
     }
 
     public Task<AiChatResult> SendAsync(string prompt, CancellationToken cancellationToken) =>
@@ -51,17 +58,25 @@ public sealed class AiChatClient
             throw new InvalidOperationException("请输入要发送给 AI 的问题。");
         }
 
+        string selection = selectedText?.Trim() ?? "";
+        if (selection.Length > AiSelectionPolishService.MaxSelectionLength)
+        {
+            throw new InvalidOperationException("选中文本过长，已取消任意提问。");
+        }
+        _client.EnsureReady();
+        WebSearchGrounding? grounding = _settings.Ai.AskWebSearchEnabled
+            ? await _webSearch.SearchAsync(
+                _settings.Ai.WebSearchBackend, prompt, cancellationToken)
+            : null;
+
         var messages = new List<AiProviderChatMessage>
         {
             new(
                 "system",
                 "你是法墨输入法的 AI 助手。只回答用户主动发送的问题，不读取普通输入候选。"),
         };
-        string selection = selectedText?.Trim() ?? "";
-        if (selection.Length > AiSelectionPolishService.MaxSelectionLength)
-        {
-            throw new InvalidOperationException("选中文本过长，已取消任意提问。");
-        }
+        if (grounding is not null)
+            messages.Add(new AiProviderChatMessage("system", grounding.Context));
         if (selection.Length > 0)
         {
             messages.Add(new AiProviderChatMessage(
@@ -78,6 +93,7 @@ public sealed class AiChatClient
         messages.Add(new AiProviderChatMessage("user", prompt.Trim()));
 
         AiProviderChatCompletionResult response = await _client.SendAsync(messages, cancellationToken);
-        return new AiChatResult(response.Text, response.ProviderId, response.Model);
+        return new AiChatResult(
+            response.Text, response.ProviderId, response.Model, grounding?.Provider);
     }
 }

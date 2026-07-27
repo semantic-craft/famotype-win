@@ -2,6 +2,7 @@ using Famo.Settings.Core.Ai;
 using Famo.Settings.Theming;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Windows.ApplicationModel.DataTransfer;
 
 namespace Famo.Settings.Views;
 
@@ -32,6 +33,11 @@ public sealed class AiPage : UserControl
     private PasswordBox _apiKey = null!;
     private FrameworkElement _deepSeekModelRow = null!;
     private StackPanel _providerList = null!;
+    private ComboBox _searchBackend = null!;
+    private PasswordBox _searchKey = null!;
+    private TextBlock _searchKeyState = null!;
+    private TextBlock _searchHint = null!;
+    private FrameworkElement _searchDetails = null!;
 
     public AiPage()
     {
@@ -77,10 +83,178 @@ public sealed class AiPage : UserControl
 
         _providerList = new StackPanel { Spacing = 8 };
         sp.Children.Add(FamoUI.Card("已保存供应商", FamoUI.RowFull(_providerList)));
+        sp.Children.Add(BuildWebSearchCard());
 
         Content = sp;
         FillPreset(Presets[0]);
         RenderProviderList();
+    }
+
+    private FrameworkElement BuildWebSearchCard()
+    {
+        _searchBackend = new ComboBox { MinWidth = 180 };
+        foreach (string backend in WebSearchBackends.All)
+        {
+            _searchBackend.Items.Add(new ComboBoxItem
+            {
+                Content = WebSearchBackends.DisplayName(backend),
+                Tag = backend,
+            });
+        }
+        string selected = WebSearchBackends.Normalize(App.Settings.Ai.WebSearchBackend);
+        _searchBackend.SelectedIndex = Array.IndexOf(WebSearchBackends.All, selected);
+        _searchBackend.SelectionChanged += (_, _) =>
+        {
+            App.Settings.Ai.WebSearchBackend = SelectedSearchBackend();
+            App.Store.Save(App.Settings);
+            _searchKey.Password = "";
+            UpdateSearchBackendUi();
+        };
+
+        _searchKey = new PasswordBox
+        {
+            PlaceholderText = "搜索服务 API Key",
+            MinWidth = 300,
+        };
+        _searchKeyState = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = FamoUI.Br("Famo.Ink3"),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        _searchHint = new TextBlock
+        {
+            FontSize = 12,
+            Foreground = FamoUI.Br("Famo.Ink3"),
+            TextWrapping = TextWrapping.Wrap,
+        };
+
+        var details = new StackPanel();
+        details.Children.Add(FamoUI.Row(
+            "搜索服务",
+            "搜索与作答模型解耦；豆包搜索默认，更适合中文站点。",
+            _searchBackend,
+            divider: false));
+        details.Children.Add(FamoUI.Row(
+            "搜索服务 API Key",
+            "独立于上面的模型密钥，保存到 Windows Credential Manager。",
+            _searchKey));
+        details.Children.Add(FamoUI.RowFull(BuildSearchKeyActions(), divider: true));
+        details.Children.Add(FamoUI.RowFull(_searchHint));
+        _searchDetails = details;
+
+        var enabled = FamoUI.Pill(App.Settings.Ai.AskWebSearchEnabled, value =>
+        {
+            App.Settings.Ai.AskWebSearchEnabled = value;
+            App.Store.Save(App.Settings);
+            _searchDetails.Visibility = value ? Visibility.Visible : Visibility.Collapsed;
+        });
+
+        _searchDetails.Visibility = App.Settings.Ai.AskWebSearchEnabled
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        UpdateSearchBackendUi();
+        return FamoUI.Card(
+            "任意提问 · 联网搜索",
+            FamoUI.Row(
+                "联网搜索",
+                "开启后先检索网页，再交给当前默认供应商作答；只作用于任意提问，不影响划词技能与输入候选。",
+                enabled,
+                divider: false),
+            FamoUI.RowFull(_searchDetails, divider: true));
+    }
+
+    private FrameworkElement BuildSearchKeyActions()
+    {
+        var row = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            Margin = new Thickness(0, 12, 0, 0),
+        };
+        var paste = new Button { Content = "粘贴" };
+        paste.Click += async (_, _) =>
+        {
+            try
+            {
+                DataPackageView data = Clipboard.GetContent();
+                if (data.Contains(StandardDataFormats.Text))
+                    _searchKey.Password = (await data.GetTextAsync()).Trim();
+            }
+            catch
+            {
+                SetStatus("读取剪贴板失败。");
+            }
+        };
+        var save = new Button { Content = "保存" };
+        save.Click += (_, _) => SaveSearchKey();
+        var clear = new Button { Content = "清除" };
+        clear.Click += (_, _) => ClearSearchKey();
+        row.Children.Add(paste);
+        row.Children.Add(save);
+        row.Children.Add(clear);
+        row.Children.Add(_searchKeyState);
+        return row;
+    }
+
+    private void SaveSearchKey()
+    {
+        string key = _searchKey.Password.Trim();
+        if (key.Length == 0)
+        {
+            SetStatus($"请输入{WebSearchBackends.DisplayName(SelectedSearchBackend())}的 API Key。");
+            return;
+        }
+        try
+        {
+            _secretStore.SetSecret(WebSearchBackends.SecretName(SelectedSearchBackend()), key);
+            _searchKey.Password = "";
+            UpdateSearchBackendUi();
+            SetStatus("搜索服务 API Key 已保存；联网提问会先检索，再由默认供应商作答。");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("保存搜索服务 API Key 失败：" + ex.Message);
+        }
+    }
+
+    private void ClearSearchKey()
+    {
+        try
+        {
+            _secretStore.DeleteSecret(WebSearchBackends.SecretName(SelectedSearchBackend()));
+            _searchKey.Password = "";
+            UpdateSearchBackendUi();
+            SetStatus("搜索服务 API Key 已清除。");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("清除搜索服务 API Key 失败：" + ex.Message);
+        }
+    }
+
+    private string SelectedSearchBackend() =>
+        (_searchBackend.SelectedItem as ComboBoxItem)?.Tag as string
+        ?? WebSearchBackends.Doubao;
+
+    private void UpdateSearchBackendUi()
+    {
+        string backend = SelectedSearchBackend();
+        bool configured;
+        try
+        {
+            configured = !string.IsNullOrWhiteSpace(
+                _secretStore.GetSecret(WebSearchBackends.SecretName(backend)));
+        }
+        catch
+        {
+            configured = false;
+        }
+        _searchKeyState.Text = configured ? "已设置" : "未设置";
+        _searchHint.Text =
+            $"端点：{WebSearchBackends.Endpoint(backend)}\n{WebSearchBackends.KeyHint(backend)}" +
+            $"\n配好后由{WebSearchBackends.DisplayName(backend)}取回网页、交给你的默认供应商作答；" +
+            "两家的 Key 分开存，切换不用重填。未配置专用 Key 时自动退回普通问答。";
     }
 
     private ComboBox BuildPresetCombo()

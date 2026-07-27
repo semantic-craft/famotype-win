@@ -38,6 +38,8 @@ public class SettingsStoreTests : IDisposable
         Assert.False(settings.Engine.EmojiEnabled);          // 出厂 emoji 关
         Assert.Equal("rime_ice", settings.Engine.SchemaList[0].Id); // 出厂雾凇拼音优先
         Assert.False(settings.Switches.Traditionalization);  // 出厂简体
+        Assert.False(settings.Ai.AskWebSearchEnabled);        // 联网搜索需显式开启
+        Assert.Equal("doubao", settings.Ai.WebSearchBackend);
 
         // seed 出的文件自身也应通过 schema。
         SchemaValidationResult v = SchemaValidator.Validate(File.ReadAllText(_file));
@@ -154,6 +156,8 @@ public class SettingsStoreTests : IDisposable
         Assert.True(ai.AskAnythingSkillEnabled);
         Assert.True(ai.PublishFormattingSkillEnabled);
         Assert.True(ai.TranslationSkillEnabled);
+        Assert.False(ai.AskWebSearchEnabled);
+        Assert.Equal("doubao", ai.WebSearchBackend);
     }
 
     [Fact]
