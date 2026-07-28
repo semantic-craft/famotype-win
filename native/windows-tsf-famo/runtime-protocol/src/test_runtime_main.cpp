@@ -13,6 +13,14 @@ using namespace famo::runtime;
 
 namespace {
 
+constexpr wchar_t kTestRuntimePreviewSourceClass[] =
+    L"FamoTestRuntimePreviewSource";
+
+LRESULT CALLBACK PreviewSourceProc(HWND window, UINT message, WPARAM wparam,
+                                   LPARAM lparam) {
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
 std::wstring ModuleDirectory() {
   std::wstring path(32768, L'\0');
   const DWORD length =
@@ -72,7 +80,8 @@ int wmain(int argc, wchar_t **argv) {
   ServerFault fault;
   PipeEndpoint endpoint;
   std::string error;
-  const int max_connections = parallel ? 64 : 4;
+  const int max_connections =
+      parallel ? static_cast<int>(kRuntimeClientCapacity * 2) : 4;
   if (connections < 1 || connections > max_connections || fault_after < 0 ||
       fault_after > 100 ||
       preview_rows < 0 || preview_rows > 2 ||
@@ -82,6 +91,24 @@ int wmain(int argc, wchar_t **argv) {
     return 2;
   }
   const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
+  WNDCLASSW preview_source_class{};
+  preview_source_class.lpfnWndProc = PreviewSourceProc;
+  preview_source_class.hInstance = GetModuleHandleW(nullptr);
+  preview_source_class.lpszClassName = kTestRuntimePreviewSourceClass;
+  if (!RegisterClassW(&preview_source_class) &&
+      GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    std::fprintf(stderr, "preview source class registration failed\n");
+    return 2;
+  }
+  const std::wstring preview_source_title =
+      std::to_wstring(GetCurrentProcessId());
+  HWND preview_source = CreateWindowExW(
+      0, kTestRuntimePreviewSourceClass, preview_source_title.c_str(), 0, 0, 0,
+      0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  if (!preview_source) {
+    std::fprintf(stderr, "preview source window creation failed\n");
+    return 2;
+  }
 
   if (preview_rows > 0)
     _putenv_s("FAMO_TEST_MULTIPAGE", "1");
@@ -112,7 +139,8 @@ int wmain(int argc, wchar_t **argv) {
             (connection % 2) == 0 ? endpoint : ui_endpoint;
         served[connection].store(server.ServeOnce(
             active_endpoint, &service, fault, std::chrono::seconds(60),
-            &errors[connection], static_cast<uint32_t>(fault_after)));
+            &errors[connection], static_cast<uint32_t>(fault_after), nullptr,
+            (connection % 2) != 0));
       });
     }
     for (std::thread &worker : workers)
@@ -124,6 +152,7 @@ int wmain(int argc, wchar_t **argv) {
         return 4;
       }
     }
+    DestroyWindow(preview_source);
     return 0;
   }
   RuntimePipeServer server;
@@ -137,5 +166,6 @@ int wmain(int argc, wchar_t **argv) {
       return 4;
     }
   }
+  DestroyWindow(preview_source);
   return 0;
 }

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace Famo.Settings.Core;
@@ -208,7 +209,10 @@ public static class ConfigWriter
     private static string SetScalar(string yaml, string key, string value)
     {
         // 匹配：缩进 + key: + 值（到行尾注释或行尾），保留缩进与 ` # 注释`。
-        var rx = new Regex($@"(?m)^(?<indent>[ \t]*{Regex.Escape(key)}:[ \t]*)(?<val>[^\r\n#]*?)(?<trail>[ \t]*(#[^\r\n]*)?)$");
+        var rx = new Regex(
+            $@"(?m)^(?<indent>[ \t]*{Regex.Escape(key)}:[ \t]*)" +
+            @"(?<val>""(?:\\.|[^""\\])*""|'(?:''|[^'])*'|[^#\r\n]*?)" +
+            @"(?<trail>[ \t]*(#[^\r\n]*)?)$");
         Match m = rx.Match(yaml);
         if (!m.Success)
         {
@@ -509,7 +513,7 @@ public static class ConfigWriter
         return rx.Replace(yaml, m => m.Groups[1].Value + value.ToString(CultureInfo.InvariantCulture), 1);
     }
 
-    private static string Quote(string s) => "\"" + s.Replace("\"", "\\\"") + "\"";
+    private static string Quote(string s) => JsonSerializer.Serialize(s, SettingsStore.JsonOptions);
 
     private static string Int(int v) => v.ToString(CultureInfo.InvariantCulture);
 

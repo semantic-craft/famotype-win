@@ -137,6 +137,38 @@ public class ConfigWriterTests : IDisposable
     }
 
     [Fact]
+    public void UserText_IsEscapedAsOneYamlScalar()
+    {
+        FamoSettings s = SettingsStore.CreateDefault();
+        s.Appearance.FontFace = "A\\B\"\nstyle: injected";
+        s.Convenience.AppEnglishExes = new() { "evil.exe\"\n  injected: true" };
+
+        string style = ConfigWriter.BuildStyleOverlay(s);
+        string deployed = ConfigWriter.BuildDefaultCustom(s);
+
+        Assert.Contains("font_face: \"A\\\\B\\\"\\nstyle: injected\"", style);
+        Assert.DoesNotContain("\nstyle: injected", style);
+        Assert.Contains(
+            "\"app_options/evil.exe\\\"\\n  injected: true/ascii_mode\": true",
+            deployed);
+        Assert.DoesNotContain("\n  injected: true/ascii_mode", deployed);
+    }
+
+    [Fact]
+    public void ExistingQuotedHash_IsNotMistakenForAYamlComment()
+    {
+        FamoSettings s = SettingsStore.CreateDefault();
+        s.Appearance.FontFace = "C# Font";
+        string first = ConfigWriter.BuildWeaselCustom(s);
+
+        s.Appearance.FontFace = "Next Font";
+        string second = ConfigWriter.BuildWeaselCustom(s, first);
+
+        Assert.Contains("font_face: \"Next Font\"", second);
+        Assert.DoesNotContain("# Font\"", second);
+    }
+
+    [Fact]
     public void StyleOverlay_EmitsNativeTsfCommitBehaviors()
     {
         FamoSettings s = SettingsStore.CreateDefault();

@@ -29,8 +29,8 @@ Windows 10 / 11 (x64).
 > published in the release notes before running it.
 
 If an old TSF DLL is still loaded by a running desktop app, the installer safely enters
-`PendingReboot` and lets RunOnce finish the swap after a restart, rather than force-closing your
-applications.
+`PendingReboot` and creates a one-user logon recovery task bound to the exact SID that started the
+install. That task finishes the swap after a restart rather than force-closing your applications.
 
 **Updates:** there is no background auto-update on Windows. The "检查更新" button on the settings
 panel's About page opens this repository's Releases page; downloading and installing over the top

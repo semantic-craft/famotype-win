@@ -62,6 +62,17 @@ bool PureTestAndExactlyOnce() {
   return true;
 }
 
+bool DigitCanStartSchemaInput() {
+  ContextState state;
+  state.Open(Identity(55));
+  CHECK(state.TestKey(Down('7')));
+  const auto plan = state.PlanKey(Down('7'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '7');
+  state.CompleteUnhandled();
+  return true;
+}
+
 bool CandidateAndCorrelation() {
   ContextState state;
   state.Open(Identity(60));
@@ -73,8 +84,23 @@ bool CandidateAndCorrelation() {
   CHECK(absolute && absolute->sequence == plan.correlation.sequence + 1);
   state.CompleteUnhandled();
   plan = state.PlanKey(Down('2'));
-  CHECK(plan.request == RequestKind::SelectCandidate);
-  CHECK(plan.candidate_index == 1);
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '2');
+  state.CompleteUnhandled();
+  plan = state.PlanKey(Down('0'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '0');
+  state.CompleteUnhandled();
+  plan = state.PlanKey(Down('9'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '9');
+  state.CompleteUnhandled();
+  // A schema may use punctuation (for example ';') as a select key. The host
+  // must forward the physical key and let librime interpret the real
+  // candidate labels/select_keys instead of fabricating a numeric index.
+  plan = state.PlanKey(Down(';'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == ';');
   Correlation stale = plan.correlation;
   --stale.connection_generation;
   CHECK(!state.AcceptReply(stale));
@@ -183,7 +209,8 @@ bool UtfConversionIsStrict() {
 } // namespace
 
 int main() {
-  if (!PureTestAndExactlyOnce() || !CandidateAndCorrelation() ||
+  if (!PureTestAndExactlyOnce() || !DigitCanStartSchemaInput() ||
+      !CandidateAndCorrelation() ||
       !FailureLatchesRecovery() || !ContextsAndGenerationAreIndependent() ||
       !TransientUnavailableReleasesPendingKey() || !UtfConversionIsStrict())
     return 1;

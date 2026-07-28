@@ -132,8 +132,18 @@ internal sealed class WebSearchClient
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(8));
-        using HttpResponseMessage response = await _http.SendAsync(request, timeout.Token);
-        byte[] payload = await response.Content.ReadAsByteArrayAsync(timeout.Token);
+        using HttpResponseMessage response = await _http.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+        byte[] payload;
+        try
+        {
+            payload = await BoundedHttpContent.ReadBytesAsync(
+                response.Content, timeout.Token);
+        }
+        catch (InvalidDataException)
+        {
+            throw new WebSearchRouteUnavailableException();
+        }
         if (!response.IsSuccessStatusCode)
         {
             int status = (int)response.StatusCode;

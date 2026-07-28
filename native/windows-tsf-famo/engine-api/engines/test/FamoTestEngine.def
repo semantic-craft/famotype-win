@@ -1,3 +1,4 @@
 LIBRARY FamoTestEngine
 EXPORTS
     FamoCreateEngineApi
+    FamoCreateEngineApiV2

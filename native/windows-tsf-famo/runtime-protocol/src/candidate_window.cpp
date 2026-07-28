@@ -10,6 +10,7 @@
 #include "../../famo-candidate-ui/famo_candidate_ui.h"
 #include "candidate_skin.h"
 #include "dib_surface.h"
+#include "win_handle.h"
 
 namespace famo::runtime {
 namespace {
@@ -73,7 +74,8 @@ bool SameUiExceptPlacement(const UiState &left, const UiState &right) {
   return left.dpi == right.dpi &&
          left.layout_available == right.layout_available &&
          left.focused == right.focused &&
-         left.show_allowed == right.show_allowed;
+         left.show_allowed == right.show_allowed &&
+         left.selection_capability == right.selection_capability;
 }
 
 class ViewAdapter {
@@ -141,33 +143,15 @@ struct WindowNotifications {
   std::atomic<uint64_t> *system_generation = nullptr;
   FamoLayoutResult layout{};
   PreviewSelectionRequest selection_request{};
+  PipeClientIdentity selection_owner{};
   uint32_t page_index = 0;
   uint32_t page_size = 0;
   int shadow_margin = 0;
   HWND foreground_window = nullptr;
 };
 
-bool SendPreviewSelection(const PreviewSelectionRequest &request) {
-  if (request.correlation.client_id == 0 ||
-      request.composition_sequence == 0)
-    return false;
-  const std::wstring title = std::to_wstring(request.correlation.client_id);
-  HWND target = FindWindowExW(HWND_MESSAGE, nullptr,
-                              kPreviewSelectionWindowClass, title.c_str());
-  if (!target)
-    return false;
-  COPYDATASTRUCT data{static_cast<ULONG_PTR>(kPreviewSelectionCopyDataId),
-                      static_cast<DWORD>(sizeof(request)),
-                      const_cast<PreviewSelectionRequest *>(&request)};
-  DWORD_PTR handled = 0;
-  return SendMessageTimeoutW(target, WM_COPYDATA, 0,
-                             reinterpret_cast<LPARAM>(&data),
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &handled) != 0 &&
-         handled != 0;
-}
-
-LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
-                            LPARAM lparam) {
+LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
+                       LPARAM lparam) {
   if (message == WM_NCCREATE) {
     const auto *create = reinterpret_cast<const CREATESTRUCTW *>(lparam);
     SetWindowLongPtrW(window, GWLP_USERDATA,
@@ -196,7 +180,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
                            notifications->page_size, &selection)) {
       PreviewSelectionRequest request = notifications->selection_request;
       request.absolute_index = selection.absolute_index;
-      SendPreviewSelection(request);
+      SendPreviewSelectionToOwner(window, request,
+                                  notifications->selection_owner);
       return 0;
     }
   }
@@ -205,6 +190,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
   if (message == WM_NCHITTEST && GetWindowLongPtrW(window, GWLP_USERDATA) == 0)
     return HTTRANSPARENT;
   return DefWindowProcW(window, message, wparam, lparam);
+}
+
+LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
+                            LPARAM lparam) noexcept {
+  try {
+    return WindowProcImpl(window, message, wparam, lparam);
+  } catch (...) {
+    return message == WM_NCCREATE
+               ? FALSE
+               : DefWindowProcW(window, message, wparam, lparam);
+  }
 }
 
 HWND CreateLayeredWindow(const wchar_t *class_name,
@@ -309,6 +305,61 @@ bool PrewarmRenderer(FamoTextResources *resources, const FamoSkin *skin,
 }
 
 } // namespace
+
+bool SendPreviewSelectionToOwner(
+    HWND source_window, const PreviewSelectionRequest &request,
+    const PipeClientIdentity &selection_owner) noexcept {
+  if (!source_window || !IsWindow(source_window) ||
+      request.correlation.client_id == 0 ||
+      request.composition_sequence == 0 ||
+      !request.selection_capability || !selection_owner) {
+    return false;
+  }
+  win::UniqueHandle owner_process(
+      AcquirePipeClientIdentityLease(selection_owner));
+  if (!owner_process)
+    return false;
+  DWORD source_process_id = 0;
+  if (GetWindowThreadProcessId(source_window, &source_process_id) == 0 ||
+      source_process_id != GetCurrentProcessId()) {
+    return false;
+  }
+
+  wchar_t title[32]{};
+  if (swprintf_s(title, L"%llu",
+                 static_cast<unsigned long long>(
+                     request.correlation.client_id)) <= 0) {
+    return false;
+  }
+  HWND target = nullptr;
+  HWND after = nullptr;
+  while ((after = FindWindowExW(HWND_MESSAGE, after,
+                                kPreviewSelectionWindowClass, title))) {
+    DWORD process_id = 0;
+    if (GetWindowThreadProcessId(after, &process_id) != 0 &&
+        process_id == selection_owner.process_id) {
+      target = after;
+      break;
+    }
+  }
+  DWORD confirmed_process_id = 0;
+  if (!target ||
+      GetWindowThreadProcessId(target, &confirmed_process_id) == 0 ||
+      confirmed_process_id != selection_owner.process_id ||
+      WaitForSingleObject(owner_process.get(), 0) != WAIT_TIMEOUT) {
+    return false;
+  }
+
+  COPYDATASTRUCT data{static_cast<ULONG_PTR>(kPreviewSelectionCopyDataId),
+                      static_cast<DWORD>(sizeof(request)),
+                      const_cast<PreviewSelectionRequest *>(&request)};
+  DWORD_PTR handled = 0;
+  return SendMessageTimeoutW(
+             target, WM_COPYDATA, reinterpret_cast<WPARAM>(source_window),
+             reinterpret_cast<LPARAM>(&data), SMTO_ABORTIFHUNG | SMTO_BLOCK,
+             100, &handled) != 0 &&
+         handled != 0;
+}
 
 bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
                         uint32_t page_index, uint32_t page_size,
@@ -481,18 +532,18 @@ struct CandidateWindow::State {
 CandidateWindow::~CandidateWindow() { Stop(); }
 
 bool CandidateWindow::Start() {
-  Stop();
-  auto state = std::make_shared<State>(fault_);
-  if (!state->stop_event || !state->update_event ||
-      !state->prewarm_complete_event)
-    return false;
   try {
+    Stop();
+    auto state = std::make_shared<State>(fault_);
+    if (!state->stop_event || !state->update_event ||
+        !state->prewarm_complete_event)
+      return false;
     thread_ = std::thread(&CandidateWindow::ThreadMain, state);
+    state_ = std::move(state);
+    return true;
   } catch (...) {
     return false;
   }
-  state_ = std::move(state);
-  return true;
 }
 
 bool CandidateWindow::Prewarm() {
@@ -565,16 +616,24 @@ CandidateWindow::Counters CandidateWindow::counters() const noexcept {
           state->mode_indicator_count.load(std::memory_order_relaxed)};
 }
 
-void CandidateWindow::Stop() {
-  std::shared_ptr<State> state = std::move(state_);
-  if (!state)
-    return;
-  SetEvent(state->stop_event);
-  if (thread_.joinable()) {
-    if (WaitForSingleObject(thread_.native_handle(), 250) == WAIT_OBJECT_0)
-      thread_.join();
-    else
-      thread_.detach();
+void CandidateWindow::Stop() noexcept {
+  try {
+    std::shared_ptr<State> state = std::move(state_);
+    if (!state)
+      return;
+    SetEvent(state->stop_event);
+    if (thread_.joinable()) {
+      if (WaitForSingleObject(thread_.native_handle(), 250) == WAIT_OBJECT_0)
+        thread_.join();
+      else
+        thread_.detach();
+    }
+  } catch (...) {
+    try {
+      if (thread_.joinable())
+        thread_.detach();
+    } catch (...) {
+    }
   }
 }
 
@@ -608,6 +667,7 @@ void CandidateWindow::Publish(
 }
 
 void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
+  try {
   SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   // Candidate painting is brief and user-visible; keep it ahead of ordinary
   // background work without using a real-time priority class.
@@ -874,7 +934,8 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         presented_dpi == dpi &&
         presented_high_contrast == high_contrast &&
         presented_system_generation == current_system_generation &&
-        snapshot->source_window == presented_snapshot->source_window;
+        snapshot->source_window == presented_snapshot->source_window &&
+        snapshot->selection_owner == presented_snapshot->selection_owner;
     if (stable_presentation &&
         snapshot->composition == presented_snapshot->composition &&
         snapshot->ui_state == presented_snapshot->ui_state) {
@@ -1045,7 +1106,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       if (animate_scroll)
         notifications.layout.preview_candidate_count = 0;
       notifications.selection_request =
-          {snapshot->correlation, snapshot->composition_sequence, 0, 0};
+          {snapshot->correlation, snapshot->composition_sequence, 0, 0,
+           snapshot->ui_state.selection_capability};
+      notifications.selection_owner = snapshot->selection_owner;
       notifications.page_index = snapshot->composition.page_index;
       notifications.page_size = snapshot->composition.page_size;
       notifications.shadow_margin = margin;
@@ -1073,6 +1136,11 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   FamoTextResourcesDestroy(resources);
   if (SUCCEEDED(com))
     CoUninitialize();
+  } catch (...) {
+    state->prewarm_succeeded.store(false, std::memory_order_release);
+    state->prewarm_requested.store(false, std::memory_order_release);
+    SetEvent(state->prewarm_complete_event);
+  }
 }
 
 } // namespace famo::runtime

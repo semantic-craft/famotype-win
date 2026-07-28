@@ -23,8 +23,21 @@ DWORD Remaining(std::chrono::steady_clock::time_point deadline) {
 }
 
 bool ValidReply(const Frame &request, const Frame &reply) {
-  return reply.flags == kFlagResponse && reply.command == request.command &&
-         reply.correlation == request.correlation;
+  if (reply.flags != kFlagResponse)
+    return false;
+  if (reply.command == request.command &&
+      reply.correlation == request.correlation) {
+    return true;
+  }
+  if (request.command != Command::ExecutePrepared &&
+      request.command != Command::ClaimResult) {
+    return false;
+  }
+  DeliveryReference reference;
+  std::string error;
+  return DecodeDeliveryReference(request.payload, &reference, &error) &&
+         reply.command == reference.command &&
+         reply.correlation == reference.correlation;
 }
 
 bool SameSession(const Correlation &left, const Correlation &right) {
@@ -33,6 +46,13 @@ bool SameSession(const Correlation &left, const Correlation &right) {
          left.connection_generation == right.connection_generation &&
          left.session_id == right.session_id &&
          left.session_generation == right.session_generation;
+}
+
+bool PreservesLogicalConnection(Command command) {
+  return IsDeliveryTracked(command) ||
+         command == Command::ExecutePrepared ||
+         command == Command::ClaimResult || command == Command::AckResult ||
+         command == Command::AbandonConnection;
 }
 
 } // namespace
@@ -65,11 +85,21 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
       *error = "invalid connection arguments";
     return false;
   }
+  std::shared_ptr<const Correlation> connected_identity;
+  try {
+    connected_identity =
+        std::make_shared<const Correlation>(connection_identity);
+  } catch (...) {
+    if (error)
+      *error = "connection identity allocation failed";
+    return false;
+  }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   const auto connect_pipe = [&](const PipeEndpoint &channel_endpoint,
                                 std::string *channel_error,
                                 const auto &retirement,
-                                auto connect_deadline) {
+                                auto connect_deadline,
+                                PipeClientIdentity *server_identity) {
     HANDLE pipe = INVALID_HANDLE_VALUE;
     while (pipe == INVALID_HANDLE_VALUE &&
            std::chrono::steady_clock::now() < connect_deadline &&
@@ -96,8 +126,9 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
           release_candidate(true);
           break;
         }
+        PipeClientIdentity candidate_identity;
         if (!VerifyPipeServer(candidate, channel_endpoint, expected_server,
-                              channel_error)) {
+                              channel_error, &candidate_identity)) {
           release_candidate(true);
           return INVALID_HANDLE_VALUE;
         }
@@ -126,6 +157,8 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
             ValidReply(hello, hello_reply) &&
             hello_reply.status == Status::Ok &&
             (!cancelled || !cancelled->load())) {
+          if (server_identity)
+            *server_identity = candidate_identity;
           pipe = candidate;
           release_candidate(false);
           break;
@@ -165,7 +198,9 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
     return pipe;
   };
 
-  HANDLE pipe = connect_pipe(endpoint, error, retirement_, deadline);
+  PipeClientIdentity primary_server;
+  HANDLE pipe =
+      connect_pipe(endpoint, error, retirement_, deadline, &primary_server);
   if (pipe == INVALID_HANDLE_VALUE) {
     return false;
   }
@@ -178,12 +213,23 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
       std::min(deadline, std::chrono::steady_clock::now() +
                              kOptionalUiConnectBudget);
   const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
+  PipeClientIdentity ui_server;
   HANDLE ui_pipe = connect_pipe(ui_endpoint, &ignored_ui_error,
-                                ui_retirement_, ui_deadline);
+                                ui_retirement_, ui_deadline, &ui_server);
+  if (ui_pipe != INVALID_HANDLE_VALUE && ui_server != primary_server) {
+    CloseHandle(ui_pipe);
+    ui_pipe = INVALID_HANDLE_VALUE;
+  }
   {
     std::lock_guard lock(mutex_);
     pipe_ = pipe;
     connection_generation_.store(connection_identity.connection_generation);
+    // Publish creation time before PID; readers treat PID zero as invalid.
+    server_creation_time_.store(primary_server.process_creation_time,
+                                std::memory_order_release);
+    server_process_id_.store(primary_server.process_id,
+                             std::memory_order_release);
+    connection_identity_.store(std::move(connected_identity));
     state_.store(ChannelState::Ready);
     slot_busy_.store(false);
     stop_ = false;
@@ -204,6 +250,9 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
     CloseHandle(pipe_);
     pipe_ = INVALID_HANDLE_VALUE;
     state_.store(ChannelState::NotReady);
+    server_process_id_.store(0, std::memory_order_release);
+    server_creation_time_.store(0, std::memory_order_release);
+    connection_identity_.store(nullptr);
     slot_busy_.store(false);
     if (ui_pipe != INVALID_HANDLE_VALUE) {
       CloseHandle(ui_pipe);
@@ -236,14 +285,15 @@ void PipeRuntimePort::CancelConnect() {
     CancelIoEx(connecting_pipe_, nullptr);
 }
 
-void PipeRuntimePort::CancelCall() {
-  OpenCircuit();
+void PipeRuntimePort::CancelCall(bool preserve_connection_generation) {
+  OpenCircuit(preserve_connection_generation);
   std::lock_guard lock(mutex_);
   if (pipe_ != INVALID_HANDLE_VALUE)
     CancelIoEx(pipe_, nullptr);
 }
 
-void PipeRuntimePort::Stop() {
+void PipeRuntimePort::Stop() noexcept {
+  try {
   HANDLE pipe = INVALID_HANDLE_VALUE;
   HANDLE ui_pipe = INVALID_HANDLE_VALUE;
   {
@@ -283,6 +333,9 @@ void PipeRuntimePort::Stop() {
       CloseHandle(pipe_);
     pipe_ = INVALID_HANDLE_VALUE;
     state_.store(ChannelState::NotReady);
+    server_process_id_.store(0, std::memory_order_release);
+    server_creation_time_.store(0, std::memory_order_release);
+    connection_identity_.store(nullptr);
     slot_busy_.store(false);
     stop_ = false;
     in_flight_ = false;
@@ -296,31 +349,71 @@ void PipeRuntimePort::Stop() {
     ui_stop_ = false;
     ui_ready_ = false;
   }
+  } catch (...) {
+    try {
+      if (worker_.joinable())
+        worker_.detach();
+      if (ui_worker_.joinable())
+        ui_worker_.detach();
+    } catch (...) {
+    }
+    state_.store(ChannelState::NotReady);
+    server_process_id_.store(0, std::memory_order_release);
+    server_creation_time_.store(0, std::memory_order_release);
+    slot_busy_.store(false);
+    ui_ready_.store(false);
+  }
 }
 
 CallResult PipeRuntimePort::Call(Frame &&request,
                                  std::chrono::milliseconds deadline) {
   const auto started = std::chrono::steady_clock::now();
-  CallResult immediate;
   const std::chrono::milliseconds maximum =
       request.command == Command::OpenSession ? kSessionOpenDeadline
                                                : kHardCallDeadline;
   deadline = std::min(deadline, maximum);
   if (deadline.count() <= 0)
-    return immediate;
+    return {};
+  return CallUntil(std::move(request), started + deadline);
+}
 
-  const auto wait_budget =
-      std::max(std::chrono::milliseconds(1), deadline - kWaitSchedulingReserve);
-  const auto absolute_deadline = started + wait_budget;
+CallResult
+PipeRuntimePort::Call(Frame &&request,
+                      std::chrono::steady_clock::time_point absolute_deadline) {
+  return CallUntil(std::move(request), absolute_deadline);
+}
+
+CallResult PipeRuntimePort::CallUntil(
+    Frame &&request,
+    std::chrono::steady_clock::time_point absolute_deadline) {
+  const auto started = std::chrono::steady_clock::now();
+  const bool preserve_connection_generation =
+      PreservesLogicalConnection(request.command);
+  CallResult immediate;
+  const std::chrono::milliseconds maximum =
+      request.command == Command::OpenSession ? kSessionOpenDeadline
+                                               : kHardCallDeadline;
+  absolute_deadline =
+      std::min(absolute_deadline, started + maximum);
+  if (absolute_deadline <= started + std::chrono::milliseconds(1)) {
+    immediate.status = Status::Timeout;
+    return immediate;
+  }
+  const auto remaining = absolute_deadline - started;
+  const auto reserve =
+      std::min(remaining - std::chrono::milliseconds(1),
+               std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                   kWaitSchedulingReserve));
+  const auto wait_deadline = absolute_deadline - reserve;
   if (state_.load() != ChannelState::Ready || slot_busy_.load()) {
     immediate.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
     return immediate;
   }
   std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
-  if (!lock.try_lock_until(absolute_deadline)) {
+  if (!lock.try_lock_until(wait_deadline)) {
     if (state_.load() == ChannelState::Ready) {
-      OpenCircuit();
+      OpenCircuit(preserve_connection_generation);
       immediate.status = Status::Timeout;
     }
     immediate.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -336,7 +429,7 @@ CallResult PipeRuntimePort::Call(Frame &&request,
     return immediate;
   }
   work_.request = std::move(request);
-  work_.deadline = absolute_deadline;
+  work_.deadline = wait_deadline;
   work_.result = {};
   work_.done = false;
   slot_busy_.store(true);
@@ -345,10 +438,10 @@ CallResult PipeRuntimePort::Call(Frame &&request,
   available_.notify_one();
 
   std::unique_lock item_lock(work_.mutex);
-  const bool done = work_.completed.wait_until(item_lock, absolute_deadline,
+  const bool done = work_.completed.wait_until(item_lock, wait_deadline,
                                                [&] { return work_.done; });
   const auto completed_at = std::chrono::steady_clock::now();
-  if (done && completed_at < absolute_deadline) {
+  if (done && completed_at < wait_deadline) {
     work_.result.elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(completed_at -
                                                               started);
@@ -358,13 +451,84 @@ CallResult PipeRuntimePort::Call(Frame &&request,
     return result;
   }
   item_lock.unlock();
-  OpenCircuit();
+  OpenCircuit(preserve_connection_generation);
   if (done)
     slot_busy_.store(false);
   immediate.status = Status::Timeout;
   immediate.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       completed_at - started);
   return immediate;
+}
+
+CallResult PipeRuntimePort::Prepare(
+    Frame &&request,
+    std::chrono::steady_clock::time_point absolute_deadline) {
+  if (!IsDeliveryTracked(request.command)) {
+    CallResult invalid;
+    invalid.status = Status::InvalidFrame;
+    return invalid;
+  }
+  return CallUntil(std::move(request), absolute_deadline);
+}
+
+Frame PipeRuntimePort::DeliveryControl(
+    Command command, const DeliveryReference &reference) const {
+  Frame request;
+  request.command = command;
+  const std::shared_ptr<const Correlation> identity =
+      connection_identity_.load();
+  if (identity)
+    request.correlation = *identity;
+  (void)EncodeDeliveryReference(reference, &request.payload);
+  return request;
+}
+
+DeliveryResult PipeRuntimePort::DeliveryCall(
+    Command command, const DeliveryReference &reference,
+    std::chrono::steady_clock::time_point absolute_deadline) {
+  DeliveryResult delivery;
+  Frame request = DeliveryControl(command, reference);
+  if (request.correlation.client_id == 0 || request.payload.empty())
+    return delivery;
+  CallResult result = CallUntil(std::move(request), absolute_deadline);
+  delivery.elapsed = result.elapsed;
+  if (result.reply.flags == kFlagResponse &&
+      result.reply.command == reference.command &&
+      result.reply.correlation == reference.correlation) {
+    if (result.reply.status == Status::RecoveryPending) {
+      delivery.status = Status::RecoveryPending;
+    } else {
+      delivery.status = Status::Ok;
+      delivery.final_reply = std::move(result.reply);
+    }
+  } else {
+    delivery.status = result.status;
+  }
+  return delivery;
+}
+
+DeliveryResult PipeRuntimePort::ExecutePrepared(
+    const DeliveryReference &reference,
+    std::chrono::steady_clock::time_point absolute_deadline) {
+  return DeliveryCall(Command::ExecutePrepared, reference, absolute_deadline);
+}
+
+DeliveryResult PipeRuntimePort::Claim(
+    const DeliveryReference &reference,
+    std::chrono::steady_clock::time_point absolute_deadline) {
+  return DeliveryCall(Command::ClaimResult, reference, absolute_deadline);
+}
+
+CallResult PipeRuntimePort::Ack(
+    const DeliveryReference &reference,
+    std::chrono::steady_clock::time_point absolute_deadline) {
+  Frame request = DeliveryControl(Command::AckResult, reference);
+  if (request.correlation.client_id == 0 || request.payload.empty()) {
+    CallResult invalid;
+    invalid.status = Status::Unavailable;
+    return invalid;
+  }
+  return CallUntil(std::move(request), absolute_deadline);
 }
 
 void PipeRuntimePort::Post(Frame &&request) {
@@ -396,7 +560,8 @@ void PipeRuntimePort::Post(Frame &&request) {
 
 void PipeRuntimePort::Poison() { OpenCircuit(); }
 
-void PipeRuntimePort::WorkerMain() {
+void PipeRuntimePort::WorkerMain() noexcept {
+  try {
   for (;;) {
     HANDLE pipe = INVALID_HANDLE_VALUE;
     Frame request;
@@ -421,7 +586,7 @@ void PipeRuntimePort::WorkerMain() {
         break;
       }
       queued_ = false;
-      request = work_.request;
+      request = std::move(work_.request);
       deadline = work_.deadline;
       in_flight_ = true;
       pipe = pipe_;
@@ -443,7 +608,7 @@ void PipeRuntimePort::WorkerMain() {
                            connection_generation_.load() &&
                        state_.load() == ChannelState::Ready;
     if (!valid) {
-      OpenCircuit();
+      OpenCircuit(PreservesLogicalConnection(request.command));
       result.status = io == pipe_io::Result::Timeout ? Status::Timeout
                                                      : Status::Unavailable;
     } else {
@@ -461,9 +626,29 @@ void PipeRuntimePort::WorkerMain() {
     }
     work_.completed.notify_all();
   }
+  } catch (...) {
+    try {
+      OpenCircuit();
+    } catch (...) {
+    }
+    try {
+      std::lock_guard lock(mutex_);
+      queued_ = false;
+      in_flight_ = false;
+    } catch (...) {
+    }
+    try {
+      std::lock_guard item_lock(work_.mutex);
+      work_.result.status = Status::Unavailable;
+      work_.done = true;
+    } catch (...) {
+    }
+    work_.completed.notify_all();
+  }
 }
 
-void PipeRuntimePort::UiWorkerMain() {
+void PipeRuntimePort::UiWorkerMain() noexcept {
+  try {
   HANDLE pipe = INVALID_HANDLE_VALUE;
   {
     std::lock_guard lock(ui_mutex_);
@@ -505,12 +690,24 @@ void PipeRuntimePort::UiWorkerMain() {
     // UiState is lossy state. Ok applies it; any valid rejection simply drops
     // this obsolete update while leaving both transport lanes usable.
   }
+  } catch (...) {
+    ui_ready_.store(false);
+    posted_request_.store(nullptr);
+    ui_wake_epoch_.fetch_add(1);
+    ui_wake_epoch_.notify_all();
+  }
 }
 
-void PipeRuntimePort::OpenCircuit() {
+void PipeRuntimePort::OpenCircuit(bool preserve_connection_generation) {
   ChannelState expected = ChannelState::Ready;
-  if (state_.compare_exchange_strong(expected, ChannelState::OpenCircuit)) {
+  if (state_.compare_exchange_strong(expected, ChannelState::OpenCircuit) &&
+      !preserve_connection_generation) {
     connection_generation_.fetch_add(1);
+  }
+  if (expected == ChannelState::Ready ||
+      state_.load() == ChannelState::OpenCircuit) {
+    server_process_id_.store(0, std::memory_order_release);
+    server_creation_time_.store(0, std::memory_order_release);
   }
   available_.notify_all();
   ui_ready_ = false;
@@ -523,6 +720,17 @@ ChannelState PipeRuntimePort::state() const { return state_.load(); }
 
 uint64_t PipeRuntimePort::connection_generation() const {
   return connection_generation_.load();
+}
+
+PipeClientIdentity PipeRuntimePort::server_identity() const noexcept {
+  const uint32_t process_id =
+      server_process_id_.load(std::memory_order_acquire);
+  if (process_id == 0)
+    return {};
+  return {
+      process_id,
+      server_creation_time_.load(std::memory_order_acquire),
+  };
 }
 
 } // namespace famo::runtime

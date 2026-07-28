@@ -14,19 +14,23 @@ const std::wstring &TestEndpointSuffix() {
   return suffix;
 }
 
+constexpr wchar_t kTestRuntimePreviewSourceClass[] =
+    L"FamoTestRuntimePreviewSource";
+
 } // namespace
 
 RuntimeProcess::~RuntimeProcess() { Stop(); }
 
 bool RuntimeProcess::Start(const wchar_t *path, std::wstring_view fault,
                            uint32_t fault_after, uint32_t connections,
-                           bool inline_preedit) {
+                           bool inline_preedit, uint32_t preview_rows) {
   std::wstring command =
       L"\"" + std::wstring(path) + L"\" --endpoint-suffix " +
       TestEndpointSuffix() + L" --fault " + std::wstring(fault) +
       L" --fault-after " + std::to_wstring(fault_after) +
       L" --connections " + std::to_wstring(connections) +
-      L" --inline-preedit " + (inline_preedit ? L"true" : L"false");
+      L" --inline-preedit " + (inline_preedit ? L"true" : L"false") +
+      L" --preview-rows " + std::to_wstring(preview_rows);
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
@@ -65,6 +69,23 @@ bool RuntimeProcess::Finish() {
   return wait == WAIT_OBJECT_0 && exit_code == 0;
 }
 
+HWND RuntimeProcess::PreviewSourceWindow() const {
+  if (!process_.dwProcessId)
+    return nullptr;
+  const std::wstring title = std::to_wstring(process_.dwProcessId);
+  HWND after = nullptr;
+  while ((after = FindWindowExW(HWND_MESSAGE, after,
+                                kTestRuntimePreviewSourceClass,
+                                title.c_str()))) {
+    DWORD process_id = 0;
+    if (GetWindowThreadProcessId(after, &process_id) != 0 &&
+        process_id == process_.dwProcessId) {
+      return after;
+    }
+  }
+  return nullptr;
+}
+
 void RuntimeProcess::Stop() {
   if (process_.hThread) {
     CloseHandle(process_.hThread);
@@ -95,7 +116,11 @@ bool TextServiceModule::Load(const wchar_t *path) {
       GetProcAddress(module_, "FamoCreateTextServiceForTest"));
   reactivate_for_test_ = reinterpret_cast<ReactivateForTestFn>(
       GetProcAddress(module_, "FamoReactivateTextServiceForTest"));
-  return can_unload_ && create_for_test_ && reactivate_for_test_;
+  preview_selection_state_for_test_ =
+      reinterpret_cast<PreviewSelectionStateForTestFn>(
+          GetProcAddress(module_, "FamoGetPreviewSelectionStateForTest"));
+  return can_unload_ && create_for_test_ && reactivate_for_test_ &&
+         preview_selection_state_for_test_;
 }
 
 bool TextServiceModule::CanUnload() const { return can_unload_() == S_OK; }
@@ -111,6 +136,12 @@ HRESULT TextServiceModule::ReactivateForTest(
     ITfTextInputProcessorEx *service, ITfThreadMgr *thread_manager,
     TfClientId client_id) const {
   return reactivate_for_test_(service, thread_manager, client_id);
+}
+
+bool TextServiceModule::PreviewSelectionStateForTest(
+    ITfTextInputProcessorEx *service, HWND *target,
+    runtime::PreviewSelectionRequest *request) const {
+  return preview_selection_state_for_test_(service, target, request) != FALSE;
 }
 
 } // namespace famo::tsf::test

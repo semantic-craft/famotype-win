@@ -82,10 +82,42 @@ bool VerifyProcess(DWORD pid, const PipeEndpoint &endpoint,
   }
   if (!SamePath(std::wstring_view(path.data(), length), expected_path)) {
     if (error)
-      *error = "pipe server executable path mismatch";
+      *error = "pipe peer executable path mismatch";
     SetLastError(ERROR_ACCESS_DENIED);
     return false;
   }
+  return true;
+}
+
+uint64_t FileTimeValue(const FILETIME &value) {
+  ULARGE_INTEGER encoded{};
+  encoded.LowPart = value.dwLowDateTime;
+  encoded.HighPart = value.dwHighDateTime;
+  return encoded.QuadPart;
+}
+
+bool ReadProcessIdentity(DWORD pid, PipeClientIdentity *identity,
+                         std::string *error) {
+  if (!identity)
+    return true;
+  UniqueHandle process(
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+  if (!process) {
+    WinError("OpenProcess(client identity)", error);
+    return false;
+  }
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (!GetProcessTimes(process.get(), &created, &exited, &kernel, &user)) {
+    WinError("GetProcessTimes(client)", error);
+    return false;
+  }
+  const uint64_t creation_time = FileTimeValue(created);
+  if (creation_time == 0) {
+    if (error)
+      *error = "client process creation time is unavailable";
+    return false;
+  }
+  *identity = {pid, creation_time};
   return true;
 }
 
@@ -131,7 +163,7 @@ bool BuildCurrentPipeEndpoint(std::wstring_view suffix, PipeEndpoint *endpoint,
     return false;
   }
   endpoint->session_id = session_id;
-  endpoint->name = L"\\\\.\\pipe\\Famo.Runtime.v1." + endpoint->user_sid +
+  endpoint->name = L"\\\\.\\pipe\\Famo.Runtime.v2." + endpoint->user_sid +
                    L"." + std::to_wstring(endpoint->session_id) + L"." +
                    std::wstring(suffix);
   return true;
@@ -165,23 +197,50 @@ bool BuildPipeSecurity(const PipeEndpoint &endpoint,
 }
 
 bool VerifyPipeServer(HANDLE pipe, const PipeEndpoint &endpoint,
-                      std::wstring_view expected_path, std::string *error) {
+                      std::wstring_view expected_path, std::string *error,
+                      PipeClientIdentity *identity) {
   ULONG pid = 0;
   if (!GetNamedPipeServerProcessId(pipe, &pid)) {
     WinError("GetNamedPipeServerProcessId", error);
     return false;
   }
-  return VerifyProcess(pid, endpoint, expected_path, error);
+  return VerifyProcess(pid, endpoint, expected_path, error) &&
+         ReadProcessIdentity(pid, identity, error);
 }
 
 bool VerifyPipeClient(HANDLE pipe, const PipeEndpoint &endpoint,
-                      std::string *error) {
+                      std::string *error, PipeClientIdentity *identity,
+                      std::wstring_view expected_path) {
   ULONG pid = 0;
   if (!GetNamedPipeClientProcessId(pipe, &pid)) {
     WinError("GetNamedPipeClientProcessId", error);
     return false;
   }
-  return VerifyProcess(pid, endpoint, {}, error);
+  return VerifyProcess(pid, endpoint, expected_path, error) &&
+         ReadProcessIdentity(pid, identity, error);
+}
+
+HANDLE AcquirePipeClientIdentityLease(
+    const PipeClientIdentity &identity) noexcept {
+  if (!identity)
+    return nullptr;
+  UniqueHandle process(OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                   FALSE, identity.process_id));
+  if (!process)
+    return nullptr;
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (!GetProcessTimes(process.get(), &created, &exited, &kernel, &user) ||
+      FileTimeValue(created) != identity.process_creation_time) {
+    return nullptr;
+  }
+  if (WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT)
+    return nullptr;
+  return process.release();
+}
+
+bool PipeClientIsAlive(const PipeClientIdentity &identity) {
+  UniqueHandle process(AcquirePipeClientIdentityLease(identity));
+  return process != nullptr;
 }
 
 } // namespace famo::runtime

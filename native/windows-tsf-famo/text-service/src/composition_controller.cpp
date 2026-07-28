@@ -3,6 +3,7 @@
 #include <atomic>
 #include <utility>
 
+#include "abi_boundary.h"
 #include "famo_commit_behavior.h"
 #include "famo_utf_conversion.h"
 #include "module_state.h"
@@ -139,8 +140,10 @@ public:
     return remaining;
   }
   HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie cookie) override {
-    result_ =
-        controller_->ApplyInSession(cookie, context_.get(), plan_, sink_.get());
+    result_ = ComBoundary([&] {
+      return controller_->ApplyInSession(cookie, context_.get(), plan_,
+                                         sink_.get());
+    });
     return result_;
   }
   HRESULT result() const { return result_; }
@@ -181,7 +184,8 @@ public:
     return remaining;
   }
   HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie cookie) override {
-    result_ = controller_->EndInSession(cookie);
+    result_ =
+        ComBoundary([&] { return controller_->EndInSession(cookie); });
     return result_;
   }
   HRESULT result() const { return result_; }

@@ -62,7 +62,7 @@ add_library(FamoTextService SHARED
 target_include_directories(FamoTextService PRIVATE include src)
 target_compile_definitions(FamoTextService PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(FamoTextService PRIVATE
-  famo_tsf_host_model famo_runtime_core ole32 oleaut32 advapi32)
+  famo_tsf_host_model famo_runtime_core ole32 oleaut32 advapi32 bcrypt)
 set_target_properties(FamoTextService PROPERTIES PREFIX "")
 add_dependencies(FamoTextService FamoTestRuntime FamoTestEngine)
 add_custom_command(TARGET FamoTextService POST_BUILD
@@ -90,7 +90,8 @@ add_executable(${FAMO_PROFILE_TOOL} tools/dev_profile_main.cpp)
 target_include_directories(${FAMO_PROFILE_TOOL} PRIVATE
   src ${CMAKE_CURRENT_SOURCE_DIR}/../runtime-protocol/include)
 target_compile_definitions(${FAMO_PROFILE_TOOL} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(${FAMO_PROFILE_TOOL} PRIVATE ole32 advapi32 Rstrtmgr)
+target_link_libraries(${FAMO_PROFILE_TOOL} PRIVATE
+  ole32 advapi32 Rstrtmgr shell32 ntdll)
 add_dependencies(${FAMO_PROFILE_TOOL} FamoTextService)
 add_custom_command(TARGET ${FAMO_PROFILE_TOOL} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -102,6 +103,22 @@ target_include_directories(module_selfcheck PRIVATE
 target_compile_definitions(module_selfcheck PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(module_selfcheck PRIVATE ole32)
 add_dependencies(module_selfcheck FamoTextService ${FAMO_PROFILE_TOOL})
+
+add_executable(identity_broker_selfcheck
+  tests/identity_broker_selfcheck.cpp)
+target_compile_definitions(identity_broker_selfcheck PRIVATE
+  NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(identity_broker_selfcheck PRIVATE ole32)
+add_dependencies(identity_broker_selfcheck ${FAMO_PROFILE_TOOL})
+
+add_executable(user_data_cleanup_selfcheck
+  tests/user_data_cleanup_selfcheck.cpp)
+target_include_directories(user_data_cleanup_selfcheck PRIVATE
+  src ${CMAKE_CURRENT_SOURCE_DIR}/../runtime-protocol/include)
+target_compile_definitions(user_data_cleanup_selfcheck PRIVATE
+  NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(user_data_cleanup_selfcheck PRIVATE
+  ole32 advapi32 Rstrtmgr shell32 ntdll)
 
 add_executable(tsf_integration_selfcheck
   tests/fake_text_store.cpp
@@ -121,6 +138,11 @@ add_test(NAME candidate_ui_selfcheck COMMAND candidate_ui_selfcheck)
 add_test(NAME module_selfcheck
   COMMAND module_selfcheck $<TARGET_FILE:FamoTextService>
                            $<TARGET_FILE:${FAMO_PROFILE_TOOL}>)
+add_test(NAME identity_broker_selfcheck
+  COMMAND identity_broker_selfcheck $<TARGET_FILE:${FAMO_PROFILE_TOOL}>)
+set_tests_properties(identity_broker_selfcheck PROPERTIES TIMEOUT 70)
+add_test(NAME user_data_cleanup_selfcheck
+  COMMAND user_data_cleanup_selfcheck)
 add_test(NAME tsf_integration_selfcheck
   COMMAND tsf_integration_selfcheck
     $<TARGET_FILE:FamoTextService>

@@ -4,8 +4,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,6 +42,9 @@ public:
                                        TfClientId client_id,
                                        DWORD flags) override;
   HRESULT ActivateForTest(ITfThreadMgr *thread_manager, TfClientId client_id);
+  bool PreviewSelectionStateForTest(
+      HWND *target,
+      runtime::PreviewSelectionRequest *request) const noexcept;
 
   HRESULT STDMETHODCALLTYPE OnSetFocus(BOOL foreground) override;
   HRESULT STDMETHODCALLTYPE OnTestKeyDown(ITfContext *context, WPARAM key,
@@ -68,6 +73,22 @@ public:
                                            ITfContextView *view) override;
 
 private:
+  enum class DeliveryWorkKind { Recover, Cancel, Ack };
+  enum class DeliveryAttemptState {
+    Rejected,
+    PrepareUnknown,
+    Final,
+    PreparedAmbiguous
+  };
+
+  struct DeliveryAttempt {
+    DeliveryAttemptState state = DeliveryAttemptState::Rejected;
+    runtime::Status status = runtime::Status::Unavailable;
+    runtime::DeliveryReference reference;
+    runtime::Frame final_reply;
+    std::chrono::milliseconds elapsed{0};
+  };
+
   struct ContextEntry {
     ComPtr<ITfContext> context;
     ComPtr<ITfDocumentMgr> document;
@@ -78,9 +99,23 @@ private:
     runtime::UiState ui_state;
     runtime::Correlation pending_session;
     std::string recovery_preedit;
+    std::optional<runtime::DeliveryReference> pending_delivery;
+    std::optional<runtime::DeliveryReference> applied_delivery;
+    std::optional<runtime::Composition> deferred_delivery_composition;
+    DeliveryWorkKind pending_delivery_work = DeliveryWorkKind::Recover;
+    WPARAM pending_windows_key = 0;
+    bool pending_key_down = false;
+    bool pending_physical_key = false;
+    bool delivery_work_pending = false;
+    bool delivery_quarantined = false;
+    bool recover_after_delivery_ack = false;
     bool recovery_cleanup_required = false;
     bool session_pending = false;
     bool first_key_pending = true;
+    bool close_requested = false;
+    // Capability is valid only for this exact displayed composition sequence.
+    // Zero means the current composition has already consumed its click.
+    uint64_t selection_capability_sequence = 0;
   };
 
   enum class SessionWarmupReason { Activation, Focus, Recovery };
@@ -95,6 +130,20 @@ private:
     bool ready = false;
   };
 
+  struct DeliveryWorkRequest {
+    runtime::Correlation identity;
+    runtime::DeliveryReference reference;
+    DeliveryWorkKind kind = DeliveryWorkKind::Recover;
+  };
+
+  struct DeliveryWorkResult {
+    runtime::Correlation identity;
+    runtime::DeliveryReference reference;
+    DeliveryWorkKind kind = DeliveryWorkKind::Recover;
+    runtime::Status status = runtime::Status::Unavailable;
+    runtime::Frame final_reply;
+  };
+
   class LayoutEditSession;
 
   ~TextService();
@@ -102,22 +151,35 @@ private:
               std::wstring runtime_executable_name, std::string schema_id);
   HRESULT ActivateCore(ITfThreadMgr *thread_manager, TfClientId client_id,
                        bool advise_key_sink);
+  HRESULT DeactivateCore();
+  void ForceDeactivateCleanup() noexcept;
   bool OnActivationThread() const;
-  bool ConnectRuntime(const runtime::Correlation &identity);
+  bool ConnectRuntime(const runtime::Correlation &identity,
+                      bool retry_terminal_debt = true);
   HRESULT EnsureContext(
       ITfContext *context,
       SessionWarmupReason reason = SessionWarmupReason::Focus);
   bool StartSessionWorker();
-  void StopSessionWorker();
+  void StopSessionWorker() noexcept;
   bool StartRecoveryWindow();
   void StopRecoveryWindow();
   void PostRecoveryWork();
   void ProcessRecoveryWork();
   static LRESULT CALLBACK RecoveryWindowProc(HWND window, UINT message,
                                              WPARAM wparam, LPARAM lparam);
-  void SessionWorkerMain();
+  void SessionWorkerMain() noexcept;
+  void ProcessDeliveryWork(
+      const std::shared_ptr<const DeliveryWorkRequest> &request);
   void ScheduleSession(ContextEntry *entry, SessionWarmupReason reason);
+  void ScheduleDeliveryWork(ContextEntry *entry, DeliveryWorkKind kind,
+                            const runtime::DeliveryReference &reference);
   void ApplySessionResult();
+  void ApplyDeliveryResult();
+  void ApplyOneDeliveryResult(const DeliveryWorkResult &result);
+  void FinalizeClosingContexts();
+  bool ApplyDeferredDelivery(ContextEntry *entry);
+  void QuarantineDelivery(ContextEntry *entry);
+  DeliveryAttempt SendDelivery(ContextEntry *entry, runtime::Frame &&request);
   void DisconnectRuntimeIfIdle();
   void ReportTiming(const char *operation,
                     std::chrono::milliseconds elapsed,
@@ -125,10 +187,14 @@ private:
                     runtime::Status status) const;
   ContextEntry *FindContext(ITfContext *context);
   void CloseContext(ITfContext *context);
-  void CloseEntry(ContextEntry *entry);
+  bool CloseEntry(ContextEntry *entry);
   HRESULT HandleKey(ITfContext *context, WPARAM key, LPARAM key_data,
                     bool down, bool test_only, BOOL *eaten);
-  bool HandlePreviewSelection(const runtime::PreviewSelectionRequest &request);
+  bool HandlePreviewSelection(
+      HWND source_window,
+      const runtime::PreviewSelectionRequest &request);
+  bool RenewSelectionCapability(ContextEntry *entry,
+                                uint64_t composition_sequence) noexcept;
   HRESULT ApplyRuntimeComposition(ContextEntry *entry,
                                   const runtime::Composition &composition);
   void RecoverConnection();
@@ -169,6 +235,12 @@ private:
   std::atomic<std::shared_ptr<const SessionWarmupResult>> session_result_;
   std::atomic<std::shared_ptr<const runtime::Correlation>> desired_session_;
   std::mutex session_publication_mutex_;
+  static constexpr size_t kMaxQueuedDeliveryWork = 64;
+  std::mutex delivery_queue_mutex_;
+  std::deque<std::shared_ptr<const DeliveryWorkRequest>>
+      delivery_requests_;
+  std::deque<std::shared_ptr<const DeliveryWorkResult>>
+      delivery_results_;
   std::mutex session_retry_mutex_;
   std::condition_variable session_retry_wake_;
   HWND recovery_window_ = nullptr;

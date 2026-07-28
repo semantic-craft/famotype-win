@@ -12,8 +12,27 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
+
+#include <windows.h>
 
 #include "../famo_candidate_ui.h"
+
+static_assert(noexcept(FamoSkinDefault()));
+static_assert(noexcept(FamoUtf8ByteToWchar(nullptr, 0, 0)));
+static_assert(noexcept(FamoComputeAnchor(
+    nullptr, nullptr, {}, nullptr, nullptr, nullptr)));
+static_assert(noexcept(FamoCandidateUiLayout(
+    nullptr, nullptr, nullptr, nullptr)));
+static_assert(noexcept(FamoTextResourcesCreate(nullptr, 0)));
+static_assert(noexcept(FamoTextResourcesReconfigure(nullptr, nullptr, 0)));
+static_assert(noexcept(FamoTextResourcesDiscardDeviceResources(nullptr)));
+static_assert(noexcept(FamoTextResourcesDestroy(nullptr)));
+static_assert(noexcept(FamoTextMeasure(nullptr, 0, nullptr, 0)));
+static_assert(noexcept(FamoCandidateUiPaint(
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)));
+static_assert(noexcept(FamoStatusBarPaint(
+    nullptr, nullptr, nullptr, nullptr)));
 
 #define CHECK(cond)                                                       \
   do {                                                                    \
@@ -80,6 +99,15 @@ int32_t Measure(void* /*user*/, int32_t /*which*/, const char* s, uint32_t len) 
     i += n;
   }
   return static_cast<int32_t>(units) * 10;
+}
+
+int32_t ThrowingMeasure(void*, int32_t, const char*, uint32_t) {
+  throw std::bad_alloc();
+}
+
+int32_t FaultingMeasure(void*, int32_t, const char*, uint32_t) {
+  RaiseException(0xE0424D4Fu, 0, 0, nullptr);
+  return 0;
 }
 
 // Build a candidate array (caller owns storage). label/text/comment as given.
@@ -532,6 +560,38 @@ int RunLayoutOutputAbiCanary() {
   return 0;
 }
 
+int RunLayoutExceptionBoundary() {
+  FamoSkin skin = FamoSkinDefault();
+  FamoLayoutInput input =
+      MakeInput(R(400, 300, 402, 320), R(0, 0, 1920, 1080));
+  input.measure = &ThrowingMeasure;
+  FamoCandidate candidate;
+  const Cand source[1] = {{"1", kNiHao, nullptr}};
+  FillCands(&candidate, source, 1);
+  FamoCompositionView view = MakeView(&candidate, 1, 0, 0, 1);
+
+  FamoLayoutResult output;
+  std::memset(&output, 0xA5, sizeof(output));
+  const FamoLayoutResult original = output;
+  int32_t result = FAMO_UI_OK;
+  bool escaped = false;
+  try {
+    result = FamoCandidateUiLayout(&view, &skin, &input, &output);
+  } catch (...) {
+    escaped = true;
+  }
+  CHECK(!escaped);
+  CHECK(result == FAMO_UI_E_LAYOUT_FAILED);
+  CHECK(std::memcmp(&output, &original, sizeof(output)) == 0);
+
+  input.measure = &FaultingMeasure;
+  output = original;
+  result = FamoCandidateUiLayout(&view, &skin, &input, &output);
+  CHECK(result == FAMO_UI_E_LAYOUT_FAILED);
+  CHECK(std::memcmp(&output, &original, sizeof(output)) == 0);
+  return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -544,6 +604,7 @@ int main() {
   if (RunLegacyCandidateAbi()) return 1;
   if (RunArgGuards()) return 1;
   if (RunLayoutOutputAbiCanary()) return 1;
+  if (RunLayoutExceptionBoundary()) return 1;
   std::printf("geometry_selfcheck: OK\n");
   return 0;
 }

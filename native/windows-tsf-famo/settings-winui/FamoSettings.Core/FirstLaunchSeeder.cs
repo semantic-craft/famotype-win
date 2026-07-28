@@ -58,7 +58,7 @@ public static class FirstLaunchSeeder
 
         string fullSource = Path.GetFullPath(sourceDir);
         string fullTarget = Path.GetFullPath(targetDir);
-        Directory.CreateDirectory(fullTarget);
+        using IDisposable held = UserDataTransactionLock.Acquire(fullTarget);
 
         int copied = 0;
         int skipped = 0;
@@ -67,11 +67,6 @@ public static class FirstLaunchSeeder
         {
             string rel = Path.GetRelativePath(fullSource, file);
             string target = Path.Combine(fullTarget, rel);
-            string? targetParent = Path.GetDirectoryName(target);
-            if (!string.IsNullOrEmpty(targetParent))
-            {
-                Directory.CreateDirectory(targetParent);
-            }
 
             if (File.Exists(target) && !force)
             {
@@ -79,8 +74,18 @@ public static class FirstLaunchSeeder
                 continue;
             }
 
-            File.Copy(file, target, overwrite: true);
-            copied++;
+            try
+            {
+                SeedFileTransaction.CopyDurableAtomic(
+                    file, target, overwrite: force);
+                copied++;
+            }
+            catch (IOException) when (!force && File.Exists(target))
+            {
+                // A non-Famo writer can still win the create race. Preserve
+                // its complete object instead of overwriting it.
+                skipped++;
+            }
         }
 
         return new FirstLaunchSeedResult(fullSource, fullTarget, files.Length, copied, skipped);

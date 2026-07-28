@@ -28,7 +28,8 @@ bool RuntimeControlService::Start() {
   return true;
 }
 
-void RuntimeControlService::Stop() {
+void RuntimeControlService::Stop() noexcept {
+  try {
   {
     std::lock_guard lock(mutex_);
     stop_ = true;
@@ -40,6 +41,13 @@ void RuntimeControlService::Stop() {
   queue_.clear();
   clients_.clear();
   results_.clear();
+  } catch (...) {
+    try {
+      if (worker_.joinable())
+        worker_.detach();
+    } catch (...) {
+    }
+  }
 }
 
 Frame RuntimeControlService::Reply(const Frame &request, Status status) const {
@@ -60,7 +68,8 @@ Frame RuntimeControlService::ResultReply(const Frame &request,
   return reply;
 }
 
-Frame RuntimeControlService::Dispatch(const Frame &request) {
+Frame RuntimeControlService::Dispatch(
+    const Frame &request, const PipeClientIdentity &owner) {
   if (request.flags != 0 || request.status != Status::Ok)
     return Reply(request, Status::InvalidFrame);
   const Correlation &c = request.correlation;
@@ -74,6 +83,10 @@ Frame RuntimeControlService::Dispatch(const Frame &request) {
     if (!request.payload.empty() || c.sequence != 0)
       return Reply(request, Status::InvalidFrame);
     const auto found = clients_.find(c.client_id);
+    if (found != clients_.end() && owner && found->second.owner &&
+        found->second.owner != owner) {
+      return Reply(request, Status::StaleRequest);
+    }
     if (found != clients_.end() &&
         (c.activation_generation < found->second.activation_generation ||
          (c.activation_generation == found->second.activation_generation &&
@@ -83,8 +96,11 @@ Frame RuntimeControlService::Dispatch(const Frame &request) {
         c.activation_generation == found->second.activation_generation &&
         c.connection_generation == found->second.connection_generation)
       return Reply(request, Status::Ok);
+    if (found == clients_.end() && clients_.size() >= kMaxClients)
+      return Reply(request, Status::Unavailable);
     clients_[c.client_id] =
-        ClientState{c.activation_generation, c.connection_generation, 0};
+        ClientState{c.activation_generation, c.connection_generation, 0,
+                    owner};
     return Reply(request, Status::Ok);
   }
 
@@ -92,6 +108,7 @@ Frame RuntimeControlService::Dispatch(const Frame &request) {
   if (client == clients_.end() ||
       client->second.activation_generation != c.activation_generation ||
       client->second.connection_generation != c.connection_generation ||
+      (owner && client->second.owner != owner) ||
       c.sequence == 0 || c.sequence <= client->second.last_sequence)
     return Reply(request, Status::StaleRequest);
   client->second.last_sequence = c.sequence;
@@ -146,16 +163,18 @@ Frame RuntimeControlService::Dispatch(const Frame &request) {
 
 void RuntimeControlService::InvalidateConnection(
     uint64_t client_id, uint64_t activation_generation,
-    uint64_t connection_generation) {
+    uint64_t connection_generation, const PipeClientIdentity &owner) {
   std::lock_guard lock(mutex_);
   const auto found = clients_.find(client_id);
   if (found != clients_.end() &&
       found->second.activation_generation == activation_generation &&
-      found->second.connection_generation == connection_generation)
+      found->second.connection_generation == connection_generation &&
+      (!owner || found->second.owner == owner))
     clients_.erase(found);
 }
 
-void RuntimeControlService::WorkerMain() {
+void RuntimeControlService::WorkerMain() noexcept {
+  try {
   for (;;) {
     Operation operation;
     {
@@ -170,7 +189,14 @@ void RuntimeControlService::WorkerMain() {
       result.readiness = runtime_->readiness();
     }
 
-    const ControlError control_error = runtime_->ExecuteControl(operation.command);
+    ControlError control_error = ControlError::Runtime;
+    try {
+      control_error = runtime_->ExecuteControl(operation.command);
+    } catch (...) {
+      // A control implementation must not terminate the sole worker and leave
+      // this operation forever Running. Unknown partial state is not Ready.
+      runtime_->readiness_.store(RuntimeReadiness::Unavailable);
+    }
     {
       std::lock_guard lock(mutex_);
       ControlResult &result = results_[operation.id];
@@ -187,6 +213,24 @@ void RuntimeControlService::WorkerMain() {
     if (operation.command == Command::ControlShutdown &&
         control_error == ControlError::None)
       running_->store(false);
+  }
+  } catch (...) {
+    runtime_->readiness_.store(RuntimeReadiness::Unavailable);
+    try {
+      std::lock_guard lock(mutex_);
+      for (auto &[id, result] : results_) {
+        (void)id;
+        if (result.state == ControlState::Pending ||
+            result.state == ControlState::Running) {
+          result.state = ControlState::Failed;
+          result.error = ControlError::Runtime;
+          result.retryable = true;
+          result.readiness = RuntimeReadiness::Unavailable;
+        }
+      }
+      queue_.clear();
+    } catch (...) {
+    }
   }
 }
 

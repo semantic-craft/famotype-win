@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+#include "../famo_c_abi_boundary.h"
 #include "../famo_candidate_ui.h"
 
 namespace {
@@ -17,9 +18,8 @@ void SetFace(FamoFontSpec* f, const char* face, float pt) {
   std::memcpy(f->face, face, n);  // buffer zeroed above → NUL-terminated
   f->point_size = pt;
 }
-}  // namespace
 
-extern "C" FamoSkin FamoSkinDefault(void) {
+FamoSkin SkinDefaultImpl() {
   FamoSkin s;
   std::memset(&s, 0, sizeof(s));
   s.size = static_cast<uint32_t>(sizeof(FamoSkin));
@@ -73,4 +73,17 @@ extern "C" FamoSkin FamoSkinDefault(void) {
   s.preview_rows      = 2;
 
   return s;
+}
+
+FamoSkin SkinDefaultCpp() noexcept {
+  try {
+    return SkinDefaultImpl();
+  } catch (...) {
+    return {};
+  }
+}
+}  // namespace
+
+extern "C" FamoSkin FamoSkinDefault(void) noexcept {
+  FAMO_C_ABI_SEH_RETURN(SkinDefaultCpp(), FamoSkin{});
 }

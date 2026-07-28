@@ -28,6 +28,35 @@ public static class Program
         {
             return RunSeedOnly(args);
         }
+        if (TryGetOption(args, "--prepare-seed-transaction", out string? prepareId))
+        {
+            return PrepareSeedTransaction(prepareId!);
+        }
+        if (TryGetTwoOptions(args, "--apply-seed-transaction",
+                out string? applyId, out string? applyHash))
+        {
+            return ApplySeedTransaction(args, applyId!, applyHash!);
+        }
+        if (TryGetTwoOptions(args, "--rollback-seed-transaction",
+                out string? rollbackId, out string? rollbackHash))
+        {
+            return SeedFileTransaction.Rollback(rollbackId!, rollbackHash!) ? 0 : 1;
+        }
+        if (TryGetTwoOptions(args, "--commit-seed-transaction",
+                out string? commitId, out string? commitHash))
+        {
+            return SeedFileTransaction.Commit(commitId!, commitHash!) ? 0 : 1;
+        }
+        if (TryGetOption(args, "--discard-seed-transaction", out string? discardId))
+        {
+            return SeedFileTransaction.DiscardPrepared(discardId!) ? 0 : 1;
+        }
+        if (HasFlag(args, "--is-input-tip"))
+        {
+            return InputMethodList.TryIsFamoInUserList(out bool present)
+                ? (present ? 0 : 1)
+                : 2;
+        }
         if (HasFlag(args, "--remove-input-tip"))
         {
             // 卸载链路：把法墨从当前用户输入法列表移除（文件删除/反注册由安装器负责）。
@@ -87,6 +116,62 @@ public static class Program
         }
     }
 
+    private static int PrepareSeedTransaction(string transactionId)
+    {
+        try
+        {
+            string installedData = FirstLaunchSeeder.ResolveInstalledDataDir();
+            string receiptHash = SeedFileTransaction.Prepare(
+                transactionId,
+                installedData,
+                stagedRoot =>
+                {
+                    FirstLaunchSeeder.Seed(installedData, stagedRoot);
+                    var stagedStore = new SettingsStore(
+                        Path.Combine(stagedRoot, "famo-settings.json"));
+                    FamoSettings settings = stagedStore.Load();
+                    WriteHeadlessOverlays(settings, stagedRoot);
+                });
+            Console.WriteLine($"seed_receipt_hash={receiptHash}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"--prepare-seed-transaction failed: {ex.Message}");
+            return 1;
+        }
+    }
+
+    private static int ApplySeedTransaction(
+        string[] args, string transactionId, string receiptHash)
+    {
+        try
+        {
+            if (!SeedFileTransaction.ApplyPrepared(transactionId, receiptHash))
+            {
+                return 1;
+            }
+            if (!InputMethodList.EnsureFamoInUserList(logFailures: false))
+            {
+                Console.Error.WriteLine(
+                    "transactional EnsureFamoInUserList returned false");
+                return 1;
+            }
+            if (!HasFlag(args, "--no-activate") &&
+                !InputMethodList.ActivateFamoForCurrentDesktop(logFailures: false))
+            {
+                Console.Error.WriteLine(
+                    "transactional ActivateFamoForCurrentDesktop returned false");
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"--apply-seed-transaction failed: {ex.Message}");
+            return 1;
+        }
+    }
+
     private static int RunDemoAppearance()
     {
         try
@@ -109,12 +194,48 @@ public static class Program
         }
     }
 
-    private static void WriteHeadlessOverlays(FamoSettings settings)
+    private static void WriteHeadlessOverlays(FamoSettings settings, string? famoDir = null)
     {
-        ConfigWriter.WriteStyleOverlay(settings, FamoPaths.FamoDir);
-        ConfigWriter.WriteOptionsOverlay(settings, FamoPaths.FamoDir);
-        ConfigWriter.WriteSelectSchema(settings, FamoPaths.FamoDir);
-        ConfigWriter.WriteDeployBucket(settings, FamoPaths.FamoDir);
+        string target = famoDir ?? FamoPaths.FamoDir;
+        ConfigWriter.WriteStyleOverlay(settings, target);
+        ConfigWriter.WriteOptionsOverlay(settings, target);
+        ConfigWriter.WriteSelectSchema(settings, target);
+        ConfigWriter.WriteDeployBucket(settings, target);
+    }
+
+    private static bool HasOption(string[] args, string name) =>
+        TryGetOption(args, name, out _);
+
+    private static bool TryGetOption(string[] args, string name, out string? value)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = args[i + 1];
+                return !string.IsNullOrWhiteSpace(value);
+            }
+        }
+        value = null;
+        return false;
+    }
+
+    private static bool TryGetTwoOptions(
+        string[] args, string name, out string? first, out string? second)
+    {
+        for (int i = 0; i < args.Length - 2; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+            {
+                first = args[i + 1];
+                second = args[i + 2];
+                return !string.IsNullOrWhiteSpace(first) &&
+                    !string.IsNullOrWhiteSpace(second);
+            }
+        }
+        first = null;
+        second = null;
+        return false;
     }
 
     /// <summary>注册单实例 key。本实例为主 → 订阅 Activated 返 false；否则写 handoff + 重定向返 true。</summary>

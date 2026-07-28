@@ -19,10 +19,14 @@ public sealed class LatestMacParityContractTests
         Assert.DoesNotContain("不可点", page);
         Assert.Contains("a.Orientation == \"scroll\"", writer);
         Assert.Contains("PreviewSelectionAt", window);
-        Assert.Contains("SendPreviewSelection(request)", window);
+        Assert.Contains("SendPreviewSelectionToOwner(window, request,", window);
+        Assert.Contains("AcquirePipeClientIdentityLease(selection_owner)", window);
+        Assert.Contains("reinterpret_cast<WPARAM>(source_window)", window);
         Assert.Contains("WM_COPYDATA", window);
         Assert.DoesNotContain("SendInput", window);
         Assert.Contains("Command::SelectCandidateAbsolute", keyPath);
+        Assert.Contains("AcquirePipeClientIdentityLease(runtime_identity)", keyPath);
+        Assert.Contains("SelectionCapabilityMatches", keyPath);
         Assert.DoesNotContain("top_light", paint);
         Assert.DoesNotContain("edge_light", paint);
     }
