@@ -76,7 +76,8 @@ on-device smoke run as described in
 [`native/windows-tsf-famo/installer/smoke_test.md`](native/windows-tsf-famo/installer/smoke_test.md).
 A macOS machine must never fabricate a Windows binary release.
 
-The settings-panel tests are plain .NET and run anywhere:
+Run the settings-panel tests on Windows. They include Win32 / NTFS crash-safe
+transaction, object-identity and atomic-rename checks:
 
 ```powershell
 dotnet test native/windows-tsf-famo/settings-winui/FamoSettings.Tests

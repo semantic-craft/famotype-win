@@ -28,6 +28,9 @@ internal static class UserDataTransactionLock
     internal static string LockFilePathForTests(string dataRoot) =>
         GetLockFilePath(dataRoot);
 
+    internal static string AtomicPublicationRecoveryPath(string dataRoot) =>
+        GetLockFilePath(dataRoot) + ".atomic-publication-recovery";
+
     public static IDisposable Acquire(string? dataRoot = null)
     {
         string root = Path.GetFullPath(dataRoot ?? FamoPaths.FamoDir);
@@ -39,6 +42,7 @@ internal static class UserDataTransactionLock
         var elapsed = Stopwatch.StartNew();
         Mutex? gate = null;
         bool entered = false;
+        FileLockLease? file = null;
         try
         {
             if (!DisableNamedMutexForTests)
@@ -79,14 +83,24 @@ internal static class UserDataTransactionLock
                 }
             }
 
-            FileLockLease file = AcquireFileLock(root, elapsed);
+            file = AcquireFileLock(root, elapsed);
+            SeedFileTransaction.RecoverPendingAtomicPublication(root);
             _threadLock = new Releaser(gate, entered, file);
+            file = null;
             _threadLockDepth = 1;
             return new RecursiveLease();
         }
         catch (Exception failure)
         {
             Exception? cleanupFailure = null;
+            try
+            {
+                file?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                cleanupFailure = ex;
+            }
             try
             {
                 if (entered)
@@ -96,7 +110,9 @@ internal static class UserDataTransactionLock
             }
             catch (Exception ex)
             {
-                cleanupFailure = ex;
+                cleanupFailure = cleanupFailure is null
+                    ? ex
+                    : new AggregateException(cleanupFailure, ex);
             }
             try
             {

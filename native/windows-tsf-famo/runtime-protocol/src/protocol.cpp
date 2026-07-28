@@ -12,11 +12,11 @@ namespace {
 
 bool KnownCommand(uint16_t value) {
   return value >= static_cast<uint16_t>(Command::Hello) &&
-         value <= static_cast<uint16_t>(Command::AbandonConnection);
+         value <= static_cast<uint16_t>(Command::AbandonSession);
 }
 
 bool KnownStatus(uint32_t value) {
-  return value <= static_cast<uint32_t>(Status::RecoveryPending);
+  return value <= static_cast<uint32_t>(Status::DeliveryFailed);
 }
 
 bool Utf8Boundary(std::string_view text, uint32_t offset) {

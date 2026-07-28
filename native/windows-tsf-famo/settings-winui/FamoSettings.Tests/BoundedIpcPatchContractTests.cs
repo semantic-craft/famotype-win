@@ -14,7 +14,9 @@ public sealed class BoundedIpcPatchContractTests
         Assert.Contains("FILE_FLAG_OVERLAPPED", patch);
         Assert.Contains("WaitForSingleObject(overlapped.hEvent, kFamoPipeIoBudgetMs)", patch);
         Assert.Contains("CancelIoEx(pipe, &overlapped)", patch);
-        Assert.Contains("GetOverlappedResult(pipe, &overlapped, &transferred, TRUE)", patch);
+        Assert.Matches(
+            @"GetOverlappedResult\(\r?\n\+\s*pipe,\s*&overlapped,\s*&transferred,\s*TRUE\s*\)",
+            patch);
         Assert.Contains("completion_error == ERROR_OPERATION_ABORTED", patch);
         Assert.Contains("cancel_error == ERROR_NOT_FOUND", patch);
         Assert.DoesNotContain("+      ::CancelIo(pipe)", patch);
@@ -33,7 +35,13 @@ public sealed class BoundedIpcPatchContractTests
         Assert.Contains("body_error == ERROR_MORE_DATA ? ERROR_INVALID_DATA", patch);
         Assert.Contains("wait == WAIT_FAILED", patch);
         Assert.Contains("FamoCancelPipeIoAndWait(pipe, overlapped, wait_error)", patch);
-        Assert.Contains("WaitForSingleObject(overlapped.hEvent, INFINITE)", patch);
+        Assert.Contains(
+            "WaitForSingleObject(overlapped.hEvent,\n+                                  kFamoPipeConnectBudgetMs)",
+            patch.Replace("\r\n", "\n", StringComparison.Ordinal));
+        Assert.Contains("wait == WAIT_TIMEOUT", patch);
+        Assert.DoesNotContain(
+            "WaitForSingleObject(overlapped.hEvent, INFINITE)",
+            patch);
         Assert.Contains("catch (DWORD ex)", patch);
         Assert.Contains("ex == ERROR_SEM_TIMEOUT", patch);
         Assert.Contains("wait_error != ERROR_FILE_NOT_FOUND", patch);
@@ -69,64 +77,72 @@ public sealed class BoundedIpcPatchContractTests
         // drain it.
         Assert.DoesNotContain("deferred_actions", patch);
         Assert.DoesNotContain("pending_commit_prefix", patch);
-        int pendingResponseGate = patch.IndexOf(
-            "if (session_status->pending_response_result &&",
+        int executeStart = patch.IndexOf(
+            "+RimeWithWeaselHandler::_ExecuteAbiAction(",
             StringComparison.Ordinal);
-        int pendingResponseDelivery = patch.IndexOf(
-            "_DeliverPendingResponse(ipc_id, session_status, eat)",
-            pendingResponseGate,
+        int executeEnd = executeStart < 0
+            ? -1
+            : patch.IndexOf(
+                "+bool RimeWithWeaselHandler::_RefillAbiView(",
+                executeStart,
+                StringComparison.Ordinal);
+        Assert.True(executeStart >= 0 && executeEnd > executeStart);
+        string execute = patch[executeStart..executeEnd];
+        static int IndexAfter(string text, string value, int start)
+        {
+            return start < 0
+                ? -1
+                : text.IndexOf(value, start, StringComparison.Ordinal);
+        }
+
+        int pendingResponseGate = execute.IndexOf(
+            "if (session_status->pending_response_result)",
             StringComparison.Ordinal);
-        int pending = patch.IndexOf(
+        int pendingResponseReturn = IndexAfter(
+            execute, "return result;", pendingResponseGate);
+        int pending = execute.IndexOf(
             "if (session_status->pending_recovery_action != 0)",
-            pendingResponseDelivery,
             StringComparison.Ordinal);
-        int boundedRecovery = patch.IndexOf(
+        int boundedRecovery = IndexAfter(
+            execute,
             "for (uint32_t attempt = 0; attempt < 3u; ++attempt)",
-            pending,
-            StringComparison.Ordinal);
-        int failedRecovery = patch.IndexOf(
-            "if (!recovered)",
-            boundedRecovery,
-            StringComparison.Ordinal);
-        int failOpen = patch.IndexOf(
-            "result.handled = false",
-            failedRecovery,
-            StringComparison.Ordinal);
-        int returnWithoutDispatch = patch.IndexOf(
-            "return result;",
-            failOpen,
-            StringComparison.Ordinal);
-        int recoveredLease = patch.IndexOf(
+            pending);
+        int failedRecovery = IndexAfter(
+            execute, "if (!recovered)", boundedRecovery);
+        int failOpen = IndexAfter(
+            execute, "result.handled = false", failedRecovery);
+        int returnWithoutDispatch = IndexAfter(
+            execute, "return result;", failOpen);
+        int recoveredLease = IndexAfter(
+            execute,
             "session_status->pending_response_result = std::move(m_abi_result)",
-            returnWithoutDispatch,
-            StringComparison.Ordinal);
-        int clearReceipt = patch.IndexOf(
+            returnWithoutDispatch);
+        int clearReceipt = IndexAfter(
+            execute,
             "session_status->pending_recovery_action = 0",
-            recoveredLease,
-            StringComparison.Ordinal);
-        int deliverRecovered = patch.IndexOf(
-            "_DeliverPendingResponse(ipc_id, session_status, eat)",
-            clearReceipt,
-            StringComparison.Ordinal);
-        int currentAction = patch.IndexOf(
-            "m_engine_host.ExecuteActionRecovering(",
-            deliverRecovered,
-            StringComparison.Ordinal);
+            recoveredLease);
+        int recoveredReady = IndexAfter(
+            execute, "result.ready = true", clearReceipt);
+        int recoveredReturn = IndexAfter(
+            execute, "return result;", recoveredReady);
+        int currentAction = IndexAfter(
+            execute, "m_engine_host.ExecuteActionRecovering(", recoveredReturn);
 
         Assert.True(
             pendingResponseGate >= 0 &&
-            pendingResponseDelivery > pendingResponseGate &&
-            pending > pendingResponseDelivery &&
+            pendingResponseReturn > pendingResponseGate &&
+            pending > pendingResponseReturn &&
             boundedRecovery > pending &&
             failedRecovery > boundedRecovery &&
             failOpen > failedRecovery &&
             returnWithoutDispatch > failOpen &&
             recoveredLease > returnWithoutDispatch &&
             clearReceipt > recoveredLease &&
-            deliverRecovered > clearReceipt &&
-            currentAction > deliverRecovered,
+            recoveredReady > clearReceipt &&
+            recoveredReturn > recoveredReady &&
+            currentAction > recoveredReturn,
             "pending recovery must either fail the last key open before dispatch, " +
-            "or retain and deliver its exact engine-owned result before the current key");
+            "or retain its exact engine-owned result and return it before the current key");
         Assert.Contains(
             "Do not retain it\n+      // waiting for another user event: fail open in this callback.",
             patch);

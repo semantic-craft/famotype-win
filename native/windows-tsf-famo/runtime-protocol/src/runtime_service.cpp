@@ -71,6 +71,7 @@ bool RuntimeService::Start(const wchar_t *engine_path, const char *data_root,
     deliveries_.reserve(kMaxDeliveries);
     acknowledged_deliveries_.reserve(kMaxAcknowledgements);
     abandoned_epochs_.reserve(kMaxAbandonedEpochs);
+    abandoned_sessions_.reserve(kMaxAbandonedSessions);
     retired_contexts_.reserve(kMaxRetiredContexts);
     next_engine_path.assign(engine_path ? engine_path : L"");
     next_data_root.assign(data_root ? data_root : "");
@@ -129,6 +130,7 @@ void RuntimeService::Stop() noexcept {
   deliveries_.clear();
   acknowledged_deliveries_.clear();
   abandoned_epochs_.clear();
+  abandoned_sessions_.clear();
   if (!started_) {
     sessions_.clear();
     ui_sessions_.clear();
@@ -236,6 +238,55 @@ bool RuntimeService::RememberAbandonedEpochLocked(
   return true;
 }
 
+const RuntimeService::AbandonedSession *
+RuntimeService::FindAbandonedSessionLocked(
+    const Correlation &correlation) const {
+  const auto found = std::find_if(
+      abandoned_sessions_.begin(), abandoned_sessions_.end(),
+      [&](const AbandonedSession &entry) {
+        const Correlation &known = entry.reference.correlation;
+        return known.client_id == correlation.client_id &&
+               known.activation_generation ==
+                   correlation.activation_generation &&
+               known.connection_generation ==
+                   correlation.connection_generation &&
+               known.session_id == correlation.session_id &&
+               known.session_generation == correlation.session_generation;
+      });
+  return found == abandoned_sessions_.end() ? nullptr : &*found;
+}
+
+bool RuntimeService::RememberAbandonedSessionLocked(
+    const DeliveryReference &reference, const PipeClientIdentity &owner) {
+  if (const AbandonedSession *existing =
+          FindAbandonedSessionLocked(reference.correlation)) {
+    return existing->owner == owner && existing->reference == reference;
+  }
+
+  const size_t owner_count =
+      std::count_if(abandoned_sessions_.begin(), abandoned_sessions_.end(),
+                    [&](const AbandonedSession &entry) {
+                      return entry.owner == owner;
+                    });
+  if (owner_count >= kMaxAbandonedSessionsPerOwner) {
+    const auto oldest = std::find_if(
+        abandoned_sessions_.begin(), abandoned_sessions_.end(),
+        [&](const AbandonedSession &entry) {
+          return entry.owner == owner;
+        });
+    if (oldest != abandoned_sessions_.end())
+      abandoned_sessions_.erase(oldest);
+  }
+  if (abandoned_sessions_.size() >= kMaxAbandonedSessions)
+    abandoned_sessions_.erase(abandoned_sessions_.begin());
+  try {
+    abandoned_sessions_.push_back({reference, owner});
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
 void RuntimeService::RetryRetiredContextsLocked() {
   std::erase_if(retired_contexts_, [&](FamoEngineContext *context) {
     return !context ||
@@ -275,6 +326,9 @@ void RuntimeService::CleanupDeadOwnersLocked() {
   std::erase_if(abandoned_epochs_, [](const AbandonedEpoch &entry) {
     return !PipeClientIsAlive(entry.owner);
   });
+  std::erase_if(abandoned_sessions_, [](const AbandonedSession &entry) {
+    return !PipeClientIsAlive(entry.owner);
+  });
   for (auto client = clients_.begin(); client != clients_.end();) {
     if (!client->second.owner ||
         PipeClientIsAlive(client->second.owner)) {
@@ -309,6 +363,10 @@ void RuntimeService::CleanupDeadOwnersLocked() {
     std::erase_if(abandoned_epochs_, [&](const AbandonedEpoch &entry) {
       return entry.owner == client->second.owner;
     });
+    std::erase_if(abandoned_sessions_,
+                  [&](const AbandonedSession &entry) {
+                    return entry.owner == client->second.owner;
+                  });
     {
       std::lock_guard ui_lock(ui_sessions_mutex_);
       for (auto session = sessions_.begin(); session != sessions_.end();) {

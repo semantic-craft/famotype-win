@@ -1,5 +1,5 @@
 diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
-index 5d2766c..02d097c 100644
+index 5d2766c..cd4f040 100644
 --- a/RimeWithWeasel/RimeWithWeasel.cpp
 +++ b/RimeWithWeasel/RimeWithWeasel.cpp
 @@ -9,7 +9,10 @@
@@ -13,10 +13,9 @@ index 5d2766c..02d097c 100644
  #include <vector>
  #include <regex>
  #include <rime_api.h>
-@@ -26,7 +29,8 @@ typedef enum { COLOR_ABGR = 0, COLOR_ARGB, COLOR_RGBA } ColorFormat;
+@@ -26,12 +29,87 @@ typedef enum { COLOR_ABGR = 0, COLOR_ARGB, COLOR_RGBA } ColorFormat;
  using namespace weasel;
--
-+
+ 
  static RimeApi* rime_api;
 -WeaselSessionId _GenerateNewWeaselSessionId(SessionStatusMap sm, DWORD pid) {
 +WeaselSessionId _GenerateNewWeaselSessionId(const SessionStatusMap& sm,
@@ -24,10 +23,99 @@ index 5d2766c..02d097c 100644
    if (sm.empty())
      return (WeaselSessionId)(pid + 1);
    return (WeaselSessionId)(sm.rbegin()->first + 1);
-@@ -60,7 +64,9 @@ RimeWithWeaselHandler::RimeWithWeaselHandler(UI* ui)
  }
--
+ 
++DWORD _ReadSessionCreationNonce(LPWSTR buffer) {
++  if (!buffer)
++    return 0;
++  constexpr wchar_t kPrefix[] = L"session.creation_nonce=";
++  wbufferstream stream(buffer, WEASEL_IPC_BUFFER_LENGTH);
++  std::wstring line;
++  while (stream.good()) {
++    std::getline(stream, line);
++    if (!stream.good() || line == L".")
++      break;
++    if (!starts_with(line, std::wstring(kPrefix)))
++      continue;
++    const wchar_t* begin = line.c_str() + std::size(kPrefix) - 1;
++    wchar_t* end = nullptr;
++    const unsigned long parsed = std::wcstoul(begin, &end, 10);
++    if (begin != end && end && *end == L'\0' &&
++        parsed != 0 && parsed <= MAXDWORD) {
++      return static_cast<DWORD>(parsed);
++    }
++    return 0;
++  }
++  return 0;
++}
 +
++namespace {
++ULONGLONG FamoFileTimeValue(const FILETIME& value) noexcept {
++  ULARGE_INTEGER combined{};
++  combined.LowPart = value.dwLowDateTime;
++  combined.HighPart = value.dwHighDateTime;
++  return combined.QuadPart;
++}
++
++ULONGLONG FamoQueryProcessCreationTime(DWORD process_id) noexcept {
++  if (process_id == 0)
++    return 0;
++  HANDLE process = ::OpenProcess(
++      PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, process_id);
++  if (!process)
++    return 0;
++  FILETIME created{}, exited{}, kernel{}, user{};
++  const BOOL queried =
++      ::GetProcessTimes(process, &created, &exited, &kernel, &user);
++  ::CloseHandle(process);
++  return queried ? FamoFileTimeValue(created) : 0;
++}
++
++bool FamoObservedClientIsAlive(DWORD process_id,
++                               ULONGLONG created_at) noexcept {
++  // Sessions created by an older server/client pair have no observation.
++  // Keep them rather than guessing across a rolling update.
++  if (process_id == 0 || created_at == 0)
++    return true;
++
++  HANDLE process = ::OpenProcess(
++      PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, process_id);
++  if (!process)
++    return ::GetLastError() != ERROR_INVALID_PARAMETER;
++
++  const DWORD wait = ::WaitForSingleObject(process, 0);
++  if (wait == WAIT_OBJECT_0) {
++    ::CloseHandle(process);
++    return false;
++  }
++
++  FILETIME created{}, exited{}, kernel{}, user{};
++  const BOOL queried =
++      ::GetProcessTimes(process, &created, &exited, &kernel, &user);
++  ::CloseHandle(process);
++  if (!queried)
++    return true;
++  return FamoFileTimeValue(created) == created_at;
++}
++}  // namespace
++
+ int expand_ibus_modifier(int m) {
+   return (m & 0xff) | ((m & 0xff00) << 16);
+ }
+@@ -56,12 +134,21 @@ RimeWithWeaselHandler::RimeWithWeaselHandler(UI* ui)
+     }
+   }
+   m_pid = (m_pid << (31 - msbit));
++  LARGE_INTEGER response_seed{};
++  (void)::QueryPerformanceCounter(&response_seed);
++  m_next_response_delivery_generation =
++      response_seed.LowPart ^ response_seed.HighPart ^
++      ::GetTickCount() ^ m_pid;
++  if (m_next_response_delivery_generation == 0)
++    m_next_response_delivery_generation = 1;
+   _Setup();
+ }
+ 
  RimeWithWeaselHandler::~RimeWithWeaselHandler() {
 +  _DestroyAbiContexts();
 +  m_engine_host.Unload();
@@ -36,7 +124,8 @@ index 5d2766c..02d097c 100644
 -  m_session_status_map.clear();
    m_app_options.clear();
  }
-@@ -116,20 +122,28 @@ void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize);
+ 
+@@ -116,21 +203,29 @@ void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize);
  bool _UpdateUIStyleColor(RimeConfig* config,
                           UIStyle& style,
                           const std::string& color = std::string());
@@ -60,8 +149,7 @@ index 5d2766c..02d097c 100644
 +  return u8tow(FamoString(value));
 +}
  void _LoadAppOptions(RimeConfig* config, AppOptionsByAppName& app_options);
--
-+
+ 
 -void _RefreshTrayIcon(const RimeSessionId session_id,
 -                      const std::function<void()> _UpdateUICallback) {
 -  // Dangerous, don't touch
@@ -79,20 +167,19 @@ index 5d2766c..02d097c 100644
 +  if (_UpdateUICallback)
      _UpdateUICallback();
  }
-@@ -149,7 +163,6 @@ void RimeWithWeaselHandler::_Setup() {
+ 
+@@ -149,7 +244,6 @@ void RimeWithWeaselHandler::_Setup() {
    std::string log_dir = WeaselLogPath().u8string();
    weasel_traits.log_dir = log_dir.c_str();
    rime_api->setup(&weasel_traits);
 -  rime_api->set_notification_handler(&RimeWithWeaselHandler::OnNotify, this);
  }
--
-+
+ 
  void RimeWithWeaselHandler::Initialize() {
-@@ -158,12 +171,33 @@ void RimeWithWeaselHandler::Initialize() {
+@@ -158,13 +252,34 @@ void RimeWithWeaselHandler::Initialize() {
      return;
    }
--
-+
+ 
 -  LOG(INFO) << "Initializing la rime.";
 -  rime_api->initialize(NULL);
 -  if (rime_api->start_maintenance(/*full_check = */ False)) {
@@ -105,7 +192,7 @@ index 5d2766c..02d097c 100644
      m_disabled = true;
 -    rime_api->join_maintenance_thread();
 +    return;
-   }
++  }
 +  LOG(INFO) << "Famo engine ABI v2 backend active (FamoRimeEngine.dll).";
 +
 +  {
@@ -119,16 +206,16 @@ index 5d2766c..02d097c 100644
 +                     (DWORD)((wcslen(active) + 1) * sizeof(wchar_t)));
 +      RegCloseKey(hkey);
 +    }
-+  }
-+
+   }
+ 
 +  LOG(INFO) << "Initializing la rime through FamoRimeEngine.dll.";
 +  // 引擎 initialize() 已在 host_.Load 内完成 setup+initialize（+首启部署）。
 +  // 以下全局 config 读直连同一 librime 单例（只读、引擎已初始化）。
--
 +
    RimeConfig config = {NULL};
    if (rime_api->config_open("weasel", &config)) {
-@@ -199,18 +233,157 @@ void RimeWithWeaselHandler::Initialize() {
+     if (m_ui) {
+@@ -199,89 +314,393 @@ void RimeWithWeaselHandler::Initialize() {
  void RimeWithWeaselHandler::Finalize() {
    m_active_session = 0;
    m_disabled = true;
@@ -139,8 +226,7 @@ index 5d2766c..02d097c 100644
 +  m_engine_host.Unload();  // 引擎 shutdown() 内跑 librime finalize
 +  _ClearNotifications();   // Unload waited for the last async callback.
  }
--
-+
+ 
  DWORD RimeWithWeaselHandler::FindSession(WeaselSessionId ipc_id) {
    if (m_disabled)
      return 0;
@@ -153,6 +239,15 @@ index 5d2766c..02d097c 100644
 +                     found_session->second.engine_ctx != nullptr;
 +  DLOG(INFO) << "Find session: ipc_id = " << ipc_id << ", found = " << found;
 +  return found ? ipc_id : 0;
++}
++
++bool RimeWithWeaselHandler::RecoverResponseDelivery(
++    WeaselSessionId ipc_id,
++    EatLine eat) {
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || !session_status->pending_response_result)
++    return false;
++  return _DeliverPendingResponse(ipc_id, session_status, eat);
 +}
 +
 +RimeWithWeaselHandler::AbiActionOutcome
@@ -172,11 +267,12 @@ index 5d2766c..02d097c 100644
 +          FamoEngineActionResultLease>::value,
 +      "pending response adoption must not allocate or throw");
 +
-+  // A previously finalized result owns the only undelivered commit. Retry it
-+  // before this physical/control action can enter the engine. Failure leaves
-+  // the lease untouched and makes the current action fail open/fail.
-+  if (session_status->pending_response_result &&
-+      !_DeliverPendingResponse(ipc_id, session_status, eat)) {
++  // A previously finalized result owns the only undelivered commit. Return it
++  // in this transaction and do not dispatch the new physical/control action.
++  // The caller formats it once; the new action fails open/fails.
++  if (session_status->pending_response_result) {
++    result.ready = true;
++    result.recovered_prior = true;
 +    return result;
 +  }
 +
@@ -215,10 +311,9 @@ index 5d2766c..02d097c 100644
 +    session_status->pending_response_result = std::move(m_abi_result);
 +    session_status->pending_recovery_action = 0;
 +    session_status->pending_recovery_handled = false;
++    result.ready = true;
 +    result.recovered_prior = true;
-+    if (!_DeliverPendingResponse(ipc_id, session_status, eat)) {
-+      return result;
-+    }
++    return result;
 +  }
 +
 +  FamoEngineRecoveryOutcome recovery_outcome;
@@ -278,6 +373,7 @@ index 5d2766c..02d097c 100644
 +void RimeWithWeaselHandler::_DestroyAbiContexts() {
 +  // ABI lifecycle order is strict: result -> contexts -> shutdown/unload.
 +  (void)m_abi_result.Reset();
++  m_staged_response_delivery = {};
 +  if (m_engine_host.V2Runnable()) {
 +    for (auto& pair : m_session_status_map) {
 +      (void)pair.second.pending_response_result.Reset();
@@ -291,10 +387,18 @@ index 5d2766c..02d097c 100644
 +  m_session_status_map.clear();
 +  _ClearNotifications();
  }
--
-+
+ 
  DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
-@@ -220,49 +393,104 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
++  return AddSessionForClient(buffer, eat, 0);
++}
++
++DWORD RimeWithWeaselHandler::AddSessionForClient(
++    LPWSTR buffer,
++    EatLine eat,
++    DWORD client_process_id) {
+   if (m_disabled) {
+     DLOG(INFO) << "Trying to resume service.";
+     EndMaintenance();
      if (m_disabled)
        return 0;
    }
@@ -304,6 +408,85 @@ index 5d2766c..02d097c 100644
 -    std::string sel = _ReadFamoSelectSchema();
 -    if (!sel.empty())
 -      rime_api->select_schema(session_id, sel.c_str());
++  const ULONGLONG client_process_created =
++      FamoQueryProcessCreationTime(client_process_id);
++  const ULONGLONG now = ::GetTickCount64();
++  // Reclaim timed-out START handshakes before enforcing the hard cap. This is
++  // allocation-free so memory pressure cannot permanently disable cleanup.
++  for (auto it = m_session_status_map.begin();
++       it != m_session_status_map.end();) {
++    const auto current = it++;
++    const SessionStatus& status = current->second;
++    if (status.provisional_session &&
++        now - status.provisional_created_at > 5u * 60u * 1000u) {
++      (void)RemoveSession(current->first);
++    }
++  }
++
++  // Query each observed process incarnation once. Session ids are ordered by
++  // creation, so an earlier surviving match proves that this pair was already
++  // checked alive in this pass. A dead pair is removed as a group and the
++  // iterator restarts, avoiding both thousands of kernel calls and a heap
++  // allocation under the global request mutex.
++  for (auto probe = m_session_status_map.begin();
++       probe != m_session_status_map.end();) {
++    const DWORD observed_pid = probe->second.client_process_id;
++    const ULONGLONG observed_created =
++        probe->second.client_process_created;
++    if (observed_pid == 0 || observed_created == 0) {
++      ++probe;
++      continue;
++    }
++    bool checked_earlier = false;
++    for (auto earlier = m_session_status_map.begin();
++         earlier != probe; ++earlier) {
++      if (earlier->second.client_process_id == observed_pid &&
++          earlier->second.client_process_created == observed_created) {
++        checked_earlier = true;
++        break;
++      }
++    }
++    if (checked_earlier ||
++        FamoObservedClientIsAlive(observed_pid, observed_created)) {
++      ++probe;
++      continue;
++    }
++
++    for (auto candidate = m_session_status_map.begin();
++         candidate != m_session_status_map.end();) {
++      const auto current = candidate++;
++      if (current->second.client_process_id == observed_pid &&
++          current->second.client_process_created == observed_created) {
++        (void)RemoveSession(current->first);
++      }
++    }
++    probe = m_session_status_map.begin();
++  }
++
++  const DWORD creation_nonce = _ReadSessionCreationNonce(buffer);
++  if (creation_nonce != 0) {
++    for (auto& pair : m_session_status_map) {
++      SessionStatus& status = pair.second;
++      if (status.provisional_session && status.delivery_ack_v1 &&
++          status.client_creation_nonce == creation_nonce &&
++          (status.client_process_id == 0 || client_process_id == 0 ||
++           (status.client_process_id == client_process_id &&
++            (status.client_process_created == 0 ||
++             client_process_created == 0 ||
++             status.client_process_created == client_process_created)))) {
++        (void)_DeliverPendingResponse(pair.first, &status, eat);
++        m_active_session = pair.first;
++        return pair.first;
++      }
++    }
++  }
++  // The cap limits new engine contexts only. A START whose response was lost
++  // must still recover its already-counted provisional session at the limit.
++  constexpr size_t kMaximumObservedSessions = 4096;
++  if (m_session_status_map.size() >= kMaximumObservedSessions) {
++    LOG(ERROR) << "Add session: refusing unbounded session growth";
++    return 0;
++  }
 +  FamoEngineContext* engine_ctx = nullptr;
 +  // 法墨即时输入方式②：新会话即采用 famo-select-schema.txt 所选方案（不部署）。
 +  std::string sel = _ReadFamoSelectSchema();
@@ -343,8 +526,7 @@ index 5d2766c..02d097c 100644
 +    _DestroyEngineContext(engine_ctx);
 +    return 0;
 +  }
--
-+
+ 
    WeaselSessionId ipc_id =
        _GenerateNewWeaselSessionId(m_session_status_map, m_pid);
 -  DLOG(INFO) << "Add session: created session_id = " << session_id
@@ -380,6 +562,10 @@ index 5d2766c..02d097c 100644
 -    session_status.__synced = false;
 -    rime_api->free_status(&status);
 +  session_status.engine_ctx = engine_ctx;
++  session_status.client_creation_nonce = creation_nonce;
++  session_status.client_process_id = client_process_id;
++  session_status.client_process_created = client_process_created;
++  session_status.provisional_created_at = ::GetTickCount64();
 +  if (!_BindNotificationContext(
 +          engine_ctx, ipc_id, &session_status.engine_generation)) {
 +    m_session_status_map.erase(ipc_id);
@@ -390,7 +576,7 @@ index 5d2766c..02d097c 100644
 +    m_session_status_map.erase(ipc_id);
 +    _DestroyEngineContext(engine_ctx);
 +    return 0;
-+  }
+   }
 +
 +  // The first STATUS only identifies the selected schema.  App/schema policy
 +  // may set engine options, so it must never be the snapshot sent to the
@@ -400,7 +586,7 @@ index 5d2766c..02d097c 100644
 +    _DestroyEngineContext(engine_ctx);
 +    LOG(ERROR) << "Add session: context status unavailable, schema=" << sel;
 +    return 0;
-   }
++  }
 +  std::string schema_id = FamoString(m_abi_result->view.schema_id);
 +  m_last_schema_id = schema_id;
 +  _LoadSchemaSpecificSettings(ipc_id, schema_id);
@@ -427,11 +613,13 @@ index 5d2766c..02d097c 100644
 +    // Only the final post-option STATUS may become the initial IPC body.
      _Respond(ipc_id, eat);
    }
-   add_session = true;
-@@ -273,14 +501,25 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+-  add_session = true;
+-  _UpdateUI(ipc_id);
+-  add_session = false;
+   m_active_session = ipc_id;
+   return ipc_id;
  }
--
-+
+ 
  DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
 -  if (m_ui)
 -    m_ui->Hide();
@@ -449,6 +637,8 @@ index 5d2766c..02d097c 100644
 +  FamoEngineContext* ctx = session_status->engine_ctx;
 +  (void)m_abi_result.Reset();
 +  (void)session_status->pending_response_result.Reset();
++  if (m_staged_response_delivery.session_id == ipc_id)
++    m_staged_response_delivery = {};
 +  session_status->engine_ctx = nullptr;
 +  session_status->engine_generation = 0;
 +  if (ctx) {
@@ -460,10 +650,10 @@ index 5d2766c..02d097c 100644
 +    m_active_session = 0;
    return 0;
  }
-@@ -306,17 +545,21 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
+ 
+@@ -306,17 +725,21 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
    }
--
-+
+ 
    for (auto& pair : m_session_status_map) {
 -    RIME_STRUCT(RimeStatus, status);
 -    if (rime_api->get_status(to_session_id(pair.first), &status)) {
@@ -488,10 +678,9 @@ index 5d2766c..02d097c 100644
 +    }
 +  }
  }
--
-+
+ 
  void RimeWithWeaselHandler::_ApplyFamoStyleOverlay(RimeConfig* base) {
-@@ -351,6 +594,12 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
+@@ -351,6 +774,12 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
    // 法墨即时外观②：重读 base(weasel.yaml) + famo-style.yaml 覆盖层，刷新所有会话样式。
    // 复用 UpdateColorTheme 的传播逻辑；不部署、不重建 prism、不碰 TSF 热路径。
    LOG(INFO) << "Famo: ReloadStyleOverlay (instant style, no deploy).";
@@ -504,10 +693,9 @@ index 5d2766c..02d097c 100644
    RimeConfig config = {NULL};
    if (rime_api->config_open("weasel", &config)) {
      if (m_ui) {
-@@ -371,45 +620,55 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
+@@ -371,45 +800,55 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
    }
--
-+
+ 
    for (auto& pair : m_session_status_map) {
 -    RIME_STRUCT(RimeStatus, status);
 -    if (rime_api->get_status(to_session_id(pair.first), &status)) {
@@ -540,8 +728,7 @@ index 5d2766c..02d097c 100644
 -  if (ipc_id && eat && m_session_status_map.find(ipc_id) != m_session_status_map.end())
 -    _Respond(ipc_id, eat);
  }
--
-+
+ 
 -void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
 -  // 法墨即时开关①：把 famo-options.yaml 的 options: 映射逐项 set_option 到一个会话。
 +bool RimeWithWeaselHandler::_ApplyFamoOptions(FamoEngineContext* ctx) {
@@ -578,10 +765,9 @@ index 5d2766c..02d097c 100644
    rime_api->config_close(&cfg);
 +  return success;
  }
--
-+
+ 
  void RimeWithWeaselHandler::ReloadOptions() {
-@@ -417,8 +676,16 @@ void RimeWithWeaselHandler::ReloadOptions() {
+@@ -417,8 +856,16 @@ void RimeWithWeaselHandler::ReloadOptions() {
    LOG(INFO) << "Famo: ReloadOptions (instant switches, no deploy).";
    if (m_disabled)
      return;
@@ -600,10 +786,9 @@ index 5d2766c..02d097c 100644
    if (m_active_session)
      _UpdateUI(m_active_session);  // 中英/简繁等状态变化即时反映到候选窗/状态栏
  }
-@@ -434,17 +701,277 @@ std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
+@@ -434,17 +881,277 @@ std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
  }
--
-+
+ 
  void RimeWithWeaselHandler::SelectSchema() {
 -  // 法墨即时输入方式②：读 famo-select-schema.txt，select_schema 到所有活动会话（不部署、不重建 prism）。
 +  // 法墨即时输入方式②：读 famo-select-schema.txt，重建活动 ABI contexts（不部署、不重建 prism）。
@@ -883,10 +1068,9 @@ index 5d2766c..02d097c 100644
      _UpdateUI(m_active_session);  // 切到新方案后即时刷新候选窗/状态栏
 +  }
  }
--
-+
+ 
  BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
-@@ -454,55 +981,115 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
+@@ -454,55 +1161,111 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
               << ", mask = " << keyEvent.mask << ", ipc_id = " << ipc_id;
    if (m_disabled)
      return FALSE;
@@ -946,12 +1130,11 @@ index 5d2766c..02d097c 100644
      }
    }
 -  _Respond(ipc_id, eat);
-   _UpdateUI(ipc_id);
+-  _UpdateUI(ipc_id);
    m_active_session = ipc_id;
    return (BOOL)handled;
  }
--
-+
+ 
 -void RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id) {
 +bool RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id,
 +                                              EatLine eat) {
@@ -959,6 +1142,7 @@ index 5d2766c..02d097c 100644
    if (m_disabled)
 -    return;
 -  rime_api->commit_composition(to_session_id(ipc_id));
+-  _UpdateUI(ipc_id);
 +    return false;
 +  SessionStatus* session_status = find_session_status(ipc_id);
 +  if (!session_status || !session_status->engine_ctx)
@@ -967,12 +1151,10 @@ index 5d2766c..02d097c 100644
 +      ipc_id, session_status,
 +      FamoEngineHost::Action(FAMO_ENGINE_ACTION_COMMIT_COMPOSITION), eat);
 +  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
-   _UpdateUI(ipc_id);
    m_active_session = ipc_id;
 +  return responded;
  }
--
-+
+ 
 -void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
 +bool RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id,
 +                                             EatLine eat) {
@@ -980,6 +1162,7 @@ index 5d2766c..02d097c 100644
    if (m_disabled)
 -    return;
 -  rime_api->clear_composition(to_session_id(ipc_id));
+-  _UpdateUI(ipc_id);
 +    return false;
 +  SessionStatus* session_status = find_session_status(ipc_id);
 +  if (!session_status || !session_status->engine_ctx)
@@ -990,12 +1173,10 @@ index 5d2766c..02d097c 100644
 +      ipc_id, session_status,
 +      FamoEngineHost::Action(FAMO_ENGINE_ACTION_CLEAR_COMPOSITION), eat);
 +  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
-   _UpdateUI(ipc_id);
    m_active_session = ipc_id;
 +  return responded;
  }
--
-+
+ 
 -void RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
 +bool RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
      size_t index,
@@ -1019,20 +1200,20 @@ index 5d2766c..02d097c 100644
 +  const AbiActionOutcome action_outcome =
 +      _ExecuteAbiAction(ipc_id, session_status, action, eat);
 +  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
-+  _UpdateUI(ipc_id);
 +  m_active_session = ipc_id;
 +  return responded;
  }
--
-+
+ 
  bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
-@@ -511,11 +1098,21 @@ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
+@@ -511,11 +1274,20 @@ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
      EatLine eat) {
    DLOG(INFO) << "highlight candidate on current page, ipc_id = " << ipc_id
               << ", index = " << index;
 -  bool res = rime_api->highlight_candidate_on_current_page(
 -      to_session_id(ipc_id), index);
 -  _Respond(ipc_id, eat);
+-  _UpdateUI(ipc_id);
+-  return res;
 +  SessionStatus* session_status = find_session_status(ipc_id);
 +  if (!session_status || !session_status->engine_ctx)
 +    return false;
@@ -1044,21 +1225,20 @@ index 5d2766c..02d097c 100644
 +  const AbiActionOutcome action_outcome =
 +      _ExecuteAbiAction(ipc_id, session_status, action, eat);
 +  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
-   _UpdateUI(ipc_id);
--  return res;
 +  // IPC callers need to know whether a fresh response body was written.
 +  // `handled` is an engine semantic and must not be conflated with readiness.
 +  return responded;
  }
--
-+
+ 
  bool RimeWithWeaselHandler::ChangePage(bool backward,
-@@ -523,16 +1120,23 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
+@@ -523,16 +1295,22 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
                                         EatLine eat) {
    DLOG(INFO) << "change page, ipc_id = " << ipc_id
               << (backward ? "backward" : "foreward");
 -  bool res = rime_api->change_page(to_session_id(ipc_id), backward);
 -  _Respond(ipc_id, eat);
+-  _UpdateUI(ipc_id);
+-  return res;
 +  SessionStatus* session_status = find_session_status(ipc_id);
 +  if (!session_status || !session_status->engine_ctx)
 +    return false;
@@ -1068,12 +1248,9 @@ index 5d2766c..02d097c 100644
 +  const AbiActionOutcome action_outcome =
 +      _ExecuteAbiAction(ipc_id, session_status, action, eat);
 +  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
-   _UpdateUI(ipc_id);
--  return res;
 +  return responded;
  }
--
-+
+ 
  void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
    DLOG(INFO) << "Focus in: ipc_id = " << ipc_id
               << ", client_caps = " << client_caps;
@@ -1082,7 +1259,8 @@ index 5d2766c..02d097c 100644
      return;
    _UpdateUI(ipc_id);
    m_active_session = ipc_id;
-@@ -543,5 +1147,7 @@ void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
+@@ -542,6 +1320,8 @@ void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
+ 
  void RimeWithWeaselHandler::FocusOut(DWORD param, WeaselSessionId ipc_id) {
    DLOG(INFO) << "Focus out: ipc_id = " << ipc_id;
 +  if (!find_session_status(ipc_id))
@@ -1090,7 +1268,7 @@ index 5d2766c..02d097c 100644
    if (m_ui)
      m_ui->Hide();
    m_active_session = 0;
-@@ -554,6 +1160,8 @@ void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
+@@ -554,6 +1334,8 @@ void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
    DLOG(INFO) << "Update input position: (" << rc.left << ", " << rc.top
               << "), ipc_id = " << ipc_id
               << ", m_active_session = " << m_active_session;
@@ -1099,11 +1277,10 @@ index 5d2766c..02d097c 100644
    if (m_ui)
      m_ui->UpdateInputPosition(rc);
    if (m_disabled)
-@@ -564,38 +1172,200 @@ void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
+@@ -564,40 +1346,203 @@ void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
    }
  }
--
-+
+ 
 -std::string RimeWithWeaselHandler::m_message_type;
 -std::string RimeWithWeaselHandler::m_message_value;
 -std::string RimeWithWeaselHandler::m_message_label;
@@ -1216,16 +1393,7 @@ index 5d2766c..02d097c 100644
 +  }
 +  return false;
 +}
--
 +
--void RimeWithWeaselHandler::OnNotify(void* context_object,
--                                     uintptr_t session_id,
--                                     const char* message_type,
--                                     const char* message_value) {
--  // may be running in a thread when deploying rime
--  RimeWithWeaselHandler* self =
--      reinterpret_cast<RimeWithWeaselHandler*>(context_object);
--  if (!self || !message_type || !message_value)
 +int32_t RimeWithWeaselHandler::_DestroyEngineContext(
 +    FamoEngineContext* engine_ctx) noexcept {
 +  if (!engine_ctx)
@@ -1240,7 +1408,15 @@ index 5d2766c..02d097c 100644
 +  _ForgetNotificationContext(engine_ctx);
 +  return result;
 +}
-+
+ 
+-void RimeWithWeaselHandler::OnNotify(void* context_object,
+-                                     uintptr_t session_id,
+-                                     const char* message_type,
+-                                     const char* message_value) {
+-  // may be running in a thread when deploying rime
+-  RimeWithWeaselHandler* self =
+-      reinterpret_cast<RimeWithWeaselHandler*>(context_object);
+-  if (!self || !message_type || !message_value)
 +void FAMO_ENGINE_CALL RimeWithWeaselHandler::OnNotify(
 +    void* context_object,
 +    FamoEngineContext* context,
@@ -1278,7 +1454,7 @@ index 5d2766c..02d097c 100644
 +      notification.option_name = value.substr(state ? 0 : 1);
 +      notification.message_label =
 +          label.empty() ? notification.option_name : label;
-     }
++    }
 +    std::lock_guard<std::mutex> lock(handler->m_notifier_mutex);
 +    constexpr size_t kMaxPendingNotifications = 32;
 +    const auto enqueue =
@@ -1294,7 +1470,7 @@ index 5d2766c..02d097c 100644
 +        enqueue(handler->m_global_notifications,
 +                std::move(notification));
 +      return;
-+    }
+     }
 +    const auto target =
 +        handler->m_notification_targets.find(context);
 +    if (target != handler->m_notification_targets.end()) {
@@ -1322,16 +1498,21 @@ index 5d2766c..02d097c 100644
 +    // The notification ABI and librime worker callback are both no-unwind.
    }
  }
--
-+
+ 
 -void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
 +bool RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
                                              LPWSTR buffer) {
    std::string app_name;
++  bool delivery_ack_v1 = false;
    // parse request text
-@@ -615,55 +1385,84 @@ void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
+   wbufferstream bs(buffer, WEASEL_IPC_BUFFER_LENGTH);
+   std::wstring line;
+@@ -614,56 +1559,93 @@ void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
+       to_lower(lwr);
        app_name = wtou8(lwr.substr(kClientAppKey.length()));
      }
++    if (line == L"session.delivery_ack_v1=1")
++      delivery_ack_v1 = true;
    }
 -  SessionStatus& session_status = get_session_status(ipc_id);
 -  RimeSessionId session_id = session_status.session_id;
@@ -1350,6 +1531,12 @@ index 5d2766c..02d097c 100644
 +  if (!session_status)
 +    return false;
 +  session_status->client_app = app_name;
++  session_status->delivery_ack_v1 = delivery_ack_v1;
++  session_status->client_creation_nonce =
++      _ReadSessionCreationNonce(buffer);
++  session_status->provisional_session =
++      delivery_ack_v1 &&
++      session_status->client_creation_nonce != 0;
 +  FamoEngineContext* ctx = session_status->engine_ctx;
 +  if (!ctx)
 +    return false;
@@ -1450,21 +1637,19 @@ index 5d2766c..02d097c 100644
 +  cinfo.currentPage = view.page_index;
 +  cinfo.is_last_page = view.is_last_page;
  }
--
-+
+ 
  void RimeWithWeaselHandler::StartMaintenance() {
 -  m_session_status_map.clear();
    Finalize();
    _UpdateUI(0);
  }
-@@ -673,21 +1472,31 @@ void RimeWithWeaselHandler::EndMaintenance() {
+@@ -673,22 +1655,32 @@ void RimeWithWeaselHandler::EndMaintenance() {
      Initialize();
      _UpdateUI(0);
    }
 -  m_session_status_map.clear();
  }
--
-+
+ 
  void RimeWithWeaselHandler::SetOption(WeaselSessionId ipc_id,
                                        const std::string& opt,
                                        bool val) {
@@ -1494,7 +1679,8 @@ index 5d2766c..02d097c 100644
 +    set_opt(ipc_id);
    }
  }
-@@ -709,53 +1518,95 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
+ 
+@@ -709,53 +1701,95 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
    // if m_ui nullptr, _UpdateUI meaningless
    if (!m_ui)
      return;
@@ -1512,18 +1698,15 @@ index 5d2766c..02d097c 100644
 +      return;
 +    }
 +  }
--
-+
+ 
    Status& weasel_status = m_ui->status();
    Context weasel_context;
--
-+
+ 
 -  RimeSessionId session_id = to_session_id(ipc_id);
 -
    if (ipc_id == 0)
      weasel_status.disabled = m_disabled;
--
-+
+ 
 -  _GetStatus(weasel_status, ipc_id, weasel_context);
 -
 -  SessionStatus& session_status = get_session_status(ipc_id);
@@ -1566,8 +1749,7 @@ index 5d2766c..02d097c 100644
 +      }
 +    }
 +  }
--
-+
+ 
 -  if (!_ShowMessage(weasel_context, weasel_status)) {
 +  if (!_ShowMessage(
 +          weasel_context, weasel_status,
@@ -1576,8 +1758,7 @@ index 5d2766c..02d097c 100644
      m_ui->Hide();
      m_ui->Update(weasel_context, weasel_status);
    }
--
-+
+ 
 -  _RefreshTrayIcon(session_id, _UpdateUICallback);
 -
 -  {
@@ -1589,8 +1770,7 @@ index 5d2766c..02d097c 100644
 -  }
 +  _RefreshTrayIcon(_UpdateUICallback);
  }
--
-+
+ 
  void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
      WeaselSessionId ipc_id,
      const std::string& schema_id) {
@@ -1619,7 +1799,7 @@ index 5d2766c..02d097c 100644
    // load schema color style config
    const int BUF_SIZE = 255;
    char buffer[BUF_SIZE + 1] = {0};
-@@ -804,78 +1655,34 @@ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
+@@ -804,78 +1838,34 @@ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
      style.current_half_icon = load_icon(config, "schema/half_icon", NULL);
    }
    // load schema icon end
@@ -1675,8 +1855,7 @@ index 5d2766c..02d097c 100644
 -  if (session_status.style.inline_preedit != inline_preedit)
 -    _UpdateInlinePreeditStatus(ipc_id);
  }
--
-+
+ 
 -bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
 -  std::lock_guard<std::mutex> lock(m_notifier_mutex);
 -  if (m_message_type.empty() || m_message_value.empty())
@@ -1713,7 +1892,7 @@ index 5d2766c..02d097c 100644
        if (GetThreadUILanguage() ==
            MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_TRADITIONAL))
          tips = L"有錯誤，請查看日誌 %TEMP%\\rime.weasel\\rime.weasel.*.INFO";
-@@ -887,28 +1694,29 @@ bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
+@@ -887,28 +1877,29 @@ bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
              L"There is an error, please check the logs "
              L"%TEMP%\\rime.weasel\\rime.weasel.*.INFO";
      }
@@ -1732,8 +1911,7 @@ index 5d2766c..02d097c 100644
      } else
 -      tips = u8tow(m_message_label);
 +      tips = u8tow(notification.message_label);
--
-+
+ 
 -    if (m_message_value == "full_shape" || m_message_value == "!full_shape")
 +    if (notification.message_value == "full_shape" ||
 +        notification.message_value == "!full_shape")
@@ -1752,11 +1930,10 @@ index 5d2766c..02d097c 100644
      m_ui->Update(ctx, status);
      if (m_show_notifications_time)
        m_ui->ShowWithTimeout(m_show_notifications_time);
-@@ -925,162 +1733,198 @@ inline std::string _GetLabelText(const std::vector<Text>& labels,
+@@ -925,162 +1916,199 @@ inline std::string _GetLabelText(const std::vector<Text>& labels,
    return wtou8(std::wstring(buffer));
  }
--
-+
+ 
 -bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
 +static bool _FailResponseFormattingOnceForTesting() noexcept {
 +  wchar_t value[2] = {};
@@ -1777,7 +1954,8 @@ index 5d2766c..02d097c 100644
 +    SessionStatus* requested_session,
 +    EatLine eat) noexcept {
 +  if (!eat || !requested_session ||
-+      !requested_session->pending_response_result) {
++      !requested_session->pending_response_result ||
++      m_staged_response_delivery) {
 +    return false;
 +  }
 +  try {
@@ -1794,8 +1972,7 @@ index 5d2766c..02d097c 100644
    body.reserve(4096);
    std::vector<const char*> actions;
    actions.reserve(8);
--
-+
+ 
 -  SessionStatus& session_status = get_session_status(ipc_id);
 -  RimeSessionId session_id = session_status.session_id;
 -  RIME_STRUCT(RimeCommit, commit);
@@ -1817,8 +1994,7 @@ index 5d2766c..02d097c 100644
 +        .append(escape_string(u8tow(commit_utf8)))
 +        .append(L"\n");
    }
--
-+
+ 
 -  bool is_composing = false;
 -  RIME_STRUCT(RimeStatus, status);
 -  static const std::wstring Bool_wstring[] = {L"0", L"1"};
@@ -2094,13 +2270,11 @@ index 5d2766c..02d097c 100644
 +    oa << cinfo;
 +    body.append(L"ctx.cand=").append(ss.str()).append(L"\n");
    }
--
-+
+ 
    // configuration information
-@@ -1102,14 +1946,56 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+@@ -1102,14 +2130,63 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
        .append(L"\n");
--
-+
+ 
    // style
 -  if (!session_status.__synced) {
 +  bool includes_style = !session_status.__synced;
@@ -2108,11 +2282,17 @@ index 5d2766c..02d097c 100644
      std::wstringstream ss;
      boost::archive::text_woarchive oa(ss);
      oa << session_status.style;
--
-+
+ 
      actions.push_back("style");
      body.append(L"style=").append(ss.str()).append(L"\n");
 -    session_status.__synced = true;
++  }
++  if (session_status.pending_response_generation != 0 &&
++      session_status.pending_response_includes_style != includes_style) {
++    // A delivery generation identifies one stable document contract. If
++    // mutable style state would change a retry, retain the exact result and
++    // fail closed instead of acknowledging ambiguous content.
++    return false;
 +  }
 +
 +  // PipeChannel has an 8 MiB transaction buffer. A valid ABI result can still
@@ -2156,21 +2336,33 @@ index 5d2766c..02d097c 100644
 +      return false;  // Commit itself violates the bounded ABI/pipe contract.
 +    }
    }
--
-+
+ 
    // summarize: send header first to avoid vector head-insert cost
-@@ -1126,14 +2012,42 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+@@ -1126,13 +2203,104 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
      }
      header = std::wstring(L"action=") + u8tow(actionList) + L"\n";
    }
 -  if (!eat(header))
--    return false;
--
-   body.append(L".\n");
--  if (!eat(body))
++  DWORD generation = session_status.pending_response_generation;
++  if (generation == 0) {
++    do {
++      generation = m_next_response_delivery_generation++;
++    } while (generation == 0 ||
++             generation ==
++                 session_status.last_acknowledged_response_generation);
++  }
++  if (session_status.delivery_ack_v1) {
++    body.append(L"famo.delivery_session=")
++        .append(std::to_wstring(ipc_id))
++        .append(L"\n")
++        .append(L"famo.delivery_generation=")
++        .append(std::to_wstring(generation))
++        .append(L"\n");
++  }
++  body.append(L".\n");
 +  if (body.size() > max_body_wchars ||
 +      header.size() > max_body_wchars - body.size()) {
-     return false;
++    return false;
 +  }
 +  std::wstring response;
 +  response.reserve(header.size() + body.size());
@@ -2179,21 +2371,25 @@ index 5d2766c..02d097c 100644
 +  // for one complete document prevents a successful header from surviving a
 +  // failed body append in injected/backpressured sinks.
 +  if (!eat(response)) {
-+    return false;
+     return false;
 +  }
--
-+
-+  if (includes_style)
-+    session_status.__synced = true;
-+  (void)session_status.pending_response_result.Reset();
-   return true;
+ 
+-  body.append(L".\n");
+-  if (!eat(body))
++  if (session_status.pending_response_generation == 0) {
++    session_status.pending_response_generation = generation;
++    session_status.pending_response_includes_style = includes_style;
++  }
++  m_staged_response_delivery = {
++      ipc_id, generation, session_status.delivery_ack_v1};
++  return true;
 +  } catch (...) {
 +    // Formatting, archive conversion and a violating sink are all no-unwind.
 +    // The engine-owned lease remains the exact retry anchor.
-+    return false;
+     return false;
 +  }
 +}
-+
+ 
 +bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
 +  SessionStatus* requested_session = find_session_status(ipc_id);
 +  if (!requested_session)
@@ -2204,15 +2400,56 @@ index 5d2766c..02d097c 100644
 +    requested_session->pending_response_result = std::move(m_abi_result);
 +  }
 +  return _DeliverPendingResponse(ipc_id, requested_session, eat);
- }
--
++}
 +
- // Blend foreground and background ARGB colors taking alpha into account.
-@@ -1643,80 +2557,74 @@ static void _LoadAppOptions(RimeConfig* config,
++weasel::ResponseDeliveryToken
++RimeWithWeaselHandler::TakeStagedResponseDelivery() noexcept {
++  const weasel::ResponseDeliveryToken token = m_staged_response_delivery;
++  m_staged_response_delivery = {};
++  return token;
++}
++
++void RimeWithWeaselHandler::ConfirmResponsePipeWrite(
++    const weasel::ResponseDeliveryToken& token) noexcept {
++  if (!token || token.requires_client_ack)
++    return;
++  (void)AcknowledgeResponseDelivery(token);
++}
++
++bool RimeWithWeaselHandler::AcknowledgeResponseDelivery(
++    const weasel::ResponseDeliveryToken& token) noexcept {
++  SessionStatus* session_status = find_session_status(token.session_id);
++  if (!session_status || !token)
++    return false;
++  if (session_status->last_acknowledged_response_generation ==
++      token.generation) {
++    return true;
++  }
++  if (session_status->pending_response_generation != token.generation ||
++      !session_status->pending_response_result)
++    return false;
++  const bool includes_style =
++      session_status->pending_response_includes_style;
++  session_status->last_acknowledged_response_generation =
++      token.generation;
++  session_status->provisional_session = false;
++  session_status->pending_response_generation = 0;
++  session_status->pending_response_includes_style = false;
++  if (includes_style)
++    session_status->__synced = true;
++  (void)session_status->pending_response_result.Reset();
++  try {
++    _UpdateUI(token.session_id);
++  } catch (...) {
++    // Delivery is already complete; UI refresh remains best-effort.
++  }
+   return true;
+ }
+ 
+@@ -1643,80 +2811,74 @@ static void _LoadAppOptions(RimeConfig* config,
        });
  }
--
-+
+ 
 -void RimeWithWeaselHandler::_GetStatus(Status& stat,
 -                                       WeaselSessionId ipc_id,
 -                                       Context& ctx) {
@@ -2272,8 +2509,7 @@ index 5d2766c..02d097c 100644
 +  if (view.candidate_count)
 +    _GetCandidateInfoFromView(weasel_context.cinfo, view);
  }
--
-+
+ 
 -void RimeWithWeaselHandler::_GetContext(Context& weasel_context,
 -                                        RimeSessionId session_id) {
 -  RIME_STRUCT(RimeContext, ctx);
@@ -2308,8 +2544,7 @@ index 5d2766c..02d097c 100644
 +  session_status->status.is_disabled = stat.disabled;
 +  session_status->status.is_full_shape = stat.full_shape;
 +}
--
-+
+ 
 -        weasel_context.preedit.attributes.push_back(attr);
 -      }
 -    }
@@ -2333,8 +2568,7 @@ index 5d2766c..02d097c 100644
 +         m_engine_host.SetOption(ctx, &cursor_opt, Bool(!inline_preedit)) ==
 +             FAMO_ENGINE_OK;
  }
--
-+
+ 
 -void RimeWithWeaselHandler::_UpdateInlinePreeditStatus(WeaselSessionId ipc_id) {
 +bool RimeWithWeaselHandler::_UpdateInlinePreeditStatus(
 +    WeaselSessionId ipc_id) {
@@ -2463,6 +2697,27 @@ index 42a2827..16156fd 100644
 +    m_pTarget->p_commit->append(unescape_string(value));
    }
  }
+diff --git a/WeaselIPC/PipeChannel.cpp b/WeaselIPC/PipeChannel.cpp
+index c43ecef..82a4ef8 100644
+--- a/WeaselIPC/PipeChannel.cpp
++++ b/WeaselIPC/PipeChannel.cpp
+@@ -272,6 +272,7 @@ void PipeChannelBase::_Receive(HANDLE pipe, LPVOID msg, size_t rec_len) {
+   auto ctx = _GetContext();
+   if (buff_size >= sizeof(wchar_t))
+     *reinterpret_cast<wchar_t*>(ctx->buffer.get()) = L'\0';
++  ctx->received_wchars = 0;
+ 
+   DWORD read_error = ERROR_SUCCESS;
+   DWORD lread =
+@@ -300,6 +301,8 @@ void PipeChannelBase::_Receive(HANDLE pipe, LPVOID msg, size_t rec_len) {
+     // shorter response cannot expose the previous transaction's tail.
+     *reinterpret_cast<wchar_t*>(
+         ctx->buffer.get() + body_read) = L'\0';
++    ctx->received_wchars =
++        static_cast<UINT>(body_read / sizeof(wchar_t) + 1u);
+   }
+   ctx->has_body = false;
+ }
 diff --git a/WeaselIPC/ResponseParser.cpp b/WeaselIPC/ResponseParser.cpp
 index 7aaf7d2..49fa43a 100644
 --- a/WeaselIPC/ResponseParser.cpp
@@ -2477,8 +2732,7 @@ index 7aaf7d2..49fa43a 100644
      if (!bs.good())
 -      return false;
 +      return complete;
--
-+
+ 
 -    // file ends
 -    if (line == L".")
 -      break;
@@ -2493,33 +2747,1015 @@ index 7aaf7d2..49fa43a 100644
 +      }
 +      continue;
 +    }
--
-+
+ 
      Feed(line);
    }
 -  return bs.good();
 +  return complete;
  }
--
-+
+ 
  void ResponseParser::Feed(const std::wstring& line) {
+diff --git a/WeaselIPC/WeaselClientImpl.cpp b/WeaselIPC/WeaselClientImpl.cpp
+index f8a5dce..4250c71 100644
+--- a/WeaselIPC/WeaselClientImpl.cpp
++++ b/WeaselIPC/WeaselClientImpl.cpp
+@@ -4,14 +4,94 @@
+ 
+ using namespace weasel;
+ 
++namespace {
++bool FamoParseDword(const wchar_t* begin,
++                    const wchar_t* end,
++                    DWORD* value) noexcept {
++  if (!begin || !end || !value || begin == end)
++    return false;
++  unsigned long long parsed = 0;
++  for (const wchar_t* current = begin; current != end; ++current) {
++    if (*current < L'0' || *current > L'9')
++      return false;
++    parsed = parsed * 10u + static_cast<unsigned>(*current - L'0');
++    if (parsed > MAXDWORD)
++      return false;
++  }
++  *value = static_cast<DWORD>(parsed);
++  return true;
++}
++
++bool FamoReadResponseDelivery(LPWSTR buffer,
++                              UINT length,
++                              ResponseDeliveryToken* token,
++                              bool* has_commit) noexcept {
++  if (!buffer || !token || !has_commit)
++    return false;
++  *token = {};
++  *has_commit = false;
++  constexpr wchar_t kSessionPrefix[] = L"famo.delivery_session=";
++  constexpr wchar_t kGenerationPrefix[] = L"famo.delivery_generation=";
++  bool found_session = false;
++  bool found_generation = false;
++  UINT offset = 0;
++  while (offset < length && buffer[offset] != L'\0') {
++    const UINT line_start = offset;
++    while (offset < length && buffer[offset] != L'\0' &&
++           buffer[offset] != L'\n') {
++      ++offset;
++    }
++    UINT line_end = offset;
++    if (line_end > line_start && buffer[line_end - 1] == L'\r')
++      --line_end;
++    const wchar_t* line = buffer + line_start;
++    const size_t line_length = line_end - line_start;
++    if (line_length == 1 && line[0] == L'.')
++      break;
++    if (line_length > 7 &&
++        std::wmemcmp(line, L"commit=", 7) == 0) {
++      *has_commit = true;
++    }
++    if (line_length >= std::size(kSessionPrefix) - 1 &&
++        std::wmemcmp(line, kSessionPrefix,
++                     std::size(kSessionPrefix) - 1) == 0) {
++      if (found_session ||
++          !FamoParseDword(
++              line + std::size(kSessionPrefix) - 1,
++              line + line_length, &token->session_id)) {
++        return false;
++      }
++      found_session = true;
++    } else if (line_length >= std::size(kGenerationPrefix) - 1 &&
++               std::wmemcmp(line, kGenerationPrefix,
++                            std::size(kGenerationPrefix) - 1) == 0) {
++      if (found_generation ||
++          !FamoParseDword(
++              line + std::size(kGenerationPrefix) - 1,
++              line + line_length, &token->generation)) {
++        return false;
++      }
++      found_generation = true;
++    }
++    if (offset < length && buffer[offset] == L'\n')
++      ++offset;
++  }
++  if (found_session != found_generation)
++    return false;
++  if (found_session)
++    token->requires_client_ack = true;
++  return !found_session || static_cast<bool>(*token);
++}
++}  // namespace
++
+ ClientImpl::ClientImpl()
+     : session_id(0), channel(GetPipeName()), is_ime(false) {
+   _InitializeClientInfo();
++  _RenewSessionCreationNonce();
+ }
+ 
+-ClientImpl::~ClientImpl() {
+-  if (channel.Connected())
+-    Disconnect();
++ClientImpl::~ClientImpl() noexcept {
++  Disconnect();
+ }
+ 
+ // http://stackoverflow.com/questions/557081/how-do-i-get-the-hmodule-for-the-currently-executing-code
+@@ -41,14 +121,26 @@ void ClientImpl::_InitializeClientInfo() {
+   is_ime = ends_with(path, L".ime");
+ }
+ 
+-bool ClientImpl::Connect(ServerLauncher const& launcher) {
+-  return channel.Connect();
++bool ClientImpl::Connect(ServerLauncher const& launcher) noexcept {
++  try {
++    return channel.Connect();
++  } catch (...) {
++    channel.DisconnectNoexcept();
++    return false;
++  }
++}
++
++void ClientImpl::Disconnect() noexcept {
++  try {
++    if (session_id != 0)
++      EndSession();
++  } catch (...) {
++  }
++  channel.DisconnectNoexcept();
+ }
+ 
+-void ClientImpl::Disconnect() {
+-  if (_Active())
+-    EndSession();
+-  channel.Disconnect();
++void ClientImpl::CloseTransport() noexcept {
++  channel.DisconnectNoexcept();
+ }
+ 
+ void ClientImpl::ShutdownServer() {
+@@ -143,17 +235,56 @@ void ClientImpl::TrayCommand(UINT menuId) {
+ }
+ 
+ void ClientImpl::StartSession() {
+-  if (_Active() && Echo())
+-    return;
+-
+-  _WriteClientInfo();
+-  UINT ret = _SendMessage(WEASEL_IPC_START_SESSION, 0, 0);
+-  session_id = ret;
++  try {
++    if (_Active() && Echo())
++      return;
++    // Client-info shares PipeChannel's owned response buffer. Resolve the
++    // exact pending envelope before writing even one request character.
++    if (pending_response_delivery) {
++      if (!pending_response_applied ||
++          !_AcknowledgePendingResponse()) {
++        return;
++      }
++    }
++    if (pending_response_body_length != 0)
++      return;
++
++    if (!session_start_pending) {
++      _RenewSessionCreationNonce();
++      session_start_pending = true;
++    }
++    if (!_WriteClientInfo())
++      return;
++    UINT ret = _SendMessage(WEASEL_IPC_START_SESSION, 0, 0);
++    session_id = ret;
++  } catch (...) {
++    // A partially staged START body must not survive into the nonce retry.
++    channel.DisconnectNoexcept();
++    session_id = 0;
++  }
+ }
+ 
+-void ClientImpl::EndSession() {
+-  _SendMessage(WEASEL_IPC_END_SESSION, 0, session_id);
++void ClientImpl::EndSession() noexcept {
++  if (session_id == 0)
++    return;
++  try {
++    if (pending_response_delivery && pending_response_applied)
++      (void)_AcknowledgePendingResponse();
++    // Logical teardown is terminal and must bypass the business-action gate.
++    // If an envelope was never applied, explicitly removing the session is
++    // safer than leaking its engine lease forever.
++    PipeMessage end{WEASEL_IPC_END_SESSION, 0, session_id};
++    (void)channel.Transact(end);
++  } catch (...) {
++    channel.DisconnectNoexcept();
++  }
++  pending_response_delivery = {};
++  pending_response_applied = false;
++  pending_response_claimed = false;
++  pending_response_has_commit = false;
++  pending_response_body_length = 0;
+   session_id = 0;
++  session_start_pending = false;
+ }
+ 
+ void ClientImpl::StartMaintenance() {
+@@ -193,25 +324,237 @@ bool ClientImpl::GetResponseData(ResponseHandler const& handler) {
+   if (!handler) {
+     return false;
+   }
++  if (pending_response_has_commit)
++    return false;
++  return GetCommitResponseData(handler);
++}
++
++bool ClientImpl::GetCommitResponseData(
++    ResponseHandler const& handler) {
++  if (!handler)
++    return false;
++  if (pending_response_body_length == 0 || pending_response_claimed)
++    return false;
++  // A response document has one application consumer. OnTestKeyDown and
++  // OnKeyDown can both reach _UpdateComposition before an asynchronous edit
++  // session runs; without this claim they would enqueue the same commit twice.
++  pending_response_claimed = true;
++  bool parsed = false;
++  try {
++    parsed = channel.HandleResponseData(handler);
++  } catch (...) {
++    pending_response_claimed = false;
++    return false;
++  }
++  if (!parsed) {
++    pending_response_claimed = false;
++    return false;
++  }
++  if (!pending_response_delivery) {
++    pending_response_body_length = 0;
++    pending_response_claimed = false;
++    pending_response_has_commit = false;
++  }
++  return true;
++}
++
++ResponseDeliveryToken ClientImpl::PendingResponseDelivery() const {
++  return pending_response_delivery;
++}
++
++bool ClientImpl::ResponseDataApplied() const noexcept {
++  return pending_response_delivery && pending_response_applied;
++}
++
++bool ClientImpl::ResponseDataHasCommit() const noexcept {
++  return pending_response_delivery && pending_response_has_commit;
++}
++
++TransactionDeliveryState
++ClientImpl::LastTransactionDeliveryState() const noexcept {
++  return last_transaction_delivery_state;
++}
++
++void ClientImpl::MarkResponseDataApplied(
++    const ResponseDeliveryToken& token) {
++  if (pending_response_delivery && pending_response_claimed && token &&
++      pending_response_delivery.session_id == token.session_id &&
++      pending_response_delivery.generation == token.generation &&
++      pending_response_delivery.requires_client_ack ==
++          token.requires_client_ack) {
++    pending_response_applied = true;
++  }
++}
++
++void ClientImpl::ReleaseResponseDataClaim(
++    const ResponseDeliveryToken& token) {
++  if (pending_response_delivery && pending_response_claimed &&
++      !pending_response_applied && token &&
++      pending_response_delivery.session_id == token.session_id &&
++      pending_response_delivery.generation == token.generation &&
++      pending_response_delivery.requires_client_ack ==
++          token.requires_client_ack) {
++    pending_response_claimed = false;
++  }
++}
++
++bool ClientImpl::_AcknowledgePendingResponse() noexcept {
++  if (!pending_response_delivery || !pending_response_applied)
++    return !pending_response_delivery;
++  if (!pending_response_delivery.requires_client_ack) {
++    // A new client talking to an old server owns the only remaining copy after
++    // the legacy server's write-success release. Keep the local envelope until
++    // exact application, then retire it without sending an unsupported ACK.
++    pending_response_delivery = {};
++    pending_response_applied = false;
++    pending_response_claimed = false;
++    pending_response_has_commit = false;
++    pending_response_body_length = 0;
++    return true;
++  }
++  try {
++    PipeMessage ack{WEASEL_IPC_ACK_DELIVERY,
++                    pending_response_delivery.generation,
++                    pending_response_delivery.session_id};
++    const LRESULT ack_result = channel.Transact(ack);
++    if (ack_result != 1) {
++      // Missing session (2) and exact-generation mismatch (0) both prove that
++      // this applied envelope belongs to a stale incarnation. Never END the
++      // reused numeric session id: that could delete a different client's
++      // session after provisional TTL expiry. Invalidate locally and negotiate
++      // a fresh nonce/session on the next event.
++      pending_response_delivery = {};
++      pending_response_applied = false;
++      pending_response_claimed = false;
++      pending_response_has_commit = false;
++      pending_response_body_length = 0;
++      session_id = 0;
++      session_start_pending = false;
++      channel.DisconnectNoexcept();
++      return false;
++    }
++    pending_response_delivery = {};
++    pending_response_applied = false;
++    pending_response_claimed = false;
++    pending_response_has_commit = false;
++    pending_response_body_length = 0;
++    return true;
++  } catch (...) {
++    // A timed-out ACK may already have been applied by the server. Close the
++    // physical pipe, retain the same token, and retry its idempotent command
++    // before any later business action.
++    channel.DisconnectNoexcept();
++    return false;
++  }
++}
+ 
+-  return channel.HandleResponseData(handler);
++bool ClientImpl::AcknowledgeResponseData() noexcept {
++  if (!pending_response_delivery)
++    return true;
++  MarkResponseDataApplied(pending_response_delivery);
++  return _AcknowledgePendingResponse();
+ }
+ 
+ bool ClientImpl::_WriteClientInfo() {
++  if (pending_response_delivery || pending_response_body_length != 0)
++    return false;
+   channel << L"action=session\n";
+   channel << L"session.client_app=" << app_name.c_str() << L"\n";
+   channel << L"session.client_type=" << (is_ime ? L"ime" : L"tsf") << L"\n";
++  channel << L"session.delivery_ack_v1=1\n";
++  channel << L"session.creation_nonce=" << session_creation_nonce << L"\n";
+   channel << L".\n";
+   return true;
+ }
+ 
++void ClientImpl::_RenewSessionCreationNonce() {
++  LARGE_INTEGER counter{};
++  (void)::QueryPerformanceCounter(&counter);
++  session_creation_nonce =
++      counter.LowPart ^ counter.HighPart ^
++      ::GetTickCount() ^ ::GetCurrentProcessId();
++  if (session_creation_nonce == 0)
++    session_creation_nonce = 1;
++}
++
+ LRESULT ClientImpl::_SendMessage(WEASEL_IPC_COMMAND Msg,
+                                  DWORD wParam,
+                                  DWORD lParam) {
++  last_transaction_delivery_state =
++      TransactionDeliveryState::RequestNotDispatched;
++  // New-client/old-server compatibility requires ownership before dispatch.
++  // PipeChannel's persistent receive buffer is the envelope store itself:
++  // allocate it before sending, then retain it behind the pending gate without
++  // a second 8 MiB vector or any post-read allocation.
++  if (!channel.PrepareTransactionBuffer()) {
++    channel.ClearTransactionBuffer();
++    return 0;
++  }
++  bool request_sent = false;
+   try {
++    if (pending_response_delivery) {
++      if (!pending_response_applied ||
++          !_AcknowledgePendingResponse()) {
++        return 0;
++      }
++    }
++    if (pending_response_body_length != 0)
++      return 0;
+     PipeMessage req{Msg, wParam, lParam};
+-    return channel.Transact(req);
+-  } catch (DWORD /* ex */) {
++    const LRESULT result = channel.Transact(req, &request_sent);
++    ResponseDeliveryToken received_delivery;
++    bool received_has_commit = false;
++    DWORD received_body_length = 0;
++    const auto inspect_response =
++        [&](LPWSTR buffer, DWORD length) {
++          if (!FamoReadResponseDelivery(
++                  buffer, length, &received_delivery,
++                  &received_has_commit)) {
++            return false;
++          }
++          DWORD used = 0;
++          while (used < length && buffer[used] != L'\0')
++            ++used;
++          if (used != 0)
++            received_body_length = used + 1u;
++          return true;
++        };
++    const bool inspected =
++        channel.HandleResponseData(inspect_response);
++    if (!inspected)
++      throw static_cast<DWORD>(ERROR_INVALID_DATA);
++    if (received_delivery) {
++      pending_response_delivery = received_delivery;
++      pending_response_applied = false;
++    } else if (received_body_length != 0) {
++      DWORD local_session =
++          Msg == WEASEL_IPC_START_SESSION
++              ? static_cast<DWORD>(result)
++              : (lParam != 0 ? lParam : session_id);
++      if (local_session == 0)
++        local_session = 1;
++      DWORD local_generation = next_local_response_generation++;
++      if (local_generation == 0)
++        local_generation = next_local_response_generation++;
++      pending_response_delivery = {
++          local_session, local_generation, false};
++      pending_response_applied = false;
++    }
++    pending_response_body_length = received_body_length;
++    pending_response_claimed = false;
++    pending_response_has_commit = received_has_commit;
++    last_transaction_delivery_state =
++        TransactionDeliveryState::Completed;
++    return result;
++  } catch (...) {
++    // A late or malformed response must not cross the TSF/COM boundary. Close
++    // only the physical pipe; the logical session and creation nonce remain,
++    // so a new server retains and replays the exact result.
++    if (request_sent) {
++      last_transaction_delivery_state =
++          TransactionDeliveryState::ResponseUncertain;
++    }
++    channel.DisconnectNoexcept();
+     return 0;
+   }
+ }
+@@ -310,3 +653,42 @@ bool Client::Echo() {
+ bool Client::GetResponseData(ResponseHandler handler) {
+   return m_pImpl->GetResponseData(handler);
+ }
++
++bool Client::GetCommitResponseData(ResponseHandler handler) {
++  return m_pImpl->GetCommitResponseData(handler);
++}
++
++TransactionDeliveryState
++Client::LastTransactionDeliveryState() const noexcept {
++  return m_pImpl->LastTransactionDeliveryState();
++}
++
++ResponseDeliveryToken Client::PendingResponseDelivery() const {
++  return m_pImpl->PendingResponseDelivery();
++}
++
++bool Client::ResponseDataApplied() const noexcept {
++  return m_pImpl->ResponseDataApplied();
++}
++
++bool Client::ResponseDataHasCommit() const noexcept {
++  return m_pImpl->ResponseDataHasCommit();
++}
++
++void Client::MarkResponseDataApplied(
++    const ResponseDeliveryToken& token) {
++  m_pImpl->MarkResponseDataApplied(token);
++}
++
++void Client::ReleaseResponseDataClaim(
++    const ResponseDeliveryToken& token) {
++  m_pImpl->ReleaseResponseDataClaim(token);
++}
++
++bool Client::AcknowledgeResponseData() {
++  return m_pImpl->AcknowledgeResponseData();
++}
++
++void Client::CloseTransport() noexcept {
++  m_pImpl->CloseTransport();
++}
+diff --git a/WeaselIPC/WeaselClientImpl.h b/WeaselIPC/WeaselClientImpl.h
+index 3161d14..9331f5a 100644
+--- a/WeaselIPC/WeaselClientImpl.h
++++ b/WeaselIPC/WeaselClientImpl.h
+@@ -7,13 +7,13 @@ namespace weasel {
+ class ClientImpl {
+  public:
+   ClientImpl();
+-  ~ClientImpl();
++  ~ClientImpl() noexcept;
+ 
+-  bool Connect(ServerLauncher const& launcher);
+-  void Disconnect();
++  bool Connect(ServerLauncher const& launcher) noexcept;
++  void Disconnect() noexcept;
+   void ShutdownServer();
+   void StartSession();
+-  void EndSession();
++  void EndSession() noexcept;
+   void StartMaintenance();
+   void EndMaintenance();
+   void ReloadStyle();
+@@ -31,22 +31,43 @@ class ClientImpl {
+   void FocusOut();
+   void TrayCommand(UINT menuId);
+   bool GetResponseData(ResponseHandler const& handler);
++  bool GetCommitResponseData(ResponseHandler const& handler);
++  ResponseDeliveryToken PendingResponseDelivery() const;
++  bool ResponseDataApplied() const noexcept;
++  bool ResponseDataHasCommit() const noexcept;
++  TransactionDeliveryState LastTransactionDeliveryState() const noexcept;
++  void MarkResponseDataApplied(const ResponseDeliveryToken& token);
++  void ReleaseResponseDataClaim(const ResponseDeliveryToken& token);
++  bool AcknowledgeResponseData() noexcept;
++  void CloseTransport() noexcept;
+ 
+  protected:
+   void _InitializeClientInfo();
+   bool _WriteClientInfo();
++  void _RenewSessionCreationNonce();
+ 
+   LRESULT _SendMessage(WEASEL_IPC_COMMAND Msg, DWORD wParam, DWORD lParam);
++  bool _AcknowledgePendingResponse() noexcept;
+ 
+   bool _Connected() const { return channel.Connected(); }
+   bool _Active() const { return channel.Connected() && session_id != 0; }
+ 
+  private:
+   UINT session_id;
++  DWORD session_creation_nonce = 0;
++  bool session_start_pending = false;
+   std::wstring app_name;
+   bool is_ime;
++  ResponseDeliveryToken pending_response_delivery;
++  DWORD next_local_response_generation = 1;
++  bool pending_response_applied = false;
++  bool pending_response_claimed = false;
++  bool pending_response_has_commit = false;
++  DWORD pending_response_body_length = 0;
++  TransactionDeliveryState last_transaction_delivery_state =
++      TransactionDeliveryState::Completed;
+ 
+   PipeChannel<PipeMessage> channel;
+ };
+ 
+-}  // namespace weasel
+\ No newline at end of file
++}  // namespace weasel
 diff --git a/WeaselIPCServer/WeaselServerImpl.cpp b/WeaselIPCServer/WeaselServerImpl.cpp
-index 487d5af..4ca10e0 100644
+index 487d5af..e0870ff 100644
 --- a/WeaselIPCServer/WeaselServerImpl.cpp
 +++ b/WeaselIPCServer/WeaselServerImpl.cpp
-@@ -199,7 +199,6 @@ DWORD ServerImpl::OnStartSession(WEASEL_IPC_COMMAND uMsg,
-   return m_pRequestHandler->AddSession(
+@@ -1,6 +1,11 @@
+ ﻿#include "stdafx.h"
+ #include "WeaselServerImpl.h"
++#include <atomic>
++#include <exception>
++#include <memory>
+ #include <mutex>
++#include <utility>
++#include <vector>
+ #include <Windows.h>
+ #include <resource.h>
+ #include <WeaselUtility.h>
+@@ -10,17 +15,31 @@ class PipeServer : public PipeChannel<DWORD, PipeMessage> {
+  public:
+   using ServerRunner = std::function<void()>;
+   using Respond = std::function<void(Msg)>;
+-  using ServerHandler = std::function<void(PipeMessage, Respond)>;
++  using ServerHandler = std::function<void(PipeMessage, DWORD, Respond)>;
+ 
+   PipeServer(std::wstring&& pn_cmd, SECURITY_ATTRIBUTES* s);
+ 
+  public:
+-  void Listen(ServerHandler const& handler);
++  void Listen(ServerHandler handler);
++  void StopAccepting() noexcept;
++  void WaitForWorkers();
+   /* Get a server runner */
+-  ServerRunner GetServerRunner(ServerHandler const& handler);
++  ServerRunner GetServerRunner(ServerHandler handler);
+ 
+  private:
+-  void _ProcessPipeThread(HANDLE pipe, ServerHandler const& handler);
++  void _SendAcceptedResponse(HANDLE pipe, Msg response) {
++    _SendAccepted(pipe, response);
++  }
++  void _ProcessPipeThread(HANDLE pipe, ServerHandler handler);
++  void _ReapWorkers(bool join_all);
++
++  struct Worker {
++    std::shared_ptr<std::atomic<bool>> completed;
++    std::unique_ptr<boost::thread> thread;
++  };
++
++  std::atomic<bool> stopping_{false};
++  std::vector<Worker> workers_;
+ };
+ }  // namespace weasel
+ 
+@@ -28,6 +47,10 @@ using namespace weasel;
+ 
+ extern CAppModule _Module;
+ 
++namespace {
++std::mutex g_api_mutex;
++}
++
+ ServerImpl::ServerImpl()
+     : m_pRequestHandler(NULL),
+       m_darkMode(IsUserDarkMode()),
+@@ -40,26 +63,66 @@ ServerImpl::~ServerImpl() {
+ }
+ 
+ void ServerImpl::_Finailize() {
+-  if (pipeThread != nullptr) {
++  if (shutdownThread && shutdownThread->joinable()) {
++    shutdownThread->join();
++  }
++  shutdownThread.reset();
++  if (pipeThread && pipeThread->joinable()) {
++    channel->StopAccepting();
+     pipeThread->interrupt();
+-    pipeThread = nullptr;
+-  } else {
+-    // avoid finalize again
+-    return;
++    pipeThread->join();
++    channel->WaitForWorkers();
+   }
++  pipeThread.reset();
++  _FinalizeRequestHandler();
++  _DrainUiTasks(false);
+ 
+   if (IsWindow()) {
+     DestroyWindow();
+   }
+ }
+ 
++void ServerImpl::_FinalizeRequestHandler() {
++  std::lock_guard guard(g_api_mutex);
++  RequestHandler* handler = std::exchange(m_pRequestHandler, nullptr);
++  if (handler) {
++    try {
++      handler->Finalize();
++    } catch (...) {
++      // Shutdown must still release the handler and finish draining the server.
++    }
++  }
++}
++
++void ServerImpl::_DrainUiTasks(bool run_tasks) {
++  std::deque<std::function<void()>> tasks;
++  {
++    std::lock_guard guard(m_deferred_mutex);
++    tasks.swap(m_ui_tasks);
++  }
++  if (run_tasks) {
++    for (auto& task : tasks) {
++      if (task)
++        task();
++    }
++  }
++}
++
+ LRESULT ServerImpl::OnColorChange(UINT uMsg,
+                                   WPARAM wParam,
+                                   LPARAM lParam,
+                                   BOOL& bHandled) {
+-  if (IsUserDarkMode() != m_darkMode) {
+-    m_darkMode = IsUserDarkMode();
+-    m_pRequestHandler->UpdateColorTheme(m_darkMode);
++  if (m_shutdown_started.load(std::memory_order_acquire))
++    return 0;
++  std::unique_lock lock(g_api_mutex, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    ::PostMessage(m_hWnd, WM_FAMO_RETRY_COLOR, 0, 0);
++    return 0;
++  }
++  const BOOL dark_mode = IsUserDarkMode();
++  if (dark_mode != m_darkMode && m_pRequestHandler) {
++    m_darkMode = dark_mode;
++    m_pRequestHandler->UpdateColorTheme(dark_mode);
+   }
+   return 0;
+ }
+@@ -100,10 +163,8 @@ LRESULT ServerImpl::OnEndSystemSession(UINT uMsg,
+                                        WPARAM wParam,
+                                        LPARAM lParam,
+                                        BOOL& bHandled) {
+-  if (m_pRequestHandler) {
+-    m_pRequestHandler->Finalize();
+-    m_pRequestHandler = nullptr;
+-  }
++  if (wParam)
++    Stop();
+   return 0;
+ }
+ 
+@@ -111,13 +172,31 @@ LRESULT ServerImpl::OnCommand(UINT uMsg,
+                               WPARAM wParam,
+                               LPARAM lParam,
+                               BOOL& bHandled) {
++  if (m_shutdown_started.load(std::memory_order_acquire))
++    return 0;
++  std::unique_lock lock(g_api_mutex, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    ::PostMessage(m_hWnd, WM_COMMAND, wParam, lParam);
++    return 0;
++  }
++  return _DispatchCommandLocked(uMsg, wParam, lParam, bHandled);
++}
++
++LRESULT ServerImpl::_DispatchCommandLocked(UINT uMsg,
++                                           WPARAM wParam,
++                                           LPARAM lParam,
++                                           BOOL& bHandled) {
+   UINT uID = LOWORD(wParam);
+   switch (uID) {
+     case ID_WEASELTRAY_ENABLE_ASCII:
+-      m_pRequestHandler->SetOption(lParam, "ascii_mode", true);
++      if (m_pRequestHandler)
++        m_pRequestHandler->SetOption(
++            static_cast<DWORD>(lParam), "ascii_mode", true);
+       return 0;
+     case ID_WEASELTRAY_DISABLE_ASCII:
+-      m_pRequestHandler->SetOption(lParam, "ascii_mode", false);
++      if (m_pRequestHandler)
++        m_pRequestHandler->SetOption(
++            static_cast<DWORD>(lParam), "ascii_mode", false);
+       return 0;
+     default:;
+   }
+@@ -134,9 +213,16 @@ LRESULT ServerImpl::OnCommand(UINT uMsg,
+ DWORD ServerImpl::OnCommand(WEASEL_IPC_COMMAND uMsg,
+                             DWORD wParam,
+                             DWORD lParam) {
+-  BOOL handled = TRUE;
+-  OnCommand(uMsg, wParam, lParam, handled);
+-  return handled;
++  const UINT command = LOWORD(wParam);
++  if (command == ID_WEASELTRAY_ENABLE_ASCII ||
++      command == ID_WEASELTRAY_DISABLE_ASCII) {
++    if (!m_pRequestHandler)
++      return 0;
++    m_pRequestHandler->SetOption(
++        lParam, "ascii_mode", command == ID_WEASELTRAY_ENABLE_ASCII);
++    return 1;
++  }
++  return ::PostMessage(m_hWnd, WM_COMMAND, wParam, lParam) ? 1 : 0;
+ }
+ 
+ HWND ServerImpl::Start() {
+@@ -156,14 +242,11 @@ HWND ServerImpl::Start() {
+ }
+ 
+ int ServerImpl::Stop() {
+-  // DO NOT exit process or finalize here
+-  // Let WeaselServer handle this
+-  PostMessage(WM_QUIT);
++  channel->StopAccepting();
++  ::PostMessage(m_hWnd, WM_FAMO_BEGIN_SHUTDOWN, 0, 0);
+   return 0;
+ }
+ 
+-static std::mutex g_api_mutex;
+-
+ int ServerImpl::Run() {
+   // This workaround causes a VC internal error:
+   // void PipeServer::Listen(ServerHandler handler);
+@@ -171,24 +254,201 @@ int ServerImpl::Run() {
+   // auto handler = boost::bind(&ServerImpl::HandlePipeMessage, this);
+   // auto listener = boost::bind(&PipeServer::Listen, channel.get(), handler);
+   //
+-  auto listener = [this](PipeMessage msg, PipeServer::Respond resp) -> void {
++  auto listener = [this](PipeMessage msg,
++                         DWORD client_process_id,
++                         PipeServer::Respond resp) -> void {
+     std::lock_guard guard(g_api_mutex);
+-    HandlePipeMessage(msg, resp);
++    if (m_shutdown_started.load(std::memory_order_acquire) ||
++        !m_pRequestHandler) {
++      resp(0);
++      return;
++    }
++    HandlePipeMessage(msg, client_process_id, resp);
+   };
+   pipeThread = std::make_unique<boost::thread>(
+-      [this, &listener]() { channel->Listen(listener); });
++      [this, listener]() {
++        try {
++          channel->Listen(listener);
++        } catch (const boost::thread_interrupted&) {
++        } catch (...) {
++          ::PostMessage(m_hWnd, WM_FAMO_BEGIN_SHUTDOWN, 0, 0);
++        }
++      });
+ 
+   CMessageLoop theLoop;
+   _Module.AddMessageLoop(&theLoop);
+-  int nRet = theLoop.Run();
++  int nRet = -1;
++  std::exception_ptr run_error;
++  try {
++    nRet = theLoop.Run();
++  } catch (...) {
++    run_error = std::current_exception();
++  }
++  if (!m_shutdown_complete) {
++    _BeginShutdown();
++    while (!m_shutdown_complete) {
++      MSG msg = {};
++      while (::PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
++        if (msg.message == WM_QUIT)
++          continue;
++        try {
++          ::TranslateMessage(&msg);
++          ::DispatchMessage(&msg);
++        } catch (...) {
++          if (!run_error)
++            run_error = std::current_exception();
++        }
++      }
++      if (!m_shutdown_complete) {
++        ::MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT);
++      }
++    }
++  }
+   _Module.RemoveMessageLoop();
++  if (run_error)
++    std::rethrow_exception(run_error);
+   return nRet;
+ }
+ 
++void ServerImpl::_BeginShutdown() {
++  bool expected = false;
++  if (!m_shutdown_started.compare_exchange_strong(
++          expected, true, std::memory_order_acq_rel)) {
++    return;
++  }
++
++  channel->StopAccepting();
++  if (pipeThread)
++    pipeThread->interrupt();
++  shutdownThread = std::make_unique<boost::thread>([this] {
++    if (pipeThread && pipeThread->joinable())
++      pipeThread->join();
++    channel->WaitForWorkers();
++    ::PostMessage(m_hWnd, WM_FAMO_FINISH_SHUTDOWN, 0, 0);
++  });
++}
++
++LRESULT ServerImpl::OnBeginShutdown(UINT uMsg,
++                                    WPARAM wParam,
++                                    LPARAM lParam,
++                                    BOOL& bHandled) {
++  _BeginShutdown();
++  return 0;
++}
++
++LRESULT ServerImpl::OnFinishShutdown(UINT uMsg,
++                                     WPARAM wParam,
++                                     LPARAM lParam,
++                                     BOOL& bHandled) {
++  if (m_shutdown_complete)
++    return 0;
++  if (shutdownThread && shutdownThread->joinable())
++    shutdownThread->join();
++  shutdownThread.reset();
++  pipeThread.reset();
++  {
++    std::lock_guard guard(m_deferred_mutex);
++    m_deferred_options.clear();
++  }
++  _DrainUiTasks(false);
++  _FinalizeRequestHandler();
++  m_shutdown_complete = true;
++  ::PostQuitMessage(0);
++  return 0;
++}
++
++void ServerImpl::SetOption(DWORD session_id,
++                           const std::string& option,
++                           bool value) {
++  if (m_shutdown_started.load(std::memory_order_acquire))
++    return;
++
++  std::unique_lock lock(g_api_mutex, std::try_to_lock);
++  if (lock.owns_lock()) {
++    if (m_pRequestHandler)
++      m_pRequestHandler->SetOption(session_id, option, value);
++    return;
++  }
++
++  {
++    std::lock_guard guard(m_deferred_mutex);
++    if (m_shutdown_started.load(std::memory_order_acquire))
++      return;
++    m_deferred_options.push_back({session_id, option, value});
++  }
++  ::PostMessage(m_hWnd, WM_FAMO_DEFERRED_OPTIONS, 0, 0);
++}
++
++LRESULT ServerImpl::OnDeferredOptions(UINT uMsg,
++                                      WPARAM wParam,
++                                      LPARAM lParam,
++                                      BOOL& bHandled) {
++  if (m_shutdown_started.load(std::memory_order_acquire)) {
++    std::lock_guard guard(m_deferred_mutex);
++    m_deferred_options.clear();
++    return 0;
++  }
++
++  std::unique_lock lock(g_api_mutex, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    ::PostMessage(m_hWnd, WM_FAMO_DEFERRED_OPTIONS, 0, 0);
++    return 0;
++  }
++
++  std::deque<DeferredOption> options;
++  {
++    std::lock_guard guard(m_deferred_mutex);
++    options.swap(m_deferred_options);
++  }
++  if (m_pRequestHandler) {
++    for (const auto& option : options) {
++      m_pRequestHandler->SetOption(
++          option.session_id, option.option, option.value);
++    }
++  }
++  return 0;
++}
++
++void ServerImpl::PostUiTask(std::function<void()> task) {
++  if (!task || m_shutdown_started.load(std::memory_order_acquire))
++    return;
++  {
++    std::lock_guard guard(m_deferred_mutex);
++    if (m_shutdown_started.load(std::memory_order_acquire))
++      return;
++    m_ui_tasks.push_back(std::move(task));
++  }
++  ::PostMessage(m_hWnd, WM_FAMO_UI_TASKS, 0, 0);
++}
++
++LRESULT ServerImpl::OnUiTasks(UINT uMsg,
++                              WPARAM wParam,
++                              LPARAM lParam,
++                              BOOL& bHandled) {
++  if (m_shutdown_started.load(std::memory_order_acquire)) {
++    _DrainUiTasks(false);
++    return 0;
++  }
++  std::unique_lock lock(g_api_mutex, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    ::PostMessage(m_hWnd, WM_FAMO_UI_TASKS, 0, 0);
++    return 0;
++  }
++  _DrainUiTasks(true);
++  return 0;
++}
++
+ DWORD ServerImpl::OnEcho(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam) {
+   if (!m_pRequestHandler)
+     return 0;
+-  return m_pRequestHandler->FindSession(lParam);
++  const DWORD session = m_pRequestHandler->FindSession(lParam);
++  if (session != 0) {
++    (void)m_pRequestHandler->RecoverResponseDelivery(
++        session, [this](std::wstring& msg) -> bool {
++          return channel->TryWrite(msg);
++        });
++  }
++  return session;
+ }
+ 
+ DWORD ServerImpl::OnStartSession(WEASEL_IPC_COMMAND uMsg,
+@@ -196,12 +456,12 @@ DWORD ServerImpl::OnStartSession(WEASEL_IPC_COMMAND uMsg,
+                                  DWORD lParam) {
+   if (!m_pRequestHandler)
+     return 0;
+-  return m_pRequestHandler->AddSession(
++  return m_pRequestHandler->AddSessionForClient(
        reinterpret_cast<LPWSTR>(channel->ReceiveBuffer()),
        [this](std::wstring& msg) -> bool {
 -        *channel << msg;
 -        return true;
+-      });
 +        return channel->TryWrite(msg);
-       });
++      },
++      lParam);
  }
-@@ -219,8 +218,7 @@ DWORD ServerImpl::OnKeyEvent(WEASEL_IPC_COMMAND uMsg,
+ 
+ DWORD ServerImpl::OnEndSession(WEASEL_IPC_COMMAND uMsg,
+@@ -219,8 +479,7 @@ DWORD ServerImpl::OnKeyEvent(WEASEL_IPC_COMMAND uMsg,
      return 0;
--
-+
+ 
    auto eat = [this](std::wstring& msg) -> bool {
 -    *channel << msg;
 -    return true;
@@ -2527,7 +3763,7 @@ index 487d5af..4ca10e0 100644
    };
    return m_pRequestHandler->ProcessKeyEvent(KeyEvent(wParam), lParam, eat);
  }
-@@ -311,23 +309,38 @@ DWORD ServerImpl::OnEndMaintenance(WEASEL_IPC_COMMAND uMsg,
+@@ -311,24 +570,39 @@ DWORD ServerImpl::OnEndMaintenance(WEASEL_IPC_COMMAND uMsg,
  DWORD ServerImpl::OnCommitComposition(WEASEL_IPC_COMMAND uMsg,
                                        DWORD wParam,
                                        DWORD lParam) {
@@ -2541,8 +3777,7 @@ index 487d5af..4ca10e0 100644
 +  }
    return 0;
  }
--
-+
+ 
  DWORD ServerImpl::OnClearComposition(WEASEL_IPC_COMMAND uMsg,
                                       DWORD wParam,
                                       DWORD lParam) {
@@ -2556,8 +3791,7 @@ index 487d5af..4ca10e0 100644
 +  }
    return 0;
  }
--
-+
+ 
  DWORD ServerImpl::OnSelectCandidateOnCurrentPage(WEASEL_IPC_COMMAND uMsg,
                                                   DWORD wParam,
                                                   DWORD lParam) {
@@ -2574,7 +3808,8 @@ index 487d5af..4ca10e0 100644
 +  }
    return 0;
  }
-@@ -337,10 +350,12 @@ DWORD ServerImpl::OnHighlightCandidateOnCurrentPage(WEASEL_IPC_COMMAND uMsg,
+ 
+@@ -337,10 +611,12 @@ DWORD ServerImpl::OnHighlightCandidateOnCurrentPage(WEASEL_IPC_COMMAND uMsg,
                                                      DWORD lParam) {
    if (m_pRequestHandler) {
      auto eat = [this](std::wstring& msg) -> bool {
@@ -2590,7 +3825,7 @@ index 487d5af..4ca10e0 100644
    }
    return 0;
  }
-@@ -350,10 +365,9 @@ DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
+@@ -350,10 +626,9 @@ DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
                                 DWORD lParam) {
    if (m_pRequestHandler) {
      auto eat = [this](std::wstring& msg) -> bool {
@@ -2603,7 +3838,7 @@ index 487d5af..4ca10e0 100644
    }
    return 0;
  }
-@@ -364,8 +378,7 @@ DWORD ServerImpl::OnReloadStyle(WEASEL_IPC_COMMAND uMsg,
+@@ -364,8 +639,7 @@ DWORD ServerImpl::OnReloadStyle(WEASEL_IPC_COMMAND uMsg,
    // 法墨即时外观②：重读 famo-style.yaml 覆盖层并重绘（不部署）。
    if (m_pRequestHandler) {
      auto eat = [this](std::wstring& msg) -> bool {
@@ -2613,14 +3848,433 @@ index 487d5af..4ca10e0 100644
      };
      m_pRequestHandler->ReloadStyleOverlay(lParam, eat);
    }
+@@ -390,6 +664,19 @@ DWORD ServerImpl::OnSelectSchema(WEASEL_IPC_COMMAND uMsg,
+   return 0;
+ }
+ 
++DWORD ServerImpl::OnAcknowledgeDelivery(WEASEL_IPC_COMMAND /*uMsg*/,
++                                        DWORD wParam,
++                                        DWORD lParam) {
++  if (!m_pRequestHandler)
++    return 0;
++  if (m_pRequestHandler->FindSession(lParam) == 0)
++    return 2;
++  return m_pRequestHandler->AcknowledgeResponseDelivery(
++             ResponseDeliveryToken{lParam, wParam})
++             ? 1
++             : 0;
++}
++
+ #define MAP_PIPE_MSG_HANDLE(__msg, __wParam, __lParam) \
+   {                                                    \
+     auto lParam = __lParam;                            \
+@@ -407,10 +694,22 @@ DWORD ServerImpl::OnSelectSchema(WEASEL_IPC_COMMAND uMsg,
+   }
+ 
+ template <typename _Resp>
+-void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
+-  DWORD result;
+-
+-  MAP_PIPE_MSG_HANDLE(pipe_msg.Msg, pipe_msg.wParam, pipe_msg.lParam)
++void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg,
++                                   DWORD client_process_id,
++                                   _Resp resp) {
++  DWORD result = 0;
++  const ResponseDeliveryToken stale =
++      m_pRequestHandler
++          ? m_pRequestHandler->TakeStagedResponseDelivery()
++          : ResponseDeliveryToken{};
++  if (stale)
++    throw static_cast<DWORD>(ERROR_INVALID_DATA);
++
++  const DWORD dispatch_lparam =
++      pipe_msg.Msg == WEASEL_IPC_START_SESSION
++          ? client_process_id
++          : pipe_msg.lParam;
++  MAP_PIPE_MSG_HANDLE(pipe_msg.Msg, pipe_msg.wParam, dispatch_lparam)
+   PIPE_MSG_HANDLE(WEASEL_IPC_ECHO, OnEcho)
+   PIPE_MSG_HANDLE(WEASEL_IPC_START_SESSION, OnStartSession)
+   PIPE_MSG_HANDLE(WEASEL_IPC_END_SESSION, OnEndSession)
+@@ -431,24 +730,102 @@ void ServerImpl::HandlePipeMessage(PipeMessage pipe_msg, _Resp resp) {
+   PIPE_MSG_HANDLE(WEASEL_IPC_RELOAD_STYLE, OnReloadStyle);
+   PIPE_MSG_HANDLE(WEASEL_IPC_RELOAD_OPTIONS, OnReloadOptions);
+   PIPE_MSG_HANDLE(WEASEL_IPC_SELECT_SCHEMA, OnSelectSchema);
++  PIPE_MSG_HANDLE(WEASEL_IPC_ACK_DELIVERY, OnAcknowledgeDelivery);
+   PIPE_MSG_HANDLE(WEASEL_IPC_TRAY_COMMAND, OnCommand);
+   END_MAP_PIPE_MSG_HANDLE(result);
+ 
+-  resp(result);
++  const ResponseDeliveryToken token =
++      m_pRequestHandler
++          ? m_pRequestHandler->TakeStagedResponseDelivery()
++          : ResponseDeliveryToken{};
++  const DWORD expected_session =
++      pipe_msg.Msg == WEASEL_IPC_START_SESSION ? result : pipe_msg.lParam;
++  if (token && token.session_id != expected_session) {
++    if (pipe_msg.Msg == WEASEL_IPC_START_SESSION && result &&
++        m_pRequestHandler) {
++      m_pRequestHandler->RemoveSession(result);
++    }
++    throw static_cast<DWORD>(ERROR_INVALID_DATA);
++  }
++  try {
++    resp(result);
++  } catch (...) {
++    if (pipe_msg.Msg == WEASEL_IPC_START_SESSION && result &&
++        m_pRequestHandler) {
++      m_pRequestHandler->RemoveSession(result);
++    }
++    throw;
++  }
++  if (token && m_pRequestHandler)
++    m_pRequestHandler->ConfirmResponsePipeWrite(token);
++  // ACK-capable clients retain the lease after this pipe write and release it
++  // only with a later idempotent WEASEL_IPC_ACK_DELIVERY. Legacy clients use
++  // the post-write confirmation above for rolling-update compatibility.
+ }
+ 
+ PipeServer::PipeServer(std::wstring&& pn_cmd, SECURITY_ATTRIBUTES* s)
+     : PipeChannel(std::move(pn_cmd), s) {}
+ 
+-void PipeServer::Listen(ServerHandler const& handler) {
+-  for (;;) {
++void PipeServer::StopAccepting() noexcept {
++  stopping_.store(true, std::memory_order_release);
++}
++
++void PipeServer::WaitForWorkers() {
++  _ReapWorkers(true);
++}
++
++void PipeServer::_ReapWorkers(bool join_all) {
++  for (auto it = workers_.begin(); it != workers_.end();) {
++    const bool completed =
++        it->completed &&
++        it->completed->load(std::memory_order_acquire);
++    if (!join_all && !completed) {
++      ++it;
++      continue;
++    }
++    if (it->thread && it->thread->joinable())
++      it->thread->join();
++    it = workers_.erase(it);
++  }
++}
++
++void PipeServer::Listen(ServerHandler handler) {
++  while (!stopping_.load(std::memory_order_acquire)) {
++    _ReapWorkers(false);
+     HANDLE pipe = INVALID_HANDLE_VALUE;
+     try {
+       boost::this_thread::interruption_point();
+       pipe = _ConnectServerPipe(pname);
+-      boost::thread th(
+-          [&handler, pipe, this] { _ProcessPipeThread(pipe, handler); });
+-    } catch (DWORD ex) {
++      if (stopping_.load(std::memory_order_acquire)) {
++        _FinalizePipe(pipe);
++        return;
++      }
++
++      bool worker_slot_added = false;
++      try {
++        auto completed = std::make_shared<std::atomic<bool>>(false);
++        workers_.emplace_back();
++        worker_slot_added = true;
++        workers_.back().completed = completed;
++        workers_.back().thread = std::make_unique<boost::thread>(
++            [this, pipe, handler, completed] {
++              try {
++                _ProcessPipeThread(pipe, handler);
++              } catch (...) {
++              }
++              // No owner access follows this release. The accept thread joins
++              // before erasing the record, so lambda capture teardown is also
++              // complete before ServerImpl can be destroyed.
++              completed->store(true, std::memory_order_release);
++            });
++        pipe = INVALID_HANDLE_VALUE;
++      } catch (...) {
++        if (worker_slot_added)
++          workers_.pop_back();
++        _FinalizePipe(pipe);
++        throw;
++      }
++    } catch (DWORD) {
+       _FinalizePipe(pipe);
+     }
+     boost::this_thread::interruption_point();
+@@ -456,20 +833,28 @@ void PipeServer::Listen(ServerHandler const& handler) {
+ }
+ 
+ PipeServer::ServerRunner PipeServer::GetServerRunner(
+-    ServerHandler const& handler) {
+-  return [&handler, this]() { Listen(handler); };
++    ServerHandler handler) {
++  return [handler = std::move(handler), this]() mutable {
++    Listen(std::move(handler));
++  };
+ }
+ 
+-void PipeServer::_ProcessPipeThread(HANDLE pipe, ServerHandler const& handler) {
++void PipeServer::_ProcessPipeThread(HANDLE pipe, ServerHandler handler) {
+   try {
+-    for (;;) {
++    ULONG client_process_id = 0;
++    (void)::GetNamedPipeClientProcessId(pipe, &client_process_id);
++    while (!stopping_.load(std::memory_order_acquire)) {
+       Res msg;
+       _Receive(pipe, &msg, sizeof(msg));
+-      handler(msg, [this, pipe](Msg resp) { _Send(pipe, resp); });
++      if (stopping_.load(std::memory_order_acquire))
++        break;
++      handler(
++          msg, static_cast<DWORD>(client_process_id),
++          [this, pipe](Msg resp) { _SendAcceptedResponse(pipe, resp); });
+     }
+   } catch (...) {
+-    _FinalizePipe(pipe);
+   }
++  _FinalizePipe(pipe);
+ }
+ 
+ // weasel::Server
+@@ -497,6 +882,16 @@ void Server::SetRequestHandler(RequestHandler* pHandler) {
+   m_pImpl->SetRequestHandler(pHandler);
+ }
+ 
++void Server::SetOption(DWORD session_id,
++                       const std::string& option,
++                       bool value) {
++  m_pImpl->SetOption(session_id, option, value);
++}
++
++void Server::PostUiTask(std::function<void()> task) {
++  m_pImpl->PostUiTask(std::move(task));
++}
++
+ void Server::AddMenuHandler(UINT uID, CommandHandler handler) {
+   m_pImpl->AddMenuHandler(uID, handler);
+ }
+diff --git a/WeaselIPCServer/WeaselServerImpl.h b/WeaselIPCServer/WeaselServerImpl.h
+index a857e69..208891e 100644
+--- a/WeaselIPCServer/WeaselServerImpl.h
++++ b/WeaselIPCServer/WeaselServerImpl.h
+@@ -1,6 +1,10 @@
+ #pragma once
+ #include <WeaselIPC.h>
++#include <atomic>
++#include <deque>
++#include <functional>
+ #include <map>
++#include <mutex>
+ #include <Winnt.h>   // for security attributes constants
+ #include <aclapi.h>  // for ACL
+ #include <boost/thread.hpp>
+@@ -19,6 +23,14 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+  public:
+   DECLARE_WND_CLASS(WEASEL_IPC_WINDOW)
+ 
++  enum : UINT {
++    WM_FAMO_RETRY_COLOR = WM_APP + 0x100,
++    WM_FAMO_DEFERRED_OPTIONS,
++    WM_FAMO_UI_TASKS,
++    WM_FAMO_BEGIN_SHUTDOWN,
++    WM_FAMO_FINISH_SHUTDOWN,
++  };
++
+   BEGIN_MSG_MAP(WEASEL_IPC_WINDOW)
+   MESSAGE_HANDLER(WM_CREATE, OnCreate)
+   MESSAGE_HANDLER(WM_DESTROY, OnDestroy)
+@@ -28,6 +40,11 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   MESSAGE_HANDLER(WM_DWMCOLORIZATIONCOLORCHANGED, OnColorChange)
+   MESSAGE_HANDLER(WM_SETTINGCHANGE, OnColorChange)
+   MESSAGE_HANDLER(WM_COMMAND, OnCommand)
++  MESSAGE_HANDLER(WM_FAMO_RETRY_COLOR, OnColorChange)
++  MESSAGE_HANDLER(WM_FAMO_DEFERRED_OPTIONS, OnDeferredOptions)
++  MESSAGE_HANDLER(WM_FAMO_UI_TASKS, OnUiTasks)
++  MESSAGE_HANDLER(WM_FAMO_BEGIN_SHUTDOWN, OnBeginShutdown)
++  MESSAGE_HANDLER(WM_FAMO_FINISH_SHUTDOWN, OnFinishShutdown)
+   END_MSG_MAP()
+ 
+   LRESULT OnColorChange(UINT uMsg,
+@@ -46,6 +63,22 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+                              LPARAM lParam,
+                              BOOL& bHandled);
+   LRESULT OnCommand(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
++  LRESULT OnDeferredOptions(UINT uMsg,
++                            WPARAM wParam,
++                            LPARAM lParam,
++                            BOOL& bHandled);
++  LRESULT OnUiTasks(UINT uMsg,
++                    WPARAM wParam,
++                    LPARAM lParam,
++                    BOOL& bHandled);
++  LRESULT OnBeginShutdown(UINT uMsg,
++                          WPARAM wParam,
++                          LPARAM lParam,
++                          BOOL& bHandled);
++  LRESULT OnFinishShutdown(UINT uMsg,
++                           WPARAM wParam,
++                           LPARAM lParam,
++                           BOOL& bHandled);
+   DWORD OnCommand(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnEcho(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnStartSession(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+@@ -73,6 +106,9 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   DWORD OnReloadStyle(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnReloadOptions(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+   DWORD OnSelectSchema(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
++  DWORD OnAcknowledgeDelivery(WEASEL_IPC_COMMAND uMsg,
++                              DWORD wParam,
++                              DWORD lParam);
+ 
+  public:
+   ServerImpl();
+@@ -81,6 +117,8 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   HWND Start();
+   int Stop();
+   int Run();
++  void SetOption(DWORD session_id, const std::string& option, bool value);
++  void PostUiTask(std::function<void()> task);
+ 
+   void SetRequestHandler(RequestHandler* pHandler) {
+     m_pRequestHandler = pHandler;
+@@ -90,14 +128,35 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   }
+ 
+  private:
++  struct DeferredOption {
++    DWORD session_id;
++    std::string option;
++    bool value;
++  };
++
+   void _Finailize();
++  void _BeginShutdown();
++  void _FinalizeRequestHandler();
++  void _DrainUiTasks(bool run_tasks);
++  LRESULT _DispatchCommandLocked(UINT uMsg,
++                                 WPARAM wParam,
++                                 LPARAM lParam,
++                                 BOOL& bHandled);
+   template <typename _Resp>
+-  void HandlePipeMessage(PipeMessage pipe_msg, _Resp resp);
++  void HandlePipeMessage(PipeMessage pipe_msg,
++                         DWORD client_process_id,
++                         _Resp resp);
+ 
+   std::unique_ptr<PipeServer> channel;
+   std::unique_ptr<boost::thread> pipeThread;
++  std::unique_ptr<boost::thread> shutdownThread;
+   RequestHandler* m_pRequestHandler;  // reference
+   std::map<UINT, CommandHandler> m_MenuHandlers;
++  std::atomic<bool> m_shutdown_started{false};
++  bool m_shutdown_complete = false;
++  std::mutex m_deferred_mutex;
++  std::deque<DeferredOption> m_deferred_options;
++  std::deque<std::function<void()>> m_ui_tasks;
+   HMODULE m_hUser32Module;
+   SecurityAttribute sa;
+   BOOL m_darkMode;
+diff --git a/WeaselServer/WeaselServerApp.cpp b/WeaselServer/WeaselServerApp.cpp
+index 125eb0d..2406b71 100644
+--- a/WeaselServer/WeaselServerApp.cpp
++++ b/WeaselServer/WeaselServerApp.cpp
+@@ -10,7 +10,11 @@ WeaselServerApp::WeaselServerApp()
+   SetupMenuHandlers();
+ }
+ 
+-WeaselServerApp::~WeaselServerApp() {}
++WeaselServerApp::~WeaselServerApp() {
++  // The handler member is destroyed before the server member. Unpublish the
++  // non-owning pointer even when Start/initialization returned early.
++  m_server.SetRequestHandler(nullptr);
++}
+ 
+ int WeaselServerApp::Run() {
+   if (!m_server.Start())
+@@ -35,22 +39,25 @@ int WeaselServerApp::Run() {
+ 
+   m_handler->Initialize();
+   m_handler->OnUpdateUI([this]() {
+-    tray_icon.Refresh();
+-    // 法墨状态栏：从真实 Rime 状态同步中英/全半角（Rime 无 GetOption）。
+-    m_status_bar.SyncStatus(m_ui.status().ascii_mode, m_ui.status().full_shape);
+-    // 皮肤跟随候选窗（含 famo-style.yaml 覆盖 / 深色切换）；带变更检测，不会每次重建。
+-    m_status_bar.ApplySkin(m_ui.style());
+-    m_popup.ApplySkin(m_ui.style());
+-    m_context_popup.ApplySkin(m_ui.style());
++    m_server.PostUiTask([this]() {
++      tray_icon.Refresh();
++      // 法墨状态栏：从真实 Rime 状态同步中英/全半角（Rime 无 GetOption）。
++      m_status_bar.SyncStatus(m_ui.status().ascii_mode,
++                              m_ui.status().full_shape);
++      // 皮肤跟随候选窗（含 famo-style.yaml 覆盖 / 深色切换）；带变更检测，不会每次重建。
++      m_status_bar.ApplySkin(m_ui.style());
++      m_popup.ApplySkin(m_ui.style());
++      m_context_popup.ApplySkin(m_ui.style());
++    });
+   });
+ 
+   tray_icon.Create(m_server.GetHWnd());
+   tray_icon.Refresh();
+ 
+-  // 法墨悬浮状态栏（阶段 1）：开关回调直达同进程 RimeWithWeaselHandler::SetOption
+-  // （ipc_id=0 -> 活跃 session），零 IPC。创建后置于主屏右下角并显示。
++  // 法墨悬浮状态栏（阶段 1）：开关经 server 串行入口调用同进程
++  // RimeWithWeaselHandler::SetOption（ipc_id=0 -> 活跃 session），零 IPC。
+   m_status_bar.Bind([this](const std::string& opt, bool val) {
+-    m_handler->SetOption(0, opt, val);
++    m_server.SetOption(0, opt, val);
+   });
+   // 法墨：托盘右键菜单的开关勾选态读 FamoStatusBar 影子态（与悬浮状态栏同一真相源）。
+   tray_icon.SetOptionQuery(
+@@ -60,8 +67,10 @@ int WeaselServerApp::Run() {
+   if (m_status_bar.CreateBar(m_server.GetHWnd()))
+     m_status_bar.ApplySkin(m_ui.style());  // 初次套皮肤（与候选窗一致）
+   // 焦点驱动显隐：编辑域获得焦点 -> 显示（跟随前台窗/或固定拖动位）；失焦 -> 隐藏。
+-  m_handler->OnFocusIn([this] { m_status_bar.ShowOnFocus(); });
+-  m_handler->OnFocusOut([this] { m_status_bar.HideBar(); });
++  m_handler->OnFocusIn(
++      [this] { m_server.PostUiTask([this] { m_status_bar.ShowOnFocus(); }); });
++  m_handler->OnFocusOut(
++      [this] { m_server.PostUiTask([this] { m_status_bar.HideBar(); }); });
+ 
+   // 法墨弹出面板（阶段 2）：4 开关复用状态栏单一真相源 + 设定/关于/退出动作。
+   {
+@@ -129,7 +138,6 @@ int WeaselServerApp::Run() {
+ 
+   int ret = m_server.Run();
+ 
+-  m_handler->Finalize();
+   if (m_popup.IsWindow())
+     m_popup.DestroyWindow();
+   if (m_context_popup.IsWindow())
 diff --git a/WeaselTSF/CandidateList.cpp b/WeaselTSF/CandidateList.cpp
-index 11c1e88..d923cb4 100644
+index 11c1e88..143415a 100644
 --- a/WeaselTSF/CandidateList.cpp
 +++ b/WeaselTSF/CandidateList.cpp
-@@ -442,24 +442,17 @@ void WeaselTSF::_DeleteCandidateList() {
+@@ -410,11 +410,15 @@ void WeaselTSF::_UpdateUI(const Context& ctx, const Status& status) {
+ 
+ void WeaselTSF::_ReloadStyleFromServerForCandidate() {
+   m_client.ReloadStyle();
++  if (_SchedulePendingCommitResponse())
++    return;
+   auto context = std::make_shared<weasel::Context>();
+   weasel::ResponseParser parser(NULL, context.get(), &_status, NULL,
+                                 &_cand->style());
+-  if (m_client.GetResponseData(std::ref(parser)))
++  if (m_client.GetResponseData(std::ref(parser))) {
+     _UpdateUI(*context, _status);
++    (void)m_client.AcknowledgeResponseData();
++  }
  }
--
-+
+ 
+ void WeaselTSF::_StartUI() {
+@@ -442,24 +446,19 @@ void WeaselTSF::_DeleteCandidateList() {
+ }
+ 
  void WeaselTSF::_SelectCandidateOnCurrentPage(size_t index) {
 -  m_client.SelectCandidateOnCurrentPage(index);
 -  // simulate a VK_SELECT presskey to get data back and DoEditSession
@@ -2632,14 +4286,15 @@ index 11c1e88..d923cb4 100644
 -  inputs[1].type = INPUT_KEYBOARD;
 -  inputs[1].ki = {VK_SELECT, 0, KEYEVENTF_KEYUP, 0, 0};
 -  ::SendInput(sizeof(inputs) / sizeof(INPUT), inputs, sizeof(INPUT));
++  _PrepareResponseContext(_pEditSessionContext);
 +  if (m_client.SelectCandidateOnCurrentPage(index))
 +    _UpdateComposition(_pEditSessionContext);
  }
--
-+
+ 
  void WeaselTSF::_HandleMousePageEvent(bool* const nextPage,
                                        bool* const scrollNextPage) {
 +  bool response_ready = false;
++  _PrepareResponseContext(_pEditSessionContext);
    // from scrolling event
    if (scrollNextPage) {
      if (_cand->style().paging_on_scroll)
@@ -2648,7 +4303,7 @@ index 11c1e88..d923cb4 100644
      else {
        UINT current_select = 0, cand_count = 0;
        _cand->GetSelection(&current_select);
-@@ -469,17 +462,23 @@ void WeaselTSF::_HandleMousePageEvent(bool* const nextPage,
+@@ -469,17 +468,23 @@ void WeaselTSF::_HandleMousePageEvent(bool* const nextPage,
        offset = offset * (is_reposition ? -1 : 1);
        int index = (int)current_select + offset;
        if (index >= 0 && index < (int)cand_count)
@@ -2673,39 +4328,1233 @@ index 11c1e88..d923cb4 100644
 +  if (response_ready)
 +    _UpdateComposition(_pEditSessionContext);
  }
--
-+
+ 
  void WeaselTSF::_HandleMouseHoverEvent(const size_t index) {
-@@ -487,7 +486,7 @@ void WeaselTSF::_HandleMouseHoverEvent(const size_t index) {
+@@ -487,8 +492,9 @@ void WeaselTSF::_HandleMouseHoverEvent(const size_t index) {
    _cand->GetSelection(&current_select);
--
-+
+ 
    if (index != current_select) {
 -    m_client.HighlightCandidateOnCurrentPage(index);
 -    _UpdateComposition(_pEditSessionContext);
++    _PrepareResponseContext(_pEditSessionContext);
 +    if (m_client.HighlightCandidateOnCurrentPage(index))
 +      _UpdateComposition(_pEditSessionContext);
    }
  }
+ 
+diff --git a/WeaselTSF/Compartment.cpp b/WeaselTSF/Compartment.cpp
+index a45e0d1..a228aed 100644
+--- a/WeaselTSF/Compartment.cpp
++++ b/WeaselTSF/Compartment.cpp
+@@ -247,6 +247,7 @@ HRESULT WeaselTSF::_HandleCompartment(REFGUID guidCompartment) {
+       BOOL isOpen = _IsKeyboardOpen();
+       // clear composition when close keyboard
+       if (!isOpen && _pEditSessionContext) {
++        _PrepareResponseContext(_pEditSessionContext);
+         m_client.ClearComposition();
+         _EndComposition(_pEditSessionContext, true);
+       }
+@@ -260,18 +261,24 @@ HRESULT WeaselTSF::_HandleCompartment(REFGUID guidCompartment) {
+       _HandleLangBarMenuSelect(_status.ascii_mode
+                                    ? ID_WEASELTRAY_ENABLE_ASCII
+                                    : ID_WEASELTRAY_DISABLE_ASCII);
+-      if (_pEditSessionContext)
++      if (_pEditSessionContext) {
++        _PrepareResponseContext(_pEditSessionContext);
+         m_client.ClearComposition();
++      }
+       _UpdateLanguageBar(_status);
+     }
+   } else if (IsEqualGUID(guidCompartment,
+                          GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION)) {
+     BOOL isOpen = _IsKeyboardOpen();
+     if (isOpen) {
++      if (_SchedulePendingCommitResponse())
++        return S_OK;
+       weasel::ResponseParser parser(NULL, NULL, &_status, NULL,
+                                     &_cand->style());
+       bool ok = m_client.GetResponseData(std::ref(parser));
+       _UpdateLanguageBar(_status);
++      if (ok)
++        (void)m_client.AcknowledgeResponseData();
+     }
+   }
+   return S_OK;
+diff --git a/WeaselTSF/Composition.cpp b/WeaselTSF/Composition.cpp
+index 62852bc..34f3120 100644
+--- a/WeaselTSF/Composition.cpp
++++ b/WeaselTSF/Composition.cpp
+@@ -25,25 +25,43 @@ class CStartCompositionEditSession : public CEditSession {
+ };
+ 
+ STDAPI CStartCompositionEditSession::DoEditSession(TfEditCookie ec) {
+-  HRESULT hr = E_FAIL;
++  if (!_pTextService || !_pContext)
++    return E_FAIL;
++  return _pTextService->_StartCompositionInEditSession(
++      _pContext, ec, _inlinePreeditEnabled);
++}
++
++HRESULT WeaselTSF::_StartCompositionInEditSession(
++    ITfContext* pContext,
++    TfEditCookie ec,
++    BOOL inlinePreeditEnabled) {
++  if (!pContext)
++    return E_INVALIDARG;
++  if (_IsComposing())
++    return S_OK;
++
+   com_ptr<ITfInsertAtSelection> pInsertAtSelection;
+   com_ptr<ITfRange> pRangeComposition;
+-  if (_pContext->QueryInterface(IID_ITfInsertAtSelection,
+-                                (LPVOID*)&pInsertAtSelection) != S_OK)
++  HRESULT hr = pContext->QueryInterface(IID_ITfInsertAtSelection,
++                                        (LPVOID*)&pInsertAtSelection);
++  if (FAILED(hr))
+     return hr;
+   if (pInsertAtSelection->InsertTextAtSelection(ec, TF_IAS_QUERYONLY, NULL, 0,
+                                                 &pRangeComposition) != S_OK)
+-    return hr;
++    return E_FAIL;
+ 
+   com_ptr<ITfContextComposition> pContextComposition;
+   com_ptr<ITfComposition> pComposition;
+-  if (_pContext->QueryInterface(IID_ITfContextComposition,
+-                                (LPVOID*)&pContextComposition) != S_OK)
++  hr = pContext->QueryInterface(IID_ITfContextComposition,
++                                (LPVOID*)&pContextComposition);
++  if (FAILED(hr))
+     return hr;
+-  if ((pContextComposition->StartComposition(
+-           ec, pRangeComposition, _pTextService, &pComposition) == S_OK) &&
++  hr = pContextComposition->StartComposition(
++      ec, pRangeComposition, this, &pComposition);
++  if (SUCCEEDED(hr) &&
+       (pComposition != NULL)) {
+-    _pTextService->_SetComposition(pComposition);
++    _SetComposition(pComposition);
++    _cand->StartUI();
+ 
+     /* WORKAROUND:
+      *   CUAS does not provide a correct GetTextExt() position unless the
+@@ -51,23 +69,28 @@ STDAPI CStartCompositionEditSession::DoEditSession(TfEditCookie ec) {
+      * here. The workaround is only needed when inline preedit is not enabled.
+      *   See https://github.com/rime/weasel/pull/883#issuecomment-1567625762
+      */
+-    if (!_inlinePreeditEnabled) {
+-      pRangeComposition->SetText(ec, TF_ST_CORRECTION, L" ", 1);
++    if (!inlinePreeditEnabled) {
++      hr = pRangeComposition->SetText(ec, TF_ST_CORRECTION, L" ", 1);
++      if (FAILED(hr))
++        return hr;
+     }
+ 
+     /* set selection */
+     TF_SELECTION tfSelection;
+-    if (_inlinePreeditEnabled)
++    if (inlinePreeditEnabled)
+       pRangeComposition->Collapse(ec, TF_ANCHOR_END);
+     else
+       pRangeComposition->Collapse(ec, TF_ANCHOR_START);
+     tfSelection.range = pRangeComposition;
+     tfSelection.style.ase = TF_AE_NONE;
+     tfSelection.style.fInterimChar = FALSE;
+-    _pContext->SetSelection(ec, 1, &tfSelection);
++    hr = pContext->SetSelection(ec, 1, &tfSelection);
++    if (FAILED(hr))
++      return hr;
++    return S_OK;
+   }
+ 
+-  return hr;
++  return FAILED(hr) ? hr : E_FAIL;
+ }
+ 
+ void WeaselTSF::_StartComposition(com_ptr<ITfContext> pContext,
+@@ -75,7 +98,6 @@ void WeaselTSF::_StartComposition(com_ptr<ITfContext> pContext,
+   com_ptr<CStartCompositionEditSession> pStartCompositionEditSession;
+   pStartCompositionEditSession.Attach(new CStartCompositionEditSession(
+       this, pContext, fCUASWorkaroundEnabled, _cand->style().inline_preedit));
+-  _cand->StartUI();
+   if (pStartCompositionEditSession != nullptr) {
+     HRESULT hr;
+     pContext->RequestEditSession(_tfClientId, pStartCompositionEditSession,
+@@ -106,9 +128,8 @@ STDAPI CEndCompositionEditSession::DoEditSession(TfEditCookie ec) {
+   /* Clear the dummy text we set before, if any. */
+   if (_pComposition == nullptr)
+     return S_OK;
+-  // Avoid null pointer dereference
+   if (!_pTextService || !_pContext)
+-    return S_OK;
++    return E_FAIL;
+ 
+   _pTextService->_ClearCompositionDisplayAttributes(ec, _pContext);
+ 
+@@ -116,10 +137,35 @@ STDAPI CEndCompositionEditSession::DoEditSession(TfEditCookie ec) {
+   if (_clear && _pComposition->GetRange(&pCompositionRange) == S_OK)
+     pCompositionRange->SetText(ec, 0, L"", 0);
+ 
+-  _pComposition->EndComposition(ec);
+-  if (_pTextService)  // if _pTextService released, skip _FinalizeComposition
++  const HRESULT result = _pComposition->EndComposition(ec);
++  if (SUCCEEDED(result))
+     _pTextService->_FinalizeComposition();
+-  return S_OK;
++  return result;
++}
++
++HRESULT WeaselTSF::_EndCompositionInEditSession(ITfContext* pContext,
++                                                TfEditCookie ec,
++                                                BOOL clear) {
++  /* Clear the dummy text we set before, if any. */
++  if (!_pComposition)
++    return S_OK;
++  if (!pContext)
++    return E_INVALIDARG;
++
++  _cand->EndUI();
++  _ClearCompositionDisplayAttributes(ec, pContext);
++
++  com_ptr<ITfRange> pCompositionRange;
++  if (clear && _pComposition->GetRange(&pCompositionRange) == S_OK) {
++    const HRESULT clear_result = pCompositionRange->SetText(ec, 0, L"", 0);
++    if (FAILED(clear_result))
++      return clear_result;
++  }
++
++  const HRESULT result = _pComposition->EndComposition(ec);
++  if (SUCCEEDED(result))
++    _FinalizeComposition();
++  return result;
+ }
+ 
+ void WeaselTSF::_EndComposition(com_ptr<ITfContext> pContext, BOOL clear) {
+@@ -307,6 +353,54 @@ STDAPI CInlinePreeditEditSession::DoEditSession(TfEditCookie ec) {
+   return S_OK;
+ }
+ 
++HRESULT WeaselTSF::_ShowInlinePreeditInEditSession(
++    ITfContext* pContext,
++    TfEditCookie ec,
++    const std::shared_ptr<weasel::Context>& context) {
++  if (!pContext || !context || !_pComposition)
++    return E_INVALIDARG;
++
++  com_ptr<ITfRange> pRangeComposition;
++  HRESULT hr = _pComposition->GetRange(&pRangeComposition);
++  if (FAILED(hr))
++    return hr;
++
++  const std::wstring& preedit = context->preedit.str;
++  hr = pRangeComposition->SetText(
++      ec, 0, preedit.c_str(), static_cast<LONG>(preedit.length()));
++  if (FAILED(hr))
++    return hr;
++
++  int sel_cursor = -1;
++  for (const auto& attribute : context->preedit.attributes) {
++    if (attribute.type == weasel::HIGHLIGHTED) {
++      sel_cursor = attribute.range.cursor;
++      break;
++    }
++  }
++
++  if (!_SetCompositionDisplayAttributes(ec, pContext, pRangeComposition))
++    return E_FAIL;
++
++  LONG shifted = 0;
++  if (sel_cursor < 0) {
++    hr = pRangeComposition->Collapse(ec, TF_ANCHOR_END);
++  } else {
++    hr = pRangeComposition->Collapse(ec, TF_ANCHOR_START);
++    if (SUCCEEDED(hr)) {
++      hr = pRangeComposition->ShiftStart(ec, sel_cursor, &shifted, NULL);
++    }
++  }
++  if (FAILED(hr))
++    return hr;
++
++  TF_SELECTION selection{};
++  selection.range = pRangeComposition;
++  selection.style.ase = TF_AE_NONE;
++  selection.style.fInterimChar = FALSE;
++  return pContext->SetSelection(ec, 1, &selection);
++}
++
+ BOOL WeaselTSF::_ShowInlinePreedit(
+     com_ptr<ITfContext> pContext,
+     const std::shared_ptr<weasel::Context> context) {
+@@ -321,73 +415,131 @@ BOOL WeaselTSF::_ShowInlinePreedit(
+   return TRUE;
+ }
+ 
+-/* Update Composition */
+-class CInsertTextEditSession : public CEditSession {
+- public:
+-  CInsertTextEditSession(com_ptr<WeaselTSF> pTextService,
+-                         com_ptr<ITfContext> pContext,
+-                         com_ptr<ITfComposition> pComposition,
+-                         const std::wstring& text)
+-      : CEditSession(pTextService, pContext),
+-        _text(text),
+-        _pComposition(pComposition) {}
++HRESULT WeaselTSF::_InsertTextInEditSession(ITfContext* pContext,
++                                            TfEditCookie ec,
++                                            const std::wstring& text,
++                                            bool* durable) {
++  if (durable)
++    *durable = false;
++  if (!pContext || !durable || !_pComposition)
++    return E_INVALIDARG;
+ 
+-  /* ITfEditSession */
+-  STDMETHODIMP DoEditSession(TfEditCookie ec);
+-
+- private:
+-  std::wstring _text;
+-  com_ptr<ITfComposition> _pComposition;
+-};
+-
+-STDMETHODIMP CInsertTextEditSession::DoEditSession(TfEditCookie ec) {
+   com_ptr<ITfRange> pRange;
+-  TF_SELECTION tfSelection;
+-  HRESULT hRet = S_OK;
+-
+-  if (_pComposition == nullptr)
+-    return E_FAIL;
+-  if (FAILED(_pComposition->GetRange(&pRange)))
+-    return E_FAIL;
++  HRESULT hr = _pComposition->GetRange(&pRange);
++  if (FAILED(hr))
++    return hr;
+ 
+-  if (FAILED(pRange->SetText(ec, 0, _text.c_str(),
+-                             static_cast<LONG>(_text.length()))))
+-    return E_FAIL;
++  hr = pRange->SetText(
++      ec, 0, text.c_str(), static_cast<LONG>(text.length()));
++  if (FAILED(hr))
++    return hr;
++  *durable = true;
+ 
+   /* update the selection to an insertion point just past the inserted text. */
+-  pRange->Collapse(ec, TF_ANCHOR_END);
+-
+-  tfSelection.range = pRange;
+-  tfSelection.style.ase = TF_AE_NONE;
+-  tfSelection.style.fInterimChar = FALSE;
++  hr = pRange->Collapse(ec, TF_ANCHOR_END);
++  if (FAILED(hr))
++    return hr;
+ 
+-  _pContext->SetSelection(ec, 1, &tfSelection);
++  TF_SELECTION selection{};
++  selection.range = pRange;
++  selection.style.ase = TF_AE_NONE;
++  selection.style.fInterimChar = FALSE;
+ 
+-  return hRet;
++  return pContext->SetSelection(ec, 1, &selection);
+ }
+ 
+-BOOL WeaselTSF::_InsertText(com_ptr<ITfContext> pContext,
+-                            const std::wstring& text) {
+-  CInsertTextEditSession* pEditSession;
+-  HRESULT hr;
++/* Update Composition */
++class CResponseApplyEditSession : public CEditSession {
++ public:
++  CResponseApplyEditSession(
++      com_ptr<WeaselTSF> text_service,
++      com_ptr<ITfContext> context,
++      const weasel::ResponseDeliveryToken& delivery)
++      : CEditSession(text_service, context), delivery_(delivery) {}
++
++  STDMETHODIMP DoEditSession(TfEditCookie ec) override {
++    if (!_pTextService || !_pContext)
++      return E_FAIL;
++    return _pTextService->_ApplyResponseInEditSession(
++        _pContext, ec, delivery_);
++  }
+ 
+-  if ((pEditSession = new CInsertTextEditSession(this, pContext, _pComposition,
+-                                                 text)) != NULL) {
+-    pContext->RequestEditSession(_tfClientId, pEditSession,
+-                                 TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
+-    pEditSession->Release();
++ private:
++  weasel::ResponseDeliveryToken delivery_;
++};
++
++namespace {
++bool SameResponseDelivery(
++    const weasel::ResponseDeliveryToken& left,
++    const weasel::ResponseDeliveryToken& right) noexcept {
++  return left && right &&
++         left.session_id == right.session_id &&
++         left.generation == right.generation &&
++         left.requires_client_ack == right.requires_client_ack;
++}
++}  // namespace
++
++void WeaselTSF::_PrepareResponseContext(ITfContext* context) noexcept {
++  if (_responseOriginContext && !_responseOriginDelivery &&
++      !m_client.PendingResponseDelivery() &&
++      m_client.LastTransactionDeliveryState() !=
++          weasel::TransactionDeliveryState::ResponseUncertain) {
++    _responseOriginContext.Release();
+   }
++  if (!context || _responseOriginContext)
++    return;
++  try {
++    _responseOriginContext = context;
++  } catch (...) {
++    // CComPtr assignment is AddRef-only in production. If a platform wrapper
++    // ever violates that contract, leave the action unbound and fail open.
++  }
++}
+ 
+-  return TRUE;
++void WeaselTSF::_CompleteResponseContext(
++    const weasel::ResponseDeliveryToken& token) noexcept {
++  if (!SameResponseDelivery(_responseOriginDelivery, token))
++    return;
++  _responseOriginDelivery = {};
++  _responseOriginContext.Release();
+ }
+ 
+ void WeaselTSF::_UpdateComposition(com_ptr<ITfContext> pContext) {
+   HRESULT hr;
+ 
+   _pEditSessionContext = pContext;
++  const weasel::ResponseDeliveryToken delivery =
++      m_client.PendingResponseDelivery();
++  if (!delivery || m_client.ResponseDataApplied()) {
++    if (!delivery && !_responseOriginDelivery &&
++        m_client.LastTransactionDeliveryState() !=
++            weasel::TransactionDeliveryState::ResponseUncertain) {
++      _responseOriginContext.Release();
++    }
++    _async_edit = FALSE;
++    _UpdateCompositionWindow(pContext);
++    return;
++  }
+ 
+-  _pEditSessionContext->RequestEditSession(
+-      _tfClientId, this, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
++  _PrepareResponseContext(pContext);
++  if (!_responseOriginContext)
++    return;
++  if (!_responseOriginDelivery)
++    _responseOriginDelivery = delivery;
++  if (!SameResponseDelivery(_responseOriginDelivery, delivery))
++    return;
++
++  com_ptr<CResponseApplyEditSession> response_session;
++  response_session.Attach(new CResponseApplyEditSession(
++      this, _responseOriginContext, delivery));
++  if (!response_session)
++    return;
++
++  const HRESULT requested = _responseOriginContext->RequestEditSession(
++      _tfClientId, response_session,
++      TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
++  if (FAILED(requested))
++    hr = requested;
+   _async_edit = !!(hr == TF_S_ASYNC);
+   _UpdateCompositionWindow(pContext);
+ }
+@@ -404,6 +556,7 @@ STDAPI WeaselTSF::OnCompositionTerminated(TfEditCookie ecWrite,
+ }
+ 
+ void WeaselTSF::_AbortComposition(bool clear) {
++  _PrepareResponseContext(_pEditSessionContext);
+   m_client.ClearComposition();
+   if (_IsComposing()) {
+     _EndComposition(_pEditSessionContext, clear);
+diff --git a/WeaselTSF/EditSession.cpp b/WeaselTSF/EditSession.cpp
+index c61b2cd..5b31ddf 100644
+--- a/WeaselTSF/EditSession.cpp
++++ b/WeaselTSF/EditSession.cpp
+@@ -37,21 +37,89 @@ bool FamoNeedsSpace(FamoBoundaryKind left,
+     return cjk_number;
+   return false;
+ }
++
++class ResponseClaimGuard {
++ public:
++  ResponseClaimGuard(weasel::Client& client,
++                     bool& claimed,
++                     bool& applied,
++                     weasel::ResponseDeliveryToken& token) noexcept
++      : client_(client),
++        claimed_(claimed),
++        applied_(applied),
++        token_(token) {}
++
++  ~ResponseClaimGuard() noexcept {
++    if (!claimed_ || !token_)
++      return;
++    try {
++      if (applied_)
++        client_.MarkResponseDataApplied(token_);
++      else
++        client_.ReleaseResponseDataClaim(token_);
++    } catch (...) {
++      // A COM edit-session boundary must never unwind. Both state transitions
++      // are allocation-free; retain the envelope if a future implementation
++      // violates that contract.
++    }
++  }
++
++ private:
++  weasel::Client& client_;
++  bool& claimed_;
++  bool& applied_;
++  weasel::ResponseDeliveryToken& token_;
++};
+ }  // namespace
+ 
+ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+-  // get commit string from server
+-  std::wstring commit;
+-  weasel::Config config;
+-  auto context = std::make_shared<weasel::Context>();
+-  weasel::ResponseParser parser(&commit, context.get(), &_status, &config,
+-                                &_cand->style());
++  return _ApplyResponseInEditSession(
++      _pEditSessionContext, ec, m_client.PendingResponseDelivery());
++}
+ 
+-  bool ok = m_client.GetResponseData(std::ref(parser));
++HRESULT WeaselTSF::_ApplyResponseInEditSession(
++    ITfContext* response_context,
++    TfEditCookie ec,
++    const weasel::ResponseDeliveryToken& expected_delivery) {
++  bool claimed_response = false;
++  bool response_applied = false;
++  weasel::ResponseDeliveryToken response_delivery{};
++  ResponseClaimGuard claim_guard(m_client, claimed_response, response_applied,
++                                 response_delivery);
+ 
+-  _UpdateLanguageBar(_status);
++  try {
++    if (!response_context || !expected_delivery)
++      return E_INVALIDARG;
++    const weasel::ResponseDeliveryToken pending_delivery =
++        m_client.PendingResponseDelivery();
++    if (!pending_delivery ||
++        pending_delivery.session_id != expected_delivery.session_id ||
++        pending_delivery.generation != expected_delivery.generation ||
++        pending_delivery.requires_client_ack !=
++            expected_delivery.requires_client_ack ||
++        m_client.ResponseDataApplied()) {
++      return S_FALSE;
++    }
++
++    // Parse the immutable, client-owned response only after the host grants
++    // this exact READWRITE edit session.
++    std::wstring commit;
++    weasel::Config config;
++    auto context = std::make_shared<weasel::Context>();
++    weasel::ResponseParser parser(&commit, context.get(), &_status, &config,
++                                  &_cand->style());
++
++    const bool ok = m_client.GetCommitResponseData(std::ref(parser));
++    claimed_response = ok;
++    if (claimed_response)
++      response_delivery = m_client.PendingResponseDelivery();
++
++    _UpdateLanguageBar(_status);
++    if (!ok) {
++      _UpdateUI(*context, _status);
++      return S_OK;
++    }
+ 
+-  if (ok) {
+     // 法墨标点配对：左符号上屏补右符号+光标居中；敲右符号且光标右侧已有 → 跳过。
+     // 表用码位转义，避免源码编码歧义：（）「」『』《》【】〔〕〈〉 共 7 对。
+     int caret_backshift = 0;
+@@ -69,13 +137,11 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+           {L'\x3014', L'\x3015'}, /* 〔〕 */
+           {L'\x3008', L'\x3009'}, /* 〈〉 */
+       };
+-      // type-over 仅限"标点直接上屏"（无 preedit），避免打断组句。
+-      // 优先读文档核实右侧字符；读不到（transitory 上下文）时退回 pending
+-      // 状态判定：上一个 commit 恰是配对补全 → 本次同一右符号视为闭合。
+       if (commit.size() == 1 && !_IsComposing()) {
+         for (const auto& p : kFamoPairs) {
+           if (commit[0] == p.close) {
+-            int next_is = _FamoProbeNextChar(ec, p.close);
++            const int next_is =
++                _FamoProbeNextChar(response_context, ec, p.close);
+             if (next_is == 1 ||
+                 (next_is < 0 && _famo_pending_close == p.close)) {
+               commit.clear();
+@@ -96,14 +162,15 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+         }
+       }
+     }
+-    // 法墨中英/中数字自动加空格：在 auto-pair 决策块之后跑，此时 commit 已是
+-    // 最终形态；两个开关各自独立，互不依赖（design.md 顺序小节）。
++
++    FamoBoundaryKind applied_boundary = _famo_prev_commit_boundary;
++    bool update_boundary = false;
+     if (config.famo_cjk_english_spacing || config.famo_cjk_number_spacing) {
+       std::wstring spaced;
+       spaced.reserve(commit.size() * 2);
+       FamoBoundaryKind prev = _famo_prev_commit_boundary;
+       for (wchar_t ch : commit) {
+-        FamoBoundaryKind cur = FamoClassify(ch);
++        const FamoBoundaryKind cur = FamoClassify(ch);
+         if (prev != FamoBoundaryKind::None && cur != FamoBoundaryKind::None &&
+             FamoNeedsSpace(prev, cur, config.famo_cjk_english_spacing,
+                           config.famo_cjk_number_spacing) &&
+@@ -114,23 +181,36 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+         prev = cur;
+       }
+       commit.swap(spaced);
+-      if (!commit.empty())
+-        _famo_prev_commit_boundary = prev;
++      if (!commit.empty()) {
++        applied_boundary = prev;
++        update_boundary = true;
++      }
+     }
+-    // pending 生命周期：任何非配对 commit（含 type-over 本身）都作废，
+-    // 配对 commit 在下方注入光标时重新登记
+-    if (!commit.empty() || famo_typed_over)
+-      _famo_pending_close = 0;
++
++    HRESULT apply_result = S_OK;
+     if (!commit.empty()) {
+-      // For auto-selecting, commit and preedit can both exist.
+-      // Commit and close the original composition first.
++      // Commit in this edit session. No child session may outlive the response
++      // claim: SetText is the exact durable-apply barrier for the delivery.
+       if (!_IsComposing()) {
+-        _StartComposition(_pEditSessionContext,
+-                          _fCUASWorkaroundEnabled && !config.inline_preedit);
++        apply_result = _StartCompositionInEditSession(
++            response_context, ec, config.inline_preedit);
++        if (FAILED(apply_result))
++          return apply_result;
+       }
+-      _InsertText(_pEditSessionContext, commit);
+-      _EndComposition(_pEditSessionContext, false);
+-      // 配对补全后把光标移回配对符号中间，并登记 pending 供 type-over 判定
++
++      bool durable = false;
++      apply_result = _InsertTextInEditSession(
++          response_context, ec, commit, &durable);
++      response_applied = durable;
++      if (!durable)
++        return FAILED(apply_result) ? apply_result : E_FAIL;
++
++      // SetText has succeeded, so retrying would duplicate the commit.
++      // Selection/composition/UI failures below are secondary and best-effort.
++      (void)_EndCompositionInEditSession(response_context, ec, false);
++      _famo_pending_close = 0;
++      if (update_boundary)
++        _famo_prev_commit_boundary = applied_boundary;
+       if (caret_backshift > 0) {
+         _FamoInjectArrow(VK_LEFT, caret_backshift);
+         _famo_guard_until = GetTickCount64() + 200;
+@@ -138,28 +218,49 @@ STDAPI WeaselTSF::DoEditSession(TfEditCookie ec) {
+       }
+       _committed = TRUE;
+     } else if (famo_typed_over) {
+-      // type-over：不插入，注入 → 越过既有右符号
++      // type-over is an irreversible host input action; a retry would advance
++      // the caret twice.
+       _FamoInjectArrow(VK_RIGHT, 1);
+       _famo_guard_until = GetTickCount64() + 200;
++      _famo_pending_close = 0;
+       _committed = TRUE;
++      response_applied = true;
+     } else {
+       _committed = FALSE;
+     }
++
+     if (_status.composing && !_IsComposing()) {
+-      _StartComposition(_pEditSessionContext,
+-                        _fCUASWorkaroundEnabled && !config.inline_preedit);
++      apply_result = _StartCompositionInEditSession(
++          response_context, ec, config.inline_preedit);
++      if (FAILED(apply_result) && !response_applied)
++        return apply_result;
+     } else if (!_status.composing && _IsComposing()) {
+-      _EndComposition(_pEditSessionContext, true);
++      apply_result =
++          _EndCompositionInEditSession(response_context, ec, true);
++      if (FAILED(apply_result) && !response_applied)
++        return apply_result;
+     }
+     if (_IsComposing() && config.inline_preedit) {
+-      _ShowInlinePreedit(_pEditSessionContext, context);
++      apply_result = _ShowInlinePreeditInEditSession(
++          response_context, ec, context);
++      if (FAILED(apply_result) && !response_applied)
++        return apply_result;
+     }
+-    _UpdateCompositionWindow(_pEditSessionContext);
+-  }
+ 
+-  _UpdateUI(*context, _status);
+-
+-  return TRUE;
++    // A commit is already durable, or all non-commit composition state was
++    // applied synchronously under this write cookie.
++    response_applied = true;
++    (void)_UpdateCompositionWindow(response_context);
++    _UpdateUI(*context, _status);
++    _CompleteResponseContext(response_delivery);
++    return S_OK;
++  } catch (...) {
++    // COM ABI boundary: ResponseClaimGuard retains an unapplied envelope, or
++    // marks an exact durable commit without doing synchronous pipe I/O.
++    if (response_applied)
++      _CompleteResponseContext(response_delivery);
++    return E_FAIL;
++  }
+ }
+ 
+ /* 法墨标点配对：commit 后注入方向键移动光标（←回到配对中间 / →越过右符号）。
+@@ -207,11 +308,15 @@ void WeaselTSF::_FamoInjectArrow(WORD vk, int count) {
+ 
+ /* 法墨标点配对 type-over：光标为空选区且右侧紧邻字符 == ch 时，右移越过。
+  * 任一 COM 调用失败（应用不支持读周边文本）→ 返回 FALSE，走正常插入。 */
+-int WeaselTSF::_FamoProbeNextChar(TfEditCookie ec, wchar_t ch) {
++int WeaselTSF::_FamoProbeNextChar(ITfContext* context,
++                                 TfEditCookie ec,
++                                 wchar_t ch) {
++  if (!context)
++    return -1;
+   TF_SELECTION selection;
+   ULONG nSelection = 0;
+-  if (FAILED(_pEditSessionContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1,
+-                                                &selection, &nSelection)) ||
++  if (FAILED(context->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &selection,
++                                   &nSelection)) ||
+       nSelection == 0 || selection.range == nullptr)
+     return -1;
+ 
+@@ -221,7 +326,7 @@ int WeaselTSF::_FamoProbeNextChar(TfEditCookie ec, wchar_t ch) {
+   com_ptr<ITfRange> pDocEnd;
+   if (SUCCEEDED(selection.range->IsEmpty(ec, &empty)) && empty &&
+       SUCCEEDED(selection.range->Clone(&pProbe)) &&
+-      SUCCEEDED(_pEditSessionContext->GetEnd(ec, &pDocEnd))) {
++      SUCCEEDED(context->GetEnd(ec, &pDocEnd))) {
+     WCHAR buf[2] = {0, 0};
+     ULONG cchRead = 0;
+     pProbe->Collapse(ec, TF_ANCHOR_END);
+diff --git a/WeaselTSF/KeyEventSink.cpp b/WeaselTSF/KeyEventSink.cpp
+index dacb0af..aaabcb3 100644
+--- a/WeaselTSF/KeyEventSink.cpp
++++ b/WeaselTSF/KeyEventSink.cpp
+@@ -8,7 +8,10 @@ static weasel::KeyEvent prevKeyEvent;
+ static BOOL prevfEaten = FALSE;
+ static int keyCountToSimulate = 0;
+ 
+-void WeaselTSF::_ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
++void WeaselTSF::_ProcessKeyEvent(ITfContext* context,
++                                 WPARAM wParam,
++                                 LPARAM lParam,
++                                 BOOL* pfEaten) {
+   // when _IsKeyboardDisabled don't eat the key,
+   // when keyboard closable and keyboard closed, don't eat the key
+   if ((_isToOpenClose && !_IsKeyboardOpen()) || _IsKeyboardDisabled()) {
+@@ -61,8 +64,10 @@ void WeaselTSF::_ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
+           break;
+       }
+     }
+-    if (!keyCountToSimulate)
++    if (!keyCountToSimulate) {
++      _PrepareResponseContext(context);
+       *pfEaten = (BOOL)m_client.ProcessKeyEvent(ke);
++    }
+ 
+     if (ke.keycode == ibus::Caps_Lock) {
+       if (prevKeyEvent.keycode == ibus::Caps_Lock && prevfEaten == TRUE &&
+@@ -118,14 +123,22 @@ STDAPI WeaselTSF::OnTestKeyDown(ITfContext* pContext,
+                                 LPARAM lParam,
+                                 BOOL* pfEaten) {
+   _fTestKeyUpPending = FALSE;
++  if (_fFamoTestKeyDeliveryPending) {
++    // Multiple test callbacks for the same physical key must not consume or
++    // redispatch a response whose asynchronous edit is still outstanding.
++    *pfEaten = FALSE;
++    return S_OK;
++  }
+   if (_fTestKeyDownPending) {
+     *pfEaten = TRUE;
+     return S_OK;
+   }
+-  _ProcessKeyEvent(wParam, lParam, pfEaten);
++  _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+   _UpdateComposition(pContext);
+   if (*pfEaten)
+     _fTestKeyDownPending = TRUE;
++  else if (m_client.PendingResponseDelivery())
++    _fFamoTestKeyDeliveryPending = TRUE;
+   return S_OK;
+ }
+ 
+@@ -134,11 +147,19 @@ STDAPI WeaselTSF::OnKeyDown(ITfContext* pContext,
+                             LPARAM lParam,
+                             BOOL* pfEaten) {
+   _fTestKeyUpPending = FALSE;
++  if (_fFamoTestKeyDeliveryPending) {
++    // OnTestKeyDown already sent this physical input. Its recovered-prior
++    // response deliberately failed open, so skip OnKeyDown even if the child
++    // edit finished between the two callbacks.
++    _fFamoTestKeyDeliveryPending = FALSE;
++    *pfEaten = FALSE;
++    return S_OK;
++  }
+   if (_fTestKeyDownPending) {
+     _fTestKeyDownPending = FALSE;
+     *pfEaten = TRUE;
+   } else {
+-    _ProcessKeyEvent(wParam, lParam, pfEaten);
++    _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+     _UpdateComposition(pContext);
+   }
+   return S_OK;
+@@ -149,11 +170,12 @@ STDAPI WeaselTSF::OnTestKeyUp(ITfContext* pContext,
+                               LPARAM lParam,
+                               BOOL* pfEaten) {
+   _fTestKeyDownPending = FALSE;
++  _fFamoTestKeyDeliveryPending = FALSE;
+   if (_fTestKeyUpPending) {
+     *pfEaten = TRUE;
+     return S_OK;
+   }
+-  _ProcessKeyEvent(wParam, lParam, pfEaten);
++  _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+   _UpdateComposition(pContext);
+   if (*pfEaten)
+     _fTestKeyUpPending = TRUE;
+@@ -165,11 +187,12 @@ STDAPI WeaselTSF::OnKeyUp(ITfContext* pContext,
+                           LPARAM lParam,
+                           BOOL* pfEaten) {
+   _fTestKeyDownPending = FALSE;
++  _fFamoTestKeyDeliveryPending = FALSE;
+   if (_fTestKeyUpPending) {
+     _fTestKeyUpPending = FALSE;
+     *pfEaten = TRUE;
+   } else {
+-    _ProcessKeyEvent(wParam, lParam, pfEaten);
++    _ProcessKeyEvent(pContext, wParam, lParam, pfEaten);
+     if (!_async_edit)
+       _UpdateComposition(pContext);
+   }
+diff --git a/WeaselTSF/WeaselTSF.cpp b/WeaselTSF/WeaselTSF.cpp
+index 2e7dcff..b4f45f9 100644
+--- a/WeaselTSF/WeaselTSF.cpp
++++ b/WeaselTSF/WeaselTSF.cpp
+@@ -1,8 +1,7 @@
+ ﻿#include "stdafx.h"
+ 
+ #include <WeaselIPCData.h>
+-#include <thread>
+-#include <shellapi.h>
++#include <shellapi.h>
+ #include <tlhelp32.h>
+ #include "WeaselTSF.h"
+ #include "CandidateList.h"
+@@ -27,8 +26,9 @@ WeaselTSF::WeaselTSF() {
+   _dwTextEditSinkCookie = TF_INVALID_COOKIE;
+   _dwTextLayoutSinkCookie = TF_INVALID_COOKIE;
+   _dwThreadFocusSinkCookie = TF_INVALID_COOKIE;
+-  _fTestKeyDownPending = FALSE;
+-  _fTestKeyUpPending = FALSE;
++  _fTestKeyDownPending = FALSE;
++  _fTestKeyUpPending = FALSE;
++  _fFamoTestKeyDeliveryPending = FALSE;
+ 
+   _fCUASWorkaroundTested = _fCUASWorkaroundEnabled = FALSE;
+ 
+@@ -169,17 +169,43 @@ ExitError:
+   return E_FAIL;
+ }
+ 
+-STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
+-  std::wstring _ToggleImeOnOpenClose{};
+-  RegGetStringValue(HKEY_CURRENT_USER, L"Software\\Rime\\weasel",
+-                    L"ToggleImeOnOpenClose", _ToggleImeOnOpenClose);
+-  _isToOpenClose = (_ToggleImeOnOpenClose == L"yes");
+-  if (m_client.Echo()) {
+-    m_client.ProcessKeyEvent(0);
+-    weasel::ResponseParser parser(NULL, NULL, &_status, NULL, &_cand->style());
+-    bool ok = m_client.GetResponseData(std::ref(parser));
+-    if (ok)
+-      _UpdateLanguageBar(_status);
++bool WeaselTSF::_SchedulePendingCommitResponse() noexcept {
++  if (!m_client.ResponseDataHasCommit())
++    return false;
++  if (m_client.ResponseDataApplied())
++    return true;
++  try {
++    // A recovered response stays bound to the context that initiated the
++    // action. Focus may now belong to a different document.
++    if (!_responseOriginContext)
++      _PrepareResponseContext(_pEditSessionContext);
++    if (_responseOriginContext)
++      _UpdateComposition(_responseOriginContext);
++  } catch (...) {
++    // Keep the owned envelope unclaimed. A later key with a real context will
++    // schedule the same exact commit through the main edit path.
++  }
++  return true;
++}
++
++STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
++  std::wstring _ToggleImeOnOpenClose{};
++  RegGetStringValue(HKEY_CURRENT_USER, L"Software\\Rime\\weasel",
++                    L"ToggleImeOnOpenClose", _ToggleImeOnOpenClose);
++  _isToOpenClose = (_ToggleImeOnOpenClose == L"yes");
++  if (_SchedulePendingCommitResponse())
++    return S_OK;
++  if (m_client.Echo()) {
++    _PrepareResponseContext(_pEditSessionContext);
++    m_client.ProcessKeyEvent(0);
++    if (_SchedulePendingCommitResponse())
++      return S_OK;
++    weasel::ResponseParser parser(NULL, NULL, &_status, NULL, &_cand->style());
++    bool ok = m_client.GetResponseData(std::ref(parser));
++    if (ok) {
++      _UpdateLanguageBar(_status);
++      (void)m_client.AcknowledgeResponseData();
++    }
+   }
+   return S_OK;
+ }
+@@ -222,60 +248,106 @@ STDMETHODIMP WeaselTSF::OnActivated(REFCLSID clsid,
+   return S_OK;
+ }
+ 
+-void WeaselTSF::_Reconnect() {
+-  m_client.Disconnect();
+-  m_client.Connect(NULL);
+-  m_client.StartSession();
+-  weasel::ResponseParser parser(NULL, NULL, &_status, NULL, &_cand->style());
+-  bool ok = m_client.GetResponseData(std::ref(parser));
+-  if (ok) {
+-    _UpdateLanguageBar(_status);
+-  }
+-}
++bool WeaselTSF::_Reconnect() noexcept {
++  try {
++    // Transport recovery must not END the logical session: the server may own
++    // the only copy of a commit whose response read timed out.
++    m_client.CloseTransport();
++    if (!m_client.Connect(NULL))
++      return false;
++    if (m_client.Echo()) {
++      if (_SchedulePendingCommitResponse())
++        return false;
++      if (!m_client.PendingResponseDelivery())
++        return true;
++      weasel::ResponseParser recovered_parser(
++          NULL, NULL, &_status, NULL, &_cand->style());
++      if (!m_client.GetResponseData(std::ref(recovered_parser)))
++        return false;
++      _UpdateLanguageBar(_status);
++      return m_client.AcknowledgeResponseData();
++    }
++
++    // The physical server was replaced and no longer knows this logical
++    // session. START reuses an outstanding creation nonce when its first
++    // response was uncertain; otherwise it negotiates a fresh session.
++    m_client.StartSession();
++    if (_SchedulePendingCommitResponse())
++      return false;
++    weasel::ResponseParser parser(NULL, NULL, &_status, NULL, &_cand->style());
++    const bool ok = m_client.GetResponseData(std::ref(parser));
++    if (!ok)
++      return false;
++    _UpdateLanguageBar(_status);
++    return m_client.AcknowledgeResponseData();
++  } catch (...) {
++    // Service absence and allocation pressure must fail open at every TSF/COM
++    // entrypoint.
++    return false;
++  }
++}
+ 
+ static unsigned int retry = 0;
+ 
+-bool WeaselTSF::_EnsureServerConnected() {
+-  if (!m_client.Echo()) {
+-    _Reconnect();
+-    retry++;
+-    if (retry >= 6) {
+-      HANDLE hMutex = CreateMutex(NULL, TRUE, L"WeaselDeployerExclusiveMutex");
+-      const auto count_server_process = []() -> int {
+-        int count = 0;
+-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+-        if (snap == INVALID_HANDLE_VALUE)
+-          return 0;
+-        PROCESSENTRY32 pe;
+-        pe.dwSize = sizeof(pe);
+-        if (Process32First(snap, &pe)) {
+-          do {
+-            if (_wcsicmp(pe.szExeFile, L"WeaselServer.exe") == 0)
+-              count++;
+-          } while (Process32Next(snap, &pe));
+-        }
+-        CloseHandle(snap);
+-        return count;
+-      };
+-      if (!m_client.Echo() && GetLastError() != ERROR_ALREADY_EXISTS &&
+-          !count_server_process()) {
+-        std::wstring dir = _GetRootDir();
+-        std::thread th([dir, this]() {
+-          ShellExecuteW(NULL, L"open", (dir + L"\\start_service.bat").c_str(),
+-                        NULL, dir.c_str(), SW_HIDE);
+-          // wait 500ms, then reconnect
+-          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+-          _Reconnect();
+-        });
+-        th.detach();
+-      }
+-      if (hMutex) {
+-        CloseHandle(hMutex);
+-      }
+-      retry = 0;
+-    }
+-    return (m_client.Echo() != 0);
+-  } else {
+-    return true;
+-  }
+-}
++bool WeaselTSF::_EnsureServerConnected() noexcept {
++  try {
++    const weasel::ResponseDeliveryToken pending =
++        m_client.PendingResponseDelivery();
++    if (pending) {
++      // An owned envelope is application state, not a transport failure. Never
++      // Echo/reconnect through it: Disconnect would END the logical session
++      // and destroy the only retained commit. Applied envelopes may ACK here
++      // because this method runs outside a TSF edit lock.
++      if (!m_client.ResponseDataApplied())
++        return false;
++      return m_client.AcknowledgeResponseData();
++    }
++    if (m_client.Echo())
++      return true;
++
++    (void)_Reconnect();
++    retry++;
++    if (retry >= 6) {
++      HANDLE hMutex =
++          CreateMutex(NULL, TRUE, L"WeaselDeployerExclusiveMutex");
++      try {
++        const auto count_server_process = []() -> int {
++          int count = 0;
++          HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
++          if (snap == INVALID_HANDLE_VALUE)
++            return 0;
++          PROCESSENTRY32 pe;
++          pe.dwSize = sizeof(pe);
++          if (Process32First(snap, &pe)) {
++            do {
++              if (_wcsicmp(pe.szExeFile, L"WeaselServer.exe") == 0)
++                count++;
++            } while (Process32Next(snap, &pe));
++          }
++          CloseHandle(snap);
++          return count;
++        };
++        if (!m_client.Echo() &&
++            GetLastError() != ERROR_ALREADY_EXISTS &&
++            !count_server_process()) {
++          const std::wstring dir = _GetRootDir();
++          // ShellExecute returns after launching. A detached std::thread adds
++          // allocation/system_error and lifetime failure modes here.
++          (void)ShellExecuteW(
++              NULL, L"open", (dir + L"\\start_service.bat").c_str(),
++              NULL, dir.c_str(), SW_HIDE);
++        }
++      } catch (...) {
++        if (hMutex)
++          CloseHandle(hMutex);
++        throw;
++      }
++      if (hMutex)
++        CloseHandle(hMutex);
++      retry = 0;
++    }
++    return (m_client.Echo() != 0);
++  } catch (...) {
++    return false;
++  }
++}
+diff --git a/WeaselTSF/WeaselTSF.h b/WeaselTSF/WeaselTSF.h
+index bee6c78..b746012 100644
+--- a/WeaselTSF/WeaselTSF.h
++++ b/WeaselTSF/WeaselTSF.h
+@@ -90,6 +90,10 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+ 
+   /* ITfEditSession */
+   STDMETHODIMP DoEditSession(TfEditCookie ec);
++  HRESULT _ApplyResponseInEditSession(
++      ITfContext* response_context,
++      TfEditCookie ec,
++      const weasel::ResponseDeliveryToken& expected_delivery);
+ 
+   /* ITfActiveLanguageProfileNotifySink */
+   STDMETHODIMP OnActivated(REFCLSID clsid,
+@@ -119,6 +123,20 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   void _EndComposition(com_ptr<ITfContext> pContext, BOOL clear);
+   BOOL _ShowInlinePreedit(com_ptr<ITfContext> pContext,
+                           const std::shared_ptr<weasel::Context> context);
++  HRESULT _StartCompositionInEditSession(ITfContext* pContext,
++                                         TfEditCookie ec,
++                                         BOOL inlinePreeditEnabled);
++  HRESULT _EndCompositionInEditSession(ITfContext* pContext,
++                                       TfEditCookie ec,
++                                       BOOL clear);
++  HRESULT _ShowInlinePreeditInEditSession(
++      ITfContext* pContext,
++      TfEditCookie ec,
++      const std::shared_ptr<weasel::Context>& context);
++  HRESULT _InsertTextInEditSession(ITfContext* pContext,
++                                   TfEditCookie ec,
++                                   const std::wstring& text,
++                                   bool* durable);
+   void _UpdateComposition(com_ptr<ITfContext> pContext);
+   BOOL _IsComposing();
+   void _SetComposition(com_ptr<ITfComposition> pComposition);
+@@ -132,7 +150,19 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   void _HandleLangBarMenuSelect(UINT wID);
+ 
+   /* IPC */
+-  bool _EnsureServerConnected();
++  bool _EnsureServerConnected() noexcept;
++  bool _SchedulePendingCommitResponse() noexcept;
++  void _PrepareResponseContext(ITfContext* context) noexcept;
++  void _CompleteResponseContext(
++      const weasel::ResponseDeliveryToken& token) noexcept;
++  void _MarkResponseDataApplied(
++      const weasel::ResponseDeliveryToken& token) {
++    m_client.MarkResponseDataApplied(token);
++  }
++  void _ReleaseResponseDataClaim(
++      const weasel::ResponseDeliveryToken& token) {
++    m_client.ReleaseResponseDataClaim(token);
++  }
+ 
+   /* UI */
+   void _UpdateUI(const weasel::Context& ctx, const weasel::Status& status);
+@@ -174,7 +204,10 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+ 
+   BOOL _InitKeyEventSink();
+   void _UninitKeyEventSink();
+-  void _ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten);
++  void _ProcessKeyEvent(ITfContext* context,
++                        WPARAM wParam,
++                        LPARAM lParam,
++                        BOOL* pfEaten);
+ 
+   BOOL _InitPreservedKey();
+   void _UninitPreservedKey();
+@@ -185,10 +218,11 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   void _ShowLanguageBar(BOOL show);
+   void _EnableLanguageBar(BOOL enable);
+ 
+-  BOOL _InsertText(com_ptr<ITfContext> pContext, const std::wstring& ext);
+   // 法墨标点配对：读光标右侧一字符与 ch 比较。1=是 0=否 -1=读不到
+   //（transitory/CUAS 上下文文档不可读）
+-  int _FamoProbeNextChar(TfEditCookie ec, wchar_t ch);
++  int _FamoProbeNextChar(ITfContext* context,
++                         TfEditCookie ec,
++                         wchar_t ch);
+   // 法墨标点配对：注入方向键移动光标（搜狗同方案）
+   void _FamoInjectArrow(WORD vk, int count);
+   // 法墨标点配对 pending 状态：配对补全后记住右符号；下一个 commit 若恰是
+@@ -208,7 +242,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   void _UninitCompartment();
+   HRESULT _HandleCompartment(REFGUID guidCompartment);
+ 
+-  void _Reconnect();
++  bool _Reconnect() noexcept;
+   std::wstring _GetRootDir();
+ 
+   bool isImmersive() const {
+@@ -223,8 +257,14 @@ class WeaselTSF : public ITfTextInputProcessorEx,
+   DWORD _dwTextEditSinkCookie, _dwTextLayoutSinkCookie;
+   BYTE _lpbKeyState[256];
+   BOOL _fTestKeyDownPending, _fTestKeyUpPending;
++  BOOL _fFamoTestKeyDeliveryPending;
+ 
+   com_ptr<ITfContext> _pEditSessionContext;
++  // The response belongs to the context that initiated its business action.
++  // Keep that COM identity across pipe reconnects and never retarget a
++  // recovered commit to whichever document happens to have focus later.
++  com_ptr<ITfContext> _responseOriginContext;
++  weasel::ResponseDeliveryToken _responseOriginDelivery;
+   std::wstring _editSessionText;
+ 
+   com_ptr<CCompartmentEventSink> _pKeyboardCompartmentSink;
 diff --git a/include/PipeChannel.h b/include/PipeChannel.h
-index 646c09b..6dc5d21 100644
+index 646c09b..5e04a10 100644
 --- a/include/PipeChannel.h
 +++ b/include/PipeChannel.h
-@@ -86,7 +86,7 @@ class PipeChannel : public PipeChannelBase {
+@@ -16,9 +16,13 @@ class PipeChannelBase {
+     std::unique_ptr<char[]> buffer;
+     std::unique_ptr<Stream> write_stream;
+     bool has_body;
++    UINT received_wchars;
+ 
+     ChannelContext(size_t bs)
+-        : buffer(std::make_unique<char[]>(bs)), has_body(false) {}
++        : buffer(new char[bs]), has_body(false), received_wchars(0) {
++      if (bs != 0)
++        buffer[0] = '\0';
++    }
+   };
+ 
+   PipeChannelBase(std::wstring&& pn_cmd, size_t bs, SECURITY_ATTRIBUTES* s);
+@@ -86,7 +90,7 @@ class PipeChannel : public PipeChannelBase {
   public:
    PipeChannel(std::wstring&& pn_cmd,
                SECURITY_ATTRIBUTES* s = NULL,
 -              size_t bs = 64 * 1024)
 +              size_t bs = 8 * 1024 * 1024)
        : PipeChannelBase(std::move(pn_cmd), bs, s) {}
--
-+
+ 
   public:
-@@ -117,6 +117,31 @@ class PipeChannel : public PipeChannelBase {
+@@ -101,6 +105,23 @@ class PipeChannel : public PipeChannelBase {
+     HANDLE* phandle = _GetPipeHandle();
+     _FinalizePipe(*phandle);
+   }
++  void DisconnectNoexcept() noexcept {
++    try {
++      HANDLE* phandle = hpipe_ptr.get();
++      if (phandle)
++        _FinalizePipe(*phandle);
++    } catch (...) {
++    }
++    ClearTransactionBuffer();
++  }
++  bool PrepareTransactionBuffer() noexcept {
++    try {
++      (void)_GetContext();
++      return true;
++    } catch (...) {
++      return false;
++    }
++  }
+ 
+   /* Write data to buffer */
+ 
+@@ -117,37 +138,99 @@ class PipeChannel : public PipeChannelBase {
      return *this;
    }
--
-+
+ 
+-  _TyRes Transact(Msg& msg) {
 +  // Append one complete response document only when it fits in the remaining
 +  // transaction buffer.  The preflight keeps a failed append from exposing a
 +  // truncated document while allowing an already-buffered recovered response
@@ -2731,28 +5580,84 @@ index 646c09b..6dc5d21 100644
 +    return true;
 +  }
 +
-   _TyRes Transact(Msg& msg) {
++  _TyRes Transact(Msg& msg, bool* request_sent = nullptr) {
++    if (request_sent)
++      *request_sent = false;
      _Ensure();
      HANDLE* phandle = _GetPipeHandle();
-@@ -132,6 +157,15 @@ class PipeChannel : public PipeChannelBase {
+     _Send(*phandle, msg);
++    if (request_sent)
++      *request_sent = true;
+     return _ReceiveResponse();
+   }
+ 
+   void ClearBufferStream() {
+     auto ctx = _GetContext();
+     ctx->has_body = false;
++    ctx->received_wchars = 0;
+     if (ctx->write_stream != nullptr) {
+       ctx->write_stream.reset(nullptr);
      }
    }
--
-+
+ 
 +  void ClearTransactionBuffer() noexcept {
 +    auto* ctx = context.get();
 +    if (!ctx)
 +      return;
 +    ctx->has_body = false;
++    ctx->received_wchars = 0;
 +    ctx->write_stream.reset(nullptr);
-+    memset(ctx->buffer.get(), 0, buff_size);
++    if (buff_size >= sizeof(wchar_t))
++      *reinterpret_cast<wchar_t*>(ctx->buffer.get()) = L'\0';
 +  }
 +
    char* SendBuffer() const { return _GetContext()->buffer.get() + _MsgSize; }
--
-+
+ 
    char* ReceiveBuffer() const { return _GetContext()->buffer.get() + _ResSize; }
-@@ -180,16 +214,23 @@ class PipeChannel : public PipeChannelBase {
+ 
+   template <typename _TyHandler>
+   bool HandleResponseData(_TyHandler const& handler) {
+-    if (!handler) {
+-      return false;
+-    }
+-
++    auto ctx = _GetContext();
+     // Use whole buffer to receive data in client
+-    return handler((LPWSTR)_GetContext()->buffer.get(),
+-                   (UINT)(buff_size * sizeof(char) / sizeof(wchar_t)));
++    return handler((LPWSTR)ctx->buffer.get(), ctx->received_wchars);
+   }
+ 
+  protected:
++  void _SendAccepted(HANDLE pipe, Msg& msg) {
++    auto ctx = _GetContext();
++    char* pbuff = ctx->buffer.get();
++    *reinterpret_cast<Msg*>(pbuff) = msg;
++    size_t body_bytes = 0;
++    if (ctx->has_body && ctx->write_stream) {
++      const std::streampos pos = ctx->write_stream->tellp();
++      if (pos != std::streampos(-1))
++        body_bytes = static_cast<size_t>(pos) * sizeof(wchar_t);
++    }
++    size_t data_sz = ctx->has_body ? (_MsgSize + body_bytes) : _MsgSize;
++    if (data_sz > buff_size)
++      data_sz = buff_size;
++    try {
++      // A server-accepted pipe is already the exact peer. Reconnecting here
++      // could target the server itself or another client and create a false
++      // delivery acknowledgement.
++      _WritePipe(pipe, data_sz, pbuff);
++    } catch (...) {
++      ClearTransactionBuffer();
++      throw;
++    }
++    ClearTransactionBuffer();
++  }
++
+   void _Send(HANDLE pipe, Msg& msg) {
+     auto ctx = _GetContext();
+     char* pbuff = ctx->buffer.get();
+@@ -180,16 +263,25 @@ class PipeChannel : public PipeChannelBase {
          _WritePipe(*retry_pipe, data_sz, pbuff);
        }
      } catch (...) {
@@ -2766,8 +5671,7 @@ index 646c09b..6dc5d21 100644
 -    ClearBufferStream();
 +    ClearTransactionBuffer();
    }
--
-+
+ 
    _TyRes _ReceiveResponse() {
      HANDLE* phandle = _GetPipeHandle();
 -    _TyRes result;
@@ -2775,14 +5679,26 @@ index 646c09b..6dc5d21 100644
 +    // A response may contain only the DWORD result.  Clear the shared body
 +    // buffer before every transaction so a failed/body-less action can never
 +    // replay the previous composition or commit.
-+    memset(ctx->buffer.get(), 0, buff_size);
++    if (buff_size >= sizeof(wchar_t))
++      *reinterpret_cast<wchar_t*>(ctx->buffer.get()) = L'\0';
++    ctx->received_wchars = 0;
 +    ctx->has_body = false;
 +    _TyRes result{};
      _Receive(*phandle, &result, sizeof(result));
      return result;
    }
+@@ -198,7 +290,8 @@ class PipeChannel : public PipeChannelBase {
+     auto ctx = _GetContext();
+     if (ctx->write_stream == nullptr) {
+       char* pbuff = (char*)ctx->buffer.get() + _MsgSize;
+-      memset(pbuff, 0, buff_size - _MsgSize);
++      if (buff_size - _MsgSize >= sizeof(wchar_t))
++        *reinterpret_cast<wchar_t*>(pbuff) = L'\0';
+       ctx->write_stream =
+           std::make_unique<Stream>((wchar_t*)pbuff, _SendBufferSizeW());
+     }
 diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
-index 49d17d0..9b76c53 100644
+index 49d17d0..ae8daf6 100644
 --- a/include/RimeWithWeasel.h
 +++ b/include/RimeWithWeasel.h
 @@ -1,12 +1,22 @@
@@ -2796,11 +5712,9 @@ index 49d17d0..9b76c53 100644
  #include <mutex>
 +#include <string>
 +#include <utility>
--
-+
+ 
  #include <rime_api.h>
--
-+
+ 
 +// 法墨引擎 ABI：会话 I/O 经中立 FamoEngineApi 重路由到 FamoRimeEngine.dll。
 +// famo_engine_host.h 是纯 Win32 host loader（无 librime/Weasel/TSF 依赖）。用相对本头的路径
 +// include：engine-api 经 build-prep 置于 $(SolutionDir)..\engine-api，即本 include/ 目录的
@@ -2811,10 +5725,9 @@ index 49d17d0..9b76c53 100644
  struct CaseInsensitiveCompare {
    bool operator()(const std::string& str1, const std::string& str2) const {
      std::string str1Lower, str2Lower;
-@@ -23,13 +33,27 @@ typedef std::map<std::string, AppOptions, CaseInsensitiveCompare>
+@@ -23,13 +33,36 @@ typedef std::map<std::string, AppOptions, CaseInsensitiveCompare>
      AppOptionsByAppName;
--
-+
+ 
  struct SessionStatus {
 -  SessionStatus() : style(weasel::UIStyle()), __synced(false), session_id(0) {
 -    RIME_STRUCT(RimeStatus, status);
@@ -2827,6 +5740,12 @@ index 49d17d0..9b76c53 100644
 +  // Parsed from the IPC session request. It is also written through the v2
 +  // property seam so schemas/Lua observe the legacy client_app property.
 +  std::string client_app;
++  bool delivery_ack_v1 = false;
++  DWORD client_creation_nonce = 0;
++  DWORD client_process_id = 0;
++  ULONGLONG client_process_created = 0;
++  ULONGLONG provisional_created_at = 0;
++  bool provisional_session = false;
 +  // ABI-only 会话支点。RemoveSession 经 host v2 seam 释放。
 +  FamoEngineContext* engine_ctx = nullptr;
 +  // Notification routing uses a generation in addition to the opaque pointer,
@@ -2841,10 +5760,23 @@ index 49d17d0..9b76c53 100644
 +  // response formatting and sink backpressure. While it is live no later
 +  // business action may enter this context.
 +  FamoEngineActionResultLease pending_response_result;
++  DWORD pending_response_generation = 0;
++  DWORD last_acknowledged_response_generation = 0;
++  bool pending_response_includes_style = false;
  };
  typedef std::map<DWORD, SessionStatus> SessionStatusMap;
  typedef DWORD WeaselSessionId;
-@@ -45,10 +69,11 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+@@ -40,15 +73,21 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   virtual void Initialize();
+   virtual void Finalize();
+   virtual DWORD FindSession(WeaselSessionId ipc_id);
++  virtual bool RecoverResponseDelivery(WeaselSessionId ipc_id,
++                                       EatLine eat);
+   virtual DWORD AddSession(LPWSTR buffer, EatLine eat = 0);
++  virtual DWORD AddSessionForClient(LPWSTR buffer,
++                                    EatLine eat,
++                                    DWORD client_process_id);
+   virtual DWORD RemoveSession(WeaselSessionId ipc_id);
    virtual BOOL ProcessKeyEvent(weasel::KeyEvent keyEvent,
                                 WeaselSessionId ipc_id,
                                 EatLine eat);
@@ -2860,7 +5792,20 @@ index 49d17d0..9b76c53 100644
    virtual bool HighlightCandidateOnCurrentPage(size_t index,
                                                 WeaselSessionId ipc_id,
                                                 EatLine eat);
-@@ -77,35 +102,82 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+@@ -65,6 +104,12 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   virtual void ReloadStyleOverlay(WeaselSessionId ipc_id = 0, EatLine eat = 0);
+   virtual void SelectSchema();
+   virtual void ReloadOptions();
++  virtual weasel::ResponseDeliveryToken
++  TakeStagedResponseDelivery() noexcept;
++  virtual void ConfirmResponsePipeWrite(
++      const weasel::ResponseDeliveryToken& token) noexcept;
++  virtual bool AcknowledgeResponseDelivery(
++      const weasel::ResponseDeliveryToken& token) noexcept;
+ 
+   void OnUpdateUI(std::function<void()> const& cb);
+   // 法墨状态栏：焦点驱动显隐回调（FocusIn/FocusOut 时触发）。
+@@ -77,35 +122,82 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
    void _UpdateUI(WeaselSessionId ipc_id);
    void _LoadSchemaSpecificSettings(WeaselSessionId ipc_id,
                                     const std::string& schema_id);
@@ -2926,8 +5871,7 @@ index 49d17d0..9b76c53 100644
 +  void _ApplyAppInlinePreeditSetting(WeaselSessionId ipc_id);
    // 法墨即时输入方式②：读 %LOCALAPPDATA%\Famo\famo-select-schema.txt（单行 schema id，trim）；缺失返回空串。
    std::string _ReadFamoSelectSchema();
--
-+
+ 
 -  void _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
 +  bool _SetInlinePreeditOptions(FamoEngineContext* ctx,
 +                                bool inline_preedit);
@@ -2944,8 +5888,7 @@ index 49d17d0..9b76c53 100644
 +                                     EatLine eat);
 +  bool _RefillAbiView(FamoEngineContext* ctx);
 +  void _DestroyAbiContexts();
--
-+
+ 
 -  RimeSessionId to_session_id(WeaselSessionId ipc_id) {
 -    return m_session_status_map[ipc_id].session_id;
 -  }
@@ -2962,14 +5905,12 @@ index 49d17d0..9b76c53 100644
 +    const auto found = m_session_status_map.find(ipc_id);
 +    return found == m_session_status_map.end() ? nullptr : &found->second;
    }
--
-+
+ 
    AppOptionsByAppName m_app_options;
-@@ -121,18 +193,30 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+@@ -121,18 +213,32 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
    std::function<void()> _FocusInCallback;   // 法墨状态栏 focus-in
    std::function<void()> _FocusOutCallback;  // 法墨状态栏 focus-out
--
-+
+ 
 -  static void OnNotify(void* context_object,
 -                       uintptr_t session_id,
 -                       const char* message_type,
@@ -2994,6 +5935,8 @@ index 49d17d0..9b76c53 100644
 +      m_session_notifications;
 +  std::deque<PendingEngineNotification> m_global_notifications;
 +  uint64_t m_next_notification_generation = 1;
++  weasel::ResponseDeliveryToken m_staged_response_delivery;
++  DWORD m_next_response_delivery_generation = 1;
 +  // Declare the host before every result-owning session container. Destruction
 +  // is reversed, so all leases disappear before the engine DLL can unload.
 +  FamoEngineHost m_engine_host;
@@ -3007,10 +5950,65 @@ index 49d17d0..9b76c53 100644
 +  FamoEngineActionResultLease m_abi_result;
  };
 diff --git a/include/WeaselIPC.h b/include/WeaselIPC.h
-index 2633fe2..5321030 100644
+index 2633fe2..80a81e3 100644
 --- a/include/WeaselIPC.h
 +++ b/include/WeaselIPC.h
-@@ -72,9 +72,17 @@ struct RequestHandler {
+@@ -2,6 +2,7 @@
+ #include <WeaselIPCData.h>
+ #include <WeaselUtility.h>
+ #include <windows.h>
++#include <cstdint>
+ #include <functional>
+ #include <memory>
+ #include <KeyEvent.h>
+@@ -41,6 +42,8 @@ enum WEASEL_IPC_COMMAND {
+   // 法墨即时输入方式②：令 server 读 famo-select-schema.txt 并 rime_api->select_schema 到各会话
+   //（拼音/双拼/五笔秒切），无需 deploy / 重建 prism。无字符串载荷（schema id 经文件传递）。
+   WEASEL_IPC_SELECT_SCHEMA,
++  // Confirm one response only after the client has parsed and applied it.
++  WEASEL_IPC_ACK_DELIVERY,
+   WEASEL_IPC_LAST_COMMAND
+ };
+ 
+@@ -57,6 +60,22 @@ struct IPCMetadata {
+   WCHAR server_window_class[WINDOW_CLASS_LENGTH];
+ };
+ 
++struct ResponseDeliveryToken {
++  DWORD session_id = 0;
++  DWORD generation = 0;
++  bool requires_client_ack = false;
++
++  explicit operator bool() const noexcept {
++    return session_id != 0 && generation != 0;
++  }
++};
++
++enum class TransactionDeliveryState : uint8_t {
++  Completed = 0,
++  RequestNotDispatched = 1,
++  ResponseUncertain = 2,
++};
++
+ // 處理請求之物件
+ struct RequestHandler {
+   using EatLine = std::function<bool(std::wstring&)>;
+@@ -65,16 +84,32 @@ struct RequestHandler {
+   virtual void Initialize() {}
+   virtual void Finalize() {}
+   virtual DWORD FindSession(DWORD session_id) { return 0; }
++  virtual bool RecoverResponseDelivery(DWORD session_id, EatLine eat) {
++    return false;
++  }
+   virtual DWORD AddSession(LPWSTR buffer, EatLine eat = 0) { return 0; }
++  virtual DWORD AddSessionForClient(LPWSTR buffer,
++                                    EatLine eat,
++                                    DWORD client_process_id) {
++    return AddSession(buffer, eat);
++  }
+   virtual DWORD RemoveSession(DWORD session_id) { return 0; }
+   virtual BOOL ProcessKeyEvent(KeyEvent keyEvent,
+                                DWORD session_id,
                                 EatLine eat) {
      return FALSE;
    }
@@ -3031,21 +6029,69 @@ index 2633fe2..5321030 100644
    virtual bool HighlightCandidateOnCurrentPage(size_t index,
                                                 DWORD session_id,
                                                 EatLine eat) {
+@@ -96,6 +131,15 @@ struct RequestHandler {
+   virtual void ReloadOptions() {}
+   // 法墨即时输入方式②：读 famo-select-schema.txt，select_schema 到各会话（不部署）。
+   virtual void SelectSchema() {}
++  virtual ResponseDeliveryToken TakeStagedResponseDelivery() noexcept {
++    return {};
++  }
++  virtual void ConfirmResponsePipeWrite(
++      const ResponseDeliveryToken& token) noexcept {}
++  virtual bool AcknowledgeResponseDelivery(
++      const ResponseDeliveryToken& token) noexcept {
++    return false;
++  }
+ };
+ 
+ // 處理server端回應之物件
+@@ -163,6 +207,21 @@ class Client {
+   void TrayCommand(UINT menuId);
+   // 读取server返回的数据
+   bool GetResponseData(ResponseHandler handler);
++  // Consume a response that may contain an application commit.
++  bool GetCommitResponseData(ResponseHandler handler);
++  ResponseDeliveryToken PendingResponseDelivery() const;
++  bool ResponseDataApplied() const noexcept;
++  bool ResponseDataHasCommit() const noexcept;
++  TransactionDeliveryState LastTransactionDeliveryState() const noexcept;
++  // Mark the response applied without performing pipe I/O from an edit lock.
++  void MarkResponseDataApplied(const ResponseDeliveryToken& token);
++  // Release an exact, not-yet-applied envelope so its owned body can be retried.
++  void ReleaseResponseDataClaim(const ResponseDeliveryToken& token);
++  // Confirm that the last parsed response was applied by the TSF caller.
++  bool AcknowledgeResponseData();
++  // Close only the physical pipe. The logical session and any server-owned
++  // response lease remain recoverable.
++  void CloseTransport() noexcept;
+ 
+  private:
+   ClientImpl* m_pImpl;
+@@ -181,6 +240,8 @@ class Server {
+   int Run();
+ 
+   void SetRequestHandler(RequestHandler* pHandler);
++  void SetOption(DWORD session_id, const std::string& option, bool value);
++  void PostUiTask(std::function<void()> task);
+   void AddMenuHandler(UINT uID, CommandHandler handler);
+   HWND GetHWnd();
+ 
 diff --git a/test/TestResponseParser/TestResponseParser.cpp b/test/TestResponseParser/TestResponseParser.cpp
 index 643fd67..e679df3 100644
 --- a/test/TestResponseParser/TestResponseParser.cpp
 +++ b/test/TestResponseParser/TestResponseParser.cpp
-@@ -4,4 +4,5 @@
+@@ -3,6 +3,7 @@
+ 
  #include "stdafx.h"
  #include <boost/detail/lightweight_test.hpp>
 +#include <PipeChannel.h>
  #include <ResponseParser.h>
  #include <string>
+ 
 @@ -85,12 +86,50 @@ void test_4() {
    BOOST_TEST_EQ(1, c.totalPages);
  }
--
-+
+ 
 +void test_5() {
 +  WCHAR resp[] =
 +      L"action=commit\n"
@@ -3090,8 +6136,7 @@ index 643fd67..e679df3 100644
    test_4();
 +  test_5();
 +  test_6();
--
-+
+ 
 -  system("pause");
    return boost::report_errors();
  }

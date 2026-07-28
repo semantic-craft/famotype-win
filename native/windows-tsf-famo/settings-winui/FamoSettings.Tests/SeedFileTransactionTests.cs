@@ -17,6 +17,8 @@ public sealed class SeedFileTransactionTests : IDisposable
     private string TransactionDir => Path.Combine(
         FamoDir, ".transactions", TransactionId);
     private string ReceiptPath => Path.Combine(TransactionDir, "receipt.json");
+    private string RolledBackReceiptPath => Path.Combine(
+        FamoDir, ".transactions", $"{TransactionId}.rolledback.json");
 
     public SeedFileTransactionTests()
     {
@@ -51,8 +53,63 @@ public sealed class SeedFileTransactionTests : IDisposable
         Assert.Equal("before", File.ReadAllText(settings));
         Assert.False(File.Exists(Path.Combine(FamoDir, "payload.txt")));
         Assert.False(Directory.Exists(TransactionDir));
+        Assert.True(File.Exists(RolledBackReceiptPath));
+        Assert.True(SeedFileTransaction.Rollback(
+            TransactionId, hash, FamoDir));
+    }
+
+    [Fact]
+    public void RollbackCrashAfterTreeDeletionRetriesOnlyWithPinnedTombstone()
+    {
+        Write(Path.Combine(InstalledDir, "payload.txt"), "payload");
+        string hash = Prepare();
+        Assert.True(SeedFileTransaction.ApplyPrepared(
+            TransactionId, hash, FamoDir));
+        SeedFileTransaction.AfterRollbackTransactionDeleteForTests = () =>
+            throw new IOException(
+                "simulated crash after rollback transaction deletion");
+
+        Assert.Throws<IOException>(() => SeedFileTransaction.Rollback(
+            TransactionId, hash, FamoDir));
+        SeedFileTransaction.AfterRollbackTransactionDeleteForTests = null;
+
+        Assert.False(Directory.Exists(TransactionDir));
+        Assert.True(File.Exists(RolledBackReceiptPath));
+        Assert.False(File.Exists(Path.Combine(FamoDir, "payload.txt")));
+        Assert.True(SeedFileTransaction.Rollback(
+            TransactionId, hash, FamoDir));
+        Assert.Throws<InvalidOperationException>(() => Prepare());
+
+        File.Delete(RolledBackReceiptPath);
         Assert.False(SeedFileTransaction.Rollback(
             TransactionId, hash, FamoDir));
+    }
+
+    [Fact]
+    public void RollbackRejectsAnUnpinnedOrForgedMissingRootTombstone()
+    {
+        Write(Path.Combine(InstalledDir, "payload.txt"), "payload");
+        string hash = Prepare();
+        Assert.True(SeedFileTransaction.ApplyPrepared(
+            TransactionId, hash, FamoDir));
+        Assert.True(SeedFileTransaction.Rollback(
+            TransactionId, hash, FamoDir));
+        string valid = File.ReadAllText(RolledBackReceiptPath);
+
+        Assert.Throws<InvalidDataException>(() =>
+            SeedFileTransaction.Rollback(
+                TransactionId,
+                new string('A', 64),
+                FamoDir));
+
+        File.WriteAllText(
+            RolledBackReceiptPath,
+            valid.Replace(
+                "\"Phase\":\"Prepared\"",
+                "\"Phase\":\"Forged\"",
+                StringComparison.Ordinal));
+        Assert.Throws<InvalidDataException>(() =>
+            SeedFileTransaction.Rollback(TransactionId, hash, FamoDir));
     }
 
     [Fact]
@@ -998,6 +1055,7 @@ public sealed class SeedFileTransactionTests : IDisposable
         SeedFileTransaction.BeforePinnedAtomicFilePublishForTests = null;
         SeedFileTransaction.AfterInitialSnapshotHashForTests = null;
         SeedFileTransaction.AfterInitialSnapshotCopyForTests = null;
+        SeedFileTransaction.AfterRollbackTransactionDeleteForTests = null;
         UserDataTransactionLock.LocalAppDataOverrideForTests =
             TestUserDataLockEnvironment.LocalAppDataRoot;
         if (Directory.Exists(_root))

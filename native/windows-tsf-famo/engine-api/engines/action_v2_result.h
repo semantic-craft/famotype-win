@@ -157,6 +157,13 @@ inline bool TrimOptionalToResultBudget(Snapshot* snapshot) noexcept {
     snapshot->preedit_cursor_pos = 0;
     snapshot->state_flags &= ~FAMO_COMPOSITION_HAS_PREEDIT;
   }
+  if (snapshot->candidates.empty()) {
+    snapshot->highlighted_index = 0;
+    snapshot->page_index = 0;
+    snapshot->page_size = 0;
+    snapshot->is_last_page = 1;
+    snapshot->state_flags &= ~FAMO_COMPOSITION_HAS_CANDIDATES;
+  }
   return SnapshotAllocationSize(*snapshot, &total) &&
          total <= FAMO_ENGINE_V2_MAX_RESULT_BYTES;
 }
@@ -398,6 +405,15 @@ class ResultStore {
     return FAMO_ENGINE_OK;
   }
 
+  bool Empty() noexcept {
+    try {
+      std::lock_guard<std::mutex> lock(mutex_);
+      return live_.empty();
+    } catch (...) {
+      return false;
+    }
+  }
+
   void Drain(const FamoEngineHostApi& host) noexcept {
     std::unordered_set<FamoEngineActionResultV2*> pending;
     try {
@@ -461,7 +477,7 @@ inline int32_t ValidateRequest(
         return FAMO_ENGINE_E_INVALID_ARGUMENT;
       }
       const bool release =
-          (request->key.modifiers & FAMO_KEY_MOD_RELEASE) != 0;
+          (request->key.modifiers & FAMO_KEY_V2_MOD_RELEASE) != 0;
       if ((request->key.is_key_down != 0) == release)
         return FAMO_ENGINE_E_INVALID_ARGUMENT;
       return FAMO_ENGINE_OK;

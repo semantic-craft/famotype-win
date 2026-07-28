@@ -32,6 +32,7 @@ struct TerminalAbandonDebt {
 
 std::mutex g_terminal_debt_mutex;
 std::deque<TerminalAbandonDebt> g_terminal_abandon_debts;
+std::atomic<uint32_t> g_terminal_cleanup_connect_attempts{0};
 
 bool SameConnectionEpoch(const runtime::Correlation &left,
                          const runtime::Correlation &right) {
@@ -181,6 +182,10 @@ bool RefreshSelectionCapability(runtime::UiState *state) {
 }
 
 } // namespace
+
+uint32_t TerminalCleanupConnectAttemptsForTest() noexcept {
+  return g_terminal_cleanup_connect_attempts.load();
+}
 
 TextService::TextService()
     : TextService(kRuntimeEndpointSuffix, L"FamoRuntime.exe", "") {}
@@ -505,10 +510,101 @@ HRESULT TextService::DeactivateCore() {
   return S_OK;
 }
 
+void TextService::AbandonOutstandingDeliveriesNoexcept() noexcept {
+  g_terminal_cleanup_connect_attempts.store(0);
+  constexpr size_t kIdentitySlots = 4;
+  const auto identity_at =
+      [](const std::unique_ptr<ContextEntry> &owned, size_t index,
+         runtime::Correlation *identity) {
+        if (!owned || !identity)
+          return false;
+        switch (index) {
+        case 0:
+          if (!owned->pending_delivery)
+            return false;
+          *identity = owned->pending_delivery->correlation;
+          return true;
+        case 1:
+          if (!owned->applied_delivery)
+            return false;
+          *identity = owned->applied_delivery->correlation;
+          return true;
+        case 2:
+          if (owned->pending_session.client_id == 0)
+            return false;
+          *identity = owned->pending_session;
+          return true;
+        case 3:
+          *identity = owned->state.session_identity();
+          return identity->client_id != 0;
+        default:
+          return false;
+        }
+      };
+  const auto already_seen =
+      [&](size_t context_index, size_t identity_index,
+          const runtime::Correlation &connection) {
+        for (size_t earlier_context = 0;
+             earlier_context <= context_index; ++earlier_context) {
+          const auto &owned = contexts_[earlier_context];
+          if (!owned)
+            continue;
+          const size_t limit =
+              earlier_context == context_index ? identity_index
+                                               : kIdentitySlots;
+          for (size_t earlier_identity = 0; earlier_identity < limit;
+               ++earlier_identity) {
+            runtime::Correlation candidate;
+            if (identity_at(owned, earlier_identity, &candidate) &&
+                SameConnectionEpoch(candidate, connection)) {
+              return true;
+            }
+          }
+        }
+        return false;
+      };
+
+  for (size_t context_index = 0; context_index < contexts_.size();
+       ++context_index) {
+    const auto &owned = contexts_[context_index];
+    if (!owned)
+      continue;
+    for (size_t identity_index = 0; identity_index < kIdentitySlots;
+         ++identity_index) {
+      runtime::Correlation identity;
+      if (!identity_at(owned, identity_index, &identity))
+        continue;
+      const runtime::Correlation connection = ConnectionIdentity(identity);
+      if (already_seen(context_index, identity_index, connection))
+        continue;
+      g_terminal_cleanup_connect_attempts.fetch_add(1);
+      bool resolved = false;
+      try {
+        if (ConnectRuntime(connection, false)) {
+          runtime::Frame request;
+          request.command = runtime::Command::AbandonConnection;
+          request.correlation = connection;
+          const runtime::CallResult result =
+              runtime_port_.Call(std::move(request),
+                                 runtime::kHardCallDeadline);
+          resolved = result.status == runtime::Status::Ok ||
+                     result.status == runtime::Status::StaleRequest;
+        }
+      } catch (...) {
+      }
+      if (!resolved) {
+        RememberTerminalAbandonDebt(runtime_endpoint_suffix_,
+                                    runtime_executable_name_, connection);
+      }
+    }
+  }
+}
+
 void TextService::ForceDeactivateCleanup() noexcept {
-  // Idempotent, allocation-free release barrier for both normal deactivation
-  // and any exception caught at the COM boundary.
+  // Idempotent no-unwind release barrier for both normal deactivation and any
+  // exception caught at the COM boundary.
   StopSessionWorker();
+  AbandonOutstandingDeliveriesNoexcept();
   try {
     runtime_port_.Stop();
   } catch (...) {
@@ -697,6 +793,7 @@ bool TextService::StartSessionWorker() {
     delivery_requests_.clear();
     delivery_results_.clear();
   }
+  terminal_delivery_result_.store(nullptr);
   desired_session_.store(nullptr);
   try {
     session_worker_ = std::thread(&TextService::SessionWorkerMain, this);
@@ -711,11 +808,22 @@ void TextService::StopSessionWorker() noexcept {
   session_retry_wake_.notify_all();
   try {
     runtime_port_.CancelConnect();
-    runtime_port_.CancelCall(true);
   } catch (...) {
   }
   session_worker_epoch_.fetch_add(1);
   session_worker_epoch_.notify_all();
+  // An idle worker exits immediately after the producer stop above. Preserve
+  // its authenticated lane so forced terminal cleanup can abandon the exact
+  // epoch without a reconnect window. A genuinely blocked call is still
+  // cancelled after this short grace period.
+  if (session_worker_.joinable() &&
+      WaitForSingleObject(session_worker_.native_handle(), 10) !=
+          WAIT_OBJECT_0) {
+    try {
+      runtime_port_.CancelCall(true);
+    } catch (...) {
+    }
+  }
   try {
     if (session_worker_.joinable())
       session_worker_.join();
@@ -728,6 +836,7 @@ void TextService::StopSessionWorker() noexcept {
   }
   session_request_.store(nullptr);
   session_result_.store(nullptr);
+  terminal_delivery_result_.store(nullptr);
   try {
     std::lock_guard lock(delivery_queue_mutex_);
     delivery_requests_.clear();
@@ -1137,6 +1246,39 @@ void TextService::ProcessDeliveryWork(
     const std::shared_ptr<const DeliveryWorkRequest> &request) {
   if (!request || session_worker_stop_.load())
     return;
+  const auto requeue_without_dropping = [&]() {
+    std::unique_lock retry_lock(session_retry_mutex_);
+    session_retry_wake_.wait_for(retry_lock, kSessionRetryDelay, [&] {
+      return session_worker_stop_.load();
+    });
+    retry_lock.unlock();
+    while (!session_worker_stop_.load()) {
+      try {
+        {
+          std::lock_guard lock(delivery_queue_mutex_);
+          // The worker has already removed this request. A concurrent producer
+          // may refill the public bound, so this one exact retry is permitted
+          // to occupy the single in-flight overflow slot.
+          delivery_requests_.push_front(request);
+        }
+        session_worker_epoch_.fetch_add(1);
+        session_worker_epoch_.notify_one();
+        return;
+      } catch (...) {
+        std::unique_lock allocation_retry(session_retry_mutex_);
+        session_retry_wake_.wait_for(
+            allocation_retry, kSessionRetryDelay,
+            [&] { return session_worker_stop_.load(); });
+      }
+    }
+  };
+  while (GetEnvironmentVariableA("FAMO_TEST_PAUSE_DELIVERY_RECOVERY",
+                                 nullptr, 0) != 0 &&
+         !session_worker_stop_.load()) {
+    Sleep(1);
+  }
+  if (session_worker_stop_.load())
+    return;
 
   runtime::Status status = runtime::Status::Unavailable;
   runtime::Frame final_reply;
@@ -1163,6 +1305,53 @@ void TextService::ProcessDeliveryWork(
                        runtime::kHardCallDeadline)
               .status;
     }
+  }
+
+  if (status == runtime::Status::DeliveryFailed) {
+    std::shared_ptr<const DeliveryWorkResult> terminal_result;
+    try {
+      if (GetEnvironmentVariableA(
+              "FAMO_TEST_TERMINAL_RESULT_ALLOCATION_FAILURE_ONCE", nullptr,
+              0) != 0) {
+        SetEnvironmentVariableA(
+            "FAMO_TEST_TERMINAL_RESULT_ALLOCATION_FAILURE_ONCE", nullptr);
+        throw std::bad_alloc();
+      }
+      terminal_result = std::make_shared<const DeliveryWorkResult>(
+          DeliveryWorkResult{request->identity, request->reference,
+                             request->kind, status, {}});
+    } catch (...) {
+      requeue_without_dropping();
+      return;
+    }
+
+    // Reserve the allocation-free publication slot before the terminal
+    // mutation. A stopped/deactivating host leaves the runtime delivery intact
+    // for ForceDeactivateCleanup's connection-wide teardown.
+    while (terminal_delivery_result_.load() &&
+           !session_worker_stop_.load()) {
+      std::unique_lock publication_wait(session_retry_mutex_);
+      session_retry_wake_.wait_for(publication_wait, kSessionRetryDelay, [&] {
+        return session_worker_stop_.load() ||
+               !terminal_delivery_result_.load();
+      });
+    }
+    if (session_worker_stop_.load())
+      return;
+
+    const runtime::CallResult abandoned = runtime_port_.AbandonSession(
+        request->reference,
+        std::chrono::steady_clock::now() + runtime::kHardCallDeadline);
+    if (abandoned.status != runtime::Status::Ok &&
+        abandoned.status != runtime::Status::StaleRequest) {
+      requeue_without_dropping();
+      return;
+    }
+
+    terminal_delivery_result_.store(std::move(terminal_result));
+    if (recovery_window_)
+      PostMessageW(recovery_window_, kRecoveryMessage, 0, 0);
+    return;
   }
 
   const bool retryable =
@@ -1217,6 +1406,7 @@ void TextService::ProcessDeliveryWork(
     if (published && recovery_window_)
       PostMessageW(recovery_window_, kRecoveryMessage, 0, 0);
   } catch (...) {
+    requeue_without_dropping();
   }
 }
 
@@ -1275,8 +1465,9 @@ void TextService::ApplySessionResult() {
 
 void TextService::ApplyDeliveryResult() {
   for (;;) {
-    std::shared_ptr<const DeliveryWorkResult> result;
-    {
+    std::shared_ptr<const DeliveryWorkResult> result =
+        terminal_delivery_result_.exchange(nullptr);
+    if (!result) {
       std::lock_guard lock(delivery_queue_mutex_);
       if (delivery_results_.empty())
         break;
@@ -1293,6 +1484,12 @@ void TextService::ApplyOneDeliveryResult(
     const DeliveryWorkResult &delivery_result) {
   const DeliveryWorkResult *result = &delivery_result;
   if (result->identity.activation_generation != activation_generation_)
+    return;
+  if (result->status == runtime::Status::DeliveryFailed) {
+    RetireAbandonedSession(result->reference);
+    return;
+  }
+  if (result->identity.connection_generation != connection_generation_)
     return;
 
   ContextEntry *entry = nullptr;
@@ -1424,6 +1621,83 @@ void TextService::ApplyOneDeliveryResult(
   if (!entry->ui_state.focused) {
     ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack, result->reference);
   }
+}
+
+void TextService::RetireAbandonedSession(
+    const runtime::DeliveryReference &reference) {
+  try {
+    std::lock_guard lock(delivery_queue_mutex_);
+    std::erase_if(
+        delivery_requests_,
+        [&](const std::shared_ptr<const DeliveryWorkRequest> &request) {
+          return request &&
+                 SameLogicalSession(request->reference.correlation,
+                                    reference.correlation);
+        });
+    std::erase_if(
+        delivery_results_,
+        [&](const std::shared_ptr<const DeliveryWorkResult> &result) {
+          return result &&
+                 SameLogicalSession(result->reference.correlation,
+                                    reference.correlation);
+        });
+  } catch (...) {
+  }
+  session_retry_wake_.notify_all();
+
+  ContextEntry *retired = nullptr;
+  for (auto &owned : contexts_) {
+    ContextEntry *entry = owned.get();
+    if (!SameLogicalSession(entry->state.session_identity(),
+                            reference.correlation) &&
+        (!entry->pending_delivery ||
+         !SameLogicalSession(entry->pending_delivery->correlation,
+                             reference.correlation)) &&
+        (!entry->applied_delivery ||
+         !SameLogicalSession(entry->applied_delivery->correlation,
+                             reference.correlation))) {
+      continue;
+    }
+    retired = entry;
+    if (entry->candidates)
+      entry->candidates->End();
+    entry->ui_state.show_allowed = false;
+    entry->composition.ResetBehaviorState();
+    const RecoveryPlan recovery = entry->state.Fail();
+    if (recovery.commit_preedit) {
+      entry->recovery_preedit = *recovery.commit_preedit;
+      entry->recovery_cleanup_required = true;
+    }
+    entry->pending_delivery.reset();
+    entry->applied_delivery.reset();
+    entry->deferred_delivery_composition.reset();
+    entry->pending_physical_key = false;
+    entry->delivery_work_pending = false;
+    entry->delivery_quarantined = false;
+    entry->recover_after_delivery_ack = false;
+    entry->selection_capability_sequence = 0;
+    {
+      std::lock_guard lock(session_publication_mutex_);
+      const std::shared_ptr<const runtime::Correlation> desired =
+          desired_session_.load();
+      if (desired && *desired == entry->pending_session) {
+        desired_session_.store(nullptr);
+        session_request_.store(nullptr);
+        const std::shared_ptr<const SessionWarmupResult> result =
+            session_result_.load();
+        if (result && result->identity == entry->pending_session)
+          session_result_.store(nullptr);
+      }
+      entry->session_pending = false;
+      entry->pending_session = {};
+    }
+    break;
+  }
+  if (!retired)
+    return;
+  PostRecoveryWork();
+  if (retired->ui_state.focused)
+    ScheduleSession(retired, SessionWarmupReason::Recovery);
 }
 
 bool TextService::ApplyDeferredDelivery(ContextEntry *entry) {

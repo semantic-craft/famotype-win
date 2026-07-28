@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -18,6 +19,13 @@ public static class SeedFileTransaction
     private const string ReceiptName = "receipt.json";
     private const int MaxEntries = 10_000;
     private const int MaxReceiptBytes = 4 * 1024 * 1024;
+    private const string AtomicPublicationRecoverySchema =
+        "famo-atomic-publication-recovery-v1";
+    private const int MaxAtomicPublicationRecoveryBytes = 512 * 1024;
+    private static readonly byte[] AtomicPublicationRecoveryHeader =
+        Encoding.ASCII.GetBytes("FAMO-PUBLISH-RECOVERY-V1");
+    private static readonly byte[] AtomicPublicationRecoveryCommit =
+        Encoding.ASCII.GetBytes("FAMO-PUBLISH-COMMITTED-V1");
     internal static Action<string>? BeforeAtomicMutationForTests { get; set; }
     internal static Action<string>? AfterAtomicDisplacementForTests { get; set; }
     internal static Action<string>? AfterAtomicInstallForTests { get; set; }
@@ -29,8 +37,19 @@ public static class SeedFileTransaction
         get;
         set;
     }
+    internal static Action? AfterPinnedTemporaryDeleteDispositionClearedForTests
+    {
+        get;
+        set;
+    }
+    internal static Action? AfterPinnedAtomicFileRenameForTests
+    {
+        get;
+        set;
+    }
     internal static Action<string>? AfterInitialSnapshotHashForTests { get; set; }
     internal static Action<string>? AfterInitialSnapshotCopyForTests { get; set; }
+    internal static Action? AfterRollbackTransactionDeleteForTests { get; set; }
     private static readonly string[] GeneratedFiles =
     [
         "famo-settings.json",
@@ -57,7 +76,9 @@ public static class SeedFileTransaction
         ArgumentNullException.ThrowIfNull(generateStagedFiles);
         EnsureDirectoryTree(root, create: true);
         string transactionRoot = TransactionRoot(root, transactionId);
-        if (Directory.Exists(transactionRoot))
+        if (Directory.Exists(transactionRoot) ||
+            File.Exists(RolledBackTombstonePath(root, transactionId)) ||
+            Directory.Exists(RolledBackTombstonePath(root, transactionId)))
         {
             throw new InvalidOperationException(
                 "Seed transaction already exists; recovery must resolve it before prepare.");
@@ -206,6 +227,16 @@ public static class SeedFileTransaction
         string root = FullRoot(famoDir);
         using IDisposable held = UserDataTransactionLock.Acquire(root);
         string transactionRoot = TransactionRoot(root, transactionId);
+        if (TryReadRolledBackTombstone(
+                root, transactionId, expectedReceiptHash))
+        {
+            if (Directory.Exists(transactionRoot))
+            {
+                DeleteTransactionTree(root, transactionRoot);
+                AfterRollbackTransactionDeleteForTests?.Invoke();
+            }
+            return true;
+        }
         if (!Directory.Exists(transactionRoot))
         {
             return false;
@@ -418,7 +449,10 @@ public static class SeedFileTransaction
             FamoLog.Append(
                 $"seed rollback preserved {preservedUserChanges} later user change(s); transaction={transactionId}");
         }
+        WriteRolledBackTombstone(
+            root, receipt.TransactionId, expectedReceiptHash);
         DeleteTransactionTree(root, transactionRoot);
+        AfterRollbackTransactionDeleteForTests?.Invoke();
         return true;
     }
 
@@ -683,6 +717,14 @@ public static class SeedFileTransaction
     private static string TransactionRoot(string root, string transactionId) =>
         Path.Combine(root, ".transactions", transactionId);
 
+    private static string RolledBackTombstonePath(
+        string root,
+        string transactionId) =>
+        Path.Combine(
+            root,
+            ".transactions",
+            $"{transactionId}.rolledback.json");
+
     private static void ValidateTransactionId(string transactionId)
     {
         if (transactionId.Length != 32 ||
@@ -741,6 +783,7 @@ public static class SeedFileTransaction
         string destination, ReadOnlySpan<byte> content, bool overwrite = true)
     {
         destination = Path.GetFullPath(destination);
+        using IDisposable held = UserDataTransactionLock.Acquire(destination);
         string parent = Path.GetDirectoryName(destination)
             ?? throw new IOException("Durable destination has no parent.");
         EnsureDirectoryTree(parent, create: false);
@@ -757,16 +800,24 @@ public static class SeedFileTransaction
         BeforeAtomicFilePublishForTests?.Invoke(destination);
         BeforePinnedAtomicFilePublishForTests?.Invoke(
             destination, temporary);
+        using AtomicPublicationRecoveryLease recovery =
+            CreateAtomicPublicationRecovery(
+                output.SafeFileHandle,
+                temporary,
+                destination);
         lease.MovePinnedFile(
             output.SafeFileHandle,
             temporary,
             destination,
             overwrite);
+        recovery.DeleteOnClose();
     }
 
     private static void CopyFileAtomic(
         string source, string destination, bool overwrite = true)
     {
+        destination = Path.GetFullPath(destination);
+        using IDisposable held = UserDataTransactionLock.Acquire(destination);
         EnsureNoReparseChain(source, includeLeaf: true);
         string parent = Path.GetDirectoryName(destination)
             ?? throw new IOException("Seed destination has no parent.");
@@ -792,11 +843,17 @@ public static class SeedFileTransaction
             BeforeAtomicFilePublishForTests?.Invoke(destination);
             BeforePinnedAtomicFilePublishForTests?.Invoke(
                 destination, temporary);
+            using AtomicPublicationRecoveryLease recovery =
+                CreateAtomicPublicationRecovery(
+                    output.SafeFileHandle,
+                    temporary,
+                    destination);
             lease.MovePinnedFile(
                 output.SafeFileHandle,
                 temporary,
                 destination,
                 overwrite);
+            recovery.DeleteOnClose();
         }
     }
 
@@ -855,6 +912,496 @@ public static class SeedFileTransaction
                 message,
                 new Win32Exception(Marshal.GetLastWin32Error()));
         }
+    }
+
+    internal static void RecoverPendingAtomicPublication(string dataRoot)
+    {
+        string recoveryPath =
+            UserDataTransactionLock.AtomicPublicationRecoveryPath(dataRoot);
+        string recoveryParent = Path.GetDirectoryName(recoveryPath)
+            ?? throw new IOException(
+                "Atomic publication recovery path has no parent.");
+        using DirectoryMutationLease recoveryDirectory =
+            DirectoryMutationLease.Acquire(recoveryParent);
+        SafeFileHandle handle = NativeMethods.CreateFile(
+            recoveryPath,
+            GenericRead | DeleteAccess | FileReadAttributes,
+            FileShare.None,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagSequentialScan | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            if (error is ErrorFileNotFound or ErrorPathNotFound)
+            {
+                return;
+            }
+            throw new IOException(
+                "Cannot open the atomic publication recovery record.",
+                new Win32Exception(error));
+        }
+
+        try
+        {
+            ValidatePinnedRegularFile(
+                handle,
+                recoveryPath,
+                "Unsafe atomic publication recovery record.");
+            using var input = new FileStream(
+                handle,
+                FileAccess.Read,
+                bufferSize: 4096,
+                isAsync: false);
+            AtomicPublicationRecoveryRecord? record =
+                ReadAtomicPublicationRecovery(input);
+            if (record is not null)
+            {
+                RecoverExactAtomicPublicationTemporary(record);
+            }
+            SetDeleteDisposition(
+                input.SafeFileHandle,
+                delete: true,
+                "Cannot remove the atomic publication recovery record.");
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    private static AtomicPublicationRecoveryLease
+        CreateAtomicPublicationRecovery(
+            SafeFileHandle temporaryHandle,
+            string temporary,
+            string destination)
+    {
+        FileObjectIdentity identity =
+            GetFileObjectIdentity(temporaryHandle);
+        var record = new AtomicPublicationRecoveryRecord
+        {
+            Schema = AtomicPublicationRecoverySchema,
+            Temporary = Path.GetFullPath(temporary),
+            Destination = Path.GetFullPath(destination),
+            VolumeSerialNumber = identity.VolumeSerialNumber,
+            FileIndex = identity.FileIndex,
+        };
+        ValidateAtomicPublicationRecoveryRecord(record);
+        byte[] envelope = SerializeAtomicPublicationRecovery(record);
+        string recoveryPath =
+            UserDataTransactionLock.AtomicPublicationRecoveryPath(destination);
+        string recoveryParent = Path.GetDirectoryName(recoveryPath)
+            ?? throw new IOException(
+                "Atomic publication recovery path has no parent.");
+        using DirectoryMutationLease recoveryDirectory =
+            DirectoryMutationLease.Acquire(recoveryParent);
+        SafeFileHandle handle = NativeMethods.CreateFile(
+            recoveryPath,
+            GenericRead | GenericWrite |
+            DeleteAccess | FileReadAttributes,
+            FileShare.None,
+            IntPtr.Zero,
+            CreateNew,
+            FileAttributeNormal | FileFlagWriteThrough |
+            FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new IOException(
+                "Cannot create the atomic publication recovery record.",
+                new Win32Exception(error));
+        }
+        try
+        {
+            ValidatePinnedRegularFile(
+                handle,
+                recoveryPath,
+                "Unsafe atomic publication recovery record.");
+            var output = new FileStream(
+                handle,
+                FileAccess.ReadWrite,
+                bufferSize: 4096,
+                isAsync: false);
+            try
+            {
+                output.Write(envelope);
+                output.Flush(flushToDisk: true);
+                return new AtomicPublicationRecoveryLease(output);
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    private static byte[] SerializeAtomicPublicationRecovery(
+        AtomicPublicationRecoveryRecord record)
+    {
+        byte[] payload = JsonSerializer.SerializeToUtf8Bytes(record);
+        int envelopeLength = checked(
+            AtomicPublicationRecoveryHeader.Length +
+            sizeof(int) +
+            payload.Length +
+            SHA256.HashSizeInBytes +
+            AtomicPublicationRecoveryCommit.Length);
+        if (envelopeLength > MaxAtomicPublicationRecoveryBytes)
+        {
+            throw new IOException(
+                "Atomic publication recovery record is too large.");
+        }
+        byte[] envelope = new byte[envelopeLength];
+        int offset = 0;
+        AtomicPublicationRecoveryHeader.CopyTo(envelope, offset);
+        offset += AtomicPublicationRecoveryHeader.Length;
+        BinaryPrimitives.WriteInt32LittleEndian(
+            envelope.AsSpan(offset, sizeof(int)),
+            payload.Length);
+        offset += sizeof(int);
+        payload.CopyTo(envelope, offset);
+        offset += payload.Length;
+        SHA256.HashData(
+            payload,
+            envelope.AsSpan(offset, SHA256.HashSizeInBytes));
+        offset += SHA256.HashSizeInBytes;
+        AtomicPublicationRecoveryCommit.CopyTo(envelope, offset);
+        return envelope;
+    }
+
+    private static AtomicPublicationRecoveryRecord?
+        ReadAtomicPublicationRecovery(FileStream input)
+    {
+        if (input.Length > MaxAtomicPublicationRecoveryBytes)
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery record is too large.");
+        }
+        byte[] envelope = new byte[checked((int)input.Length)];
+        input.ReadExactly(envelope);
+        if (envelope.Length < AtomicPublicationRecoveryCommit.Length ||
+            !envelope.AsSpan(
+                    envelope.Length - AtomicPublicationRecoveryCommit.Length)
+                .SequenceEqual(AtomicPublicationRecoveryCommit))
+        {
+            // Publication never clears delete disposition until this exact
+            // commit marker has reached stable storage. A torn, uncommitted
+            // record therefore cannot own a persistent temporary object.
+            return null;
+        }
+        int minimumLength =
+            AtomicPublicationRecoveryHeader.Length +
+            sizeof(int) +
+            SHA256.HashSizeInBytes +
+            AtomicPublicationRecoveryCommit.Length;
+        if (envelope.Length < minimumLength ||
+            !envelope.AsSpan(0, AtomicPublicationRecoveryHeader.Length)
+                .SequenceEqual(AtomicPublicationRecoveryHeader))
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery record header is invalid.");
+        }
+        int payloadOffset =
+            AtomicPublicationRecoveryHeader.Length + sizeof(int);
+        int payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
+            envelope.AsSpan(
+                AtomicPublicationRecoveryHeader.Length,
+                sizeof(int)));
+        int expectedLength;
+        try
+        {
+            expectedLength = checked(
+                payloadOffset +
+                payloadLength +
+                SHA256.HashSizeInBytes +
+                AtomicPublicationRecoveryCommit.Length);
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery record length is invalid.",
+                ex);
+        }
+        if (payloadLength <= 0 || expectedLength != envelope.Length)
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery record length is invalid.");
+        }
+        ReadOnlySpan<byte> payload =
+            envelope.AsSpan(payloadOffset, payloadLength);
+        ReadOnlySpan<byte> recordedDigest = envelope.AsSpan(
+            payloadOffset + payloadLength,
+            SHA256.HashSizeInBytes);
+        Span<byte> actualDigest = stackalloc byte[SHA256.HashSizeInBytes];
+        SHA256.HashData(payload, actualDigest);
+        if (!CryptographicOperations.FixedTimeEquals(
+                actualDigest,
+                recordedDigest))
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery record digest is invalid.");
+        }
+        AtomicPublicationRecoveryRecord record;
+        try
+        {
+            record =
+                JsonSerializer.Deserialize<AtomicPublicationRecoveryRecord>(
+                    payload)
+                ?? throw new InvalidDataException(
+                    "Atomic publication recovery record is empty.");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery record JSON is invalid.",
+                ex);
+        }
+        ValidateAtomicPublicationRecoveryRecord(record);
+        return record;
+    }
+
+    private static void ValidateAtomicPublicationRecoveryRecord(
+        AtomicPublicationRecoveryRecord record)
+    {
+        if (!string.Equals(
+                record.Schema,
+                AtomicPublicationRecoverySchema,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery record schema is invalid.");
+        }
+        string temporary;
+        string destination;
+        try
+        {
+            temporary = Path.GetFullPath(record.Temporary);
+            destination = Path.GetFullPath(record.Destination);
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException or NotSupportedException or
+            PathTooLongException)
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery path is invalid.",
+                ex);
+        }
+        if (!string.Equals(
+                temporary,
+                record.Temporary,
+                StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(
+                destination,
+                record.Destination,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery path is not canonical.");
+        }
+        string prefix = destination + ".famo-tmp-";
+        if (!temporary.StartsWith(
+                prefix,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery temporary path is invalid.");
+        }
+        string suffix = temporary[prefix.Length..];
+        if (suffix.Length != 32 || suffix.Any(character =>
+                !Uri.IsHexDigit(character)))
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery temporary name is invalid.");
+        }
+        if (record.FileIndex == 0)
+        {
+            throw new InvalidDataException(
+                "Atomic publication recovery object identity is invalid.");
+        }
+    }
+
+    private static void RecoverExactAtomicPublicationTemporary(
+        AtomicPublicationRecoveryRecord record)
+    {
+        string parent = Path.GetDirectoryName(record.Temporary)
+            ?? throw new InvalidDataException(
+                "Atomic publication temporary path has no parent.");
+        if (!Directory.Exists(parent))
+        {
+            FlushPublishedAtomicPublicationIfPresent(record);
+            return;
+        }
+        using DirectoryMutationLease temporaryDirectory =
+            DirectoryMutationLease.Acquire(parent);
+        SafeFileHandle handle = NativeMethods.CreateFile(
+            record.Temporary,
+            GenericWrite | DeleteAccess | FileReadAttributes,
+            FileShare.Read | FileShare.Write,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagWriteThrough | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            if (error is ErrorFileNotFound or ErrorPathNotFound)
+            {
+                FlushPublishedAtomicPublicationIfPresent(record);
+                return;
+            }
+            throw new IOException(
+                "Cannot open the pending atomic publication temporary.",
+                new Win32Exception(error));
+        }
+        using (handle)
+        {
+            ValidatePinnedRegularFile(
+                handle,
+                record.Temporary,
+                "Unsafe pending atomic publication temporary.");
+            FileObjectIdentity actual = GetFileObjectIdentity(handle);
+            var expected = new FileObjectIdentity(
+                record.VolumeSerialNumber,
+                record.FileIndex);
+            if (actual != expected)
+            {
+                throw new IOException(
+                    "Pending atomic publication temporary identity changed.");
+            }
+            SetDeleteDisposition(
+                handle,
+                delete: true,
+                "Cannot remove the pending atomic publication temporary.");
+            FlushPinnedFile(
+                handle,
+                "Cannot flush pending atomic publication cleanup.");
+        }
+    }
+
+    private static void FlushPublishedAtomicPublicationIfPresent(
+        AtomicPublicationRecoveryRecord record)
+    {
+        string parent = Path.GetDirectoryName(record.Destination)
+            ?? throw new InvalidDataException(
+                "Atomic publication destination path has no parent.");
+        if (!Directory.Exists(parent))
+        {
+            return;
+        }
+        using DirectoryMutationLease destinationDirectory =
+            DirectoryMutationLease.Acquire(parent);
+        SafeFileHandle handle = NativeMethods.CreateFile(
+            record.Destination,
+            GenericWrite | FileReadAttributes,
+            FileShare.Read | FileShare.Write,
+            IntPtr.Zero,
+            OpenExisting,
+            FileFlagWriteThrough | FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid)
+        {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            if (error is ErrorFileNotFound or ErrorPathNotFound)
+            {
+                return;
+            }
+            throw new IOException(
+                "Cannot open the published atomic destination for recovery.",
+                new Win32Exception(error));
+        }
+        using (handle)
+        {
+            ValidatePinnedRegularFile(
+                handle,
+                record.Destination,
+                "Unsafe published atomic destination.");
+            FileObjectIdentity actual = GetFileObjectIdentity(handle);
+            var expected = new FileObjectIdentity(
+                record.VolumeSerialNumber,
+                record.FileIndex);
+            if (actual == expected)
+            {
+                FlushPinnedFile(
+                    handle,
+                    "Cannot flush the recovered atomic destination.");
+            }
+        }
+    }
+
+    private static void FlushPinnedFile(
+        SafeFileHandle handle,
+        string message)
+    {
+        if (!NativeMethods.FlushFileBuffers(handle))
+        {
+            throw new IOException(
+                message,
+                new Win32Exception(Marshal.GetLastWin32Error()));
+        }
+    }
+
+    private static void ValidatePinnedRegularFile(
+        SafeFileHandle handle,
+        string expectedPath,
+        string message)
+    {
+        if (!NativeMethods.GetFileInformationByHandle(
+                handle,
+                out ByHandleFileInformation information) ||
+            (information.FileAttributes &
+             (FileAttributeDirectory | FileAttributeReparsePoint)) != 0)
+        {
+            throw new IOException(message);
+        }
+        ulong index = ((ulong)information.FileIndexHigh << 32) |
+            information.FileIndexLow;
+        if (index == 0)
+        {
+            throw new IOException(message);
+        }
+        var finalPath = new StringBuilder(32_768);
+        uint length = NativeMethods.GetFinalPathNameByHandle(
+            handle,
+            finalPath,
+            (uint)finalPath.Capacity,
+            0);
+        if (length == 0 || length >= finalPath.Capacity ||
+            !string.Equals(
+                NormalizeFinalFilePath(finalPath.ToString()),
+                Path.GetFullPath(expectedPath),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException(message);
+        }
+    }
+
+    private static string NormalizeFinalFilePath(string path)
+    {
+        if (path.StartsWith(
+                @"\\?\UNC\",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            path = @"\\" + path[8..];
+        }
+        else if (path.StartsWith(
+                     @"\\?\",
+                     StringComparison.OrdinalIgnoreCase))
+        {
+            path = path[4..];
+        }
+        return Path.GetFullPath(path);
     }
 
     private static AtomicMutationResult ApplyOwnedAtomic(
@@ -1605,6 +2152,12 @@ public static class SeedFileTransaction
             FileMode.Open,
             FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete);
+        return GetFileObjectIdentity(handle);
+    }
+
+    private static FileObjectIdentity GetFileObjectIdentity(
+        SafeFileHandle handle)
+    {
         if (!NativeMethods.GetFileInformationByHandle(
                 handle, out ByHandleFileInformation information))
         {
@@ -1698,6 +2251,62 @@ public static class SeedFileTransaction
             throw new InvalidDataException("Seed receipt size is invalid.");
         }
         WriteDurableAtomic(path, json, overwrite: false);
+    }
+
+    private static void WriteRolledBackTombstone(
+        string root,
+        string transactionId,
+        string expectedReceiptHash)
+    {
+        string source = Path.Combine(
+            TransactionRoot(root, transactionId), ReceiptName);
+        byte[] receiptBytes = ReadBoundedFile(source, MaxReceiptBytes);
+        string actualHash =
+            Convert.ToHexString(SHA256.HashData(receiptBytes));
+        if (!string.Equals(
+                actualHash,
+                expectedReceiptHash,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "Seed rollback receipt changed before finalization.");
+        }
+        _ = ReadReceipt(receiptBytes, transactionId);
+        WriteDurableAtomic(
+            RolledBackTombstonePath(root, transactionId),
+            receiptBytes,
+            overwrite: false);
+    }
+
+    private static bool TryReadRolledBackTombstone(
+        string root,
+        string transactionId,
+        string expectedReceiptHash)
+    {
+        ValidateTransactionId(transactionId);
+        ValidateHash(expectedReceiptHash);
+        string path = RolledBackTombstonePath(root, transactionId);
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+        string transactionsRoot = Path.Combine(root, ".transactions");
+        EnsureDirectoryTree(root, create: false);
+        EnsureDirectoryTree(transactionsRoot, create: false);
+        EnsureRegularFile(transactionsRoot, path);
+        byte[] receiptBytes = ReadBoundedFile(path, MaxReceiptBytes);
+        string actualHash =
+            Convert.ToHexString(SHA256.HashData(receiptBytes));
+        if (!string.Equals(
+                actualHash,
+                expectedReceiptHash,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                "Seed rollback tombstone does not match the elevated journal hash.");
+        }
+        _ = ReadReceipt(receiptBytes, transactionId);
+        return true;
     }
 
     private static Receipt ReadReceipt(byte[] json, string expectedTransactionId)
@@ -2177,6 +2786,8 @@ public static class SeedFileTransaction
                             _source,
                             delete: false,
                             "Cannot publish the pinned seed temporary file.");
+                        AfterPinnedTemporaryDeleteDispositionClearedForTests
+                            ?.Invoke();
                     }
                     int status = NativeMethods.NtSetInformationFile(
                             _source,
@@ -2205,6 +2816,16 @@ public static class SeedFileTransaction
                             new Win32Exception((int)
                                 NativeMethods.RtlNtStatusToDosError(status)));
                     }
+                    if (_clearDeleteDispositionBeforeExecute)
+                    {
+                        // The recovery record can live on a different volume.
+                        // Do not remove it until the destination volume has
+                        // persisted the rename metadata.
+                        AfterPinnedAtomicFileRenameForTests?.Invoke();
+                        FlushPinnedFile(
+                            _source,
+                            "Cannot flush the published seed file.");
+                    }
                 }
                 finally
                 {
@@ -2220,6 +2841,37 @@ public static class SeedFileTransaction
                 }
             }
         }
+    }
+
+    private sealed class AtomicPublicationRecoveryLease(
+        FileStream stream) : IDisposable
+    {
+        private bool _deleteArmed;
+
+        internal void DeleteOnClose()
+        {
+            if (_deleteArmed)
+            {
+                throw new InvalidOperationException(
+                    "Atomic publication recovery was already completed.");
+            }
+            SetDeleteDisposition(
+                stream.SafeFileHandle,
+                delete: true,
+                "Cannot remove the completed atomic publication recovery record.");
+            _deleteArmed = true;
+        }
+
+        public void Dispose() => stream.Dispose();
+    }
+
+    private sealed class AtomicPublicationRecoveryRecord
+    {
+        public string Schema { get; set; } = "";
+        public string Temporary { get; set; } = "";
+        public string Destination { get; set; } = "";
+        public uint VolumeSerialNumber { get; set; }
+        public ulong FileIndex { get; set; }
     }
 
     private sealed class Receipt
@@ -2251,11 +2903,18 @@ public static class SeedFileTransaction
     private readonly record struct FileObjectIdentity(
         uint VolumeSerialNumber, ulong FileIndex);
 
+    private const int ErrorFileNotFound = 2;
+    private const int ErrorPathNotFound = 3;
+    private const uint GenericRead = 0x80000000;
     private const uint GenericWrite = 0x40000000;
     private const uint DeleteAccess = 0x00010000;
     private const uint FileReadAttributes = 0x00000080;
     private const uint CreateNew = 1;
+    private const uint OpenExisting = 3;
+    private const uint FileAttributeDirectory = 0x00000010;
+    private const uint FileAttributeNormal = 0x00000080;
     private const uint FileAttributeTemporary = 0x00000100;
+    private const uint FileAttributeReparsePoint = 0x00000400;
     private const uint FileFlagSequentialScan = 0x08000000;
     private const uint FileFlagWriteThrough = 0x80000000;
     private const uint FileFlagOpenReparsePoint = 0x00200000;
@@ -2323,6 +2982,10 @@ public static class SeedFileTransaction
         internal static extern bool GetFileInformationByHandle(
             SafeFileHandle file,
             out ByHandleFileInformation information);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool FlushFileBuffers(SafeFileHandle file);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]

@@ -27,7 +27,10 @@ public sealed class InstallerContractTests
         Assert.Contains("OriginalUserSid", iss);
         Assert.Contains("OriginalUserSession", iss);
         Assert.Contains("OriginalUserResumeCapable", iss);
-        Assert.Contains("DeleteFile(IdentityRecord)", iss);
+        Assert.Contains(
+            "CleanupExactHelperAndDebt(TransactionId", iss);
+        Assert.Contains(
+            "'identity-' + Nonce + '.txt'", iss);
         Assert.DoesNotContain("{username}", iss, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -995,11 +998,165 @@ public sealed class InstallerContractTests
             "ready-debt-before-ready",
             "ready-after-phase-before-seedcommit",
             "rollback-debts-before-terminal",
+            "rolledback-before-debt-finalize",
             "rolledback-before-artifact-cleanup",
+            "uninstall-intent-before-commit",
+            "uninstall-intent-after-commit",
+            "uninstall-delete-anchor-before-commit",
+            "uninstall-delete-anchor-after-commit",
+            "uninstall-brand-deleted-before-anchor-retire",
         })
         {
             Assert.Contains($"FailIfRequested('{phase}')", iss);
         }
+    }
+
+    [Fact]
+    public void InnoSetup_UninstallIntentPinsReentryBeforeAutomaticFileDeletion()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int persist = Position(iss, "procedure PersistUninstallIntent");
+        string persistBody = iss[persist..Position(
+            iss, "function LoadCommittedUninstallIntent", persist)];
+        int owner = Position(persistBody, "'UninstallIntentOwner'");
+        int target = Position(persistBody, "'UninstallIntentTarget'", owner);
+        int finalTarget = Position(
+            persistBody, "'UninstallIntentFinalTarget'", target);
+        int objectId = Position(
+            persistBody, "'UninstallIntentObjectId'", finalTarget);
+        int commit = Position(
+            persistBody, "'UninstallIntent', UninstallIntentSchema", objectId);
+        int flush = Position(
+            persistBody, "FlushMachineRegistryKey(BrandKey)", commit);
+        Assert.True(
+            owner < target &&
+            target < finalTarget &&
+            finalTarget < objectId &&
+            objectId < commit &&
+            commit < flush);
+
+        int load = Position(iss, "function LoadCommittedUninstallIntent");
+        string loadBody = iss[load..Position(
+            iss, "procedure RemoveActiveInstall", load)];
+        Assert.Contains("if JournalPhase = PhaseReady then", loadBody);
+        Assert.Contains(
+            "else if (JournalPhase = PhaseRolledBack) and", loadBody);
+        Assert.Contains("JournalPreviousFinalTarget", loadBody);
+        Assert.Contains("PreviousCompatibilityTransactionId", loadBody);
+
+        int remove = Position(iss, "procedure RemoveActiveInstall");
+        string removeBody = iss[remove..Position(
+            iss, "procedure CurUninstallStepChanged", remove)];
+        int loadIntent = Position(
+            removeBody, "LoadCommittedUninstallIntent");
+        int loadReady = Position(
+            removeBody, "LoadPendingState", loadIntent);
+        string reentry = removeBody[loadIntent..loadReady];
+        Assert.Contains("RunTrustedDirectMachineUnregister", reentry);
+        Assert.DoesNotContain("ValidateCurrentPayloadForExecution", reentry);
+        Assert.DoesNotContain("RunAndRequire(ProfileTool", reentry);
+
+        int unregister = Position(
+            removeBody, "UnregisterMachineTarget(ActiveTarget)");
+        int persistCall = Position(
+            removeBody, "PersistUninstallIntent(", unregister);
+        int legacyAnchor = Position(
+            removeBody, "IsLegacyRollbackAnchorForProjection");
+        int legacyIntentIdentity = Position(
+            removeBody, "JournalPreviousFinalTarget", legacyAnchor);
+        int prepared = Position(
+            removeBody, "UninstallPrepared := True", persistCall);
+        Assert.True(
+            legacyAnchor < legacyIntentIdentity &&
+            legacyIntentIdentity < persistCall &&
+            unregister < persistCall &&
+            persistCall < prepared);
+    }
+
+    [Fact]
+    public void InnoSetup_UninstallRegistryDeletionUsesAnExternalCommittedAnchor()
+    {
+        string iss = InstallerText("famo-setup.iss");
+
+        Assert.Contains(
+            "UninstallDeleteAnchorKey = 'Software\\Famo\\UninstallRecovery'",
+            iss);
+        int persist = Position(
+            iss, "procedure PersistUninstallDeleteAnchor");
+        string persistBody = iss[persist..Position(
+            iss, "function LoadCommittedUninstallDeleteAnchor", persist)];
+        int owner = Position(persistBody, "'Owner'");
+        int digest = Position(persistBody, "'Digest'", owner);
+        int beforeCommit = Position(
+            persistBody, "uninstall-delete-anchor-before-commit", digest);
+        int commit = Position(
+            persistBody, "'Commit', UninstallDeleteAnchorSchema",
+            beforeCommit);
+        int flush = Position(
+            persistBody, "FlushMachineRegistryKey(UninstallDeleteAnchorKey)",
+            commit);
+        int afterCommit = Position(
+            persistBody, "uninstall-delete-anchor-after-commit", flush);
+        Assert.True(
+            owner < digest &&
+            digest < beforeCommit &&
+            beforeCommit < commit &&
+            commit < flush &&
+            flush < afterCommit);
+
+        int remove = Position(iss, "procedure RemoveActiveInstall");
+        string removeBody = iss[remove..Position(
+            iss, "procedure CurUninstallStepChanged", remove)];
+        int loadAnchor = Position(
+            removeBody, "LoadCommittedUninstallDeleteAnchor");
+        int loadActive = Position(
+            removeBody, "'ActiveTransactionId'", loadAnchor);
+        Assert.True(loadAnchor < loadActive);
+        Assert.Contains("RecoveryTaskFolderAbsentByCom", removeBody);
+
+        int initialize = Position(iss, "function InitializeSetup");
+        string initializeBody = iss[initialize..Position(
+            iss, "procedure CurStepChanged", initialize)];
+        int baseIntentBlock = Position(
+            initializeBody, "'UninstallIntent'");
+        int deleteAnchorBlock = Position(
+            initializeBody, "UninstallDeleteAnchorKey", baseIntentBlock);
+        int transactionRecovery = Position(
+            initializeBody, "FindRecoverableTransaction", deleteAnchorBlock);
+        Assert.True(
+            baseIntentBlock < deleteAnchorBlock &&
+            deleteAnchorBlock < transactionRecovery);
+
+        int post = Position(iss, "procedure CurUninstallStepChanged");
+        string postBody = iss[post..];
+        int machineFlush = Position(
+            postBody, "FlushMachineRegistryKey('Software\\Classes\\CLSID')");
+        int cleanup = Position(
+            postBody, "CleanupAllValidatedRecoveryArtifacts", machineFlush);
+        int persistAnchor = Position(
+            postBody, "PersistUninstallDeleteAnchor", cleanup);
+        int deleteBrand = Position(
+            postBody,
+            "if not RegDeleteKeyIncludingSubkeys(HKLM64, BrandKey)",
+            persistAnchor);
+        int flushParent = Position(
+            postBody, "FlushMachineRegistryKey(FamoRootKey)", deleteBrand);
+        int absentReadback = Position(
+            postBody, "RegKeyExists(HKLM64, BrandKey)", flushParent);
+        int crash = Position(
+            postBody,
+            "uninstall-brand-deleted-before-anchor-retire",
+            absentReadback);
+        int retire = Position(
+            postBody, "RetireUninstallDeleteAnchor", crash);
+        Assert.True(
+            machineFlush < cleanup &&
+            cleanup < persistAnchor &&
+            persistAnchor < deleteBrand &&
+            deleteBrand < flushParent &&
+            flushParent < absentReadback &&
+            absentReadback < crash &&
+            crash < retire);
     }
 
     [Fact]
@@ -1383,15 +1540,25 @@ public sealed class InstallerContractTests
         Assert.Contains(
             "HasReadyCommitDebt and (SeedReceiptHash = '')",
             rollbackBody);
+        int rollbackDebt = Position(
+            rollbackBody,
+            "ArmTransactionDebt('UserRollbackDebt'");
         int supersededReadyDebt = Position(
             rollbackBody,
-            "ClearTransactionDebt('UserCleanupDebt', DebtKindSeedCommit)");
+            "ClearTransactionDebt('UserCleanupDebt', DebtKindSeedCommit)",
+            rollbackDebt);
+        int rollbackTerminal = Position(
+            rollbackBody,
+            "TransitionTransactionPhase(PhaseRolledBack)",
+            supersededReadyDebt);
+        int terminalFault = Position(
+            rollbackBody,
+            "rolledback-before-debt-finalize",
+            rollbackTerminal);
         Assert.True(
-            supersededReadyDebt <
-            Position(
-                rollbackBody,
-                "TransitionTransactionPhase(PhaseRolledBack)",
-                supersededReadyDebt));
+            rollbackDebt < supersededReadyDebt &&
+            supersededReadyDebt < rollbackTerminal &&
+            rollbackTerminal < terminalFault);
 
         int binding = Position(health, "function Test-TransactionDebtBinding");
         string bindingBody = health[binding..Position(
@@ -1480,16 +1647,48 @@ public sealed class InstallerContractTests
         int targetDebt =
             Position(rollbackBody, "ArmTransactionDebt('TargetCleanupDebt'",
                 userRollbackDebt);
+        int supersededReadyDebt =
+            Position(
+                rollbackBody,
+                "ClearTransactionDebt('UserCleanupDebt', DebtKindSeedCommit)",
+                targetDebt);
         int rollbackTerminal =
             Position(rollbackBody, "TransitionTransactionPhase(PhaseRolledBack)",
-                targetDebt);
+                supersededReadyDebt);
+        int terminalFault =
+            Position(rollbackBody, "rolledback-before-debt-finalize",
+                rollbackTerminal);
+        int seedRollback =
+            Position(rollbackBody, "--rollback-seed-transaction",
+                terminalFault);
+        int clearUserRollback =
+            Position(rollbackBody, "ClearTransactionDebt('UserRollbackDebt'",
+                seedRollback);
+        int deleteTarget =
+            Position(rollbackBody, "DelTree(ValidatedTarget",
+                clearUserRollback);
         int taskCleanup =
-            Position(rollbackBody, "DeleteRecoveryTask", rollbackTerminal);
+            Position(rollbackBody, "DeleteRecoveryTask", deleteTarget);
         Assert.True(
             rollbackIntent < userRollbackDebt &&
             userRollbackDebt < targetDebt &&
-            targetDebt < rollbackTerminal &&
+            targetDebt < supersededReadyDebt &&
+            supersededReadyDebt < rollbackTerminal &&
+            rollbackTerminal < terminalFault &&
+            terminalFault < seedRollback &&
+            seedRollback < clearUserRollback &&
+            clearUserRollback < deleteTarget &&
             rollbackTerminal < taskCleanup);
+        int rolledBackReentry =
+            Position(rollbackBody, "if JournalPhase = PhaseRolledBack then");
+        int retryDebt =
+            Position(rollbackBody, "RetryRolledBackCleanupDebt",
+                rolledBackReentry);
+        int reentryComplete =
+            Position(rollbackBody, "RollbackComplete := True", retryDebt);
+        Assert.True(
+            rolledBackReentry < retryDebt &&
+            retryDebt < reentryComplete);
         Assert.Contains("rollback compensation remains durably recoverable",
             rollbackBody);
 
@@ -1546,6 +1745,248 @@ public sealed class InstallerContractTests
         Assert.DoesNotContain(
             "RegWriteStringValue(HKLM64, BrandKey, 'CleanupDebt'",
             iss);
+    }
+
+    [Fact]
+    public void Installer_HelperRecoveryOwnsAnEarlyLifetimeMutexBeforeAnyMutation()
+    {
+        string iss = InstallerText("famo-setup.iss");
+
+        Assert.Contains("EarlyTransactionMutexName =", iss);
+        Assert.Contains(
+            "'Global\\FamoInstallerEarlyTransactionV2'", iss);
+        Assert.Contains(
+            "SetupMutex=FamoInstallerTransactionV2,Global\\FamoInstallerTransactionV2",
+            iss);
+
+        int acquire = Position(iss, "function AcquireEarlyTransactionMutex");
+        string acquireBody = iss[acquire..Position(
+            iss, "procedure ReleaseEarlyTransactionMutex", acquire)];
+        Assert.Contains("SetLastError(0)", acquireBody);
+        Assert.Contains("CreateMutexW", acquireBody);
+        Assert.Contains("ErrorAlreadyExists", acquireBody);
+        Assert.Contains("CloseHandle(Candidate)", acquireBody);
+
+        int initialize = Position(iss, "function InitializeSetup");
+        string initializeBody = iss[initialize..Position(
+            iss, "procedure CurStepChanged", initialize)];
+        int setupAcquire = Position(
+            initializeBody, "AcquireEarlyTransactionMutex");
+        Assert.True(
+            setupAcquire < Position(initializeBody, "PinRunningSetupSource") &&
+            setupAcquire <
+            Position(initializeBody, "RequireFixedProtectedInstallRoot") &&
+            setupAcquire <
+            Position(initializeBody, "RecoverHelperCleanupDebt"));
+
+        int deinitialize = Position(iss, "procedure DeinitializeSetup");
+        string deinitializeBody = iss[deinitialize..Position(
+            iss, "function InitializeUninstall", deinitialize)];
+        Assert.Contains("finally", deinitializeBody);
+        Assert.Contains("ReleaseEarlyTransactionMutex", deinitializeBody);
+
+        int uninstall = Position(iss, "function InitializeUninstall");
+        string uninstallBody = iss[uninstall..Position(
+            iss, "procedure DeinitializeUninstall", uninstall)];
+        int uninstallAcquire = Position(
+            uninstallBody, "AcquireEarlyTransactionMutex");
+        Assert.True(
+            uninstallAcquire <
+            Position(uninstallBody, "RequireFixedProtectedInstallRoot") &&
+            uninstallAcquire <
+            Position(uninstallBody, "RecoverHelperCleanupDebt"));
+
+        int deinitializeUninstall = Position(
+            iss, "procedure DeinitializeUninstall");
+        string deinitializeUninstallBody = iss[deinitializeUninstall..Position(
+            iss, "function OnlyLoadedHostResidue", deinitializeUninstall)];
+        Assert.Contains(
+            "ReleaseEarlyTransactionMutex", deinitializeUninstallBody);
+    }
+
+    [Fact]
+    public void Installer_TransientHelpersAreDurablyRecordedAndExactlyRecovered()
+    {
+        string iss = InstallerText("famo-setup.iss");
+
+        Assert.Contains("DebtKindIdentityHelper = 'identity-helper'", iss);
+        Assert.Contains(
+            "DebtKindMachineCleanupHelper = 'machine-cleanup-helper'", iss);
+
+        int debtHelpers = Position(
+            iss, "procedure ArmHelperCleanupDebt",
+            Position(iss, "procedure ClearTransactionDebt"));
+        string armBody = iss[debtHelpers..Position(
+            iss, "procedure ClearHelperCleanupDebt", debtHelpers)];
+        Assert.Contains(
+            "TransactionDebtValue(TransactionId, Kind + ':' + Nonce)",
+            armBody);
+        int write = Position(armBody, "RequireJournalWrite");
+        int flush = Position(armBody, "FlushMachineRegistryKey", write);
+        int readback = Position(armBody, "RegQueryStringValue", flush);
+        Assert.True(write < flush && flush < readback);
+
+        int clearDebt = Position(
+            iss, "procedure ClearHelperCleanupDebt", debtHelpers);
+        string clearDebtBody = iss[clearDebt..Position(
+            iss, "function ValidateExactHelperFile", clearDebt)];
+        Assert.Contains("Existing <> Expected", clearDebtBody);
+        int deleteDebt = Position(clearDebtBody, "RegDeleteValue");
+        int flushClear = Position(
+            clearDebtBody, "FlushMachineRegistryKey", deleteDebt);
+        int absentReadback = Position(
+            clearDebtBody, "RegQueryStringValue", flushClear);
+        Assert.True(deleteDebt < flushClear && flushClear < absentReadback);
+
+        int capture = Position(iss, "procedure CaptureOriginalUserIdentity");
+        string captureBody = iss[capture..Position(
+            iss, "function ReadPinnedManagedFileIdentity", capture)];
+        int identityDebt = Position(
+            captureBody,
+            "ArmHelperCleanupDebt(DebtKindIdentityHelper, PipeId)");
+        int identityCreate = Position(
+            captureBody, "ForceDirectories(PendingRoot)", identityDebt);
+        int identityFault = Position(
+            captureBody, "FailIfRequested('after-identity-helper-debt')",
+            identityDebt);
+        Assert.True(identityDebt < identityFault && identityFault < identityCreate);
+        Assert.Contains(
+            "FailIfRequested('after-identity-helper-debt')", captureBody);
+        Assert.Contains(
+            "FailIfRequested('after-identity-helper-create')", captureBody);
+        Assert.Contains("CleanupExactHelperAndDebt(TransactionId", captureBody);
+        Assert.Contains("DebtKindIdentityHelper, PipeId", captureBody);
+
+        int machine = Position(
+            iss, "function RunTrustedDirectMachineUnregister");
+        string machineBody = iss[machine..Position(
+            iss, "function TransactionJournalKey", machine)];
+        int machineDebt = Position(
+            machineBody,
+            "ArmHelperCleanupDebt(DebtKindMachineCleanupHelper, Nonce)");
+        int machineCreate = Position(
+            machineBody, "ForceDirectories(PendingRoot)", machineDebt);
+        int machineFault = Position(
+            machineBody, "FailIfRequested('after-machine-helper-debt')",
+            machineDebt);
+        Assert.True(machineDebt < machineFault && machineFault < machineCreate);
+        Assert.Contains(
+            "FailIfRequested('after-machine-helper-debt')", machineBody);
+        Assert.Contains(
+            "FailIfRequested('after-machine-helper-create')", machineBody);
+        Assert.Contains("CleanupExactHelperAndDebt(TransactionId", machineBody);
+        Assert.Contains("DebtKindMachineCleanupHelper, Nonce", machineBody);
+
+        int pinOpen = Position(
+            iss, "function TryOpenPinnedHelperDirectory");
+        string pinOpenBody = iss[pinOpen..Position(
+            iss, "function PinExactHelperTree", pinOpen)];
+        Assert.Contains(
+            "FileShareRead or FileShareWrite, 0, OpenExisting",
+            pinOpenBody);
+        Assert.DoesNotContain("FileShareDelete", pinOpenBody);
+        Assert.Contains("FileFlagOpenReparsePoint", pinOpenBody);
+        Assert.Contains("Result := ObjectId <> ''", pinOpenBody);
+
+        int pinTree = Position(iss, "function PinExactHelperTree");
+        string pinTreeBody = iss[pinTree..Position(
+            iss, "procedure FlushHelperCleanupVolume", pinTree)];
+        Assert.Contains(
+            "TryOpenPinnedHelperDirectory(AppRoot", pinTreeBody);
+        Assert.Contains(
+            "TryOpenPinnedHelperDirectory(PendingRoot", pinTreeBody);
+        Assert.Contains(
+            "TryOpenPinnedHelperDirectory(HelperDirectory", pinTreeBody);
+        Assert.Contains(
+            "PathSame(ExtractFileDir(PendingFinalPath), AppFinalPath)",
+            pinTreeBody);
+        Assert.Contains(
+            "PathSame(ExtractFileDir(HelperFinalPath), PendingFinalPath)",
+            pinTreeBody);
+
+        int volumeFlush = Position(
+            iss, "procedure FlushHelperCleanupVolume");
+        string volumeFlushBody = iss[volumeFlush..Position(
+            iss, "function ValidateExactHelperFile", volumeFlush)];
+        Assert.Contains("VolumePath := '\\\\.\\' + Uppercase(Drive)", volumeFlushBody);
+        Assert.Contains("CreateFileW(VolumePath, GenericWrite", volumeFlushBody);
+        Assert.Contains("FlushFileBuffers(VolumeHandle)", volumeFlushBody);
+
+        int cleanup = Position(
+            iss, "function CleanupExactHelperAndDebt",
+            Position(iss, "function DeleteExactHelperFileWithRetries"));
+        string cleanupBody = iss[cleanup..Position(
+            iss, "function RecoverHelperCleanupDebt", cleanup)];
+        int recover = Position(iss, "function RecoverHelperCleanupDebt");
+        string recoverBody = iss[recover..Position(
+            iss, "procedure ClearExactLegacyRegistryValue", recover)];
+        foreach (string exact in new[]
+        {
+            "'identity-' + Nonce",
+            "'FamoIdentityBroker-' + Nonce + '.exe'",
+            "'identity-' + Nonce + '.txt'",
+            "'machine-cleanup-' + Nonce",
+            "'payload-manifest.txt'",
+            "'FamoMachineCleanup.exe'",
+            "ValidateExactHelperDirectory",
+            "DeleteExactHelperFile",
+        })
+        {
+            Assert.Contains(exact, cleanupBody);
+        }
+        Assert.Contains("PinExactHelperTree", cleanupBody);
+        Assert.Contains("ClosePinnedHelperHandle(HelperHandle)", cleanupBody);
+        int removeDirectory = Position(
+            cleanupBody, "RemoveDir(HelperDirectory)");
+        int flushFilesystem = Position(
+            cleanupBody, "FlushHelperCleanupVolume", removeDirectory);
+        int clearRegistryDebt = Position(
+            cleanupBody, "ClearHelperCleanupDebt", flushFilesystem);
+        Assert.True(
+            removeDirectory < flushFilesystem &&
+            flushFilesystem < clearRegistryDebt);
+
+        int missingDirectory = Position(
+            cleanupBody, "if not HelperExists then");
+        string missingDirectoryBody = cleanupBody[missingDirectory..Position(
+            cleanupBody, "if not PinExactHelperTree", missingDirectory)];
+        Assert.True(
+            Position(missingDirectoryBody, "FlushHelperCleanupVolume") <
+            Position(missingDirectoryBody, "ClearHelperCleanupDebt"));
+        Assert.Contains(
+            "FailIfRequested('after-helper-remove-before-volume-flush')",
+            cleanupBody);
+        Assert.Contains(
+            "FailIfRequested('after-helper-volume-flush-before-debt-clear')",
+            cleanupBody);
+        Assert.Contains(
+            "CleanupExactHelperAndDebt(", recoverBody);
+
+        int validate = Position(iss, "function ValidateExactHelperDirectory");
+        string validateBody = iss[validate..Position(
+            iss, "function DeleteExactHelperFile", validate)];
+        Assert.Contains("CompareText(Path, FirstFile)", validateBody);
+        Assert.Contains("CompareText(Path, SecondFile)", validateBody);
+        Assert.Contains("FileAttributeReparsePoint", validateBody);
+
+        string helperDebtAndRecovery = iss[debtHelpers..Position(
+            iss, "procedure ClearExactLegacyRegistryValue", debtHelpers)];
+        Assert.DoesNotContain("DelTree(", helperDebtAndRecovery);
+
+        int initialize = Position(iss, "function InitializeSetup");
+        string initializeBody = iss[initialize..Position(
+            iss, "procedure CurStepChanged", initialize)];
+        int startupRecovery = Position(
+            initializeBody, "RecoverHelperCleanupDebt");
+        Assert.True(
+            startupRecovery < Position(initializeBody, "ResumeId :=") &&
+            startupRecovery <
+            Position(initializeBody, "FindRecoverableTransaction"));
+
+        int uninstall = Position(iss, "function InitializeUninstall");
+        string uninstallBody = iss[uninstall..Position(
+            iss, "function OnlyLoadedHostResidue", uninstall)];
+        Assert.Contains("RecoverHelperCleanupDebt", uninstallBody);
     }
 
     [Fact]

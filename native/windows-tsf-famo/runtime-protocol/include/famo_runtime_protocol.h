@@ -63,6 +63,10 @@ enum class Command : uint16_t {
   // Terminal, authenticated teardown for a TSF activation that can no longer
   // apply an outstanding result. It never represents a successful host apply.
   AbandonConnection = 22,
+  // Terminal, authenticated teardown for one exact delivery and logical
+  // session. The payload is DeliveryReference and the frame correlation is
+  // the owning connection identity. Sibling sessions in that epoch survive.
+  AbandonSession = 23,
 };
 
 enum class Status : uint32_t {
@@ -77,6 +81,11 @@ enum class Status : uint32_t {
   // The business mutation has happened, but the engine still owes the exact
   // final snapshot. Claiming this delivery may only issue RECOVER.
   RecoveryPending = 8,
+  // The runtime can no longer produce the authoritative final snapshot for
+  // this delivery. Its authenticated logical session and exact delivery must
+  // be abandoned; sibling sessions survive, and the business action must never
+  // be replayed or treated as unhandled.
+  DeliveryFailed = 9,
 };
 
 enum class ControlState : uint32_t {
@@ -109,6 +118,9 @@ struct Correlation {
   uint64_t client_id = 0;
   uint64_t activation_generation = 0;
   uint64_t connection_generation = 0;
+  // Within one client connection epoch, each new logical session uses a
+  // strictly increasing ID. Retrying an already-open session is idempotent;
+  // an older ID is a stale replay even after its bounded tombstone expires.
   uint64_t session_id = 0;
   uint64_t session_generation = 0;
   uint64_t sequence = 0;

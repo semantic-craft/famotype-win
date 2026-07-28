@@ -69,6 +69,32 @@ struct RuntimeServiceTestAccess {
     return service.abandoned_epochs_.size();
   }
 
+  static size_t AbandonedSessionCount(RuntimeService &service) {
+    std::lock_guard lock(service.mutex_);
+    return service.abandoned_sessions_.size();
+  }
+
+  static int32_t ProcessCount(RuntimeService &service,
+                              const Correlation &correlation) {
+    std::lock_guard lock(service.mutex_);
+    const RuntimeService::SessionKey key{
+        correlation.client_id, correlation.activation_generation,
+        correlation.connection_generation, correlation.session_id,
+        correlation.session_generation};
+    const auto found = service.sessions_.find(key);
+    if (found == service.sessions_.end())
+      return -1;
+    static constexpr char kOptionName[] = "test_process_count";
+    const FamoUtf8String option{
+        sizeof(FamoUtf8String), kOptionName,
+        static_cast<uint32_t>(sizeof(kOptionName) - 1)};
+    int32_t count = -1;
+    return service.engine_.GetOption(found->second.context, &option, &count) ==
+                   FAMO_ENGINE_OK
+               ? count
+               : -1;
+  }
+
   static void SetReadiness(RuntimeService &service,
                            RuntimeReadiness readiness) {
     service.readiness_.store(readiness);
@@ -88,6 +114,10 @@ struct RuntimeServiceTestAccess {
 
   static constexpr size_t MaxSessionsPerOwner() {
     return RuntimeService::kMaxSessionsPerOwner;
+  }
+
+  static constexpr size_t MaxAbandonedSessionsPerOwner() {
+    return RuntimeService::kMaxAbandonedSessionsPerOwner;
   }
 };
 
@@ -120,7 +150,11 @@ Frame Session(Command command, uint64_t sequence) {
 }
 
 Frame DeliveryControl(Command command, const DeliveryReference &reference) {
-  Frame frame = Connection(command);
+  Frame frame;
+  frame.command = command;
+  const Correlation &target = reference.correlation;
+  frame.correlation = {target.client_id, target.activation_generation,
+                       target.connection_generation, 0, 0, 0};
   EncodeDeliveryReference(reference, &frame.payload);
   return frame;
 }
@@ -339,6 +373,65 @@ int LifecycleCapsAndDeadOwnerCleanup(const PipeClientIdentity &owner) {
   return 0;
 }
 
+int AbandonedSessionHighWaterRejectsEvictedReplay(
+    const PipeClientIdentity &owner) {
+  constexpr uint64_t kClientId = 7000;
+  std::string error;
+  RuntimeService service;
+  CHECK(service.Start(L"FamoTestEngine.dll", "", &error));
+  CHECK(service.InitializeControlState() == ControlError::None);
+  CHECK(service.DispatchForDelivery(
+                    ClientConnection(Command::Hello, kClientId), owner)
+            .status == Status::Ok);
+
+  CHECK(SetEnvironmentVariableW(
+      L"FAMO_TEST_RUNTIME_MALFORMED_FINAL_REPLY", L"1"));
+  const uint64_t abandon_count =
+      RuntimeServiceTestAccess::MaxAbandonedSessionsPerOwner() + 1;
+  for (uint64_t session_id = 1; session_id <= abandon_count; ++session_id) {
+    Frame open =
+        ClientSession(Command::OpenSession, kClientId, session_id);
+    CHECK(EncodeOpenSession("test", &open.payload, &error));
+    CHECK(service.DispatchForDelivery(open, owner).status == Status::Ok);
+
+    Frame key =
+        ClientSession(Command::ProcessKey, kClientId, session_id, 2);
+    CHECK(EncodeKeyEvent({static_cast<uint32_t>('A'), 0, 0, 1, session_id},
+                         &key.payload));
+    const DeliveryReference reference{key.command, key.correlation};
+    CHECK(service.DispatchForDelivery(key, owner).status == Status::Prepared);
+    CHECK(service.DispatchForDelivery(
+                      DeliveryControl(Command::ExecutePrepared, reference),
+                      owner)
+              .status == Status::DeliveryFailed);
+    CHECK(service.DispatchForDelivery(
+                      DeliveryControl(Command::AbandonSession, reference),
+                      owner)
+              .status == Status::Ok);
+  }
+  CHECK(SetEnvironmentVariableW(
+      L"FAMO_TEST_RUNTIME_MALFORMED_FINAL_REPLY", nullptr));
+  CHECK(RuntimeServiceTestAccess::AbandonedSessionCount(service) ==
+        RuntimeServiceTestAccess::MaxAbandonedSessionsPerOwner());
+
+  Frame evicted_replay =
+      ClientSession(Command::OpenSession, kClientId, 1);
+  CHECK(EncodeOpenSession("test", &evicted_replay.payload, &error));
+  CHECK(service.DispatchForDelivery(evicted_replay, owner).status ==
+        Status::StaleRequest);
+
+  Frame next_open =
+      ClientSession(Command::OpenSession, kClientId, abandon_count + 1);
+  CHECK(EncodeOpenSession("test", &next_open.payload, &error));
+  CHECK(service.DispatchForDelivery(next_open, owner).status == Status::Ok);
+  CHECK(service.DispatchForDelivery(
+                    ClientConnection(Command::AbandonConnection, kClientId),
+                    owner)
+            .status == Status::Ok);
+  service.Stop();
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -350,6 +443,7 @@ int main(int argc, char **argv) {
   const PipeClientIdentity owner = CurrentProcessIdentity();
   CHECK(owner);
   CHECK(LifecycleCapsAndDeadOwnerCleanup(owner) == 0);
+  CHECK(AbandonedSessionHighWaterRejectsEvictedReplay(owner) == 0);
 
   RuntimeService service;
   CHECK(service.Start(L"FamoTestEngine.dll", "", &error));
@@ -389,12 +483,16 @@ int main(int argc, char **argv) {
   CHECK(service.DispatchForDelivery(
                     DeliveryControl(Command::ClaimResult, n_reference), owner)
             .status == Status::StaleRequest);
+  CHECK(RuntimeServiceTestAccess::ProcessCount(service, key_n.correlation) ==
+        1);
 
   Frame commit = Session(Command::ProcessKey, 3);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>(' '), 0, 0, 1, 2},
                        &commit.payload));
   const DeliveryReference commit_reference{commit.command,
                                            commit.correlation};
+  const size_t abandoned_before_commit =
+      RuntimeServiceTestAccess::AbandonedSessionCount(service);
   CHECK(service.DispatchForDelivery(commit, owner).status ==
         Status::Prepared);
 
@@ -410,14 +508,39 @@ int main(int argc, char **argv) {
   const Frame recovery_pending = service.DispatchForDelivery(
       DeliveryControl(Command::ExecutePrepared, commit_reference), owner);
   CHECK(recovery_pending.status == Status::RecoveryPending);
+  CHECK(RuntimeServiceTestAccess::ProcessCount(service, commit.correlation) ==
+        2);
   CHECK(_putenv_s("FAMO_TEST_RUNTIME_COPY_FAILURE", "") == 0);
+
+  CHECK(_putenv_s(
+            "FAMO_TEST_RUNTIME_DELIVERY_ENCODING_ALLOCATION_FAILURE", "1") ==
+        0);
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const Frame encoding_pending = service.DispatchForDelivery(
+        DeliveryControl(Command::ClaimResult, commit_reference), owner);
+    CHECK(encoding_pending.status == Status::RecoveryPending);
+    CHECK(RuntimeServiceTestAccess::ProcessCount(service, commit.correlation) ==
+          2);
+    CHECK(RuntimeServiceTestAccess::DeliveryCount(service) == 1);
+    CHECK(RuntimeServiceTestAccess::AbandonedSessionCount(service) ==
+          abandoned_before_commit);
+  }
+  CHECK(_putenv_s(
+            "FAMO_TEST_RUNTIME_DELIVERY_ENCODING_ALLOCATION_FAILURE", "") ==
+        0);
 
   const Frame commit_final = service.DispatchForDelivery(
       DeliveryControl(Command::ClaimResult, commit_reference), owner);
   CHECK(commit_final.status == Status::Ok);
+  CHECK(commit_final.command == commit.command);
+  CHECK(commit_final.correlation == commit.correlation);
   CHECK(DecodeComposition(commit_final.payload, &composition, &error));
   CHECK(composition.handled && composition.commit == "n" &&
         composition.preedit.empty());
+  CHECK(RuntimeServiceTestAccess::ProcessCount(service, commit.correlation) ==
+        2);
+  CHECK(RuntimeServiceTestAccess::AbandonedSessionCount(service) ==
+        abandoned_before_commit);
   const Frame commit_duplicate = service.DispatchForDelivery(
       DeliveryControl(Command::ClaimResult, commit_reference), owner);
   CHECK(commit_duplicate.command == commit_final.command);
@@ -590,44 +713,106 @@ int main(int argc, char **argv) {
                     DeliveryControl(Command::AckResult, w_reference), owner)
             .status == Status::Ok);
 
+  Frame sibling_open;
+  sibling_open.command = Command::OpenSession;
+  sibling_open.correlation = {101, 102, 103, 204, 205, 1};
+  CHECK(EncodeOpenSession("test", &sibling_open.payload, &error));
+  CHECK(service.DispatchForDelivery(sibling_open, owner).status == Status::Ok);
+
   Frame terminal_key = Session(Command::ProcessKey, 33);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('Q'), 0, 0, 1, 7},
                        &terminal_key.payload));
   const DeliveryReference terminal_reference{terminal_key.command,
                                              terminal_key.correlation};
+  Frame sibling_key;
+  sibling_key.command = Command::ProcessKey;
+  sibling_key.correlation = {101, 102, 103, 204, 205, 2};
+  CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 8},
+                       &sibling_key.payload));
+  const DeliveryReference sibling_reference{sibling_key.command,
+                                             sibling_key.correlation};
   CHECK(service.DispatchForDelivery(terminal_key, owner).status ==
         Status::Prepared);
-  CHECK(SetEnvironmentVariableW(
-      L"FAMO_TEST_RUNTIME_MALFORMED_FINAL_REPLY", L"1"));
+  CHECK(service.DispatchForDelivery(sibling_key, owner).status ==
+        Status::Prepared);
+
+  // Both logical sessions have already mutated inside the same authenticated
+  // connection epoch and owe their exact recovered snapshots.
+  CHECK(SetEnvironmentVariableW(L"FAMO_TEST_RUNTIME_COPY_FAILURE", L"1"));
   CHECK(service.DispatchForDelivery(
                     DeliveryControl(Command::ExecutePrepared,
                                     terminal_reference),
                     owner)
-            .status == Status::Unavailable);
-  CHECK(SetEnvironmentVariableW(
-      L"FAMO_TEST_RUNTIME_MALFORMED_FINAL_REPLY", nullptr));
+            .status == Status::RecoveryPending);
+  CHECK(service.DispatchForDelivery(
+                    DeliveryControl(Command::ExecutePrepared,
+                                    sibling_reference),
+                    owner)
+            .status == Status::RecoveryPending);
   CHECK(service.DispatchForDelivery(
                     DeliveryControl(Command::ClaimResult,
                                     terminal_reference),
                     owner)
-            .status == Status::Unavailable);
+            .status == Status::RecoveryPending);
   CHECK(service.DispatchForDelivery(
                     DeliveryControl(Command::ClaimResult,
                                     terminal_reference),
                     owner)
-            .status == Status::Unavailable);
-  const Frame abandon = Connection(Command::AbandonConnection);
-  CHECK(service.DispatchForDelivery(abandon, intruder).status ==
+            .status == Status::DeliveryFailed);
+  CHECK(SetEnvironmentVariableW(L"FAMO_TEST_RUNTIME_COPY_FAILURE", nullptr));
+
+  DeliveryReference wrong_delivery = terminal_reference;
+  ++wrong_delivery.correlation.sequence;
+  CHECK(service.DispatchForDelivery(
+                    DeliveryControl(Command::AbandonSession, wrong_delivery),
+                    owner)
+            .status == Status::StaleRequest);
+  CHECK(RuntimeServiceTestAccess::DeliveryCount(service) == 2);
+  CHECK(RuntimeServiceTestAccess::SessionCount(service) == 2);
+
+  const Frame abandon_session =
+      DeliveryControl(Command::AbandonSession, terminal_reference);
+  CHECK(service.DispatchForDelivery(abandon_session, intruder).status ==
         Status::StaleRequest);
-  CHECK(service.DispatchForDelivery(abandon, owner).status == Status::Ok);
-  CHECK(service.DispatchForDelivery(abandon, owner).status == Status::Ok);
-  CHECK(RuntimeServiceTestAccess::DeliveryCount(service) == 0);
-  CHECK(RuntimeServiceTestAccess::SessionCount(service) == 0);
+  CHECK(service.DispatchForDelivery(abandon_session, owner).status ==
+        Status::Ok);
+  CHECK(service.DispatchForDelivery(
+                    DeliveryControl(Command::AbandonSession, wrong_delivery),
+                    owner)
+            .status == Status::StaleRequest);
+  CHECK(service.DispatchForDelivery(abandon_session, owner).status ==
+        Status::Ok);
+  CHECK(RuntimeServiceTestAccess::DeliveryCount(service) == 1);
+  CHECK(RuntimeServiceTestAccess::SessionCount(service) == 1);
   CHECK(service.DispatchForDelivery(
                     DeliveryControl(Command::ClaimResult,
                                     terminal_reference),
                     owner)
             .status == Status::StaleRequest);
+  CHECK(service.DispatchForDelivery(open, owner).status ==
+        Status::StaleRequest);
+  CHECK(service.DispatchForDelivery(Connection(Command::Hello), owner).status ==
+        Status::Ok);
+
+  const Frame sibling_final = service.DispatchForDelivery(
+      DeliveryControl(Command::ClaimResult, sibling_reference), owner);
+  CHECK(sibling_final.status == Status::Ok);
+  CHECK(DecodeComposition(sibling_final.payload, &composition, &error));
+  CHECK(composition.handled && composition.preedit == "n");
+  CHECK(service.DispatchForDelivery(
+                    DeliveryControl(Command::AckResult, sibling_reference),
+                    owner)
+            .status == Status::Ok);
+  Frame sibling_close;
+  sibling_close.command = Command::CloseSession;
+  sibling_close.correlation = {101, 102, 103, 204, 205, 3};
+  CHECK(service.DispatchForDelivery(sibling_close, owner).status ==
+        Status::Ok);
+
+  const Frame abandon = Connection(Command::AbandonConnection);
+  CHECK(service.DispatchForDelivery(abandon, owner).status == Status::Ok);
+  CHECK(RuntimeServiceTestAccess::DeliveryCount(service) == 0);
+  CHECK(RuntimeServiceTestAccess::SessionCount(service) == 0);
   CHECK(service.DispatchForDelivery(Connection(Command::Hello), owner).status ==
         Status::StaleRequest);
   Frame next_epoch = Connection(Command::Hello);

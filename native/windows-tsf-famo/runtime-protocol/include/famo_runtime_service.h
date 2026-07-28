@@ -120,6 +120,8 @@ private:
   static constexpr size_t kMaxRetiredContexts = 256;
   static constexpr size_t kMaxAbandonedEpochsPerOwner = 32;
   static constexpr size_t kMaxAbandonedEpochs = 512;
+  static constexpr size_t kMaxAbandonedSessionsPerOwner = 64;
+  static constexpr size_t kMaxAbandonedSessions = 512;
 
   struct SessionKey {
     uint64_t client_id;
@@ -161,11 +163,16 @@ private:
     uint64_t activation_generation = 0;
     uint64_t connection_generation = 0;
     PipeClientIdentity owner;
+    uint64_t max_session_id = 0;
   };
   struct AbandonedEpoch {
     uint64_t client_id = 0;
     uint64_t activation_generation = 0;
     uint64_t connection_generation = 0;
+    PipeClientIdentity owner;
+  };
+  struct AbandonedSession {
+    DeliveryReference reference;
     PipeClientIdentity owner;
   };
   enum class DeliveryStage {
@@ -182,7 +189,7 @@ private:
     Frame final_reply;
     PipeClientIdentity owner;
     DeliveryStage stage = DeliveryStage::Prepared;
-    uint32_t encoding_attempts = 0;
+    uint32_t recovery_attempts = 0;
   };
   struct AcknowledgedDelivery {
     DeliveryReference reference;
@@ -205,10 +212,17 @@ private:
                                   const PipeClientIdentity &owner);
   Frame AbandonConnectionLocked(const Frame &request,
                                 const PipeClientIdentity &owner);
+  Frame AbandonSessionLocked(const Frame &request,
+                             const DeliveryReference &reference,
+                             const PipeClientIdentity &owner);
   bool IsAbandonedEpochLocked(const Correlation &correlation,
                               const PipeClientIdentity *owner = nullptr) const;
   bool RememberAbandonedEpochLocked(
       const Correlation &correlation, const PipeClientIdentity &owner);
+  const AbandonedSession *FindAbandonedSessionLocked(
+      const Correlation &correlation) const;
+  bool RememberAbandonedSessionLocked(
+      const DeliveryReference &reference, const PipeClientIdentity &owner);
   bool EnsureRetiredCapacityLocked(size_t additional);
   bool DestroyOrRetireContextLocked(FamoEngineContext *context);
   void RetryRetiredContextsLocked();
@@ -255,6 +269,7 @@ private:
   FamoEngineHost engine_;
   std::map<uint64_t, ClientEpoch> clients_;
   std::vector<AbandonedEpoch> abandoned_epochs_;
+  std::vector<AbandonedSession> abandoned_sessions_;
   std::map<SessionKey, Session> sessions_;
   std::map<SessionKey, std::shared_ptr<UiSessionState>> ui_sessions_;
   // Replacement commits before old contexts retire. A transient destroy

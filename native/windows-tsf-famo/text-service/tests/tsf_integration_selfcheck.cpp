@@ -251,6 +251,332 @@ bool AllocationBoundariesReleaseReferences(TextServiceModule *module) {
   return true;
 }
 
+bool ForcedDeactivationAbandonsTerminalDelivery(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"copy-failure", 0, 2, true, 0, 1));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  TestDocument first;
+  TestDocument second;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &first));
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &second));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  ComPtr<ITfThreadMgrEventSink> thread_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfThreadMgrEventSink,
+      reinterpret_cast<void **>(thread_sink.put()))));
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), first.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+  const auto second_ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), second.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < second_ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < second_ready_deadline);
+
+  {
+    ScopedEnvironment pause_recovery(
+        "FAMO_TEST_PAUSE_DELIVERY_RECOVERY", "1");
+    CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(first.document.get(), second.document.get())));
+    CHECK(SendKey(key_sink.get(), first.context.get(), 'N', true));
+    CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+    CHECK(SendKey(key_sink.get(), second.context.get(), 'N', true));
+    CHECK(first.store->text().empty());
+    CHECK(second.store->text().empty());
+    ScopedEnvironment fail_deactivate(
+        "FAMO_TEST_DEACTIVATE_ALLOCATION_FAILURE", "1");
+    CHECK(service->Deactivate() == E_OUTOFMEMORY);
+  }
+
+  thread_sink.reset();
+  key_sink.reset();
+  service.reset();
+  CHECK(SUCCEEDED(first.document->Pop(TF_POPF_ALL)));
+  CHECK(SUCCEEDED(second.document->Pop(TF_POPF_ALL)));
+  first.context.reset();
+  second.context.reset();
+  first.document.reset();
+  second.document.reset();
+  first.store.reset();
+  second.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  CHECK(module->CanUnload());
+  CHECK(runtime.Finish());
+  return true;
+}
+
+bool ForcedDeactivationAttemptsUnavailableEpochOnce(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"no-reply", 0, 1));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  TestDocument first;
+  TestDocument second;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &first));
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &second));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  ComPtr<ITfThreadMgrEventSink> thread_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfThreadMgrEventSink,
+      reinterpret_cast<void **>(thread_sink.put()))));
+
+  auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), first.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), second.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  {
+    ScopedEnvironment pause_recovery(
+        "FAMO_TEST_PAUSE_DELIVERY_RECOVERY", "1");
+    CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(first.document.get(), second.document.get())));
+    CHECK(SendKey(key_sink.get(), first.context.get(), 'N', false));
+    CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+    CHECK(SendKey(key_sink.get(), second.context.get(), 'N', false));
+    ScopedEnvironment fail_deactivate(
+        "FAMO_TEST_DEACTIVATE_ALLOCATION_FAILURE", "1");
+    CHECK(service->Deactivate() == E_OUTOFMEMORY);
+  }
+  CHECK(module->TerminalCleanupConnectAttemptsForTest() == 1);
+
+  thread_sink.reset();
+  key_sink.reset();
+  service.reset();
+  CHECK(SUCCEEDED(first.document->Pop(TF_POPF_ALL)));
+  CHECK(SUCCEEDED(second.document->Pop(TF_POPF_ALL)));
+  first.context.reset();
+  second.context.reset();
+  first.document.reset();
+  second.document.reset();
+  first.store.reset();
+  second.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  CHECK(module->CanUnload());
+  CHECK(runtime.Finish());
+  return true;
+}
+
+bool ForcedDeactivationAbandonsIdleContexts(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 1, true, 0, 1, 0, 0));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  TestDocument first;
+  TestDocument second;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &first));
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &second));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  ComPtr<ITfThreadMgrEventSink> thread_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfThreadMgrEventSink,
+      reinterpret_cast<void **>(thread_sink.put()))));
+
+  auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), first.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), second.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  {
+    ScopedEnvironment fail_deactivate(
+        "FAMO_TEST_DEACTIVATE_ALLOCATION_FAILURE", "1");
+    CHECK(service->Deactivate() == E_OUTOFMEMORY);
+  }
+  CHECK(module->TerminalCleanupConnectAttemptsForTest() == 1);
+
+  thread_sink.reset();
+  key_sink.reset();
+  service.reset();
+  CHECK(SUCCEEDED(first.document->Pop(TF_POPF_ALL)));
+  CHECK(SUCCEEDED(second.document->Pop(TF_POPF_ALL)));
+  first.context.reset();
+  second.context.reset();
+  first.document.reset();
+  second.document.reset();
+  first.store.reset();
+  second.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  CHECK(module->CanUnload());
+  CHECK(runtime.Finish());
+  return true;
+}
+
+bool TerminalPublicationSlotSerializesFailures(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"copy-failure-sticky", 0, 1, true, 0,
+                      2));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  TestDocument first;
+  TestDocument second;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &first));
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &second));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  ComPtr<ITfThreadMgrEventSink> thread_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfThreadMgrEventSink,
+      reinterpret_cast<void **>(thread_sink.put()))));
+
+  auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), first.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), second.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  {
+    ScopedEnvironment pause_recovery(
+        "FAMO_TEST_PAUSE_DELIVERY_RECOVERY", "1");
+    CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(first.document.get(), second.document.get())));
+    CHECK(SendKey(key_sink.get(), first.context.get(), 'N', true));
+    CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+    CHECK(SendKey(key_sink.get(), second.context.get(), 'N', true));
+  }
+
+  // Do not pump the recovery window until the first terminal result occupies
+  // the allocation-free slot and the single worker reaches the second one.
+  Sleep(200);
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    PumpMessages();
+    Sleep(5);
+  }
+
+  thread_sink.reset();
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(first.document->Pop(TF_POPF_ALL)));
+  CHECK(SUCCEEDED(second.document->Pop(TF_POPF_ALL)));
+  first.context.reset();
+  second.context.reset();
+  first.document.reset();
+  second.document.reset();
+  first.store.reset();
+  second.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  CHECK(module->CanUnload());
+  // Exactly two per-session abandons prove neither terminal publication was
+  // overwritten and no connection-wide cleanup was needed at deactivation.
+  CHECK(runtime.Finish());
+  return true;
+}
+
 bool DisabledInlinePreeditStaysOutOfHost(TextServiceModule *module,
                                          const wchar_t *runtime_path) {
   RuntimeProcess runtime;
@@ -551,10 +877,10 @@ bool RecoveryEditFailureIsCleanedBeforeReconnect(
   return passed && runtime_finished;
 }
 
-bool TerminalDeactivateAbandonsAmbiguousDelivery(
+bool TerminalDeliveryRecoversWithoutDeactivation(
     TextServiceModule *module, const wchar_t *runtime_path) {
   RuntimeProcess runtime;
-  CHECK(runtime.Start(runtime_path, L"copy-failure", 0, 2));
+  CHECK(runtime.Start(runtime_path, L"copy-failure", 0, 1));
   const auto started = std::chrono::steady_clock::now();
   const bool passed = RunTextStoreSession(
       module, [](ITfKeyEventSink *key_sink, ITfContext *context,
@@ -565,21 +891,146 @@ bool TerminalDeactivateAbandonsAmbiguousDelivery(
         // the host must not invent an empty commit or replay the action.
         CHECK(SendKey(key_sink, context, 'N', true));
         CHECK(store->text().empty());
-        CHECK(TestKey(key_sink, context, 'A', false));
+        const auto ready_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!TestKey(key_sink, context, 'A', true) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+          PumpMessages();
+          Sleep(5);
+        }
+        CHECK(std::chrono::steady_clock::now() < ready_deadline);
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(store->text() == L"a");
         return true;
       });
   CHECK(passed);
   CHECK(std::chrono::steady_clock::now() - started <
         std::chrono::seconds(4));
-  // The test host is still running here. Deactivate must nevertheless have
-  // released every TSF/COM reference, while AbandonConnection reclaimed the
-  // runtime delivery and session in the still-live runtime process.
+  // The failed epoch was abandoned and replaced while the TSF activation and
+  // test host stayed alive. Deactivation now has no terminal delivery debt.
   CHECK(module->CanUnload());
   CHECK(runtime.Finish());
   return true;
 }
 
-bool TerminalAbandonDebtRetriesOnNextActivation(
+bool TerminalSessionPreservesSiblingRecovery(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"copy-failure", 0, 1, true, 0, 1));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  TestDocument first;
+  TestDocument second;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &first));
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &second));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  ComPtr<ITfThreadMgrEventSink> thread_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfThreadMgrEventSink, reinterpret_cast<void **>(thread_sink.put()))));
+
+  auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), first.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), second.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  // Hold recovery until both sessions in the same authenticated epoch have
+  // mutated and are RecoveryPending. The first terminal-result allocation is
+  // forced to fail before any destructive abandon; its retry must not replay
+  // the business action or send a second terminal command.
+  {
+    ScopedEnvironment pause_recovery(
+        "FAMO_TEST_PAUSE_DELIVERY_RECOVERY", "1");
+    ScopedEnvironment fail_terminal_publication(
+        "FAMO_TEST_TERMINAL_RESULT_ALLOCATION_FAILURE_ONCE", "1");
+    CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(first.document.get(), second.document.get())));
+    CHECK(SendKey(key_sink.get(), first.context.get(), 'N', true));
+    CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+    CHECK(SUCCEEDED(
+        thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+    CHECK(SendKey(key_sink.get(), second.context.get(), 'N', true));
+  }
+
+  CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(first.document.get(), second.document.get())));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(second.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(second.document.get(), first.document.get())));
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!TestKey(key_sink.get(), second.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SendKey(key_sink.get(), second.context.get(), ' ', true));
+  CHECK(second.store->text() == L"n");
+
+  // Session A alone was tombstoned and reopened. Its lost N action is neither
+  // replayed nor allowed to erase B's exact recovered N snapshot.
+  CHECK(SUCCEEDED(thread_manager->SetFocus(first.document.get())));
+  CHECK(SUCCEEDED(
+      thread_sink->OnSetFocus(first.document.get(), second.document.get())));
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!TestKey(key_sink.get(), first.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SendKey(key_sink.get(), first.context.get(), 'A', true));
+  CHECK(SendKey(key_sink.get(), first.context.get(), ' ', true));
+  CHECK(first.store->text() == L"a");
+
+  thread_sink.reset();
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(first.document->Pop(TF_POPF_ALL)));
+  CHECK(SUCCEEDED(second.document->Pop(TF_POPF_ALL)));
+  first.context.reset();
+  second.context.reset();
+  first.document.reset();
+  second.document.reset();
+  first.store.reset();
+  second.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  CHECK(runtime.Finish());
+  return true;
+}
+
+bool TerminalAbandonLeavesNextActivationIndependent(
     TextServiceModule *module, const wchar_t *runtime_path) {
   RuntimeProcess unavailable_after_disconnect;
   CHECK(unavailable_after_disconnect.Start(runtime_path, L"copy-failure", 0,
@@ -596,13 +1047,10 @@ bool TerminalAbandonDebtRetriesOnNextActivation(
   CHECK(module->CanUnload());
   CHECK(unavailable_after_disconnect.Finish());
 
-  // The first runtime had no second server instance, so Deactivate could not
-  // reconnect to issue AbandonConnection and recorded exact in-process debt.
-  // The next activation must retire that old epoch before opening its own
-  // connection. Two sequential server instances make a missing retry visible:
-  // the runtime would otherwise wait forever for the unused second instance.
+  // In-activation terminal recovery used the authenticated live pipe, so the
+  // next activation must not inherit or retry an already-resolved debt.
   RuntimeProcess restarted;
-  CHECK(restarted.Start(runtime_path, L"none", 0, 2));
+  CHECK(restarted.Start(runtime_path, L"none", 0, 1));
   CHECK(RunTextStoreSession(
       module, [](ITfKeyEventSink *key_sink, ITfContext *context,
                  FakeTextStore *store, ITfTextInputProcessorEx *,
@@ -1155,6 +1603,8 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   TextServiceModule module;
   CHECK(module.Load(module_path));
   CHECK(AllocationBoundariesReleaseReferences(&module));
+  CHECK(ForcedDeactivationAbandonsTerminalDelivery(&module, runtime_path));
+  CHECK(TerminalPublicationSlotSerializesFailures(&module, runtime_path));
   CHECK(MissingRuntimeFailsOpen(&module));
   CHECK(HealthyRoundtrip(&module, runtime_path));
   CHECK(DisabledInlinePreeditStaysOutOfHost(&module, runtime_path));
@@ -1168,8 +1618,10 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(FaultFailsOpen(&module, runtime_path, L"malformed"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"late"));
   CHECK(RecoveryEditFailureIsCleanedBeforeReconnect(&module, runtime_path));
-  CHECK(TerminalDeactivateAbandonsAmbiguousDelivery(&module, runtime_path));
-  CHECK(TerminalAbandonDebtRetriesOnNextActivation(&module, runtime_path));
+  CHECK(TerminalDeliveryRecoversWithoutDeactivation(&module, runtime_path));
+  CHECK(TerminalSessionPreservesSiblingRecovery(&module, runtime_path));
+  CHECK(TerminalAbandonLeavesNextActivationIndependent(&module,
+                                                       runtime_path));
   CHECK(CloseDuringWarmupInvalidatesConnection(&module, runtime_path));
   CHECK(MultiContextFaultRecoversEveryComposition(&module, runtime_path));
   CHECK(FocusChurnRejectsObsoleteWarmup(&module, runtime_path));
@@ -1179,6 +1631,9 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(ExhaustedWarmupRetriesOnNextKeySameFocus(&module, runtime_path));
   CHECK(ReactivationRejectsOldGeneration(&module, runtime_path));
   CHECK(ForegroundFocusRecyclesRuntimeConnection(&module, runtime_path));
+  CHECK(ForcedDeactivationAbandonsIdleContexts(&module, runtime_path));
+  CHECK(ForcedDeactivationAttemptsUnavailableEpochOnce(&module,
+                                                       runtime_path));
   CHECK(module.CanUnload());
   return true;
 }

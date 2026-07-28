@@ -29,7 +29,7 @@ native/windows-tsf-famo/
 |---|---|---|---|
 | `weasel.dll` TSF TIP | 进程内热路径 | **复用，最小改动** | — |
 | `WeaselServer.exe` 候选窗 | 独立进程 | 现代化 Direct2D 渲染 + 读 Famo store | Windows / VS C++ |
-| Famo 设置 store | 注册表 / `%LOCALAPPDATA%\Famo` JSON | 新增 | 跨平台 |
+| Famo 设置 store | 注册表 / `%LOCALAPPDATA%\Famo` JSON | 新增 | Windows / .NET |
 | WinUI 3 设置面板 | 独立 app | 新建 | Windows / VS + WinAppSDK |
 
 ## 两档生效模型（PRD §2.3）

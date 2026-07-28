@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 
+#include "../engines/rime/keymap.h"
 #include "../famo_engine_api.h"
 #include "../host/famo_engine_host.h"
 
@@ -172,6 +173,92 @@ void FAMO_ENGINE_CALL ThrowingNotification(
   throw std::runtime_error("notification handler failure");
 }
 
+struct ReentrantNotificationCapture {
+  FamoEngineHost* host = nullptr;
+  FamoUtf8String schema{};
+  std::atomic_bool armed{false};
+  std::atomic_bool attempted{false};
+  std::atomic<int32_t> result{FAMO_ENGINE_OK};
+  FamoEngineContext* context = nullptr;
+};
+
+void FAMO_ENGINE_CALL ReentrantNotification(
+    void* user_data,
+    FamoEngineContext* context,
+    const FamoUtf8String* /*type*/,
+    const FamoUtf8String* /*value*/,
+    const FamoUtf8String* /*label*/) noexcept {
+  auto* capture =
+      static_cast<ReentrantNotificationCapture*>(user_data);
+  if (!capture || context || !capture->host ||
+      !capture->armed.load() || capture->attempted.exchange(true)) {
+    return;
+  }
+  FamoEngineContext* nested =
+      reinterpret_cast<FamoEngineContext*>(static_cast<uintptr_t>(1));
+  capture->result.store(
+      capture->host->v2_api().create_context(
+          &capture->schema, &nested));
+  capture->context = nested;
+}
+
+void FAMO_ENGINE_CALL ReplacementNotification(
+    void* /*user_data*/,
+    FamoEngineContext* /*context*/,
+    const FamoUtf8String* /*type*/,
+    const FamoUtf8String* /*value*/,
+    const FamoUtf8String* /*label*/) noexcept {}
+
+struct ReentrantLifecycleCapture {
+  const FamoEngineApiV2* v2 = nullptr;
+  const FamoEngineApi* legacy = nullptr;
+  const FamoEngineHostApi* host = nullptr;
+  FamoUtf8String root{};
+  std::atomic_uint32_t calls{0};
+  std::atomic_bool attempted{false};
+  std::atomic<int32_t> destroy_result{FAMO_ENGINE_OK};
+  std::atomic<int32_t> shutdown_result{FAMO_ENGINE_OK};
+  std::atomic<int32_t> unregister_result{FAMO_ENGINE_OK};
+  std::atomic<int32_t> replace_result{FAMO_ENGINE_OK};
+  std::atomic<int32_t> initialize_result{FAMO_ENGINE_OK};
+  std::atomic<int32_t> legacy_initialize_result{FAMO_ENGINE_OK};
+  std::atomic<int32_t> legacy_shutdown_result{FAMO_ENGINE_OK};
+};
+
+void FAMO_ENGINE_CALL ReentrantLifecycleNotification(
+    void* user_data,
+    FamoEngineContext* context,
+    const FamoUtf8String* /*type*/,
+    const FamoUtf8String* /*value*/,
+    const FamoUtf8String* /*label*/) noexcept {
+  auto* capture =
+      static_cast<ReentrantLifecycleCapture*>(user_data);
+  if (!capture || !context || !capture->v2 || !capture->legacy ||
+      !capture->host) {
+    return;
+  }
+  ++capture->calls;
+  if (capture->attempted.exchange(true))
+    return;
+  capture->destroy_result.store(
+      capture->v2->destroy_context(context));
+  capture->shutdown_result.store(capture->v2->shutdown());
+  capture->unregister_result.store(
+      capture->v2->set_notification_handler(nullptr, nullptr));
+  capture->replace_result.store(
+      capture->v2->set_notification_handler(
+          &ReplacementNotification, capture));
+  capture->initialize_result.store(
+      capture->v2->initialize(capture->host, &capture->root));
+  // ABI v1 has no notification registration entry point, but its safe
+  // wrappers are reachable from the same DLL. Re-enter them through a v1
+  // function table while this v2 callback owns the callback lifetime token.
+  capture->legacy_initialize_result.store(
+      capture->legacy->initialize(capture->host, &capture->root));
+  capture->legacy_shutdown_result.store(
+      capture->legacy->shutdown());
+}
+
 bool WaitForEnvironment(const char* name, const char* expected,
                         DWORD timeout_ms) {
   const ULONGLONG deadline = ::GetTickCount64() + timeout_ms;
@@ -192,6 +279,40 @@ bool WaitForEnvironment(const char* name, const char* expected,
 
 int main() {
   namespace fs = std::filesystem;
+  {
+    // ABI-v1 Weasel hosts already pass expand_ibus_modifier(mask), not the
+    // public compact convenience constants. Preserve that historical wire
+    // behavior byte-for-byte, including RELEASE.
+    FamoKeyEvent legacy_expanded{};
+    legacy_expanded.virtual_key = 'x';
+    legacy_expanded.modifiers =
+        FAMO_KEY_V2_MOD_CAPS_LOCK | FAMO_KEY_V2_MOD_CONTROL |
+        FAMO_KEY_V2_MOD_ALT | FAMO_KEY_V2_MOD_SUPER |
+        FAMO_KEY_V2_MOD_RELEASE;
+    legacy_expanded.is_key_down = 0;
+    int keycode = 0;
+    int mask = 0;
+    CHECK(famo_rime_keys::FamoKeyToRimeV1(
+        legacy_expanded, &keycode, &mask));
+    CHECK(keycode == 'x');
+    CHECK(static_cast<uint32_t>(mask) ==
+          legacy_expanded.modifiers);
+
+    // is_key_down was advisory in v1 and must not manufacture a RELEASE bit.
+    FamoKeyEvent legacy_advisory = legacy_expanded;
+    legacy_advisory.modifiers = FAMO_KEY_V2_MOD_CONTROL;
+    legacy_advisory.is_key_down = 0;
+    CHECK(famo_rime_keys::FamoKeyToRimeV1(
+        legacy_advisory, &keycode, &mask));
+    CHECK(static_cast<uint32_t>(mask) == legacy_advisory.modifiers);
+
+    FamoKeyEvent expanded = legacy_expanded;
+    expanded.modifiers =
+        FAMO_KEY_V2_MOD_CONTROL | FAMO_KEY_V2_MOD_CAPS_LOCK |
+        FAMO_KEY_V2_MOD_RELEASE;
+    CHECK(famo_rime_keys::FamoKeyToRimeV2(expanded, &keycode, &mask));
+    CHECK(static_cast<uint32_t>(mask) == expanded.modifiers);
+  }
   const fs::path root =
       fs::temp_directory_path() /
       ("famo-action-v2-" + std::to_string(::GetCurrentProcessId()));
@@ -334,6 +455,45 @@ int main() {
     CHECK(notification.label == "ASCII");
   }
   CHECK(host.SetOption(context, &ascii_mode, 0) == FAMO_ENGINE_OK);
+
+  // Every lifecycle operation that can drain notifications or acquire the
+  // context-creation locks must fail fast when re-entered by a notification.
+  // The legacy v1 no-unwind adapters must preserve that result instead of
+  // invoking ResetRimeState and waiting for the current callback to exit.
+  using CreateLegacyFn =
+      int32_t(FAMO_ENGINE_CALL*)(uint32_t, FamoEngineApi*);
+  HMODULE rime_module = ::GetModuleHandleW(L"FamoRimeEngine.dll");
+  CHECK(rime_module != nullptr);
+  const auto create_legacy = reinterpret_cast<CreateLegacyFn>(
+      ::GetProcAddress(rime_module, "FamoCreateEngineApi"));
+  CHECK(create_legacy != nullptr);
+  FamoEngineApi legacy_api{};
+  legacy_api.size = static_cast<uint32_t>(sizeof(legacy_api));
+  CHECK(create_legacy(FAMO_ENGINE_ABI_VERSION, &legacy_api) ==
+        FAMO_ENGINE_OK);
+  ReentrantLifecycleCapture lifecycle;
+  lifecycle.v2 = &host.v2_api();
+  lifecycle.legacy = &legacy_api;
+  lifecycle.host = &host.host_api();
+  lifecycle.root = String(root_utf8);
+  CHECK(host.v2_api().set_notification_handler(
+            &ReentrantLifecycleNotification, &lifecycle) ==
+        FAMO_ENGINE_OK);
+  CHECK(host.SetOption(context, &ascii_mode, 1) == FAMO_ENGINE_OK);
+  CHECK(lifecycle.attempted.load());
+  CHECK(lifecycle.destroy_result.load() == FAMO_ENGINE_E_RUNTIME);
+  CHECK(lifecycle.shutdown_result.load() == FAMO_ENGINE_E_RUNTIME);
+  CHECK(lifecycle.unregister_result.load() == FAMO_ENGINE_E_RUNTIME);
+  CHECK(lifecycle.replace_result.load() == FAMO_ENGINE_E_RUNTIME);
+  CHECK(lifecycle.initialize_result.load() == FAMO_ENGINE_E_RUNTIME);
+  CHECK(lifecycle.legacy_initialize_result.load() ==
+        FAMO_ENGINE_E_RUNTIME);
+  CHECK(lifecycle.legacy_shutdown_result.load() ==
+        FAMO_ENGINE_E_RUNTIME);
+  CHECK(host.SetOption(context, &ascii_mode, 0) == FAMO_ENGINE_OK);
+  CHECK(lifecycle.calls.load() >= 2);
+  CHECK(host.v2_api().set_notification_handler(
+            &CaptureNotification, &notification) == FAMO_ENGINE_OK);
 
   // A host notification target is outside the engine's trust boundary. Its
   // exception must not unwind through librime/create_context, double-delete a
@@ -565,10 +725,9 @@ int main() {
   CHECK(::SetEnvironmentVariableA(
             "FAMO_TEST_RIME_NOTIFICATIONS_DRAINED", nullptr) != 0);
 
-  // Callback ids cannot be rebound safely without an incarnation in the
-  // librime notification signature. Retired sessions therefore stay alive in
-  // a lifetime-bounded quarantine; once full it fails closed even after every
-  // host-visible context is gone.
+  // Callback ids cannot be rebound safely within one librime epoch. When the
+  // bounded quarantine fills and no context/result is live, the engine rotates
+  // that epoch in-process and restores the notification target.
   CHECK(::SetEnvironmentVariableA(
             "FAMO_TEST_MAX_SEEN_SESSION_IDS", "1") != 0);
   CHECK(host.LoadV2(L"FamoRimeEngine.dll", root_utf8.c_str(),
@@ -579,21 +738,33 @@ int main() {
   CHECK(host.v2_api().create_context(&schema, &capped_context) ==
         FAMO_ENGINE_OK);
   CHECK(capped_context != nullptr);
-  FamoEngineContext* rejected_context =
-      reinterpret_cast<FamoEngineContext*>(
-          static_cast<uintptr_t>(1));
-  CHECK(host.v2_api().create_context(&schema, &rejected_context) ==
-        FAMO_ENGINE_E_RUNTIME);
-  CHECK(rejected_context == nullptr);
   CHECK(host.v2_api().destroy_context(capped_context) ==
         FAMO_ENGINE_OK);
   capped_context = nullptr;
-  rejected_context =
-      reinterpret_cast<FamoEngineContext*>(
-          static_cast<uintptr_t>(1));
-  CHECK(host.v2_api().create_context(&schema, &rejected_context) ==
-        FAMO_ENGINE_E_RUNTIME);
-  CHECK(rejected_context == nullptr);
+  for (size_t iteration = 0; iteration < 3; ++iteration) {
+    FamoEngineContext* rotated_context = nullptr;
+    CHECK(host.v2_api().create_context(&schema, &rotated_context) ==
+          FAMO_ENGINE_OK);
+    CHECK(rotated_context != nullptr);
+    request = Request(FAMO_ENGINE_ACTION_STATUS);
+    result = nullptr;
+    CHECK(host.v2_api().execute_action(rotated_context, &request, &result) ==
+          FAMO_ENGINE_OK);
+    CHECK(result != nullptr);
+    CHECK(FamoEngineHost::ValidateResultV2(
+        result, FAMO_ENGINE_ACTION_STATUS,
+        FAMO_ENGINE_V2_MAX_VIEW_CANDIDATES,
+        FAMO_ENGINE_V2_MAX_STRING_BYTES));
+    CHECK(host.FreeResultV2(result) == FAMO_ENGINE_OK);
+    CHECK(host.SetOption(rotated_context, &ascii_mode, 1) ==
+          FAMO_ENGINE_OK);
+    {
+      std::lock_guard<std::mutex> lock(notification.mutex);
+      CHECK(notification.context == rotated_context);
+    }
+    CHECK(host.v2_api().destroy_context(rotated_context) ==
+          FAMO_ENGINE_OK);
+  }
   CHECK(::SetEnvironmentVariableA(
             "FAMO_TEST_RIME_QUARANTINE_AUDIT", "1") != 0);
   host.Unload();
@@ -607,8 +778,8 @@ int main() {
   CHECK(::GetEnvironmentVariableA(
             "FAMO_TEST_RIME_QUARANTINE_DESTROYED", destroyed_sessions,
             static_cast<DWORD>(std::size(destroyed_sessions))) == 1);
-  // Both rejected creates failed before create_session; only the original
-  // capped session reached the shutdown quarantine.
+  // Each full quarantine rotated before the next create. Only the final
+  // epoch's one retired session reaches this shutdown.
   CHECK(std::strcmp(destroyed_sessions, "1") == 0);
   CHECK(::GetEnvironmentVariableA(
             "FAMO_TEST_RIME_QUARANTINE_DESTROY_FAILED", failed_sessions,
@@ -624,6 +795,53 @@ int main() {
             "FAMO_TEST_RIME_QUARANTINE_DESTROY_FAILED", nullptr) != 0);
   CHECK(::SetEnvironmentVariableA(
             "FAMO_TEST_RIME_NOTIFICATIONS_DRAINED", nullptr) != 0);
+  CHECK(::SetEnvironmentVariableA(
+            "FAMO_TEST_MAX_SEEN_SESSION_IDS", nullptr) != 0);
+
+  // An engine-wide host callback may re-enter create_context. If the bounded
+  // quarantine is full, that nested call must fail without trying to wait for
+  // its own callback; the outer non-callback create then rotates normally.
+  CHECK(::SetEnvironmentVariableA(
+            "FAMO_TEST_MAX_SEEN_SESSION_IDS", "1") != 0);
+  FamoEngineHost reentrant_host;
+  ReentrantNotificationCapture reentrant;
+  reentrant.host = &reentrant_host;
+  reentrant.schema = schema;
+  CHECK(reentrant_host.LoadV2(
+            L"FamoRimeEngine.dll", root_utf8.c_str(),
+            &ReentrantNotification, &reentrant) == FAMO_ENGINE_OK);
+  CHECK(reentrant_host.v2_api().deploy_schema(&schema) ==
+        FAMO_ENGINE_OK);
+  FamoEngineContext* retired_context = nullptr;
+  CHECK(reentrant_host.v2_api().create_context(
+            &schema, &retired_context) == FAMO_ENGINE_OK);
+  CHECK(reentrant_host.v2_api().destroy_context(retired_context) ==
+        FAMO_ENGINE_OK);
+  reentrant.armed.store(true);
+  CHECK(::SetEnvironmentVariableA(
+            "FAMO_TEST_RIME_ROTATION_PREFLIGHT_FAILURE", "1") != 0);
+  FamoEngineContext* failed_rotation =
+      reinterpret_cast<FamoEngineContext*>(static_cast<uintptr_t>(1));
+  CHECK(reentrant_host.v2_api().create_context(
+            &schema, &failed_rotation) == FAMO_ENGINE_E_RUNTIME);
+  CHECK(failed_rotation == nullptr);
+  CHECK(::SetEnvironmentVariableA(
+            "FAMO_TEST_RIME_ROTATION_PREFLIGHT_FAILURE", nullptr) != 0);
+  CHECK(::SetEnvironmentVariableA(
+            "FAMO_TEST_RIME_NOTIFICATION_DURING_ROTATION", "1") != 0);
+  FamoEngineContext* outer_context = nullptr;
+  CHECK(reentrant_host.v2_api().create_context(
+            &schema, &outer_context) == FAMO_ENGINE_OK);
+  CHECK(reentrant.attempted.load());
+  CHECK(reentrant.result.load() == FAMO_ENGINE_E_RUNTIME);
+  CHECK(reentrant.context == nullptr);
+  CHECK(outer_context != nullptr);
+  CHECK(::SetEnvironmentVariableA(
+            "FAMO_TEST_RIME_NOTIFICATION_DURING_ROTATION", nullptr) !=
+        0);
+  CHECK(reentrant_host.v2_api().destroy_context(outer_context) ==
+        FAMO_ENGINE_OK);
+  reentrant_host.Unload();
   CHECK(::SetEnvironmentVariableA(
             "FAMO_TEST_MAX_SEEN_SESSION_IDS", nullptr) != 0);
 

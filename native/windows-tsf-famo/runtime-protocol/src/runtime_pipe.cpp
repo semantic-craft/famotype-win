@@ -52,7 +52,8 @@ bool PreservesLogicalConnection(Command command) {
   return IsDeliveryTracked(command) ||
          command == Command::ExecutePrepared ||
          command == Command::ClaimResult || command == Command::AckResult ||
-         command == Command::AbandonConnection;
+         command == Command::AbandonConnection ||
+         command == Command::AbandonSession;
 }
 
 } // namespace
@@ -495,8 +496,9 @@ DeliveryResult PipeRuntimePort::DeliveryCall(
   if (result.reply.flags == kFlagResponse &&
       result.reply.command == reference.command &&
       result.reply.correlation == reference.correlation) {
-    if (result.reply.status == Status::RecoveryPending) {
-      delivery.status = Status::RecoveryPending;
+    if (result.reply.status == Status::RecoveryPending ||
+        result.reply.status == Status::DeliveryFailed) {
+      delivery.status = result.reply.status;
     } else {
       delivery.status = Status::Ok;
       delivery.final_reply = std::move(result.reply);
@@ -523,6 +525,18 @@ CallResult PipeRuntimePort::Ack(
     const DeliveryReference &reference,
     std::chrono::steady_clock::time_point absolute_deadline) {
   Frame request = DeliveryControl(Command::AckResult, reference);
+  if (request.correlation.client_id == 0 || request.payload.empty()) {
+    CallResult invalid;
+    invalid.status = Status::Unavailable;
+    return invalid;
+  }
+  return CallUntil(std::move(request), absolute_deadline);
+}
+
+CallResult PipeRuntimePort::AbandonSession(
+    const DeliveryReference &reference,
+    std::chrono::steady_clock::time_point absolute_deadline) {
+  Frame request = DeliveryControl(Command::AbandonSession, reference);
   if (request.correlation.client_id == 0 || request.payload.empty()) {
     CallResult invalid;
     invalid.status = Status::Unavailable;

@@ -54,6 +54,7 @@ enum class ServerFault {
   DisconnectBeforeExecute,
   DisconnectAfterDispatch,
   CopyFailureAfterMutation,
+  CopyFailureAfterMutationSticky,
 };
 
 struct DeliveryResult {
@@ -97,6 +98,9 @@ public:
   Claim(const DeliveryReference &reference,
         std::chrono::steady_clock::time_point absolute_deadline);
   CallResult Ack(const DeliveryReference &reference,
+                 std::chrono::steady_clock::time_point absolute_deadline);
+  CallResult
+  AbandonSession(const DeliveryReference &reference,
                  std::chrono::steady_clock::time_point absolute_deadline);
   // Hot path. Overwrites the previous pending UI-only update without doing
   // pipe I/O. Best-effort UI work uses an independent pipe and worker.
@@ -166,7 +170,8 @@ public:
                  ServerFault fault, std::chrono::milliseconds accept_timeout,
                  std::string *error, uint32_t fault_after_process_keys = 0,
                  PipeServerStop *stop = nullptr,
-                 bool ui_only_endpoint = false);
+                 bool ui_only_endpoint = false,
+                 std::atomic<uint32_t> *terminal_abandon_count = nullptr);
 };
 
 class RuntimeControlService;

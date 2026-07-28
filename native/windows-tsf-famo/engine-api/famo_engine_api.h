@@ -53,22 +53,38 @@ typedef enum FamoEngineLogLevel {
 #define FAMO_ENGINE_CAP_SCHEMA_DEPLOY (1ull << 3)
 #define FAMO_ENGINE_CAP_PREDICTION (1ull << 4)
 
-// Expanded librime/IBus mask bits. FamoKeyEvent::modifiers is passed through to
-// librime, so these values deliberately match its public key-event contract.
+// Frozen ABI-v1 convenience constants. Existing v1 hosts were compiled with
+// these exact values, so never renumber them. The v1 wire contract nevertheless
+// preserves modifiers verbatim: a legacy v1 host sends its already
+// expanded rime/X11 mask, and engines must not reinterpret it using these bits.
 #define FAMO_KEY_MOD_SHIFT (1u << 0)
-#define FAMO_KEY_MOD_CAPS_LOCK (1u << 1)
-#define FAMO_KEY_MOD_CONTROL (1u << 2)
-#define FAMO_KEY_MOD_ALT (1u << 3)
-#define FAMO_KEY_MOD_SUPER (1u << 26)
-#define FAMO_KEY_MOD_RELEASE (1u << 30)
+#define FAMO_KEY_MOD_CONTROL (1u << 1)
+#define FAMO_KEY_MOD_ALT (1u << 2)
+#define FAMO_KEY_MOD_SUPER (1u << 3)
+#define FAMO_KEY_MOD_CAPS_LOCK (1u << 4)
+
+// ABI-v2 uses librime's expanded IBus mask verbatim. These names are separate
+// so the v1 constants above remain binary-compatible.
+#define FAMO_KEY_V2_MOD_SHIFT (1u << 0)
+#define FAMO_KEY_V2_MOD_CAPS_LOCK (1u << 1)
+#define FAMO_KEY_V2_MOD_CONTROL (1u << 2)
+#define FAMO_KEY_V2_MOD_ALT (1u << 3)
+#define FAMO_KEY_V2_MOD_SUPER (1u << 26)
+#define FAMO_KEY_V2_MOD_RELEASE (1u << 30)
 #ifdef __cplusplus
 static_assert(FAMO_KEY_MOD_SHIFT == 0x00000001u &&
-                  FAMO_KEY_MOD_CAPS_LOCK == 0x00000002u &&
-                  FAMO_KEY_MOD_CONTROL == 0x00000004u &&
-                  FAMO_KEY_MOD_ALT == 0x00000008u &&
-                  FAMO_KEY_MOD_SUPER == 0x04000000u &&
-                  FAMO_KEY_MOD_RELEASE == 0x40000000u,
-              "key modifier constants must match librime's expanded mask");
+                  FAMO_KEY_MOD_CONTROL == 0x00000002u &&
+                  FAMO_KEY_MOD_ALT == 0x00000004u &&
+                  FAMO_KEY_MOD_SUPER == 0x00000008u &&
+                  FAMO_KEY_MOD_CAPS_LOCK == 0x00000010u,
+              "ABI-v1 key modifier constants are frozen");
+static_assert(FAMO_KEY_V2_MOD_SHIFT == 0x00000001u &&
+                  FAMO_KEY_V2_MOD_CAPS_LOCK == 0x00000002u &&
+                  FAMO_KEY_V2_MOD_CONTROL == 0x00000004u &&
+                  FAMO_KEY_V2_MOD_ALT == 0x00000008u &&
+                  FAMO_KEY_V2_MOD_SUPER == 0x04000000u &&
+                  FAMO_KEY_V2_MOD_RELEASE == 0x40000000u,
+              "ABI-v2 key modifiers must match librime's expanded mask");
 #endif
 
 #define FAMO_CANDIDATE_FLAG_DEFAULT (1u << 0)
@@ -136,7 +152,9 @@ typedef struct FamoKeyEvent {
   // A librime/X11 keysym, not a Windows virtual-key code.
   uint32_t virtual_key;
   uint32_t scan_code;
-  // Expanded librime mask. RELEASE must agree with is_key_down.
+  // ABI v1 preserves the host-supplied modifier mask verbatim (historical
+  // hosts send expand_ibus_modifier(mask)). ABI v2 explicitly uses
+  // FAMO_KEY_V2_MOD_* and RELEASE must agree with is_key_down.
   uint32_t modifiers;
   uint32_t is_key_down;
   uint64_t timestamp_ms;

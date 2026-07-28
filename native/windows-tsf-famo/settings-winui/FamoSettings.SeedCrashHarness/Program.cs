@@ -1,13 +1,43 @@
 using Famo.Settings.Core;
 
-if (args.Length != 3)
+if (args.Length is not 3 and not 5)
 {
     return 2;
 }
 
-string source = Path.GetFullPath(args[0]);
-string destination = Path.GetFullPath(args[1]);
-string marker = Path.GetFullPath(args[2]);
+bool extendedMode = args.Length == 5;
+bool crashAfterDeleteDispositionClear = extendedMode &&
+    string.Equals(
+        args[0],
+        "after-clear-before-rename",
+        StringComparison.Ordinal);
+bool crashAfterRenameBeforeRecoveryCleanup = extendedMode &&
+    string.Equals(
+        args[0],
+        "after-rename-before-recovery-cleanup",
+        StringComparison.Ordinal);
+bool crashBeforePublish = !extendedMode ||
+    string.Equals(
+        args[0],
+        "before-publish",
+        StringComparison.Ordinal);
+if (!crashAfterDeleteDispositionClear &&
+    !crashAfterRenameBeforeRecoveryCleanup &&
+    !crashBeforePublish)
+{
+    return 2;
+}
+int pathOffset = extendedMode ? 1 : 0;
+string source = Path.GetFullPath(args[pathOffset]);
+string destination = Path.GetFullPath(args[pathOffset + 1]);
+string marker = Path.GetFullPath(args[pathOffset + 2]);
+if (extendedMode)
+{
+    UserDataTransactionLock.LocalAppDataOverrideForTests =
+        Path.GetFullPath(args[pathOffset + 3]);
+}
+
+string? exactTemporary = null;
 SeedFileTransaction.BeforePinnedAtomicFilePublishForTests =
     (published, temporary) =>
     {
@@ -18,6 +48,46 @@ SeedFileTransaction.BeforePinnedAtomicFilePublishForTests =
         {
             return;
         }
+        exactTemporary = temporary;
+        if (!crashBeforePublish)
+        {
+            return;
+        }
+        WriteMarkerAndCrash(marker, temporary);
+    };
+SeedFileTransaction.AfterPinnedTemporaryDeleteDispositionClearedForTests =
+    () =>
+    {
+        if (!crashAfterDeleteDispositionClear)
+        {
+            return;
+        }
+        WriteMarkerAndCrash(
+            marker,
+            exactTemporary
+            ?? throw new InvalidOperationException(
+                "Pinned temporary path was not captured."));
+    };
+SeedFileTransaction.AfterPinnedAtomicFileRenameForTests =
+    () =>
+    {
+        if (!crashAfterRenameBeforeRecoveryCleanup)
+        {
+            return;
+        }
+        WriteMarkerAndCrash(
+            marker,
+            exactTemporary
+            ?? throw new InvalidOperationException(
+                "Pinned temporary path was not captured."));
+    };
+
+SeedFileTransaction.CopyDurableAtomic(
+    source, destination, overwrite: false);
+return 3;
+
+static void WriteMarkerAndCrash(string marker, string temporary)
+{
         Directory.CreateDirectory(
             Path.GetDirectoryName(marker)
             ?? throw new InvalidOperationException(
@@ -37,8 +107,4 @@ SeedFileTransaction.BeforePinnedAtomicFilePublishForTests =
         }
         Environment.FailFast(
             "intentional seed publication crash selfcheck");
-    };
-
-SeedFileTransaction.CopyDurableAtomic(
-    source, destination, overwrite: false);
-return 3;
+}
