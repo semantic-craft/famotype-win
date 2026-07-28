@@ -69,6 +69,12 @@ ensure_canonical_origin() {
   fi
 }
 
+clean_managed_repo() {
+  local name="$1" dir="$2"
+  git -C "${dir}" clean -ffdx \
+    || die "无法清理 ${name} 缓存中的未跟踪/忽略文件：${dir}"
+}
+
 checkout_pinned_ref() {
   local name="$1" repo="$2" ref="$3" dir="$4"
   if [ -d "${dir}/.git" ]; then
@@ -90,6 +96,7 @@ checkout_pinned_ref() {
   actual_head="$(git -C "${dir}" rev-parse --verify HEAD)"
   [ "${actual_head}" = "${expected_head}" ] \
     || die "${name} 未检出显式 ref ${ref}（HEAD=${actual_head}，期望=${expected_head}）"
+  clean_managed_repo "${name}" "${dir}"
   log "${name} HEAD = $(git -C "${dir}" rev-parse --short HEAD)"
 }
 
@@ -120,6 +127,7 @@ fetch_rime_ice() {
         2) 重跑本脚本(检测到 .cache/rime-ice/.git 即走更新分支)。"
     fi
   fi
+  clean_managed_repo "rime-ice" "${ICE_DIR}"
   log "rime-ice HEAD = $(git -C "${ICE_DIR}" rev-parse --short HEAD)"
 }
 
@@ -149,6 +157,7 @@ fetch_wubi() {
         2) 重跑本脚本。"
     fi
   fi
+  clean_managed_repo "rime-wubi86-jidian" "${WUBI_DIR}"
   log "rime-wubi86-jidian HEAD = $(git -C "${WUBI_DIR}" rev-parse --short HEAD)"
 }
 

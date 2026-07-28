@@ -1079,7 +1079,8 @@ begin
     if not ValidateTransactionTarget(TransactionTarget, TransactionId,
       PreviousTarget, ValidatedTarget) then
       RaiseException('unsafe transaction target refused during rollback');
-    DelTree(ValidatedTarget, True, True, True);
+    if not DelTree(ValidatedTarget, True, True, True) then
+      RaiseException('transaction target deletion failed during rollback');
   end;
   RollbackComplete := True;
 end;

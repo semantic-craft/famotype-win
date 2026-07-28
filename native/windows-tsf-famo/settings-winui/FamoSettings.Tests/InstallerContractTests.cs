@@ -231,8 +231,21 @@ public sealed class InstallerContractTests
         int deleteValidation = Position(rollbackBody,
             "ValidateTransactionTarget(TransactionTarget, TransactionId,");
         Assert.Contains("PreviousTarget, ValidatedTarget", rollbackBody);
-        int deleteTree = Position(rollbackBody, "DelTree(ValidatedTarget", deleteValidation);
+        int deleteTree = Position(
+            rollbackBody,
+            "if not DelTree(ValidatedTarget, True, True, True) then",
+            deleteValidation);
+        int deleteFailure = Position(
+            rollbackBody,
+            "RaiseException('transaction target deletion failed during rollback')",
+            deleteTree);
+        int rollbackComplete = Position(
+            rollbackBody,
+            "RollbackComplete := True;",
+            deleteFailure);
         Assert.True(deleteValidation < deleteTree);
+        Assert.True(deleteTree < deleteFailure);
+        Assert.True(deleteFailure < rollbackComplete);
         Assert.DoesNotContain("DelTree(TransactionTarget", rollbackBody);
     }
 
