@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include "../../famo_engine_api.h"
+#include "../view_abi.h"
 
 namespace {
 
@@ -80,26 +81,31 @@ void HostFreeStr(FamoUtf8String* v) {
 }
 
 void FillCandidates(const std::vector<std::string>& candidates, size_t start,
-                    size_t count, FamoCompositionView* out) {
+                    size_t count, uint32_t view_size,
+                    FamoCompositionView* out) {
   if (!out || !g_host.alloc || start >= candidates.size() || count == 0)
     return;
   const size_t end = (std::min)(candidates.size(), start + count);
   const size_t size = end - start;
-  auto* array = static_cast<FamoCandidate*>(
-      g_host.alloc(sizeof(FamoCandidate) * size));
+  const size_t stride = famo_view_abi::CandidateStride(view_size);
+  void* array = g_host.alloc(stride * size);
   if (!array)
     return;
   for (size_t i = 0; i < size; ++i) {
-    std::memset(&array[i], 0, sizeof(FamoCandidate));
-    array[i].size = static_cast<uint32_t>(sizeof(FamoCandidate));
-    array[i].text = Dup(candidates[start + i]);
-    array[i].comment = Dup("");
-    array[i].flags = i == 0 ? FAMO_CANDIDATE_FLAG_DEFAULT : 0u;
-    const char digit[2] = {
-        static_cast<char>('0' + ((start + i + 1) % 10)), '\0'};
-    array[i].label = Dup(digit);
+    FamoCandidate* candidate =
+        famo_view_abi::CandidateAt(array, i, stride);
+    std::memset(candidate, 0, stride);
+    candidate->size = static_cast<uint32_t>(stride);
+    candidate->text = Dup(candidates[start + i]);
+    candidate->comment = Dup("");
+    candidate->flags = i == 0 ? FAMO_CANDIDATE_FLAG_DEFAULT : 0u;
+    if (famo_view_abi::HasV12Candidates(view_size)) {
+      const char digit[2] = {
+          static_cast<char>('0' + ((start + i + 1) % 10)), '\0'};
+      candidate->label = Dup(digit);
+    }
   }
-  out->candidates = array;
+  out->candidates = static_cast<const FamoCandidate*>(array);
   out->candidate_count = static_cast<uint32_t>(size);
 }
 
@@ -113,9 +119,9 @@ FamoUtf8String Static(const char* s) {
 }
 
 void FillView(const std::string& buffer, const std::string& commit, bool handled,
-              FamoCompositionView* out) {
-  std::memset(out, 0, sizeof(*out));
-  out->size = static_cast<uint32_t>(sizeof(FamoCompositionView));
+              uint32_t view_size, FamoCompositionView* out) {
+  FamoCompositionView result;
+  famo_view_abi::BeginResult(&result, view_size);
   std::string preedit = buffer;
   uint32_t selection_start = 0;
   uint32_t selection_end = static_cast<uint32_t>(buffer.size());
@@ -145,35 +151,69 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
         break;
     }
   }
-  out->preedit = Dup(preedit);
-  out->commit = Dup(commit);
+  result.preedit = Dup(preedit);
+  result.commit = Dup(commit);
 
   std::vector<std::string> cands = CandidatesFor(buffer);
-  FillCandidates(cands, 0, cands.size(), out);
+  FillCandidates(cands, 0, cands.size(), view_size, &result);
   const bool multipage = !Environment("FAMO_TEST_MULTIPAGE").empty() &&
-                         out->candidate_count > 1;
-  out->page_size = multipage ? 1u : out->candidate_count;
+                         result.candidate_count > 1;
+  result.page_size = multipage ? 1u : result.candidate_count;
 
   uint32_t flags = 0;
   if (!preedit.empty()) flags |= FAMO_COMPOSITION_HAS_PREEDIT;
   if (!commit.empty()) flags |= FAMO_COMPOSITION_HAS_COMMIT;
-  if (out->candidate_count) flags |= FAMO_COMPOSITION_HAS_CANDIDATES;
+  if (result.candidate_count) flags |= FAMO_COMPOSITION_HAS_CANDIDATES;
   if (handled) flags |= FAMO_COMPOSITION_HANDLED;
-  out->state_flags = flags;
+  result.state_flags = flags;
 
   // v1.1 deterministic fields (exercise size negotiation + free_view teardown).
-  out->preedit_sel_start = selection_start;
-  out->preedit_sel_end = selection_end;
-  out->preedit_cursor_pos = cursor;
-  out->commit_preview = Dup(buffer.empty() ? std::string() : CandidatesFor(buffer).front());
-  out->schema_id = Dup("test");
-  out->schema_name = Dup("Test Engine");
-  out->status_flags =
-      (Environment("FAMO_TEST_SIMPLIFIED").empty()
-           ? 0u
-           : static_cast<uint32_t>(FAMO_STATUS_SIMPLIFIED)) |
-      (FAMO_STATUS_COMPOSING * (buffer.empty() ? 0u : 1u));
-  out->is_last_page = multipage ? 0u : 1u;
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, preedit_sel_start),
+          sizeof(result.preedit_sel_start))) {
+    result.preedit_sel_start = selection_start;
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, preedit_sel_end),
+          sizeof(result.preedit_sel_end))) {
+    result.preedit_sel_end = selection_end;
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, preedit_cursor_pos),
+          sizeof(result.preedit_cursor_pos))) {
+    result.preedit_cursor_pos = cursor;
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, commit_preview),
+          sizeof(result.commit_preview))) {
+    result.commit_preview =
+        Dup(buffer.empty() ? std::string() : CandidatesFor(buffer).front());
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, schema_id),
+          sizeof(result.schema_id))) {
+    result.schema_id = Dup("test");
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, schema_name),
+          sizeof(result.schema_name))) {
+    result.schema_name = Dup("Test Engine");
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, status_flags),
+          sizeof(result.status_flags))) {
+    result.status_flags =
+        (Environment("FAMO_TEST_SIMPLIFIED").empty()
+             ? 0u
+             : static_cast<uint32_t>(FAMO_STATUS_SIMPLIFIED)) |
+        (FAMO_STATUS_COMPOSING * (buffer.empty() ? 0u : 1u));
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, is_last_page),
+          sizeof(result.is_last_page))) {
+    result.is_last_page = multipage ? 0u : 1u;
+  }
+  famo_view_abi::Publish(out, result, view_size);
 }
 
 }  // namespace
@@ -211,9 +251,16 @@ int32_t FAMO_ENGINE_CALL TeShutdown(void) {
   return FAMO_ENGINE_OK;
 }
 
-int32_t FAMO_ENGINE_CALL TeCreateContext(const FamoUtf8String* /*schema_id*/,
+int32_t FAMO_ENGINE_CALL TeCreateContext(const FamoUtf8String* schema_id,
                                          FamoEngineContext** out_context) {
   if (!out_context) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  *out_context = nullptr;
+  const std::string rejected = Environment("FAMO_TEST_FAIL_SCHEMA");
+  const std::string_view schema(
+      schema_id && schema_id->data ? schema_id->data : "",
+      schema_id && schema_id->data ? schema_id->length_bytes : 0);
+  if (!rejected.empty() && schema == rejected)
+    return FAMO_ENGINE_E_SCHEMA;
   *out_context = new (std::nothrow) FamoEngineContext();
   return *out_context ? FAMO_ENGINE_OK : FAMO_ENGINE_E_RUNTIME;
 }
@@ -227,7 +274,11 @@ int32_t FAMO_ENGINE_CALL TeDestroyContext(FamoEngineContext* context) {
 int32_t FAMO_ENGINE_CALL TeProcessKey(FamoEngineContext* context,
                                       const FamoKeyEvent* key,
                                       FamoCompositionView* out_view) {
-  if (!context || !key || !out_view) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  uint32_t view_size = 0;
+  if (!context || !key ||
+      !famo_view_abi::Negotiate(out_view, &view_size)) {
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  }
 
   // A Shift release is handled only when the host supplies librime's expanded
   // release bit.  The TSF integration check uses this to guard the direct
@@ -240,14 +291,19 @@ int32_t FAMO_ENGINE_CALL TeProcessKey(FamoEngineContext* context,
         (key->virtual_key == kRimeShiftLeft ||
          key->virtual_key == kRimeShiftRight) &&
         (key->modifiers & kRimeReleaseMask) != 0;
-    FillView(context->buffer, "", handled, out_view);
+    FillView(context->buffer, "", handled, view_size, out_view);
     return FAMO_ENGINE_OK;
   }
 
   const uint32_t vk = key->virtual_key;
+  if (vk == 0xff60 &&
+      !Environment("FAMO_TEST_UNHANDLED_SELECTION").empty()) {
+    FillView(context->buffer, "unexpected-select", true, view_size, out_view);
+    return FAMO_ENGINE_OK;
+  }
   if (vk == 0xff60 && !context->pending_commit.empty()) {
     std::string commit = std::move(context->pending_commit);
-    FillView(context->buffer, commit, false, out_view);
+    FillView(context->buffer, commit, false, view_size, out_view);
     return FAMO_ENGINE_OK;
   }
 
@@ -270,33 +326,39 @@ int32_t FAMO_ENGINE_CALL TeProcessKey(FamoEngineContext* context,
     }
   } else if (vk == ' ' || vk == 13) {  // Space / Enter -> commit highlighted
     if (context->buffer.empty()) {
-      FillView(context->buffer, "", false, out_view);
+      FillView(context->buffer, "", false, view_size, out_view);
       return FAMO_ENGINE_OK;
     }
     std::vector<std::string> cands = CandidatesFor(context->buffer);
     std::string commit = cands.empty() ? context->buffer : cands[0];
     context->buffer.clear();
-    FillView(context->buffer, commit, true, out_view);
+    FillView(context->buffer, commit, true, view_size, out_view);
     return FAMO_ENGINE_OK;
   }
 
-  FillView(context->buffer, "", handled, out_view);
+  FillView(context->buffer, "", handled, view_size, out_view);
   return FAMO_ENGINE_OK;
 }
 
 int32_t FAMO_ENGINE_CALL TeSelectCandidate(FamoEngineContext* context, uint32_t index,
                                            FamoCompositionView* out_view) {
-  if (!context || !out_view) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  uint32_t view_size = 0;
+  if (!context || !famo_view_abi::Negotiate(out_view, &view_size))
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
   std::vector<std::string> cands = CandidatesFor(context->buffer);
   if (index >= cands.size()) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  if (!Environment("FAMO_TEST_UNHANDLED_SELECTION").empty()) {
+    FillView(context->buffer, "", false, view_size, out_view);
+    return FAMO_ENGINE_OK;
+  }
   std::string commit = cands[index];
   context->buffer.clear();
   if (!Environment("FAMO_TEST_DEFER_SELECTION_COMMIT").empty()) {
     context->pending_commit = std::move(commit);
-    FillView(context->buffer, "", true, out_view);
+    FillView(context->buffer, "", true, view_size, out_view);
     return FAMO_ENGINE_OK;
   }
-  FillView(context->buffer, commit, true, out_view);
+  FillView(context->buffer, commit, true, view_size, out_view);
   return FAMO_ENGINE_OK;
 }
 
@@ -323,33 +385,52 @@ int32_t FAMO_ENGINE_CALL TeDeploySchema(const FamoUtf8String* /*schema_id*/,
 }
 
 int32_t FAMO_ENGINE_CALL TeFreeView(FamoCompositionView* view) {
-  if (!view) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  uint32_t view_size = 0;
+  if (!famo_view_abi::Negotiate(view, &view_size))
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
   HostFreeStr(&view->preedit);
   HostFreeStr(&view->commit);
   if (view->candidates && g_host.free) {
-    auto* arr = const_cast<FamoCandidate*>(view->candidates);
+    void* candidates =
+        const_cast<FamoCandidate*>(view->candidates);
+    const size_t stride = famo_view_abi::CandidateStride(view_size);
     for (uint32_t i = 0; i < view->candidate_count; ++i) {
-      HostFreeStr(&arr[i].text);
-      HostFreeStr(&arr[i].comment);
-      HostFreeStr(&arr[i].label);  // v1.2
+      FamoCandidate* candidate =
+          famo_view_abi::CandidateAt(candidates, i, stride);
+      HostFreeStr(&candidate->text);
+      HostFreeStr(&candidate->comment);
+      if (famo_view_abi::HasV12Candidates(view_size))
+        HostFreeStr(&candidate->label);
     }
-    g_host.free(arr);
+    g_host.free(candidates);
   }
-  // v1.1 strings: only touch them if the caller's struct actually spans them.
-  if (view->size >= offsetof(FamoCompositionView, status_flags)) {
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, commit_preview),
+          sizeof(view->commit_preview))) {
     HostFreeStr(&view->commit_preview);
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, schema_id),
+          sizeof(view->schema_id))) {
     HostFreeStr(&view->schema_id);
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, schema_name),
+          sizeof(view->schema_name))) {
     HostFreeStr(&view->schema_name);
   }
-  std::memset(view, 0, sizeof(*view));
+  famo_view_abi::ClearPreservingSize(view, view_size);
   return FAMO_ENGINE_OK;
 }
 
 // v1.1 deterministic stubs.
 int32_t FAMO_ENGINE_CALL TeGetStatus(FamoEngineContext* context,
                                      FamoCompositionView* out_view) {
-  if (!context || !out_view) return FAMO_ENGINE_E_INVALID_ARGUMENT;
-  FillView(context->buffer, "", false, out_view);  // status folded in; no commit
+  uint32_t view_size = 0;
+  if (!context || !famo_view_abi::Negotiate(out_view, &view_size))
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  FillView(context->buffer, "", false, view_size,
+           out_view);  // status folded in; no commit
   return FAMO_ENGINE_OK;
 }
 
@@ -385,11 +466,16 @@ int32_t FAMO_ENGINE_CALL TeChangePage(FamoEngineContext* context, int32_t /*back
 int32_t FAMO_ENGINE_CALL TePeekCandidates(FamoEngineContext* context,
                                           uint32_t index, uint32_t count,
                                           FamoCompositionView* out_view) {
-  if (!context || !out_view || count > 64)
+  uint32_t view_size = 0;
+  if (!context || count > 64 ||
+      !famo_view_abi::Negotiate(out_view, &view_size)) {
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
-  std::memset(out_view, 0, sizeof(*out_view));
-  out_view->size = static_cast<uint32_t>(sizeof(FamoCompositionView));
-  FillCandidates(CandidatesFor(context->buffer), index, count, out_view);
+  }
+  FamoCompositionView result;
+  famo_view_abi::BeginResult(&result, view_size);
+  FillCandidates(CandidatesFor(context->buffer), index, count, view_size,
+                 &result);
+  famo_view_abi::Publish(out_view, result, view_size);
   return FAMO_ENGINE_OK;
 }
 

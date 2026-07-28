@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
 
   FamoCompositionView view;
   std::memset(&view, 0, sizeof(view));
+  view.size = static_cast<uint32_t>(sizeof(view));
   for (char c : keys) {
     FamoKeyEvent k;
     std::memset(&k, 0, sizeof(k));

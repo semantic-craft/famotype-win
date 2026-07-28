@@ -249,6 +249,7 @@ bool RuntimeService::ReadStatusLocked(FamoEngineContext *context,
   if (!context || !target)
     return false;
   FamoCompositionView view{};
+  view.size = static_cast<uint32_t>(sizeof(view));
   if (engine_.api().get_status(context, &view) != FAMO_ENGINE_OK)
     return false;
   Composition composition;

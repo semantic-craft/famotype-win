@@ -30,4 +30,36 @@ if ($hits.Count) {
   exit 1
 }
 
+$patchText = Get-Content -LiteralPath $PatchPath -Raw
+$processKeyHunk = [regex]::Match(
+  $patchText,
+  '(?ms)^@@[^\r\n]*RimeWithWeaselHandler::ProcessKeyEvent[^\r\n]*\r?\n(?<body>.*?)(?=^@@|\z)')
+if (-not $processKeyHunk.Success) {
+  throw 'engine-abi.patch must contain the ProcessKeyEvent ABI routing hunk.'
+}
+
+$processKeyAdded = (($processKeyHunk.Groups['body'].Value -split '\r?\n') |
+  Where-Object { $_.StartsWith('+') -and -not $_.StartsWith('+++') } |
+  ForEach-Object { $_.Substring(1) }) -join "`n"
+$handledAssignments = [regex]::Matches(
+  $processKeyAdded,
+  '(?ms)^\s*handled\s*=\s*(?<expression>.*?);')
+if ($handledAssignments.Count -ne 1) {
+  throw ('ProcessKeyEvent must assign handled exactly once after initialization; ' +
+         'a later overwrite would discard the ABI handled/eaten result.')
+}
+$handledAssignment = $handledAssignments[0]
+
+$handledExpression = $handledAssignment.Groups['expression'].Value
+$expectedHandledExpression =
+  '^\s*\(\s*m_abi_view_valid\s*&&\s*\(\s*m_abi_view\.state_flags\s*&\s*FAMO_COMPOSITION_HANDLED\s*\)\s*\)\s*\?\s*True\s*:\s*False\s*$'
+if (-not [regex]::IsMatch($handledExpression, $expectedHandledExpression)) {
+  throw ('ProcessKeyEvent must return eaten for an empty view with FAMO_COMPOSITION_HANDLED, ' +
+         'and pass through an empty view without it; read state_flags directly instead of inferring handled from view content.')
+}
+if ($handledExpression -match
+    'FAMO_COMPOSITION_HAS_(?:PREEDIT|COMMIT|CANDIDATES)') {
+  throw 'ProcessKeyEvent handled/eaten must not depend on preedit, commit, or candidate presence.'
+}
+
 Write-Host "PASS: engine-abi.patch added lines are ABI-only."
