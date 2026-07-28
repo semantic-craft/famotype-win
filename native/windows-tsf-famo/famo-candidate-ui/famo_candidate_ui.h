@@ -229,6 +229,12 @@ typedef struct FamoLayoutResult {
   int32_t origin_x;
   int32_t origin_y;
   uint32_t flipped;
+
+  // Hairline dividing the preedit/aux band from the candidate list, full-bleed
+  // across the panel and centred in `spacing`. Empty when there is no band or no
+  // candidate. Painted in border_color — appended, so a caller built against an
+  // older struct simply never sees it.
+  FamoRect separator;
 } FamoLayoutResult;
 
 // ─── DirectWrite/D2D text resources (B5) ─────────────────────────────────────

@@ -311,7 +311,6 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
   const int border_dev = Scale(skin->border, dpi);
   const bool vertical = skin->layout_type == FAMO_LAYOUT_VERTICAL_TEXT;
   const bool vertical_list = skin->layout_type != FAMO_LAYOUT_HORIZONTAL;
-  const bool mist = (skin->back_color >> 24) < 0xffu;
 
   // Drop-shadow margin: content is drawn at (sm,sm); the buffer is content+2*sm
   // (host sizes the DIB to match) with the gaussian shadow in the ring. sm==0 → no
@@ -386,22 +385,16 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
       Gdiplus::SolidBrush brush(ToGdiColor(skin->back_color));
       g.FillPath(&brush, &path);
     }
-    if (mist) {
+    // Band → list hairline. Clipped to the panel path so a full-bleed rule can
+    // never poke out of a large corner radius on a short panel.
+    if (!RectEmpty2(layout->separator) && Opaque(skin->border_color)) {
+      const FamoRect& s = layout->separator;
       Gdiplus::GraphicsPath panel;
       AddRoundRect(panel, 0, 0, cx, cy, rc_dev);
-      const uint32_t rgb = skin->back_color & 0x00ffffffu;
-      const int luminance =
-          ((rgb >> 16) & 0xff) * 3 + ((rgb >> 8) & 0xff) * 6 + (rgb & 0xff);
-      const BYTE top_alpha = luminance < 1280 ? 20 : 77;
-      const int sheen_h = (std::max)(1, cy / 4);
-      Gdiplus::LinearGradientBrush sheen(
-          Gdiplus::Rect(0, 0, cx, sheen_h),
-          Gdiplus::Color(top_alpha, 255, 255, 255),
-          Gdiplus::Color(0, 255, 255, 255),
-          Gdiplus::LinearGradientModeVertical);
+      Gdiplus::SolidBrush brush(ToGdiColor(skin->border_color));
       const Gdiplus::GraphicsState saved = g.Save();
       g.SetClip(&panel);
-      g.FillRectangle(&sheen, 0, 0, cx, sheen_h);
+      g.FillRectangle(&brush, s.left, s.top, s.right - s.left, s.bottom - s.top);
       g.Restore(saved);
     }
     if (!RectEmpty2(layout->highlight) && Opaque(skin->hilited_back_color)) {

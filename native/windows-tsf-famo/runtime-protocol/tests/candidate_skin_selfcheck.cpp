@@ -95,8 +95,10 @@ int main() {
     CHECK(skin.border_color == ((p.deep & 0x00ffffffu) | 0x29000000u));
     CHECK((skin.back_color & 0x00ffffffu) ==
           (p.card & 0x00ffffffu));
-    CHECK((skin.back_color >> 24) == 0xb8u ||
-          (skin.back_color >> 24) == 0xffu);
+    // Opaque regardless of the system's EnableTransparency setting: the panel is
+    // a layered window with no blur behind it, so translucency was see-through,
+    // not acrylic.
+    CHECK((skin.back_color >> 24) == 0xffu);
     CHECK(skin.card2_color == p.card2);
     CHECK(skin.hilited_text_color == p.on_accent);
     CHECK(skin.candidate_text_color == p.ink);

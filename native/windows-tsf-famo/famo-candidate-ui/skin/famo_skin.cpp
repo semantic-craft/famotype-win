@@ -47,7 +47,9 @@ extern "C" FamoSkin FamoSkinDefault(void) {
 
   s.margin_x          = 8;
   s.margin_y          = 8;
-  s.spacing           = 6;
+  // Band → list gap. Holds the hairline separator with ~6px of air either side;
+  // 12 also lands on the 4dp grid both Material and Apple layouts are built on.
+  s.spacing           = 12;
   s.candidate_spacing = 6;
   s.hilite_padding_x  = 8;
   s.hilite_padding_y  = 7;

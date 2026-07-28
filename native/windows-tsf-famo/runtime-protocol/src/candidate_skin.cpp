@@ -149,16 +149,15 @@ bool ApplyPalette(std::string_view name, FamoSkin *skin) {
   const Palette &p = found->second;
   const bool dark = name.size() >= 5 && name.substr(name.size() - 5) == "_dark";
   skin->text_color = p.ink2;
-  DWORD transparency = 1;
-  DWORD transparency_size = sizeof(transparency);
-  const bool transparent =
-      RegGetValueW(HKEY_CURRENT_USER,
-                   L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                   L"EnableTransparency", RRF_RT_REG_DWORD, nullptr,
-                   &transparency, &transparency_size) != ERROR_SUCCESS ||
-      transparency != 0;
-  skin->back_color = (p.card & 0x00ffffffu) |
-                     (transparent ? 0xb8000000u : 0xff000000u);
+  // Opaque, always — the panel no longer follows EnableTransparency.
+  //
+  // This is a layered window with nothing blurred behind it, so a translucent
+  // back_color was never Fluent acrylic (recipe: background + BLUR + exclusion
+  // blend + tint + noise) — only its tint layer. The result was raw see-through:
+  // a caret-following popup over live text at 72%, with the eye refocusing
+  // between two planes. Depth now comes from the drop shadow + hairline border,
+  // which is what Fluent itself falls back to when transparency is off.
+  skin->back_color = (p.card & 0x00ffffffu) | 0xff000000u;
   skin->card2_color = p.card2;
   skin->border_color = (p.deep & 0x00ffffffu) | 0x29000000u;
   skin->hilited_text_color = p.on_accent;
