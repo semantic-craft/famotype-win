@@ -367,7 +367,11 @@ std::string StatusBarSchemaGlyph(std::string_view name) {
 std::string StatusBarSchemaSwitchTarget(
     std::string_view current_schema, std::string_view previous_schema,
     const std::vector<std::string> &schema_list) {
-  if (!previous_schema.empty() && previous_schema != current_schema)
+  const bool previous_available =
+      std::find_if(schema_list.begin(), schema_list.end(),
+                   [&](const std::string &id) { return id == previous_schema; }) !=
+      schema_list.end();
+  if (previous_schema != current_schema && previous_available)
     return std::string(previous_schema);
   for (const std::string &id : schema_list) {
     if (id != current_schema)

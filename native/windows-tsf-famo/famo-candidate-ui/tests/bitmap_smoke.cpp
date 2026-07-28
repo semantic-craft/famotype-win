@@ -41,6 +41,16 @@ FamoUtf8String Str(const char* s) {
 }
 FamoUtf8String Empty() { return Str(nullptr); }
 
+struct LegacyCandidate {
+  uint32_t size;
+  FamoUtf8String text;
+  FamoUtf8String comment;
+  uint32_t quality;
+  uint32_t flags;
+};
+
+static_assert(sizeof(LegacyCandidate) == offsetof(FamoCandidate, label));
+
 inline uint32_t Rgb(uint32_t argb) { return argb & 0x00FFFFFFu; }
 
 // A 32-bit top-down DIB behind a memDC, sentinel-filled transparent.
@@ -79,6 +89,147 @@ struct Dib {
 };
 
 }  // namespace
+
+static int check_legacy_candidate_abi() {
+  struct {
+    LegacyCandidate candidates[2];
+    unsigned char guard[sizeof(FamoCandidate)];
+  } storage{};
+  for (LegacyCandidate& candidate : storage.candidates) {
+    candidate.size = static_cast<uint32_t>(sizeof(LegacyCandidate));
+    candidate.text = Empty();
+    candidate.comment = Empty();
+  }
+  storage.candidates[0].text = Str("A");
+  storage.candidates[1].comment = Str("legacy-comment");
+
+  FamoCompositionView view{};
+  view.size =
+      static_cast<uint32_t>(offsetof(FamoCompositionView, preedit_sel_start));
+  view.candidates =
+      reinterpret_cast<const FamoCandidate*>(storage.candidates);
+  view.candidate_count = 2;
+  view.highlighted_index = 0;
+  view.page_size = 5;
+
+  FamoSkin skin = FamoSkinDefault();
+  skin.layout_type = FAMO_LAYOUT_VERTICAL;
+  skin.border = 0;
+  skin.shadow_radius = 0;
+  skin.back_color = 0xFF202020u;
+  skin.comment_color = 0xFFFFFFFFu;
+  skin.hilited_comment_color = 0xFFFFFFFFu;
+  skin.prevpage_color = 0;
+  skin.nextpage_color = 0;
+
+  FamoTextResources* resources = FamoTextResourcesCreate(&skin, 96);
+  CHECK(resources != nullptr);
+  FamoLayoutInput input{};
+  input.size = static_cast<uint32_t>(sizeof(input));
+  input.caret_rect = {100, 100, 102, 120};
+  input.work_area = {0, 0, 1920, 1080};
+  input.dpi = 96;
+  input.measure = &FamoTextMeasure;
+  input.measure_user = resources;
+
+  FamoLayoutResult layout{};
+  CHECK(FamoCandidateUiLayout(&view, &skin, &input, &layout) == FAMO_UI_OK);
+  CHECK(layout.candidates[1].has_comment == 1);
+  Dib dib;
+  CHECK(dib.Make(layout.content_size.cx, layout.content_size.cy));
+  CHECK(FamoCandidateUiPaint(&view, &skin, &input, &layout, resources,
+                             dib.dc) == FAMO_UI_OK);
+  GdiFlush();
+  Dib narrow_candidate;
+  CHECK(narrow_candidate.Make(layout.content_size.cx - 1,
+                              layout.content_size.cy + 1));
+  CHECK(FamoCandidateUiPaint(&view, &skin, &input, &layout, resources,
+                             narrow_candidate.dc) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  const FamoRect comment = layout.candidates[1].comment;
+  bool comment_pixel = false;
+  for (int y = comment.top; y < comment.bottom && !comment_pixel; ++y) {
+    for (int x = comment.left; x < comment.right; ++x) {
+      if (Rgb(dib.At(x, y)) != Rgb(skin.back_color)) {
+        comment_pixel = true;
+        break;
+      }
+    }
+  }
+  CHECK(comment_pixel);
+
+  FamoCompositionView short_view = view;
+  short_view.size =
+      static_cast<uint32_t>(offsetof(FamoCompositionView, preedit_sel_start) - 1);
+  CHECK(FamoCandidateUiPaint(&short_view, &skin, &input, &layout, resources,
+                             dib.dc) == FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoCompositionView missing_candidates = view;
+  missing_candidates.candidates = nullptr;
+  CHECK(FamoCandidateUiPaint(&missing_candidates, &skin, &input, &layout,
+                             resources, dib.dc) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoSkin legacy_skin = skin;
+  legacy_skin.size = static_cast<uint32_t>(offsetof(FamoSkin, caret_width));
+  CHECK(FamoCandidateUiPaint(&view, &legacy_skin, &input, &layout, resources,
+                             dib.dc) == FAMO_UI_OK);
+  legacy_skin.size -= 1;
+  CHECK(FamoCandidateUiPaint(&view, &legacy_skin, &input, &layout, resources,
+                             dib.dc) == FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoLayoutInput short_input = input;
+  short_input.size =
+      static_cast<uint32_t>(offsetof(FamoLayoutInput, preview_candidates) - 1);
+  CHECK(FamoCandidateUiPaint(&view, &skin, &short_input, &layout, resources,
+                             dib.dc) == FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoLayoutResult bad_layout = layout;
+  bad_layout.candidate_count = FAMO_MAX_LAID_CANDIDATES + 1;
+  CHECK(FamoCandidateUiPaint(&view, &skin, &input, &bad_layout, resources,
+                             dib.dc) == FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoSkin resource_legacy = skin;
+  resource_legacy.size =
+      static_cast<uint32_t>(offsetof(FamoSkin, caret_width));
+  CHECK(FamoTextResourcesReconfigure(resources, &resource_legacy, 96) ==
+        FAMO_UI_OK);
+  FamoSkin resource_short = resource_legacy;
+  resource_short.size -= 1;
+  CHECK(FamoTextResourcesReconfigure(resources, &resource_short, 96) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+  CHECK(FamoTextResourcesCreate(&resource_short, 96) == nullptr);
+
+  FamoSkin unterminated_face = skin;
+  std::memset(unterminated_face.label_font.face, 'x',
+              sizeof(unterminated_face.label_font.face));
+  CHECK(FamoTextResourcesReconfigure(resources, &unterminated_face, 96) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  CHECK(FamoTextResourcesReconfigure(resources, &skin, 96) == FAMO_UI_OK);
+  Dib bar;
+  CHECK(bar.Make(80, 24));
+  FamoStatusBarSpec spec{};
+  spec.size = static_cast<uint32_t>(sizeof(spec));
+  spec.bar_size = {80, 24};
+  spec.dpi = 96;
+  CHECK(FamoStatusBarPaint(&spec, &skin, resources, bar.dc) == FAMO_UI_OK);
+  Dib narrow_bar;
+  CHECK(narrow_bar.Make(79, 25));
+  CHECK(FamoStatusBarPaint(&spec, &skin, resources, narrow_bar.dc) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+  FamoStatusBarSpec short_spec = spec;
+  short_spec.size -= 1;
+  CHECK(FamoStatusBarPaint(&short_spec, &skin, resources, bar.dc) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+  CHECK(FamoStatusBarPaint(&spec, &resource_legacy, resources, bar.dc) ==
+        FAMO_UI_OK);
+  CHECK(FamoStatusBarPaint(&spec, &resource_short, resources, bar.dc) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+  FamoTextResourcesDestroy(resources);
+  return 0;
+}
 
 // A drop shadow (item 1): shadow_margin>0, the paint buffer is content+2*margin,
 // the panel bg still lands at (margin,margin), and the margin ring carries shadow
@@ -285,6 +436,7 @@ int main() {
   sk.border = 0;
   sk.shadow_radius = 0;
   sk.back_color = 0xFF202020u;             // opaque dark gray panel
+  sk.border_color = 0xFF00CC55u;           // visible band/list hairline
   sk.hilited_back_color = 0xFFC02040u;     // opaque magenta highlight (distinct)
   sk.hilited_text_color = 0xFFFFFFFFu;     // white
   sk.candidate_text_color = 0xFFFFFFFFu;
@@ -375,6 +527,16 @@ int main() {
   // back_color.
   CHECK(Rgb(at(cx / 2, sk.margin_y / 2)) == Rgb(sk.back_color));
 
+  // (e) the band/list hairline is derived from stable rects rather than an
+  // appended FamoLayoutResult field.
+  const int band_bottom = (std::max)(out.preedit.bottom, out.aux.bottom);
+  const int separator_y =
+      band_bottom + (out.candidates[0].bounds.top - band_bottom) / 2;
+  const uint32_t separator_pixel = at(cx / 2, separator_y);
+  CHECK(Rgb(separator_pixel) != Rgb(sk.back_color));
+  CHECK(((separator_pixel >> 8) & 0xffu) >
+        ((separator_pixel >> 16) & 0xffu));
+
   // (a) highlight fill: top padding strip of the highlighted row (above the text).
   const FamoRect hb = out.highlight;
   CHECK(hb.right > hb.left && hb.bottom > hb.top);
@@ -404,7 +566,10 @@ int main() {
 
   if (int r = check_shadow()) return r;
   if (int r = check_soft_cursor()) return r;
+  if (int r = check_legacy_candidate_abi()) return r;
 
-  std::printf("bitmap_smoke: OK (%dx%d) +shadow +soft-cursor\n", cx, cy);
+  std::printf(
+      "bitmap_smoke: OK (%dx%d) +shadow +soft-cursor +legacy-candidate\n",
+      cx, cy);
   return 0;
 }

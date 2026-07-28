@@ -229,13 +229,13 @@ typedef struct FamoLayoutResult {
   int32_t origin_x;
   int32_t origin_y;
   uint32_t flipped;
-
-  // Hairline dividing the preedit/aux band from the candidate list, full-bleed
-  // across the panel and centred in `spacing`. Empty when there is no band or no
-  // candidate. Painted in border_color — appended, so a caller built against an
-  // older struct simply never sees it.
-  FamoRect separator;
 } FamoLayoutResult;
+
+// FamoCandidateUiLayout has no caller-capacity parameter: unlike the input
+// structs, this output is not size-negotiated and must not grow in-place.
+// Keep a fixed span so the ABI canary detects any future wider write.
+#define FAMO_LAYOUT_RESULT_STABLE_SIZE \
+  (offsetof(FamoLayoutResult, flipped) + sizeof(uint32_t))
 
 // ─── DirectWrite/D2D text resources (B5) ─────────────────────────────────────
 // Opaque rendering resources shared by Paint and the measurement callback. The

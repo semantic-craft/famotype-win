@@ -183,13 +183,18 @@ bool UseDarkPalette() {
 }
 
 bool ApplyScalar(std::string_view key, std::string_view value, bool dark,
-                 FamoSkin *skin) {
+                 bool *dark_palette_applied, FamoSkin *skin) {
   if (key == "color_scheme" || key == "color_scheme_dark") {
     const std::string_view name = Trim(value);
     if (!Palettes().contains(std::string(name)))
       return false;
-    if ((key == "color_scheme" || dark) && !ApplyPalette(name, skin))
-      return false;
+    const bool dark_scheme = key == "color_scheme_dark";
+    if ((!dark_scheme && (!dark || !*dark_palette_applied)) ||
+        (dark_scheme && dark)) {
+      if (!ApplyPalette(name, skin))
+        return false;
+      *dark_palette_applied = dark_scheme;
+    }
   } else if (key == "font_face") {
     const std::string face = Unquote(value);
     if (!IsValidUtf8(face) || face.empty() || face.size() >= FAMO_FONT_FACE_MAX)
@@ -316,6 +321,7 @@ bool ParseCandidateSkinForTheme(std::string_view text, bool dark,
   std::istringstream input{std::string(text)};
   std::string line;
   bool saw_style = false;
+  bool dark_palette_applied = false;
   std::set<std::string> seen;
   while (std::getline(input, line)) {
     if (!line.empty() && line.back() == '\r')
@@ -336,7 +342,8 @@ bool ParseCandidateSkinForTheme(std::string_view text, bool dark,
                                      ? std::string_view{}
                                      : child.substr(0, colon);
     if (key.empty() || !seen.emplace(key).second ||
-        !ApplyScalar(key, child.substr(colon + 1), dark, skin))
+        !ApplyScalar(key, child.substr(colon + 1), dark,
+                     &dark_palette_applied, skin))
       return false;
   }
   if (skin->layout_type != FAMO_LAYOUT_HORIZONTAL) {
