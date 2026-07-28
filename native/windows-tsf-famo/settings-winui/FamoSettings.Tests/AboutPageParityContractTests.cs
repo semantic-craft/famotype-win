@@ -71,7 +71,8 @@ public sealed class AboutPageParityContractTests
 
         Assert.Contains("法墨输入法 · Windows", productCopy);
         Assert.Contains("Famo Input Method", productCopy);
-        Assert.Contains("FamoTsf.dll / FamoRuntime.exe", productCopy);
+        Assert.Contains("FamoTextService.dll / FamoRuntime.exe", productCopy);
+        Assert.DoesNotContain("FamoTsf.dll", productCopy, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Weasel", productCopy, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("小狼毫", productCopy);
         Assert.DoesNotContain("weasel.dll", productCopy, StringComparison.OrdinalIgnoreCase);

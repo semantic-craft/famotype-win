@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Famo.Settings.Core;
 using Famo.Settings.Core.Clipboard;
 using Famo.Settings.Interop;
 using Famo.Settings.Theming;
@@ -195,7 +196,9 @@ public sealed class ClipboardWindow : Window
     private static string Preview(string text)
     {
         string oneLine = text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ');
-        return oneLine.Length <= 120 ? oneLine : oneLine[..120] + "...";
+        return oneLine.Length <= 120
+            ? oneLine
+            : TextElementTruncator.Truncate(oneLine, 120) + "...";
     }
 
     private void ConfigurePresenter()

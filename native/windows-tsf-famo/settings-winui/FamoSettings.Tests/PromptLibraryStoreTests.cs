@@ -165,6 +165,25 @@ public sealed class PromptLibraryStoreTests : IDisposable
     }
 
     [Fact]
+    public void UpsertPrompt_TitleTruncationDoesNotPersistHalfOfAnEmoji()
+    {
+        var store = new PromptLibraryStore(_file);
+        string prefix = new('a', PromptLibraryStore.MaxGeneratedTitleLength - 1);
+        string title = prefix + "😀";
+
+        store.UpsertPrompt(new PromptLibraryEntry
+        {
+            Title = title,
+            Content = "内容",
+        });
+
+        PromptLibraryEntry saved = Assert.Single(new PromptLibraryStore(_file).Load().Prompts);
+        Assert.Equal(prefix, saved.Title);
+        Assert.True(saved.Title.Length <= PromptLibraryStore.MaxGeneratedTitleLength);
+        Assert.DoesNotContain('\uFFFD', saved.Title);
+    }
+
+    [Fact]
     public void FilterAndSort_SearchesFieldsAndUsesPinnedThenUpdatedOrder()
     {
         DateTimeOffset now = new(2026, 7, 1, 8, 0, 0, TimeSpan.Zero);
@@ -180,6 +199,21 @@ public sealed class PromptLibraryStoreTests : IDisposable
 
         Assert.Equal(["pinned", "new", "old"], sorted.Select(p => p.Id).ToArray());
         Assert.DoesNotContain(sorted, p => p.Id == "disabled");
+    }
+
+    [Fact]
+    public void FilterAndSort_CanIncludeDisabledPromptsForManagement()
+    {
+        var prompts = new[]
+        {
+            new PromptLibraryEntry { Id = "enabled", Title = "可用", Content = "内容", Enabled = true },
+            new PromptLibraryEntry { Id = "disabled", Title = "已停用", Content = "内容", Enabled = false },
+        };
+        IReadOnlyList<PromptLibraryEntry> sorted = PromptLibraryStore.FilterAndSort(
+            prompts,
+            includeDisabled: true);
+
+        Assert.Equal(["enabled", "disabled"], sorted.Select(prompt => prompt.Id).ToArray());
     }
 
     [Fact]

@@ -24,7 +24,7 @@ public sealed class AboutPage : UserControl
         sp.Children.Add(FamoUI.Card("版本",
             FamoUI.Row("当前版本", null, FamoUI.Value(ReadAppVersion()), divider: false),
             FamoUI.Row("产品身份", "Windows TSF 输入服务 + 设置面板。", FamoUI.Value("Famo Input Method")),
-            FamoUI.Row("运行组件", "安装版组件名与系统入口保持法墨命名。", FamoUI.Value("FamoTsf.dll / FamoRuntime.exe")),
+            FamoUI.Row("运行组件", "安装版组件名与系统入口保持法墨命名。", FamoUI.Value("FamoTextService.dll / FamoRuntime.exe")),
             FamoUI.Row("软件更新", "打开法墨发布页手动检查 Windows 安装包；不声称后台自动更新已接入。",
                 FamoUI.ActionButton("检查更新", () => CheckForUpdates(statusText)))));
 

@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using Famo.Settings.Core;
 
 namespace Famo.Settings.Core.Ai;
 
@@ -437,7 +438,7 @@ internal sealed class AiProviderChatCompletionClient
         }
         catch (JsonException)
         {
-            return json.Length <= 160 ? json : json[..160];
+            return TextElementTruncator.Truncate(json, 160);
         }
 
         return "";
