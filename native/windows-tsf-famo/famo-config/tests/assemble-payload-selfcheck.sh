@@ -48,6 +48,7 @@ create_ice_remote() {
   write_fixture_file "${work_dir}/melt_eng.schema.yaml"
   write_fixture_file "${work_dir}/double_pinyin_flypy.schema.yaml"
   write_fixture_file "${work_dir}/cn_dicts/base.dict.yaml"
+  write_fixture_file "${work_dir}/.gitignore" "ignored-ice-residue.yaml"
   git -C "${work_dir}" add .
   git -C "${work_dir}" commit --quiet -m "pin target"
   ICE_PIN_SHA="$(git -C "${work_dir}" rev-parse HEAD)"
@@ -83,6 +84,7 @@ create_wubi_remote() {
   write_fixture_file "${work_dir}/pinyin_simp.dict.yaml"
   write_fixture_file "${work_dir}/lua/wubi86_jidian_date_translator.lua"
   write_fixture_file "${work_dir}/LICENSE"
+  write_fixture_file "${work_dir}/.gitignore" "ignored-wubi-residue.schema.yaml"
   git -C "${work_dir}" add .
   git -C "${work_dir}" commit --quiet -m "pin target"
   WUBI_PIN_SHA="$(git -C "${work_dir}" rev-parse HEAD)"
@@ -131,6 +133,36 @@ repo_origin() {
   git -C "${case_dir}/.cache/${repo_dir}" config --get remote.origin.url
 }
 
+seed_cache_residue() {
+  local case_dir="$1"
+  write_fixture_file "${case_dir}/.cache/rime-ice/untracked-ice-residue.yaml"
+  write_fixture_file "${case_dir}/.cache/rime-ice/ignored-ice-residue.yaml"
+  write_fixture_file \
+    "${case_dir}/.cache/rime-wubi86-jidian/untracked-wubi-residue.schema.yaml"
+  write_fixture_file \
+    "${case_dir}/.cache/rime-wubi86-jidian/ignored-wubi-residue.schema.yaml"
+  git -C "${case_dir}/.cache/rime-ice" check-ignore --quiet ignored-ice-residue.yaml \
+    || fail "ICE ignored residue fixture is not ignored"
+  git -C "${case_dir}/.cache/rime-wubi86-jidian" \
+    check-ignore --quiet ignored-wubi-residue.schema.yaml \
+    || fail "Wubi ignored residue fixture is not ignored"
+}
+
+assert_cache_residue_removed() {
+  local case_dir="$1" message="$2" path
+  for path in \
+    ".cache/rime-ice/untracked-ice-residue.yaml" \
+    ".cache/rime-ice/ignored-ice-residue.yaml" \
+    ".cache/rime-wubi86-jidian/untracked-wubi-residue.schema.yaml" \
+    ".cache/rime-wubi86-jidian/ignored-wubi-residue.schema.yaml" \
+    "payload/untracked-ice-residue.yaml" \
+    "payload/ignored-ice-residue.yaml" \
+    "payload/untracked-wubi-residue.schema.yaml" \
+    "payload/ignored-wubi-residue.schema.yaml"; do
+    [ ! -e "${case_dir}/${path}" ] || fail "${message}: residue survived at ${path}"
+  done
+}
+
 command -v git >/dev/null 2>&1 || fail "git not found"
 [ -f "${ASSEMBLE_SCRIPT}" ] || fail "assemble script not found: ${ASSEMBLE_SCRIPT}"
 
@@ -165,12 +197,15 @@ assert_equal "${ICE_DEFAULT_SHA}" "$(repo_head "${cached_switch_case}" rime-ice)
   "default clone must start ICE cache at the default HEAD"
 assert_equal "${WUBI_DEFAULT_SHA}" "$(repo_head "${cached_switch_case}" rime-wubi86-jidian)" \
   "default clone must start Wubi cache at the default HEAD"
+seed_cache_residue "${cached_switch_case}"
 run_pinned "${cached_switch_case}" "${ICE_PIN_SHA}" "${WUBI_PIN_SHA}" \
   "${TEST_ROOT}/cached-pinned.log"
 assert_equal "${ICE_PIN_SHA}" "$(repo_head "${cached_switch_case}" rime-ice)" \
   "cached ICE checkout must switch to the pinned SHA"
 assert_equal "${WUBI_PIN_SHA}" "$(repo_head "${cached_switch_case}" rime-wubi86-jidian)" \
   "cached Wubi checkout must switch to the pinned SHA"
+assert_cache_residue_removed "${cached_switch_case}" \
+  "pinned cache checkout must clean managed repositories"
 
 canonical_origin_case="$(make_case canonical-origin)"
 run_default "${canonical_origin_case}" "${TEST_ROOT}/canonical-origin-default.log"
@@ -191,6 +226,7 @@ assert_equal "${WUBI_REPO_URL}" "$(repo_origin "${canonical_origin_case}" rime-w
 
 canonical_default_case="$(make_case canonical-default)"
 run_default "${canonical_default_case}" "${TEST_ROOT}/canonical-default-initial.log"
+seed_cache_residue "${canonical_default_case}"
 git -C "${canonical_default_case}/.cache/rime-ice" remote set-url origin \
   "file://${ICE_WRONG_REMOTE}"
 git -C "${canonical_default_case}/.cache/rime-wubi86-jidian" remote set-url origin \
@@ -204,6 +240,8 @@ assert_equal "${ICE_REPO_URL}" "$(repo_origin "${canonical_default_case}" rime-i
   "unpinned ICE update must restore the canonical origin"
 assert_equal "${WUBI_REPO_URL}" "$(repo_origin "${canonical_default_case}" rime-wubi86-jidian)" \
   "unpinned Wubi update must restore the canonical origin"
+assert_cache_residue_removed "${canonical_default_case}" \
+  "unpinned online update must clean managed repositories"
 
 ice_before_invalid="$(repo_head "${first_sha_case}" rime-ice)"
 set +e
@@ -235,6 +273,7 @@ default_offline_case="$(make_case default-offline)"
 run_default "${default_offline_case}" "${TEST_ROOT}/default-online.log"
 default_ice_head="$(repo_head "${default_offline_case}" rime-ice)"
 default_wubi_head="$(repo_head "${default_offline_case}" rime-wubi86-jidian)"
+seed_cache_residue "${default_offline_case}"
 git -C "${default_offline_case}/.cache/rime-ice" remote set-url origin \
   "file://${TEST_ROOT}/missing-default-ice.git"
 git -C "${default_offline_case}/.cache/rime-wubi86-jidian" remote set-url origin \
@@ -249,6 +288,8 @@ assert_equal "${ICE_REPO_URL}" "$(repo_origin "${default_offline_case}" rime-ice
   "unpinned offline mode must retain the canonical ICE origin"
 assert_equal "${WUBI_REPO_URL}" "$(repo_origin "${default_offline_case}" rime-wubi86-jidian)" \
   "unpinned offline mode must retain the canonical Wubi origin"
+assert_cache_residue_removed "${default_offline_case}" \
+  "unpinned offline mode must clean managed repositories"
 offline_warning_count="$(grep -c '沿用已缓存' "${TEST_ROOT}/default-offline.log")"
 assert_equal "2" "${offline_warning_count}" \
   "unpinned offline mode must report both cache fallbacks"
@@ -261,3 +302,4 @@ printf '[assemble-selfcheck] PASS: pinned refs restore canonical origins\n'
 printf '[assemble-selfcheck] PASS: unpinned updates restore canonical origins\n'
 printf '[assemble-selfcheck] PASS: invalid refs fail closed\n'
 printf '[assemble-selfcheck] PASS: unpinned offline mode retains valid caches\n'
+printf '[assemble-selfcheck] PASS: managed caches exclude untracked and ignored residue\n'

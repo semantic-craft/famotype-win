@@ -112,7 +112,7 @@ index 67e9b6d..61e4fa7 100644
  }
 
  DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
-@@ -220,45 +256,29 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+@@ -220,45 +256,40 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
      if (m_disabled)
        return 0;
    }
@@ -138,8 +138,24 @@ index 67e9b6d..61e4fa7 100644
 +  // 法墨即时输入方式②：新会话即采用 famo-select-schema.txt 所选方案（不部署）。
 +  std::string sel = _ReadFamoSelectSchema();
 +  FamoUtf8String schema = FamoU8(sel);
-+  m_engine_host.api().create_context(sel.empty() ? nullptr : &schema,
-+                                     &engine_ctx);
++  const int32_t create_context_result =
++      m_engine_host.api().create_context(sel.empty() ? nullptr : &schema,
++                                           &engine_ctx);
++  if (create_context_result != FAMO_ENGINE_OK || !engine_ctx) {
++    LOG(ERROR) << "Add session: context creation failed rc="
++               << create_context_result << ", schema=" << sel;
++    if (engine_ctx)
++      m_engine_host.api().destroy_context(engine_ctx);
++    return 0;
++  }
++  _ApplyFamoOptions(engine_ctx);
++  if (!_RefillAbiView(engine_ctx)) {
++    m_engine_host.api().destroy_context(engine_ctx);
++    LOG(ERROR) << "Add session: context status unavailable, schema=" << sel;
++    return 0;
++  }
++  std::string schema_id =
++      m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
 
    WeaselSessionId ipc_id =
        _GenerateNewWeaselSessionId(m_session_status_map, m_pid);
@@ -150,27 +166,27 @@ index 67e9b6d..61e4fa7 100644
    session_status.style = m_base_style;
 -  session_status.session_id = session_id;
 +  session_status.engine_ctx = engine_ctx;
-+  _ApplyFamoOptions(engine_ctx);
    _ReadClientInfo(ipc_id, buffer);
 
 -  RIME_STRUCT(RimeStatus, status);
 -  if (rime_api->get_status(session_id, &status)) {
 -    std::string schema_id = status.schema_id;
-+  if (_RefillAbiView(engine_ctx)) {
-+    std::string schema_id =
-+        m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
-     m_last_schema_id = schema_id;
-     _LoadSchemaSpecificSettings(ipc_id, schema_id);
+-    m_last_schema_id = schema_id;
+-    _LoadSchemaSpecificSettings(ipc_id, schema_id);
++  m_last_schema_id = schema_id;
++  _LoadSchemaSpecificSettings(ipc_id, schema_id);
 -    _LoadAppInlinePreeditSet(ipc_id, true);
-     _UpdateInlinePreeditStatus(ipc_id);
+-    _UpdateInlinePreeditStatus(ipc_id);
++  _UpdateInlinePreeditStatus(ipc_id);
 -    _RefreshTrayIcon(session_id, _UpdateUICallback);
 -    session_status.status = status;
-     session_status.__synced = false;
+-    session_status.__synced = false;
++  session_status.__synced = false;
 -    rime_api->free_status(&status);
-   }
+-  }
    m_ui->style() = session_status.style;
    // show session's welcome message :-) if any
-@@ -277,9 +297,11 @@ DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
+@@ -277,9 +308,11 @@ DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
      m_ui->Hide();
    if (m_disabled)
      return 0;
@@ -184,7 +200,7 @@ index 67e9b6d..61e4fa7 100644
    m_session_status_map.erase(ipc_id);
    m_active_session = 0;
    return 0;
-@@ -306,14 +328,13 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
+@@ -306,14 +339,13 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
    }
 
    for (auto& pair : m_session_status_map) {
@@ -204,7 +220,7 @@ index 67e9b6d..61e4fa7 100644
      }
    }
    m_ui->style() = get_session_status(m_active_session).style;
-@@ -370,27 +390,29 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
+@@ -370,27 +401,29 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
    }
 
    for (auto& pair : m_session_status_map) {
@@ -249,7 +265,7 @@ index 67e9b6d..61e4fa7 100644
    std::string yaml = _ReadFamoFile(L"famo-options.yaml");
    if (yaml.empty())
      return;
-@@ -397,8 +417,11 @@ void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
+@@ -397,8 +428,11 @@ void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
      if (rime_api->config_begin_map(&it, &cfg, "options")) {
        while (rime_api->config_next(&it)) {
          Bool v = False;
@@ -263,7 +279,7 @@ index 67e9b6d..61e4fa7 100644
        }
        rime_api->config_end(&it);
      }
-@@ -411,8 +434,10 @@ void RimeWithWeaselHandler::ReloadOptions() {
+@@ -411,8 +445,10 @@ void RimeWithWeaselHandler::ReloadOptions() {
    LOG(INFO) << "Famo: ReloadOptions (instant switches, no deploy).";
    if (m_disabled)
      return;
@@ -276,7 +292,7 @@ index 67e9b6d..61e4fa7 100644
    if (m_active_session)
      _UpdateUI(m_active_session);  // 中英/简繁等状态变化即时反映到候选窗/状态栏
  }
-@@ -428,15 +453,32 @@ std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
+@@ -428,15 +464,63 @@ std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
  }
 
  void RimeWithWeaselHandler::SelectSchema() {
@@ -291,28 +307,60 @@ index 67e9b6d..61e4fa7 100644
 -  for (auto& pair : m_session_status_map)
 -    rime_api->select_schema(to_session_id(pair.first), id.c_str());
 +  FamoUtf8String schema = FamoU8(id);
++  struct PendingContext {
++    WeaselSessionId ipc_id;
++    FamoEngineContext* context;
++    std::string schema_id;
++  };
++  std::vector<PendingContext> replacements;
++  replacements.reserve(m_session_status_map.size());
 +  for (auto& pair : m_session_status_map) {
-+    FamoEngineContext* old_ctx = pair.second.engine_ctx;
++    FamoEngineContext* new_ctx = nullptr;
++    const int32_t create_context_result =
++        m_engine_host.api().create_context(&schema, &new_ctx);
++    if (create_context_result != FAMO_ENGINE_OK || !new_ctx) {
++      if (m_active_session)
++        _RefillAbiView(get_session_status(m_active_session).engine_ctx);
++      if (new_ctx)
++        m_engine_host.api().destroy_context(new_ctx);
++      for (auto& replacement : replacements)
++        m_engine_host.api().destroy_context(replacement.context);
++      LOG(ERROR) << "Famo: schema context creation failed rc="
++                 << create_context_result << ", schema=" << id;
++      return;
++    }
++    _ApplyFamoOptions(new_ctx);
++    if (!_RefillAbiView(new_ctx)) {
++      if (m_active_session)
++        _RefillAbiView(get_session_status(m_active_session).engine_ctx);
++      m_engine_host.api().destroy_context(new_ctx);
++      for (auto& replacement : replacements)
++        m_engine_host.api().destroy_context(replacement.context);
++      LOG(ERROR) << "Famo: schema context status unavailable, schema=" << id;
++      return;
++    }
++    std::string schema_id =
++        m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
++    replacements.push_back({pair.first, new_ctx, schema_id});
++  }
++  for (auto& replacement : replacements) {
++    SessionStatus& session_status =
++        get_session_status(replacement.ipc_id);
++    FamoEngineContext* old_ctx = session_status.engine_ctx;
++    session_status.engine_ctx = replacement.context;
++    _LoadSchemaSpecificSettings(replacement.ipc_id, replacement.schema_id);
++    _UpdateInlinePreeditStatus(replacement.ipc_id);
++    session_status.__synced = false;
 +    if (old_ctx)
 +      m_engine_host.api().destroy_context(old_ctx);
-+    pair.second.engine_ctx = nullptr;
-+    FamoEngineContext* new_ctx = nullptr;
-+    if (m_engine_host.api().create_context(&schema, &new_ctx) == FAMO_ENGINE_OK) {
-+      pair.second.engine_ctx = new_ctx;
-+      _ApplyFamoOptions(new_ctx);
-+      if (_RefillAbiView(new_ctx)) {
-+        std::string schema_id =
-+            m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
-+        _LoadSchemaSpecificSettings(pair.first, schema_id);
-+        _UpdateInlinePreeditStatus(pair.first);
-+        pair.second.__synced = false;
-+      }
-+    }
 +  }
-   if (m_active_session)
+-  if (m_active_session)
++  if (m_active_session) {
++    _RefillAbiView(get_session_status(m_active_session).engine_ctx);
      _UpdateUI(m_active_session);  // 切到新方案后即时刷新候选窗/状态栏
++  }
  }
-@@ -448,21 +490,50 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
+@@ -448,21 +532,50 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
               << ", mask = " << keyEvent.mask << ", ipc_id = " << ipc_id;
    if (m_disabled)
      return FALSE;
@@ -372,7 +420,7 @@ index 67e9b6d..61e4fa7 100644
      }
    }
    _Respond(ipc_id, eat);
-@@ -475,7 +546,10 @@ void RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id) {
+@@ -475,7 +588,10 @@ void RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id) {
    DLOG(INFO) << "Commit composition: ipc_id = " << ipc_id;
    if (m_disabled)
      return;
@@ -384,7 +432,7 @@ index 67e9b6d..61e4fa7 100644
    _UpdateUI(ipc_id);
    m_active_session = ipc_id;
  }
-@@ -484,7 +558,10 @@ void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
+@@ -484,7 +600,10 @@ void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
    DLOG(INFO) << "Clear composition: ipc_id = " << ipc_id;
    if (m_disabled)
      return;
@@ -396,7 +444,7 @@ index 67e9b6d..61e4fa7 100644
    _UpdateUI(ipc_id);
    m_active_session = ipc_id;
  }
-@@ -496,7 +573,18 @@ void RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
+@@ -496,7 +615,18 @@ void RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
               << ", index = " << index;
    if (m_disabled)
      return;
@@ -416,7 +464,7 @@ index 67e9b6d..61e4fa7 100644
  }
 
  bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
-@@ -505,8 +593,10 @@ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
+@@ -505,8 +635,10 @@ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
      EatLine eat) {
    DLOG(INFO) << "highlight candidate on current page, ipc_id = " << ipc_id
               << ", index = " << index;
@@ -429,7 +477,7 @@ index 67e9b6d..61e4fa7 100644
    _Respond(ipc_id, eat);
    _UpdateUI(ipc_id);
    return res;
-@@ -517,7 +607,10 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
+@@ -517,7 +649,10 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
                                         EatLine eat) {
    DLOG(INFO) << "change page, ipc_id = " << ipc_id
               << (backward ? "backward" : "foreward");
@@ -441,7 +489,7 @@ index 67e9b6d..61e4fa7 100644
    _Respond(ipc_id, eat);
    _UpdateUI(ipc_id);
    return res;
-@@ -568,6 +661,7 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
+@@ -568,6 +703,7 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
                                       uintptr_t session_id,
                                       const char* message_type,
                                       const char* message_value) {
@@ -449,7 +497,7 @@ index 67e9b6d..61e4fa7 100644
    // may be running in a thread when deploying rime
    RimeWithWeaselHandler* self =
        reinterpret_cast<RimeWithWeaselHandler*>(context_object);
-@@ -576,16 +670,11 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
+@@ -576,16 +712,11 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
    std::lock_guard<std::mutex> lock(m_notifier_mutex);
    m_message_type = message_type;
    m_message_value = message_value;
@@ -468,7 +516,7 @@ index 67e9b6d..61e4fa7 100644
    }
  }
 
-@@ -610,50 +699,48 @@ void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
+@@ -610,50 +741,48 @@ void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
      }
    }
    SessionStatus& session_status = get_session_status(ipc_id);
@@ -547,7 +595,7 @@ index 67e9b6d..61e4fa7 100644
  }
 
  void RimeWithWeaselHandler::StartMaintenance() {
-@@ -674,15 +761,21 @@ void RimeWithWeaselHandler::SetOption(WeaselSessionId ipc_id,
+@@ -674,15 +803,21 @@ void RimeWithWeaselHandler::SetOption(WeaselSessionId ipc_id,
                                        const std::string& opt,
                                        bool val) {
    // from no-session client, not actual typing session
@@ -572,7 +620,7 @@ index 67e9b6d..61e4fa7 100644
    }
  }
 
-@@ -707,25 +800,23 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
+@@ -707,25 +842,23 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
    Status& weasel_status = m_ui->status();
    Context weasel_context;
 
@@ -606,7 +654,7 @@ index 67e9b6d..61e4fa7 100644
 
    {
      std::lock_guard<std::mutex> lock(m_notifier_mutex);
-@@ -801,55 +892,6 @@ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
+@@ -801,55 +934,6 @@ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
    rime_api->config_close(&config);
  }
 
@@ -662,7 +710,7 @@ index 67e9b6d..61e4fa7 100644
 
  bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
    std::lock_guard<std::mutex> lock(m_notifier_mutex);
-@@ -926,155 +968,98 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+@@ -926,155 +1010,98 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
    actions.reserve(8);
 
    SessionStatus& session_status = get_session_status(ipc_id);
@@ -880,7 +928,7 @@ index 67e9b6d..61e4fa7 100644
    }
 
    // configuration information
-@@ -1637,80 +1622,57 @@ static void _LoadAppOptions(RimeConfig* config,
+@@ -1637,80 +1664,57 @@ static void _LoadAppOptions(RimeConfig* config,
        });
  }
 

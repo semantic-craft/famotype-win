@@ -334,12 +334,12 @@ public sealed class CandidateFormatTests
             "+      _LoadSchemaSpecificSettings(pair.first, std::string(status.schema_id));");
         AssertPatchHunkCopiesStyleBeforeSchemaLoad(
             abiPatch,
-            "@@ -306,14 +328,13 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode)",
+            "void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode)",
             "+      pair.second.style = m_base_style;",
             "+      _LoadSchemaSpecificSettings(pair.first, schema_id);");
         AssertPatchHunkCopiesStyleBeforeSchemaLoad(
             abiPatch,
-            "@@ -370,27 +390,29 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,",
+            "void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,",
             "+      pair.second.style = m_base_style;",
             "+      _LoadSchemaSpecificSettings(pair.first, schema_id);");
     }
@@ -350,7 +350,9 @@ public sealed class CandidateFormatTests
         string abiPatch = File.ReadAllText(
             RepoFile("native/windows-tsf-famo/weasel-fork/features/engine-abi.patch")).Replace("\r\n", "\n");
 
-        int hunk = abiPatch.IndexOf("@@ -370,27 +390,29 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,", StringComparison.Ordinal);
+        int hunk = abiPatch.IndexOf(
+            "void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,",
+            StringComparison.Ordinal);
         Assert.True(hunk >= 0, "engine-abi.patch must update ReloadStyleOverlay");
 
         int nextHunk = abiPatch.IndexOf("\n@@ ", hunk + 1, StringComparison.Ordinal);
