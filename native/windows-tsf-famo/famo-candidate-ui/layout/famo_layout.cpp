@@ -13,9 +13,12 @@
 // monospace fallback, so geometry is deterministic + unit-testable here.
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 
+#include "../famo_candidate_access.h"
+#include "../famo_c_abi_boundary.h"
 #include "../famo_candidate_ui.h"
 
 namespace {
@@ -79,11 +82,9 @@ int32_t MeasureText(const FamoLayoutInput& in, int32_t which,
   return FallbackMeasure(font, s.data, s.length_bytes, in.dpi);
 }
 
-}  // namespace
-
 // ── Correctness trap (research §3.3.3): UTF-8 byte offset → UTF-16 wchar ──────
-extern "C" uint32_t FamoUtf8ByteToWchar(const char* utf8, uint32_t utf8_len,
-                                        uint32_t byte_off) {
+uint32_t Utf8ByteToWcharImpl(const char* utf8, uint32_t utf8_len,
+                            uint32_t byte_off) {
   if (!utf8 || utf8_len == 0) return 0;
   if (byte_off > utf8_len) byte_off = utf8_len;
   uint32_t wchars = 0;
@@ -99,42 +100,70 @@ extern "C" uint32_t FamoUtf8ByteToWchar(const char* utf8, uint32_t utf8_len,
 }
 
 // ── Screen-edge flip decision (research §1.3): caret-follow + flip-above ──────
-extern "C" void FamoComputeAnchor(const FamoRect* caret, const FamoRect* work,
-                                  FamoSize content, int32_t* out_x,
-                                  int32_t* out_y, uint32_t* out_flipped) {
+void ComputeAnchorImpl(const FamoRect& caret, const FamoRect& work,
+                       FamoSize content, int32_t* out_x, int32_t* out_y,
+                       uint32_t* out_flipped) {
   const int32_t kGap = 6;  // 6px below the caret (research §1.3)
-  int32_t x = caret->left;
-  int32_t y = caret->bottom + kGap;
+  int32_t x = caret.left;
+  int32_t y = caret.bottom + kGap;
   uint32_t flipped = 0;
 
   // Flip above if the below-caret placement would exceed the work-area bottom.
-  if (y + content.cy > work->bottom) {
-    int32_t up = caret->top - content.cy - kGap;
+  if (y + content.cy > work.bottom) {
+    int32_t up = caret.top - content.cy - kGap;
     // Only accept the flip if it fits better (>= work top); else keep below and
     // clamp — never render off the top edge.
-    if (up >= work->top) {
+    if (up >= work.top) {
       y = up;
       flipped = 1;
     }
   }
 
   // Clamp x into [work.left, work.right - width].
-  int32_t max_x = work->right - content.cx;
+  int32_t max_x = work.right - content.cx;
   if (x > max_x) x = max_x;
-  if (x < work->left) x = work->left;
+  if (x < work.left) x = work.left;
   // Clamp y into [work.top, work.bottom - height] (bottom clamp for the non-flip
   // fallback path above).
-  int32_t max_y = work->bottom - content.cy;
+  int32_t max_y = work.bottom - content.cy;
   if (y > max_y) y = max_y;
-  if (y < work->top) y = work->top;
+  if (y < work.top) y = work.top;
 
   *out_x = x;
   *out_y = y;
   *out_flipped = flipped;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+}  // namespace
+
 namespace {
+
+uint32_t Utf8ByteToWcharCpp(const char* utf8, uint32_t utf8_len,
+                            uint32_t byte_off) noexcept {
+  try {
+    return Utf8ByteToWcharImpl(utf8, utf8_len, byte_off);
+  } catch (...) {
+    return 0;
+  }
+}
+
+void ComputeAnchorCpp(const FamoRect* caret, const FamoRect* work,
+                      FamoSize content, int32_t* out_x, int32_t* out_y,
+                      uint32_t* out_flipped) noexcept {
+  if (!caret || !work || !out_x || !out_y || !out_flipped)
+    return;
+  try {
+    int32_t next_x = 0;
+    int32_t next_y = 0;
+    uint32_t next_flipped = 0;
+    ComputeAnchorImpl(*caret, *work, content, &next_x, &next_y,
+                      &next_flipped);
+    *out_x = next_x;
+    *out_y = next_y;
+    *out_flipped = next_flipped;
+  } catch (...) {
+  }
+}
 
 struct Metrics {
   int32_t margin_x, margin_y, spacing, cand_spacing;
@@ -315,16 +344,25 @@ int32_t LayoutBand(const FamoSkin& sk, const FamoLayoutInput& in, const Metrics&
   return y - y0;  // band height (0 if neither)
 }
 
-}  // namespace
-
-// ── The layout entry point ───────────────────────────────────────────────────
-extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
-                                         const FamoSkin* skin,
-                                         const FamoLayoutInput* input,
-                                         FamoLayoutResult* out) {
-  if (!view || !skin || !input || !out) return FAMO_UI_E_INVALID_ARGUMENT;
-  if (skin->size < offsetof(FamoSkin, show_preedit) ||
+int32_t CandidateUiLayoutImpl(const FamoCompositionView* view,
+                              const FamoSkin* skin,
+                              const FamoLayoutInput* input,
+                              FamoLayoutResult* out) {
+  if (!view || !skin || !input || !out)
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  if (view->size < offsetof(FamoCompositionView, preedit_sel_start) ||
+      skin->size < offsetof(FamoSkin, caret_width) ||
       input->size < offsetof(FamoLayoutInput, preview_candidates))
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  if (!famo_candidate_ui::ReadableUtf8(view->preedit) ||
+      !famo_candidate_ui::ReadableUtf8(input->aux) ||
+      (view->candidate_count > 0 && !view->candidates))
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  const bool has_preview_fields =
+      input->size >= offsetof(FamoLayoutInput, preview_page_size) +
+                         sizeof(input->preview_page_size);
+  if (has_preview_fields && input->preview_candidate_count > 0 &&
+      !input->preview_candidates)
     return FAMO_UI_E_INVALID_ARGUMENT;
 
   std::memset(out, 0, sizeof(*out));
@@ -353,14 +391,25 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
   if (view->preedit.data && view->size >= offsetof(FamoCompositionView, commit_preview)) {
     const char* p = view->preedit.data;
     uint32_t plen = view->preedit.length_bytes;
-    out->preedit_sel_start_wchar = FamoUtf8ByteToWchar(p, plen, view->preedit_sel_start);
-    out->preedit_sel_end_wchar   = FamoUtf8ByteToWchar(p, plen, view->preedit_sel_end);
-    out->preedit_cursor_wchar    = FamoUtf8ByteToWchar(p, plen, view->preedit_cursor_pos);
+    out->preedit_sel_start_wchar =
+        Utf8ByteToWcharImpl(p, plen, view->preedit_sel_start);
+    out->preedit_sel_end_wchar =
+        Utf8ByteToWcharImpl(p, plen, view->preedit_sel_end);
+    out->preedit_cursor_wchar =
+        Utf8ByteToWcharImpl(p, plen, view->preedit_cursor_pos);
   }
 
   const uint32_t n = view->candidate_count < FAMO_MAX_LAID_CANDIDATES
                          ? view->candidate_count
                          : FAMO_MAX_LAID_CANDIDATES;
+  std::array<FamoCandidate, FAMO_MAX_LAID_CANDIDATES> candidates{};
+  for (uint32_t i = 0; i < n; ++i) {
+    if (!famo_candidate_ui::ReadCandidate(view->candidates,
+                                           view->candidate_count, i,
+                                           &candidates[i]) ||
+        !famo_candidate_ui::ReadableCandidate(candidates[i]))
+      return FAMO_UI_E_INVALID_ARGUMENT;
+  }
   out->candidate_count = n;
 
   // Page affordances: previous if not the first page; next unless the engine
@@ -378,7 +427,8 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     // Candidates laid left→right on one row; page affordances flank the row.
     int32_t row_h = 0;
     for (uint32_t i = 0; i < n; ++i)
-      row_h = (std::max)(row_h, CandRowHeight(m, MeasureCand(sk, in, view->candidates[i])));
+      row_h =
+          (std::max)(row_h, CandRowHeight(m, MeasureCand(sk, in, candidates[i])));
     if (row_h == 0) row_h = m.text_h;
 
     int32_t x = x0;
@@ -387,7 +437,7 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
       x += m.page_glyph_w + m.cand_spacing;
     }
     for (uint32_t i = 0; i < n; ++i) {
-      CandExtent e = MeasureCand(sk, in, view->candidates[i]);
+      CandExtent e = MeasureCand(sk, in, candidates[i]);
       int32_t inline_w = CandInlineWidth(m, e);
       int32_t bx = x;
       int32_t bw = inline_w + 2 * m.hpad_x;
@@ -395,7 +445,6 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
       out->candidates[i].bounds = FamoRect{bx, list_top, bx + bw, list_top + bh};
       PlaceRowInline(m, e, bx + m.hpad_x, list_top + m.hpad_y, row_h,
                      &out->candidates[i]);
-      if (static_cast<int32_t>(i) == hl) out->highlight = out->candidates[i].bounds;
       x = bx + bw;
       if (i + 1 < n) x += m.cand_spacing;
     }
@@ -424,13 +473,22 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
       const uint32_t count = static_cast<uint32_t>((std::min)(
           static_cast<uint64_t>(max_preview),
           static_cast<uint64_t>(in.preview_page_size) * wanted_rows));
+      std::array<FamoCandidate, FAMO_MAX_PREVIEW_CANDIDATES>
+          preview_candidates{};
+      for (uint32_t i = 0; i < count; ++i) {
+        if (!famo_candidate_ui::ReadCandidate(
+                in.preview_candidates, in.preview_candidate_count, i,
+                &preview_candidates[i]) ||
+            !famo_candidate_ui::ReadableCandidate(preview_candidates[i]))
+          return FAMO_UI_E_INVALID_ARGUMENT;
+      }
       int32_t preview_y = list_bottom + m.cand_spacing;
       for (uint32_t base = 0; base < count; base += in.preview_page_size) {
         int32_t preview_x = x0;
         const uint32_t row_end =
             (std::min)(count, base + in.preview_page_size);
         for (uint32_t i = base; i < row_end; ++i) {
-          const FamoCandidate& candidate = in.preview_candidates[i];
+          const FamoCandidate& candidate = preview_candidates[i];
           const int32_t text_w =
               MeasureText(in, 1, sk.text_font, candidate.text);
           FamoCandidateRects& rect = out->preview_candidates[i];
@@ -454,6 +512,12 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     int32_t content_w = max_content_w + 2 * panel_margin_x;
     int32_t content_h = list_bottom + m.margin_y;
     out->content_size = ClampSize(m, content_w, content_h);
+    // The selection pill is exactly its row. It used to bleed 4px up and 9px
+    // down into the panel's outer padding (macOS parity), which clamped it flush
+    // to the bottom edge and left only 2px between it and the preedit's dotted
+    // rule — the panel read as two stacked blocks, not a card with a selection.
+    if (hl >= 0 && static_cast<uint32_t>(hl) < n)
+      out->highlight = out->candidates[hl].bounds;
   } else {
     // Vertical + VerticalText: candidates stack top→bottom. (VerticalText differs
     // in glyph orientation at PAINT time, B5; its box geometry stacks like
@@ -463,7 +527,7 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     const int32_t row_spacing = 0;  // macOS vertical full-width rows abut
     const int32_t row_pad_x = m.hpad_x + Scale(2, in.dpi);
     for (uint32_t i = 0; i < n; ++i) {
-      CandExtent e = MeasureCand(sk, in, view->candidates[i], true);
+      CandExtent e = MeasureCand(sk, in, candidates[i], true);
       int32_t row_h = CandRowHeight(m, e);
       int32_t inline_w = CandInlineWidth(m, e);
       int32_t bw = inline_w + 2 * row_pad_x;
@@ -520,10 +584,52 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
   out->shadow_margin = ShadowMargin(sk, in.dpi);
 
   // Caret-follow + screen-edge flip → final origin.
-  FamoComputeAnchor(&in.caret_rect, &in.work_area, out->content_size,
+  ComputeAnchorImpl(in.caret_rect, in.work_area, out->content_size,
                     &out->origin_x, &out->origin_y, &out->flipped);
 
   return FAMO_UI_OK;
+}
+
+int32_t CandidateUiLayoutCpp(const FamoCompositionView* view,
+                             const FamoSkin* skin,
+                             const FamoLayoutInput* input,
+                             FamoLayoutResult* out) noexcept {
+  if (!out)
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  try {
+    FamoLayoutResult next;
+    const int32_t result =
+        CandidateUiLayoutImpl(view, skin, input, &next);
+    if (result == FAMO_UI_OK)
+      std::memcpy(out, &next, FAMO_LAYOUT_RESULT_STABLE_SIZE);
+    return result;
+  } catch (...) {
+    return FAMO_UI_E_LAYOUT_FAILED;
+  }
+}
+
+}  // namespace
+
+extern "C" uint32_t FamoUtf8ByteToWchar(
+    const char* utf8, uint32_t utf8_len, uint32_t byte_off) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      Utf8ByteToWcharCpp(utf8, utf8_len, byte_off), 0u);
+}
+
+extern "C" void FamoComputeAnchor(
+    const FamoRect* caret, const FamoRect* work, FamoSize content,
+    int32_t* out_x, int32_t* out_y, uint32_t* out_flipped) noexcept {
+  FAMO_C_ABI_SEH_VOID(ComputeAnchorCpp(
+      caret, work, content, out_x, out_y, out_flipped));
+}
+
+// ── The layout entry point ───────────────────────────────────────────────────
+extern "C" int32_t FamoCandidateUiLayout(
+    const FamoCompositionView* view, const FamoSkin* skin,
+    const FamoLayoutInput* input, FamoLayoutResult* out) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      CandidateUiLayoutCpp(view, skin, input, out),
+      FAMO_UI_E_LAYOUT_FAILED);
 }
 
 // FamoCandidateUiPaint + FamoTextResources* live in render/famo_paint.cpp (B5) —

@@ -12,7 +12,10 @@ namespace famo::tsf {
 
 struct CompositionPlan {
   std::wstring commit;
-  std::wstring preedit;
+  std::string preedit;
+  uint32_t preedit_selection_start = 0;
+  uint32_t preedit_selection_end = 0;
+  uint32_t preedit_cursor = 0;
   uint32_t behavior_flags = 0;
 };
 

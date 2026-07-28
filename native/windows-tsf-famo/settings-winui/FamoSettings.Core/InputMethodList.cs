@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Microsoft.Win32;
 
 namespace Famo.Settings.Core;
 
@@ -46,22 +47,24 @@ public static class InputMethodList
     /// <summary>加入当前用户输入法列表。幂等（已在列表时系统自行去重）；
     /// 失败（input.dll 缺失/组策略锁定等）返回 false，绝不抛——不阻断 seed/deploy 主流程。
     /// 失败可见：落一行日志到 %LOCALAPPDATA%\Famo\log\（P1-B，此前 catch 静默吞错）。</summary>
-    public static bool EnsureFamoInUserList()
+    public static bool EnsureFamoInUserList(bool logFailures = true)
     {
         try { return InstallLayoutOrTip(FamoTip, 0); }
         catch (Exception ex)
         {
-            FamoLog.Append($"InstallLayoutOrTip(install) failed: {ex.Message}");
+            if (logFailures)
+                FamoLog.Append($"InstallLayoutOrTip(install) failed: {ex.Message}");
             return false;
         }
     }
 
     /// <summary>切换当前桌面到法墨。失败只记日志：输入法已进列表时，用户仍可 Win+Space 手动切换。</summary>
-    public static bool ActivateFamoForCurrentDesktop()
+    public static bool ActivateFamoForCurrentDesktop(bool logFailures = true)
     {
         if (!OperatingSystem.IsWindows())
         {
-            FamoLog.Append("ActivateProfile skipped: Windows-only API unavailable");
+            if (logFailures)
+                FamoLog.Append("ActivateProfile skipped: Windows-only API unavailable");
             return false;
         }
 
@@ -73,7 +76,8 @@ public static class InputMethodList
             instance = Activator.CreateInstance(comType);
             if (instance is not ITfInputProcessorProfileMgr manager)
             {
-                FamoLog.Append("ActivateProfile failed: TF_InputProcessorProfiles unavailable");
+                if (logFailures)
+                    FamoLog.Append("ActivateProfile failed: TF_InputProcessorProfiles unavailable");
                 return false;
             }
 
@@ -84,12 +88,14 @@ public static class InputMethodList
             int hr = manager.ActivateProfile(TfProfileTypeInputProcessor, langid, ref clsid, ref profile, IntPtr.Zero, flags);
             if (hr == 0) return true;
 
-            FamoLog.Append($"ActivateProfile failed: 0x{hr:X8}");
+            if (logFailures)
+                FamoLog.Append($"ActivateProfile failed: 0x{hr:X8}");
             return false;
         }
         catch (Exception ex)
         {
-            FamoLog.Append($"ActivateProfile failed: {ex.Message}");
+            if (logFailures)
+                FamoLog.Append($"ActivateProfile failed: {ex.Message}");
             return false;
         }
         finally
@@ -111,6 +117,66 @@ public static class InputMethodList
             return false;
         }
     }
+
+    /// <summary>
+    /// Read-only probe of the Windows per-user language-list store. Windows
+    /// records TIP identifiers as exact value names below User Profile language
+    /// subkeys; unrelated value data is intentionally ignored.
+    /// </summary>
+    public static bool TryIsFamoInUserList(out bool present)
+    {
+        present = false;
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+        try
+        {
+            using RegistryKey? root = Registry.CurrentUser.OpenSubKey(
+                @"Control Panel\International\User Profile", writable: false);
+            if (root is null)
+            {
+                return true;
+            }
+            return Scan(root, depth: 0, ref present);
+        }
+        catch
+        {
+            present = false;
+            return false;
+        }
+
+        static bool Scan(RegistryKey key, int depth, ref bool found)
+        {
+            if (ContainsFamoTipValueName(key.GetValueNames()))
+            {
+                found = true;
+                return true;
+            }
+            if (depth >= 2)
+            {
+                return true;
+            }
+            foreach (string subkeyName in key.GetSubKeyNames())
+            {
+                using RegistryKey? subkey = key.OpenSubKey(subkeyName, writable: false);
+                if (subkey is null || !Scan(subkey, depth + 1, ref found))
+                {
+                    return false;
+                }
+                if (found)
+                {
+                    return true;
+                }
+            }
+            return true;
+        }
+    }
+
+    internal static bool ContainsFamoTipValueName(
+        IEnumerable<string> valueNames) =>
+        valueNames.Any(valueName => string.Equals(
+            valueName, FamoTip, StringComparison.OrdinalIgnoreCase));
 
     private static (ushort LangId, Guid Clsid, Guid Profile) ParseFamoTip()
     {

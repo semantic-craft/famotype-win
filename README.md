@@ -24,8 +24,8 @@ Windows 10 / 11（x64）。
 > **安装包目前未做 Authenticode 代码签名**（发布机没有代码签名证书）。Windows SmartScreen
 > 可能提示「未识别的应用」。请自行核对 Release 说明里公布的 SHA-256 后再决定是否运行。
 
-如果旧版 TSF DLL 正被桌面应用加载，安装器会安全进入 `PendingReboot`，重启后由 RunOnce
-完成切换，不会强制关掉你正在用的程序。
+如果旧版 TSF DLL 正被桌面应用加载，安装器会安全进入 `PendingReboot`，并为最初发起安装的
+精确用户 SID 创建一次登录恢复任务；重启后由该任务完成切换，不会强制关掉你正在用的程序。
 
 **更新**：Windows 版没有后台自动更新。设置面板「关于」页的「检查更新」会打开本仓库的
 Releases 页面，由你决定是否下载新版覆盖安装。
@@ -63,7 +63,8 @@ native/windows-tsf-famo/installer/build-installer.ps1
 [`native/windows-tsf-famo/installer/smoke_test.md`](native/windows-tsf-famo/installer/smoke_test.md)
 完成身份检查、契约测试及 Win10 / Win11 真机 smoke。macOS 机器不得伪造 Windows 二进制发布。
 
-设置面板的测试（纯 .NET，跨平台可跑）：
+设置面板的测试需在 Windows 上运行；其中包含 Win32 / NTFS 崩溃安全事务、
+对象身份和原子重命名验证：
 
 ```powershell
 dotnet test native/windows-tsf-famo/settings-winui/FamoSettings.Tests

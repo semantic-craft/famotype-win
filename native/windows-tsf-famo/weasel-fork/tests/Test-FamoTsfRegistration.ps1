@@ -56,6 +56,48 @@ function Same-Path {
     [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Invoke-ProfileTool {
+  param(
+    [Parameter(Mandatory)]
+    [string] $Path,
+    [Parameter(Mandatory)]
+    [string] $Argument
+  )
+
+  # FamoProfileTool is a Windows-subsystem executable. PowerShell does not wait
+  # for such applications when they are invoked directly, and rejects them in
+  # the middle of a pipeline. Use Process so the audit receives the real output
+  # and exit code without changing registration or the active input method.
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $Path
+  $startInfo.Arguments = $Argument
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  try {
+    if (-not $process.Start()) {
+      throw "Failed to start profile tool: $Path"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $output = @(
+      $stdoutTask.GetAwaiter().GetResult().Trim()
+      $stderrTask.GetAwaiter().GetResult().Trim()
+    ) | Where-Object { $_ }
+    return [pscustomobject]@{
+      ExitCode = $process.ExitCode
+      Output = ($output -join [Environment]::NewLine)
+    }
+  } finally {
+    $process.Dispose()
+  }
+}
+
 $brandPresent = Test-Path -LiteralPath $brandKey
 $machineComPresent = Test-Path -LiteralPath $machineComKey
 $userComPresent = Test-Path -LiteralPath $userComKey
@@ -75,28 +117,33 @@ if ($machineComPresent) {
   $threadingModel = [string]$com.GetValue('ThreadingModel')
 }
 $expectedDll = if ($target) { Join-Path $target 'FamoTextService.dll' } else { '' }
-$comOk = $machineComPresent -and -not $userComPresent -and (Same-Path $inprocDll $expectedDll) -and $threadingModel -eq 'Apartment'
+$comOk = if ($isPending) {
+  -not $machineComPresent -and -not $userComPresent
+} else {
+  $machineComPresent -and -not $userComPresent -and (Same-Path $inprocDll $expectedDll) -and $threadingModel -eq 'Apartment'
+}
 Add-Audit 'TSF-COM' 'HKLM COM registration; per-user COM override absent' ($notInstalled -or [bool]$comOk) `
   'The machine COM registration must point to the active transaction and no legacy HKCU key may shadow it.' `
-  "HKLM COM=$expectedDll; ThreadingModel=Apartment; HKCU override absent" `
+  $(if ($isPending) { 'HKLM/HKCU COM registration absent' } else { "HKLM COM=$expectedDll; ThreadingModel=Apartment; HKCU override absent" }) `
   $(if ($notInstalled) { 'absent with clean uninstall' } else { "COM=$inprocDll; ThreadingModel=$threadingModel; userOverride=$userComPresent" })
 
 $profileOutput = ''
 $profileExit = -1
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
-  $profileCommand = if ($isPending) { 'check-disabled' } else { 'check' }
-  $profileOutput = (& $profileTool $profileCommand 2>&1 | Out-String).Trim()
-  $profileExit = $LASTEXITCODE
+  $profileCommand = if ($isPending) { 'check-absent' } else { 'check' }
+  $profileResult = Invoke-ProfileTool -Path $profileTool -Argument $profileCommand
+  $profileOutput = $profileResult.Output
+  $profileExit = $profileResult.ExitCode
 }
 Add-Audit 'TSF-PROFILE' 'profile registration' ($notInstalled -or $profileExit -eq 0) `
   'FamoProfileTool verifies registry, Simplified Chinese profile, expected enabled state, and keyboard category.' `
-  $(if ($isPending) { 'registry=present profile=present enabled=no category=present' } else { 'registry=present profile=present enabled=yes category=present' }) `
+  $(if ($isPending) { 'registry=absent profile=absent category=absent' } else { 'registry=present profile=present enabled=yes category=present' }) `
   $(if ($notInstalled) { 'absent with clean uninstall' } else { "command=$profileCommand; exit=$profileExit; $profileOutput" })
 
 $profileActive = $false
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
-  & $profileTool is-active *> $null
-  $profileActive = $LASTEXITCODE -eq 0
+  $activeResult = Invoke-ProfileTool -Path $profileTool -Argument 'is-active'
+  $profileActive = $activeResult.ExitCode -eq 0
 }
 $activeStateOk = $notInstalled -or -not $isPending -or -not $profileActive
 Add-Audit 'TSF-ACTIVE' 'current profile' $activeStateOk `

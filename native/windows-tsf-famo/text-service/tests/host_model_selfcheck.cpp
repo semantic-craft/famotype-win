@@ -62,14 +62,45 @@ bool PureTestAndExactlyOnce() {
   return true;
 }
 
+bool DigitCanStartSchemaInput() {
+  ContextState state;
+  state.Open(Identity(55));
+  CHECK(state.TestKey(Down('7')));
+  const auto plan = state.PlanKey(Down('7'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '7');
+  state.CompleteUnhandled();
+  return true;
+}
+
 bool CandidateAndCorrelation() {
   ContextState state;
   state.Open(Identity(60));
   auto plan = state.PlanKey(Down('N'));
   state.ApplySucceeded(Preedit("ni", 3));
+  CHECK(!state.PlanAbsoluteCandidate(plan.correlation.sequence - 1));
+  const auto absolute =
+      state.PlanAbsoluteCandidate(plan.correlation.sequence);
+  CHECK(absolute && absolute->sequence == plan.correlation.sequence + 1);
+  state.CompleteUnhandled();
   plan = state.PlanKey(Down('2'));
-  CHECK(plan.request == RequestKind::SelectCandidate);
-  CHECK(plan.candidate_index == 1);
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '2');
+  state.CompleteUnhandled();
+  plan = state.PlanKey(Down('0'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '0');
+  state.CompleteUnhandled();
+  plan = state.PlanKey(Down('9'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == '9');
+  state.CompleteUnhandled();
+  // A schema may use punctuation (for example ';') as a select key. The host
+  // must forward the physical key and let librime interpret the real
+  // candidate labels/select_keys instead of fabricating a numeric index.
+  plan = state.PlanKey(Down(';'));
+  CHECK(plan.request == RequestKind::ProcessKey);
+  CHECK(plan.key.virtual_key == ';');
   Correlation stale = plan.correlation;
   --stale.connection_generation;
   CHECK(!state.AcceptReply(stale));
@@ -156,13 +187,30 @@ bool UtfConversionIsStrict() {
   CHECK(famo::tsf::Utf8ToUtf16("\xe4\xbd\xa0\xe5\xa5\xbd", &output));
   CHECK(output == L"\u4f60\u597d");
   CHECK(!famo::tsf::Utf8ToUtf16("\xff", &output));
+
+  famo::tsf::Utf16Preedit preedit;
+  CHECK(famo::tsf::Utf8PreeditToUtf16("abcd", 0, 0, 2, &preedit));
+  CHECK(preedit.selection_start == 0 && preedit.selection_end == 0 &&
+        preedit.cursor == 2);
+  CHECK(famo::tsf::Utf8PreeditToUtf16("abcdef", 1, 4, 4, &preedit));
+  CHECK(preedit.selection_start == 1 && preedit.selection_end == 4 &&
+        preedit.cursor == 4);
+  CHECK(famo::tsf::Utf8PreeditToUtf16("\xe4\xbd\xa0" "A", 0, 0, 4,
+                                      &preedit));
+  CHECK(preedit.text == L"\u4f60" L"A" && preedit.cursor == 2);
+  CHECK(famo::tsf::Utf8PreeditToUtf16("\xf0\x9f\x98\x80" "A", 0, 0, 4,
+                                      &preedit));
+  CHECK(preedit.text == L"\xd83d\xde00" L"A" && preedit.cursor == 2);
+  CHECK(!famo::tsf::Utf8PreeditToUtf16("\xe4\xbd\xa0", 0, 0, 1,
+                                       &preedit));
   return true;
 }
 
 } // namespace
 
 int main() {
-  if (!PureTestAndExactlyOnce() || !CandidateAndCorrelation() ||
+  if (!PureTestAndExactlyOnce() || !DigitCanStartSchemaInput() ||
+      !CandidateAndCorrelation() ||
       !FailureLatchesRecovery() || !ContextsAndGenerationAreIndependent() ||
       !TransientUnavailableReleasesPendingKey() || !UtfConversionIsStrict())
     return 1;

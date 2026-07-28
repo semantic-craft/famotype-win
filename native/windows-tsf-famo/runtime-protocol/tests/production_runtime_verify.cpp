@@ -63,7 +63,9 @@ public:
   bool Start(std::wstring_view suffix, std::wstring_view data_root) {
     std::wstring command = L"\"" + RuntimePath() +
                            L"\" --endpoint-suffix " + std::wstring(suffix) +
-                           L" --workers 2 --data-root \"" +
+                           L" --workers " +
+                           std::to_wstring(kRuntimeAcceptWorkerCapacity) +
+                           L" --data-root \"" +
                            std::wstring(data_root) + L"\"";
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
@@ -229,7 +231,7 @@ bool Run(std::wstring_view data_root, std::string_view schema,
 
   Frame ui = request(Command::UpdateUiState, 4);
   CHECK(EncodeUiState({{640, 480, 642, 504}, {0, 0, 1920, 1080}, 144, true,
-                       true, true},
+                       true, true, {1, 2}},
                       &ui.payload, &error));
   port.Post(std::move(ui));
   Sleep(20);

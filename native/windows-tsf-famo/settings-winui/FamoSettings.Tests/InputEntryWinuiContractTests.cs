@@ -47,6 +47,14 @@ public sealed class InputEntryWinuiContractTests
         Assert.Contains("SingleInstanceKeyPrefix", program);
         Assert.Contains("RedirectActivationTo", program);
         Assert.Contains("WritePendingPage(GetPageArg(Environment.GetCommandLineArgs()))", program);
+        Assert.Contains("RedirectTimeoutMilliseconds", program);
+        Assert.Contains("finally", program);
+        Assert.Contains("completed.Set()", program);
+        Assert.Contains("using var completed = new EventWaitHandle", program);
+        Assert.Contains("AppInstance retry = AppInstance.FindOrRegisterForKey", program);
+        Assert.Contains("RedirectionDecision.Failed", program);
+        Assert.DoesNotContain("INFINITE", program);
+        Assert.DoesNotContain("CreateEvent(", program);
         Assert.DoesNotContain("private const string SingleInstanceKey = \"Famo.Settings.SingleInstance\";", program);
         Assert.Equal("keyboard", SettingsNavigation.ResolvePageId("input"));
         Assert.Contains("SettingsNavigation.ResolvePageId", mainWindow);
@@ -61,6 +69,12 @@ public sealed class InputEntryWinuiContractTests
         Assert.Contains("RunDemoAppearance()", program);
         Assert.Contains("FirstLaunchSeeder.SeedFromInstalledData", program);
         Assert.Contains("WriteHeadlessOverlays(settings)", program);
+        Assert.Contains("--prepare-seed-transaction", program);
+        Assert.Contains("--apply-seed-transaction", program);
+        Assert.Contains("--rollback-seed-transaction", program);
+        Assert.Contains("--commit-seed-transaction", program);
+        Assert.Contains("WriteHeadlessOverlays(settings, stagedRoot)", program);
+        Assert.Contains("ConfigWriter.WriteDeployBucket(settings, target)", program);
         Assert.Contains("ConfigWriter.WriteSelectSchema", program);
         Assert.True(
             program.IndexOf("RunSeedOnly(args)", StringComparison.Ordinal) <

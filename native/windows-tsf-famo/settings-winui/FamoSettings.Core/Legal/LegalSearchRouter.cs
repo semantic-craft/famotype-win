@@ -1,3 +1,5 @@
+using Famo.Settings.Core;
+
 namespace Famo.Settings.Core.Legal;
 
 /// <summary>一个跳库目标站。<see cref="DirectBase"/> 非空走「带词直达」（该站自己的检索 URL）；
@@ -36,7 +38,7 @@ public static class LegalSearchRouter
     {
         string joined = string.Join(
             ' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-        return joined.Length <= MaxQueryLength ? joined : joined[..MaxQueryLength];
+        return TextElementTruncator.Truncate(joined, MaxQueryLength);
     }
 
     /// <summary>site 的检索结果页 URL。<see cref="Uri.EscapeDataString(string)"/> 会把 + 编成

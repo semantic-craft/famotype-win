@@ -3,6 +3,7 @@
 
 #include <windows.h>
 
+#include "abi_boundary.h"
 #include "famo_guids.h"
 #include "module_state.h"
 #include "text_service.h"
@@ -32,9 +33,12 @@ public:
   }
   HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown *outer, REFIID iid,
                                            void **object) override {
+    if (!object)
+      return E_POINTER;
+    *object = nullptr;
     if (outer)
       return CLASS_E_NOAGGREGATION;
-    return CreateTextServiceInstance(iid, object);
+    return ComBoundary([&] { return CreateTextServiceInstance(iid, object); });
   }
   HRESULT STDMETHODCALLTYPE LockServer(BOOL lock) override {
     lock ? AddServerLock() : RemoveServerLock();
@@ -66,12 +70,14 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **object) {
   *object = nullptr;
   if (clsid != famo::tsf::kTextServiceClsid)
     return CLASS_E_CLASSNOTAVAILABLE;
-  auto *factory = new (std::nothrow) famo::tsf::ClassFactory();
-  if (!factory)
-    return E_OUTOFMEMORY;
-  const HRESULT result = factory->QueryInterface(iid, object);
-  factory->Release();
-  return result;
+  return famo::tsf::ComBoundary([&] {
+    auto *factory = new (std::nothrow) famo::tsf::ClassFactory();
+    if (!factory)
+      return E_OUTOFMEMORY;
+    const HRESULT result = factory->QueryInterface(iid, object);
+    factory->Release();
+    return result;
+  });
 }
 
 extern "C" HRESULT STDAPICALLTYPE FamoCreateTextServiceForTest(
@@ -82,17 +88,19 @@ extern "C" HRESULT STDAPICALLTYPE FamoCreateTextServiceForTest(
   *object = nullptr;
   if (!runtime_endpoint_suffix || !*runtime_endpoint_suffix)
     return E_INVALIDARG;
-  auto *service = new (std::nothrow)
-      famo::tsf::TextService(runtime_endpoint_suffix);
-  if (!service)
-    return E_OUTOFMEMORY;
-  HRESULT result = service->ActivateForTest(thread_manager, client_id);
-  if (SUCCEEDED(result)) {
-    result = service->QueryInterface(
-        IID_ITfTextInputProcessorEx, reinterpret_cast<void **>(object));
-  }
-  service->Release();
-  return result;
+  return famo::tsf::ComBoundary([&] {
+    auto *service = new (std::nothrow)
+        famo::tsf::TextService(runtime_endpoint_suffix);
+    if (!service)
+      return E_OUTOFMEMORY;
+    HRESULT result = service->ActivateForTest(thread_manager, client_id);
+    if (SUCCEEDED(result)) {
+      result = service->QueryInterface(
+          IID_ITfTextInputProcessorEx, reinterpret_cast<void **>(object));
+    }
+    service->Release();
+    return result;
+  });
 }
 
 extern "C" HRESULT STDAPICALLTYPE FamoReactivateTextServiceForTest(
@@ -100,6 +108,31 @@ extern "C" HRESULT STDAPICALLTYPE FamoReactivateTextServiceForTest(
     TfClientId client_id) {
   if (!object || !thread_manager)
     return E_INVALIDARG;
-  return static_cast<famo::tsf::TextService *>(object)->ActivateForTest(
-      thread_manager, client_id);
+  return famo::tsf::ComBoundary(
+      [&] {
+        return static_cast<famo::tsf::TextService *>(object)->ActivateForTest(
+            thread_manager, client_id);
+      });
+}
+
+extern "C" BOOL STDAPICALLTYPE FamoGetPreviewSelectionStateForTest(
+    ITfTextInputProcessorEx *object, HWND *target,
+    famo::runtime::PreviewSelectionRequest *request) {
+  if (target)
+    *target = nullptr;
+  if (request)
+    *request = {};
+  if (!object || !target || !request)
+    return FALSE;
+  return famo::tsf::BoundaryOr<BOOL>(FALSE, [&] {
+    return static_cast<famo::tsf::TextService *>(object)
+                   ->PreviewSelectionStateForTest(target, request)
+               ? TRUE
+               : FALSE;
+  });
+}
+
+extern "C" uint32_t STDAPICALLTYPE
+FamoGetTerminalCleanupConnectAttemptsForTest() {
+  return famo::tsf::TerminalCleanupConnectAttemptsForTest();
 }

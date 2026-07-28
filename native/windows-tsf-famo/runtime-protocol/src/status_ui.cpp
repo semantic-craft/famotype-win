@@ -7,6 +7,7 @@
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <string>
 
@@ -17,6 +18,7 @@
 #include <windowsx.h>
 
 #include "../../famo-candidate-ui/famo_candidate_ui.h"
+#include "candidate_skin.h"
 #include "dib_surface.h"
 
 namespace famo::runtime {
@@ -45,6 +47,9 @@ constexpr UINT_PTR kPromoteTimer = 1;
 // seen the first look always misses. Retry across ~5s, then stop scanning.
 constexpr UINT kPromoteInterval = 500;
 constexpr int kPromoteAttempts = 10;
+constexpr UINT_PTR kKeyboardHookTimer = 2;
+constexpr UINT kKeyboardHookInterval = 500;
+constexpr int kKeyboardHookAttempts = 3;
 
 // Bar metrics in logical px @96dpi. The bar is a segmented control: the window
 // is the trough and the segments tile it, inset all round, sharing edges.
@@ -206,18 +211,6 @@ bool Contains(std::string_view haystack, std::string_view needle) {
   return haystack.find(needle) != std::string_view::npos;
 }
 
-bool WriteSelectedSchema(const std::wstring &data_root, const std::string &id) {
-  if (data_root.empty() || !SafeSchemaName(id))
-    return false;
-  // Binary and unterminated: SafeName rejects newlines, and the reader trims.
-  std::ofstream file(data_root + L"\\famo-select-schema.txt",
-                     std::ios::trunc | std::ios::binary);
-  if (!file)
-    return false;
-  file << id;
-  return file.good();
-}
-
 } // namespace
 
 bool ParseGlobalHotKeyBinding(std::string_view text,
@@ -363,7 +356,11 @@ std::string StatusBarSchemaGlyph(std::string_view name) {
 std::string StatusBarSchemaSwitchTarget(
     std::string_view current_schema, std::string_view previous_schema,
     const std::vector<std::string> &schema_list) {
-  if (!previous_schema.empty() && previous_schema != current_schema)
+  const bool previous_available =
+      std::find_if(schema_list.begin(), schema_list.end(),
+                   [&](const std::string &id) { return id == previous_schema; }) !=
+      schema_list.end();
+  if (previous_schema != current_schema && previous_available)
     return std::string(previous_schema);
   for (const std::string &id : schema_list) {
     if (id != current_schema)
@@ -553,6 +550,8 @@ struct StatusUi::State {
   std::mutex publish_mutex;
   std::atomic<HWND> window{nullptr};
   std::atomic<bool> ready{false};
+  std::atomic<bool> keyboard_hook_ready{false};
+  std::atomic<uint32_t> keyboard_hook_error{ERROR_SUCCESS};
   std::atomic<uint64_t> icon_registrations{0};
   std::atomic<std::shared_ptr<const void>> presentation;
   std::atomic<std::shared_ptr<const SchemaState>> schema;
@@ -565,6 +564,8 @@ struct StatusUi::State {
   int promote_attempts = 0;
   std::future<void> deploy;
   HHOOK keyboard_hook = nullptr;
+  int keyboard_hook_attempts = 0;
+  int injected_keyboard_hook_failures = 0;
   HHOOK mouse_hook = nullptr;
   AltDoubleTapDetector alt_double_tap;
   GlobalHotKeyBinding quick_phrase_hotkey;
@@ -574,7 +575,8 @@ struct StatusUi::State {
   // Floating bar, UI thread only.
   HWND bar = nullptr;
   FamoTextResources *resources = nullptr;
-  std::shared_ptr<const FamoSkin> bar_skin;  // the one `resources` was built for
+  std::shared_ptr<const CandidateStylePresentation> bar_style;
+  bool bar_dark = false;
   uint32_t resource_dpi = 0;
   uint32_t bar_dpi = 96;
   DibSurface bar_surface;
@@ -601,7 +603,7 @@ namespace {
 
 StatusUi::State *g_hook_state = nullptr;
 
-LRESULT CALLBACK KeyboardHook(int code, WPARAM wparam, LPARAM lparam) {
+LRESULT KeyboardHookImpl(int code, WPARAM wparam, LPARAM lparam) {
   if (code >= 0 && g_hook_state) {
     const auto *key = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lparam);
     if ((key->flags & LLKHF_INJECTED) == 0) {
@@ -649,10 +651,26 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM wparam, LPARAM lparam) {
   return CallNextHookEx(nullptr, code, wparam, lparam);
 }
 
-LRESULT CALLBACK MouseHook(int code, WPARAM wparam, LPARAM lparam) {
+LRESULT CALLBACK KeyboardHook(int code, WPARAM wparam, LPARAM lparam) noexcept {
+  try {
+    return KeyboardHookImpl(code, wparam, lparam);
+  } catch (...) {
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+  }
+}
+
+LRESULT MouseHookImpl(int code, WPARAM wparam, LPARAM lparam) {
   if (code >= 0 && g_hook_state && wparam != WM_MOUSEMOVE)
     g_hook_state->alt_double_tap.Reset();
   return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+LRESULT CALLBACK MouseHook(int code, WPARAM wparam, LPARAM lparam) noexcept {
+  try {
+    return MouseHookImpl(code, wparam, lparam);
+  } catch (...) {
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+  }
 }
 
 bool ToolboxEnabled(const std::wstring &data_root, bool require_menu_enabled) {
@@ -739,12 +757,46 @@ void AddOrUpdateIcon(StatusUi::State *state, HWND window, bool add) {
   data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   data.uCallbackMessage = kTrayCallback;
   data.hIcon = IconFor(state, state->status_flags.load());
-  wcsncpy_s(data.szTip, kTip, _TRUNCATE);
+  if (state->keyboard_hook_ready.load() ||
+      state->keyboard_hook_error.load() == ERROR_SUCCESS) {
+    wcsncpy_s(data.szTip, kTip, _TRUNCATE);
+  } else {
+    swprintf_s(data.szTip, L"法墨 - 全局快捷键不可用 (错误 %lu)",
+               state->keyboard_hook_error.load());
+  }
   if (!Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data))
     return;
   state->icon_added = true;
   if (add)
     state->icon_registrations.fetch_add(1);
+}
+
+bool InstallKeyboardHook(StatusUi::State *state, HWND window) {
+  if (state->keyboard_hook)
+    return true;
+  if (state->injected_keyboard_hook_failures > 0) {
+    --state->injected_keyboard_hook_failures;
+    SetLastError(ERROR_ACCESS_DENIED);
+  } else {
+    state->keyboard_hook = SetWindowsHookExW(
+        WH_KEYBOARD_LL, KeyboardHook, GetModuleHandleW(nullptr), 0);
+  }
+  const DWORD error = state->keyboard_hook ? ERROR_SUCCESS : GetLastError();
+  state->keyboard_hook_ready.store(state->keyboard_hook != nullptr);
+  state->keyboard_hook_error.store(error);
+  AddOrUpdateIcon(state, window, !state->icon_added);
+  return state->keyboard_hook != nullptr;
+}
+
+void StartKeyboardHookRecovery(StatusUi::State *state, HWND window) {
+  if (state->keyboard_hook)
+    return;
+  state->keyboard_hook_attempts = 0;
+  if (InstallKeyboardHook(state, window)) {
+    KillTimer(window, kKeyboardHookTimer);
+    return;
+  }
+  SetTimer(window, kKeyboardHookTimer, kKeyboardHookInterval, nullptr);
 }
 
 // NIM_ADD on a live id fails, so a genuine re-registration has to delete first.
@@ -818,9 +870,12 @@ void RunCommand(StatusUi::State *state, UINT command) {
       continue;
     const bool next =
         StatusBarNextOptionValue(state->status_flags.load(), index);
-    state->service->SetOption(toggle.option, next);
-    if (const char *secondary = StatusBarSecondaryOption(index))
-      state->service->SetOption(secondary, next);
+    if (const char *secondary = StatusBarSecondaryOption(index)) {
+      state->service->SetOptions(
+          {{toggle.option, next}, {secondary, next}});
+    } else {
+      state->service->SetOption(toggle.option, next);
+    }
     return;
   }
   if (command == kCmdSettings) {
@@ -898,15 +953,11 @@ void SwitchSchema(StatusUi::State *state, HWND window, const std::string &id) {
       (current && current->id == id))
     return;
   state->pending_previous = current ? current->id : std::string();
-  const std::wstring data_root = state->data_root;
-  state->deploy = std::async(std::launch::async, [state, window, id,
-                                                  data_root] {
-    if (!WriteSelectedSchema(data_root, id))
-      return;
+  state->deploy = std::async(std::launch::async, [state, window, id] {
     // A failed switch is left visible: the segment keeps painting whatever the
     // engine last published, so the bar never claims a schema that is not live.
     // Three ids in a stock schema_list have no compiled prism and land here.
-    if (state->service->ExecuteControl(Command::ControlSelectSchema) !=
+    if (state->service->SelectSchemaAndPersist(id) !=
         ControlError::None)
       return;
     try {
@@ -1030,13 +1081,17 @@ void PaintBar(StatusUi::State *state) {
   if (!state->bar)
     return;
   std::shared_ptr<const void> presentation = state->presentation.load();
-  std::shared_ptr<const FamoSkin> skin =
-      presentation ? std::static_pointer_cast<const FamoSkin>(presentation)
-                   : nullptr;
-  const FamoSkin &active = skin ? *skin : FallbackSkin();
+  std::shared_ptr<const CandidateStylePresentation> style =
+      presentation
+          ? std::static_pointer_cast<const CandidateStylePresentation>(
+                presentation)
+          : nullptr;
+  const bool dark = SystemUsesDarkPalette();
+  const FamoSkin &active = style ? (dark ? style->dark : style->light)
+                                 : FallbackSkin();
   const uint32_t dpi = state->bar_dpi;
-  if (!state->resources || state->bar_skin != skin ||
-      state->resource_dpi != dpi) {
+  if (!state->resources || state->bar_style != style ||
+      state->bar_dark != dark || state->resource_dpi != dpi) {
     const FamoSkin text_skin = BarTextSkin(active);
     if (state->resources &&
         FamoTextResourcesReconfigure(state->resources, &text_skin, dpi) !=
@@ -1046,7 +1101,8 @@ void PaintBar(StatusUi::State *state) {
     }
     if (!state->resources)
       state->resources = FamoTextResourcesCreate(&text_skin, dpi);
-    state->bar_skin = skin;
+    state->bar_style = style;
+    state->bar_dark = dark;
     state->resource_dpi = dpi;
   }
   // A renderer that will not start leaves the bar hidden; typing is unaffected
@@ -1112,8 +1168,7 @@ int HitTestBar(StatusUi::State *state, LPARAM lparam) {
   return StatusBarHitTest(layout, x, y);
 }
 
-LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
-                         LPARAM lparam) {
+LRESULT BarProcImpl(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
   auto *state = reinterpret_cast<StatusUi::State *>(
       GetWindowLongPtrW(window, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
@@ -1243,6 +1298,17 @@ LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
+                         LPARAM lparam) noexcept {
+  try {
+    return BarProcImpl(window, message, wparam, lparam);
+  } catch (...) {
+    return message == WM_NCCREATE
+               ? FALSE
+               : DefWindowProcW(window, message, wparam, lparam);
+  }
+}
+
 void CreateBar(std::shared_ptr<StatusUi::State> &state) {
   WNDCLASSW bar_class{};
   bar_class.lpfnWndProc = BarProc;
@@ -1276,8 +1342,8 @@ void CreateBar(std::shared_ptr<StatusUi::State> &state) {
   PaintBar(state.get());
 }
 
-LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
-                            LPARAM lparam) {
+LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
+                       LPARAM lparam) {
   auto *state = reinterpret_cast<StatusUi::State *>(
       GetWindowLongPtrW(window, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
@@ -1295,10 +1361,25 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     // The broadcast can arrive while our icon is still registered, and NIM_ADD
     // on a live id fails -- which would strand the icon at its last glyph.
     ReAddIcon(state, window);
+    StartKeyboardHookRecovery(state, window);
     return 0;
   }
   switch (message) {
+  case WM_SETTINGCHANGE:
+  case WM_THEMECHANGED:
+    PaintBar(state);
+    return 0;
+  case WM_POWERBROADCAST:
+    if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND)
+      StartKeyboardHookRecovery(state, window);
+    return TRUE;
   case WM_TIMER: {
+    if (wparam == kKeyboardHookTimer) {
+      if (InstallKeyboardHook(state, window) ||
+          ++state->keyboard_hook_attempts >= kKeyboardHookAttempts)
+        KillTimer(window, kKeyboardHookTimer);
+      return 0;
+    }
     if (wparam != kPromoteTimer)
       break;
     const Promote promote = PromoteTrayIcon();
@@ -1319,6 +1400,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     return 0;
   case kStyleChanged:
     RefreshHotKeys(state);
+    StartKeyboardHookRecovery(state, window);
     PaintBar(state);
     return 0;
   case kSummonToolboxGesture:
@@ -1340,6 +1422,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
+                            LPARAM lparam) noexcept {
+  try {
+    return WindowProcImpl(window, message, wparam, lparam);
+  } catch (...) {
+    return message == WM_NCCREATE
+               ? FALSE
+               : DefWindowProcW(window, message, wparam, lparam);
+  }
+}
+
 } // namespace
 
 StatusUi::StatusUi(RuntimeService *service, std::atomic<bool> *running,
@@ -1351,15 +1444,25 @@ StatusUi::StatusUi(RuntimeService *service, std::atomic<bool> *running,
   // still finds the profile's build\ output.
   state_->data_root =
       data_root.empty() ? LocalFamoDirectory() : std::move(data_root);
+  char *failures = nullptr;
+  size_t failures_size = 0;
+  if (_dupenv_s(&failures, &failures_size,
+                "FAMO_TEST_KEYBOARD_HOOK_FAILURES") == 0 &&
+      failures)
+    state_->injected_keyboard_hook_failures =
+        std::clamp(std::atoi(failures), 0, kKeyboardHookAttempts);
+  std::free(failures);
 }
 
 StatusUi::~StatusUi() { Stop(); }
 
 void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
+  HRESULT com = E_FAIL;
+  try {
   // The bar is a per-monitor DPI aware layered window, and its D2D renderer
   // plus ShellExecuteW both want an initialised apartment on this thread.
   SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   const std::wstring icons = ModuleDirectory() + L"\\data\\";
   state->icon_zh = LoadTrayIcon(icons + L"famo_zh.ico");
   state->icon_ascii = LoadTrayIcon(icons + L"famo_ascii.ico");
@@ -1397,8 +1500,7 @@ void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
   state->window.store(window);
   RefreshHotKeys(state.get());
   g_hook_state = state.get();
-  state->keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHook,
-                                           GetModuleHandleW(nullptr), 0);
+  StartKeyboardHookRecovery(state.get(), window);
   state->mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook,
                                         GetModuleHandleW(nullptr), 0);
   state->ready.store(true);
@@ -1429,28 +1531,67 @@ void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
   // D2D/DirectWrite and the GDI+ token belong to this thread; State outlives it.
   FamoTextResourcesDestroy(state->resources);
   state->resources = nullptr;
-  state->bar_skin.reset();
+  state->bar_style.reset();
   if (SUCCEEDED(com))
     CoUninitialize();
+  } catch (...) {
+    if (state->keyboard_hook)
+      UnhookWindowsHookEx(state->keyboard_hook);
+    if (state->mouse_hook)
+      UnhookWindowsHookEx(state->mouse_hook);
+    state->keyboard_hook = nullptr;
+    state->mouse_hook = nullptr;
+    g_hook_state = nullptr;
+    if (state->bar) {
+      DestroyWindow(state->bar);
+      state->bar = nullptr;
+    }
+    if (HWND window = state->window.exchange(nullptr))
+      DestroyWindow(window);
+    FamoTextResourcesDestroy(state->resources);
+    state->resources = nullptr;
+    state->bar_style.reset();
+    state->ready.store(true);
+    if (SUCCEEDED(com))
+      CoUninitialize();
+  }
 }
 
 bool StatusUi::Start() {
   if (thread_.joinable())
     return true;
-  thread_ = std::thread(&StatusUi::ThreadMain, state_);
+  state_->ready.store(false);
+  try {
+    if (GetEnvironmentVariableA("FAMO_TEST_STATUS_THREAD_CREATION_FAILURE",
+                                nullptr, 0) != 0) {
+      throw std::bad_alloc();
+    }
+    thread_ = std::thread(&StatusUi::ThreadMain, state_);
+  } catch (...) {
+    state_->ready.store(true);
+    return false;
+  }
   while (!state_->ready.load())
     Sleep(1);
   return state_->window.load() != nullptr;
 }
 
-void StatusUi::Stop() {
-  if (!thread_.joinable())
-    return;
-  if (HWND window = state_->window.load())
-    PostMessageW(window, WM_QUIT, 0, 0);
-  thread_.join();
-  if (state_->deploy.valid())
-    state_->deploy.wait();
+void StatusUi::Stop() noexcept {
+  try {
+    if (!thread_.joinable())
+      return;
+    if (HWND window = state_->window.load())
+      PostMessageW(window, WM_QUIT, 0, 0);
+    thread_.join();
+    if (state_->deploy.valid())
+      state_->deploy.wait();
+  } catch (...) {
+    try {
+      if (thread_.joinable())
+        thread_.detach();
+    } catch (...) {
+    }
+  }
 }
 
 uint64_t StatusUi::icon_registrations() const noexcept {
@@ -1459,6 +1600,14 @@ uint64_t StatusUi::icon_registrations() const noexcept {
 
 uint32_t StatusUi::status_flags() const noexcept {
   return state_->status_flags.load();
+}
+
+bool StatusUi::keyboard_hook_ready() const noexcept {
+  return state_->keyboard_hook_ready.load();
+}
+
+uint32_t StatusUi::keyboard_hook_error() const noexcept {
+  return state_->keyboard_hook_error.load();
 }
 
 void StatusUi::Publish(

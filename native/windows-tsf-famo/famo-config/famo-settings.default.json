@@ -71,6 +71,8 @@
   },
   "ai": {
     "cloudEnabled": false,
+    "askWebSearchEnabled": false,
+    "webSearchBackend": "doubao",
     "selectionMenuEnabled": true,
     "askAnythingSkillEnabled": true,
     "polishSkillEnabled": true,

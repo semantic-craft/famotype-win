@@ -10,9 +10,22 @@
 #include "../../famo-candidate-ui/famo_candidate_ui.h"
 #include "candidate_skin.h"
 #include "dib_surface.h"
+#include "win_handle.h"
 
 namespace famo::runtime {
 namespace {
+
+constexpr uint32_t kModeIndicatorDurationMs = 700;
+constexpr int kModeIndicatorSize = 40;
+constexpr int kModeIndicatorInset = 3;
+constexpr wchar_t kCandidateWindowClassName[] = L"FamoRuntimeCandidateWindow";
+constexpr wchar_t kModeIndicatorClassName[] = L"FamoRuntimeModeIndicator";
+
+int ScaleDpi(int value, uint32_t dpi) {
+  if (dpi == 0)
+    dpi = 96;
+  return static_cast<int>((static_cast<int64_t>(value) * dpi + 48) / 96);
+}
 
 FamoUtf8String ViewString(std::string_view value) {
   return {static_cast<uint32_t>(sizeof(FamoUtf8String)), value.data(),
@@ -61,7 +74,8 @@ bool SameUiExceptPlacement(const UiState &left, const UiState &right) {
   return left.dpi == right.dpi &&
          left.layout_available == right.layout_available &&
          left.focused == right.focused &&
-         left.show_allowed == right.show_allowed;
+         left.show_allowed == right.show_allowed &&
+         left.selection_capability == right.selection_capability;
 }
 
 class ViewAdapter {
@@ -128,41 +142,16 @@ struct WindowNotifications {
   HANDLE update_event = nullptr;
   std::atomic<uint64_t> *system_generation = nullptr;
   FamoLayoutResult layout{};
+  PreviewSelectionRequest selection_request{};
+  PipeClientIdentity selection_owner{};
+  uint32_t page_index = 0;
   uint32_t page_size = 0;
   int shadow_margin = 0;
   HWND foreground_window = nullptr;
 };
 
-bool SendPreviewSelectionKeys(const PreviewSelection &selection,
-                              HWND expected_foreground) {
-  if (!expected_foreground || GetForegroundWindow() != expected_foreground)
-    return false;
-  std::vector<INPUT> input;
-  input.reserve((selection.pages_forward + 1) * 2);
-  const auto append_key = [&input](WORD key) {
-    INPUT down{};
-    down.type = INPUT_KEYBOARD;
-    down.ki.wVk = key;
-    input.push_back(down);
-    INPUT up = down;
-    up.ki.dwFlags = KEYEVENTF_KEYUP;
-    input.push_back(up);
-  };
-  for (uint32_t page = 0; page < selection.pages_forward; ++page)
-    append_key(VK_NEXT);
-  append_key(static_cast<WORD>('1' + selection.candidate_offset));
-  const UINT sent = SendInput(static_cast<UINT>(input.size()), input.data(),
-                              sizeof(INPUT));
-  if (sent != input.size()) {
-    for (size_t i = 1; i < input.size(); i += 2)
-      SendInput(1, &input[i], sizeof(INPUT));
-    return false;
-  }
-  return true;
-}
-
-LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
-                            LPARAM lparam) {
+LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
+                       LPARAM lparam) {
   if (message == WM_NCCREATE) {
     const auto *create = reinterpret_cast<const CREATESTRUCTW *>(lparam);
     SetWindowLongPtrW(window, GWLP_USERDATA,
@@ -183,29 +172,40 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
     PreviewSelection selection;
     const int x = static_cast<int16_t>(LOWORD(lparam));
     const int y = static_cast<int16_t>(HIWORD(lparam));
-    const bool modifier_down =
-        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
-        (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
-    if (notifications && !modifier_down && notifications->foreground_window &&
-        notifications->foreground_window == GetForegroundWindow() &&
+    if (notifications &&
         PreviewSelectionAt(notifications->layout,
                            x - notifications->shadow_margin,
                            y - notifications->shadow_margin,
+                           notifications->page_index,
                            notifications->page_size, &selection)) {
-      SendPreviewSelectionKeys(selection, notifications->foreground_window);
+      PreviewSelectionRequest request = notifications->selection_request;
+      request.absolute_index = selection.absolute_index;
+      SendPreviewSelectionToOwner(window, request,
+                                  notifications->selection_owner);
       return 0;
     }
   }
   if (message == WM_MOUSEACTIVATE)
     return MA_NOACTIVATE;
+  if (message == WM_NCHITTEST && GetWindowLongPtrW(window, GWLP_USERDATA) == 0)
+    return HTTRANSPARENT;
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
-HWND CreateCandidateWindow(WindowNotifications *notifications) {
-  constexpr wchar_t kClassName[] = L"FamoRuntimeCandidateWindow";
+LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
+                            LPARAM lparam) noexcept {
+  try {
+    return WindowProcImpl(window, message, wparam, lparam);
+  } catch (...) {
+    return message == WM_NCCREATE
+               ? FALSE
+               : DefWindowProcW(window, message, wparam, lparam);
+  }
+}
+
+HWND CreateLayeredWindow(const wchar_t *class_name,
+                         WindowNotifications *notifications,
+                         bool click_through = false) {
   WNDCLASSW window_class{};
   window_class.lpfnWndProc = WindowProc;
   window_class.hInstance = GetModuleHandleW(nullptr);
@@ -214,15 +214,18 @@ HWND CreateCandidateWindow(WindowNotifications *notifications) {
   // panel until the pointer leaves it.
   window_class.hCursor =
       LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-  window_class.lpszClassName = kClassName;
+  window_class.lpszClassName = class_name;
   if (!RegisterClassW(&window_class) &&
       GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
     return nullptr;
   }
-  return CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
-                             WS_EX_TOPMOST,
-                         kClassName, L"", WS_POPUP, 0, 0, 1, 1, nullptr,
-                         nullptr, GetModuleHandleW(nullptr), notifications);
+  DWORD ex_style =
+      WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+  if (click_through)
+    ex_style |= WS_EX_TRANSPARENT;
+  return CreateWindowExW(ex_style, class_name, L"", WS_POPUP, 0, 0, 1, 1,
+                         nullptr, nullptr, GetModuleHandleW(nullptr),
+                         notifications);
 }
 
 bool MoveVisible(HWND window, int x, int y) {
@@ -235,6 +238,42 @@ bool ShouldShow(const RuntimeSnapshot &snapshot) {
   return ui.focused && ui.layout_available && ui.show_allowed &&
          snapshot.ui_sequence > snapshot.composition_sequence &&
          !snapshot.composition.candidates.empty();
+}
+
+bool ShowModeIndicator(HWND window, DibSurface *surface,
+                       FamoTextResources *resources, const FamoSkin *skin,
+                       const RuntimeSnapshot &snapshot) {
+  if (!window || !surface || !resources || !skin)
+    return false;
+  const uint32_t dpi = snapshot.ui_state.dpi;
+  const int size = ScaleDpi(kModeIndicatorSize, dpi);
+  const int inset = ScaleDpi(kModeIndicatorInset, dpi);
+  if (!surface->Ensure(size, size))
+    return false;
+  surface->Clear();
+  FamoStatusBarButton button{};
+  button.bounds = {inset, inset, size - inset, size - inset};
+  button.label = (snapshot.composition.status_flags & FAMO_STATUS_ASCII_MODE)
+                     ? "英"
+                     : "中";
+  FamoStatusBarSpec spec{};
+  spec.size = static_cast<uint32_t>(sizeof(spec));
+  spec.bar_size = {size, size};
+  spec.dpi = dpi;
+  spec.button_count = 1;
+  spec.buttons = &button;
+  if (FamoStatusBarPaint(&spec, skin, resources, surface->dc()) != FAMO_UI_OK)
+    return false;
+
+  const UiRect &caret = snapshot.ui_state.caret;
+  const UiRect &work = snapshot.ui_state.work_area;
+  const FamoRect caret_rect{caret.left, caret.top, caret.right, caret.bottom};
+  const FamoRect work_rect{work.left, work.top, work.right, work.bottom};
+  int32_t x = 0;
+  int32_t y = 0;
+  uint32_t flipped = 0;
+  FamoComputeAnchor(&caret_rect, &work_rect, {size, size}, &x, &y, &flipped);
+  return SubmitLayered(window, *surface, x, y);
 }
 
 bool PrewarmRenderer(FamoTextResources *resources, const FamoSkin *skin,
@@ -267,12 +306,65 @@ bool PrewarmRenderer(FamoTextResources *resources, const FamoSkin *skin,
 
 } // namespace
 
+bool SendPreviewSelectionToOwner(
+    HWND source_window, const PreviewSelectionRequest &request,
+    const PipeClientIdentity &selection_owner) noexcept {
+  if (!source_window || !IsWindow(source_window) ||
+      request.correlation.client_id == 0 ||
+      request.composition_sequence == 0 ||
+      !request.selection_capability || !selection_owner) {
+    return false;
+  }
+  win::UniqueHandle owner_process(
+      AcquirePipeClientIdentityLease(selection_owner));
+  if (!owner_process)
+    return false;
+  DWORD source_process_id = 0;
+  if (GetWindowThreadProcessId(source_window, &source_process_id) == 0 ||
+      source_process_id != GetCurrentProcessId()) {
+    return false;
+  }
+
+  wchar_t title[32]{};
+  if (swprintf_s(title, L"%llu",
+                 static_cast<unsigned long long>(
+                     request.correlation.client_id)) <= 0) {
+    return false;
+  }
+  HWND target = nullptr;
+  HWND after = nullptr;
+  while ((after = FindWindowExW(HWND_MESSAGE, after,
+                                kPreviewSelectionWindowClass, title))) {
+    DWORD process_id = 0;
+    if (GetWindowThreadProcessId(after, &process_id) != 0 &&
+        process_id == selection_owner.process_id) {
+      target = after;
+      break;
+    }
+  }
+  DWORD confirmed_process_id = 0;
+  if (!target ||
+      GetWindowThreadProcessId(target, &confirmed_process_id) == 0 ||
+      confirmed_process_id != selection_owner.process_id ||
+      WaitForSingleObject(owner_process.get(), 0) != WAIT_TIMEOUT) {
+    return false;
+  }
+
+  COPYDATASTRUCT data{static_cast<ULONG_PTR>(kPreviewSelectionCopyDataId),
+                      static_cast<DWORD>(sizeof(request)),
+                      const_cast<PreviewSelectionRequest *>(&request)};
+  DWORD_PTR handled = 0;
+  return SendMessageTimeoutW(
+             target, WM_COPYDATA, reinterpret_cast<WPARAM>(source_window),
+             reinterpret_cast<LPARAM>(&data), SMTO_ABORTIFHUNG | SMTO_BLOCK,
+             100, &handled) != 0 &&
+         handled != 0;
+}
+
 bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
-                        uint32_t page_size,
+                        uint32_t page_index, uint32_t page_size,
                         PreviewSelection *selection) noexcept {
   if (!selection || page_size == 0)
-    return false;
-  if (page_size > 9)
     return false;
   const uint32_t count = (std::min)(layout.preview_candidate_count,
                                     uint32_t{FAMO_MAX_PREVIEW_CANDIDATES});
@@ -281,15 +373,128 @@ bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
     if (x < bounds.left || x >= bounds.right || y < bounds.top ||
         y >= bounds.bottom)
       continue;
-    const uint32_t offset = i % page_size;
-    if (offset >= 9)
+    const uint64_t absolute =
+        (static_cast<uint64_t>(page_index) + 1) * page_size + i;
+    if (absolute > UINT32_MAX)
       return false;
-    selection->pages_forward = i / page_size + 1;
-    selection->candidate_offset = offset;
+    selection->absolute_index = static_cast<uint32_t>(absolute);
     return true;
   }
   return false;
 }
+
+bool PlanScrollTransition(const FamoLayoutResult &previous,
+                          const FamoLayoutResult &next,
+                          uint32_t previous_page, uint32_t next_page,
+                          bool animations_enabled,
+                          ScrollTransitionPlan *plan) noexcept {
+  if (!plan)
+    return false;
+  *plan = {};
+  int32_t direction = 0;
+  if (next_page > previous_page && next_page - previous_page == 1)
+    direction = 1;
+  else if (previous_page > next_page && previous_page - next_page == 1)
+    direction = -1;
+  if (!animations_enabled || direction == 0 ||
+      previous.candidate_count == 0 || next.candidate_count == 0 ||
+      previous.preview_candidate_count == 0 ||
+      next.preview_candidate_count == 0 ||
+      previous.content_size.cx != next.content_size.cx ||
+      previous.content_size.cy != next.content_size.cy ||
+      previous.shadow_margin != next.shadow_margin)
+    return false;
+
+  const FamoRect &previous_main = previous.candidates[0].bounds;
+  const FamoRect &next_main = next.candidates[0].bounds;
+  const FamoRect &previous_preview = previous.preview_candidates[0].bounds;
+  const FamoRect &next_preview = next.preview_candidates[0].bounds;
+  const FamoRect &previous_last =
+      previous.preview_candidates[previous.preview_candidate_count - 1].bounds;
+  const FamoRect &next_last =
+      next.preview_candidates[next.preview_candidate_count - 1].bounds;
+  const int32_t row_step = next_preview.top - next_main.top;
+  const int32_t clip_top = (std::min)(next_main.top, next.highlight.top);
+  if (row_step <= 0 || previous_preview.top - previous_main.top != row_step ||
+      previous_main.top != next_main.top ||
+      previous_last.bottom != next_last.bottom ||
+      clip_top != (std::min)(previous_main.top, previous.highlight.top) ||
+      next_last.bottom <= clip_top + row_step)
+    return false;
+
+  plan->clip = {0, clip_top, next.content_size.cx, next_last.bottom};
+  plan->row_step = row_step;
+  plan->direction = direction;
+  return true;
+}
+
+int32_t ScrollTransitionOffset(uint32_t elapsed_ms,
+                               int32_t row_step) noexcept {
+  if (row_step <= 0 || elapsed_ms == 0)
+    return 0;
+  if (elapsed_ms >= kCandidateScrollTransitionMs)
+    return row_step;
+  const double progress =
+      static_cast<double>(elapsed_ms) / kCandidateScrollTransitionMs;
+  const double remaining = 1.0 - progress;
+  const double eased = 1.0 - remaining * remaining * remaining;
+  return (std::min)(row_step,
+                    static_cast<int32_t>(row_step * eased + 0.5));
+}
+
+namespace {
+
+bool SystemAnimationsEnabled() {
+  BOOL enabled = FALSE;
+  return SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0) &&
+         enabled != FALSE;
+}
+
+bool CopySurface(DibSurface *destination, const DibSurface &source) {
+  return destination && destination->Ensure(source.width(), source.height()) &&
+         BitBlt(destination->dc(), 0, 0, source.width(), source.height(),
+                source.dc(), 0, 0, SRCCOPY) != FALSE;
+}
+
+bool ComposeScrollFrame(DibSurface *destination, const DibSurface &previous,
+                        const DibSurface &next,
+                        const ScrollTransitionPlan &plan, int margin,
+                        int32_t offset) {
+  if (!CopySurface(destination, next))
+    return false;
+  const int32_t left = plan.clip.left + margin;
+  const int32_t top = plan.clip.top + margin;
+  const int32_t right = plan.clip.right + margin;
+  const int32_t bottom = plan.clip.bottom + margin;
+  const int32_t width = right - left;
+  const int32_t height = bottom - top;
+  const int saved = SaveDC(destination->dc());
+  if (saved == 0 || IntersectClipRect(destination->dc(), left, top, right,
+                                      bottom) == ERROR) {
+    if (saved != 0)
+      RestoreDC(destination->dc(), saved);
+    return false;
+  }
+  BOOL copied = FALSE;
+  if (plan.direction > 0) {
+    copied = BitBlt(destination->dc(), left, top - offset, width,
+                    plan.row_step, previous.dc(), left, top, SRCCOPY) &&
+             BitBlt(destination->dc(), left,
+                    top + plan.row_step - offset, width, height, next.dc(),
+                    left, top, SRCCOPY);
+  } else {
+    copied = BitBlt(destination->dc(), left,
+                    top - plan.row_step + offset, width, height, next.dc(),
+                    left, top, SRCCOPY) &&
+             BitBlt(destination->dc(), left,
+                    bottom - plan.row_step + offset, width, plan.row_step,
+                    previous.dc(), left, bottom - plan.row_step, SRCCOPY);
+  }
+  RestoreDC(destination->dc(), saved);
+  return copied != FALSE;
+}
+
+} // namespace
 
 struct CandidateWindow::State {
   explicit State(Fault injected_fault) : fault(injected_fault) {
@@ -318,6 +523,7 @@ struct CandidateWindow::State {
   std::atomic<uint64_t> selection_only_count{0};
   std::atomic<uint64_t> full_count{0};
   std::atomic<uint64_t> device_recovery_count{0};
+  std::atomic<uint64_t> mode_indicator_count{0};
   bool device_loss_injected = false;
   bool submitted_visible = false;
   Fault fault;
@@ -326,18 +532,18 @@ struct CandidateWindow::State {
 CandidateWindow::~CandidateWindow() { Stop(); }
 
 bool CandidateWindow::Start() {
-  Stop();
-  auto state = std::make_shared<State>(fault_);
-  if (!state->stop_event || !state->update_event ||
-      !state->prewarm_complete_event)
-    return false;
   try {
+    Stop();
+    auto state = std::make_shared<State>(fault_);
+    if (!state->stop_event || !state->update_event ||
+        !state->prewarm_complete_event)
+      return false;
     thread_ = std::thread(&CandidateWindow::ThreadMain, state);
+    state_ = std::move(state);
+    return true;
   } catch (...) {
     return false;
   }
-  state_ = std::move(state);
-  return true;
 }
 
 bool CandidateWindow::Prewarm() {
@@ -359,10 +565,13 @@ bool CandidateWindow::PrepareStyle(
   try {
     if (!presentation)
       return false;
-    FamoSkin skin = FamoSkinDefault();
-    if (exists && !ParseCandidateSkin(text, &skin))
+    CandidateStylePresentation style{FamoSkinDefault(), FamoSkinDefault()};
+    if (exists &&
+        (!ParseCandidateSkinForTheme(text, false, &style.light) ||
+         !ParseCandidateSkinForTheme(text, true, &style.dark)))
       return false;
-    *presentation = std::make_shared<const FamoSkin>(skin);
+    *presentation =
+        std::make_shared<const CandidateStylePresentation>(std::move(style));
     return true;
   } catch (...) {
     return false;
@@ -403,19 +612,28 @@ CandidateWindow::Counters CandidateWindow::counters() const noexcept {
           state->anchor_only_count.load(std::memory_order_relaxed),
           state->selection_only_count.load(std::memory_order_relaxed),
           state->full_count.load(std::memory_order_relaxed),
-          state->device_recovery_count.load(std::memory_order_relaxed)};
+          state->device_recovery_count.load(std::memory_order_relaxed),
+          state->mode_indicator_count.load(std::memory_order_relaxed)};
 }
 
-void CandidateWindow::Stop() {
-  std::shared_ptr<State> state = std::move(state_);
-  if (!state)
-    return;
-  SetEvent(state->stop_event);
-  if (thread_.joinable()) {
-    if (WaitForSingleObject(thread_.native_handle(), 250) == WAIT_OBJECT_0)
-      thread_.join();
-    else
-      thread_.detach();
+void CandidateWindow::Stop() noexcept {
+  try {
+    std::shared_ptr<State> state = std::move(state_);
+    if (!state)
+      return;
+    SetEvent(state->stop_event);
+    if (thread_.joinable()) {
+      if (WaitForSingleObject(thread_.native_handle(), 250) == WAIT_OBJECT_0)
+        thread_.join();
+      else
+        thread_.detach();
+    }
+  } catch (...) {
+    try {
+      if (thread_.joinable())
+        thread_.detach();
+    } catch (...) {
+    }
   }
 }
 
@@ -449,6 +667,7 @@ void CandidateWindow::Publish(
 }
 
 void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
+  try {
   SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   // Candidate painting is brief and user-visible; keep it ahead of ordinary
   // background work without using a real-time priority class.
@@ -459,11 +678,32 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   HWND window =
       state->fault == Fault::Create
           ? nullptr
-          : CreateCandidateWindow(&notifications);
+          : CreateLayeredWindow(kCandidateWindowClassName, &notifications);
+  HWND mode_window =
+      state->fault == Fault::Create
+          ? nullptr
+          : CreateLayeredWindow(kModeIndicatorClassName, nullptr, true);
   DibSurface surface;
+  DibSurface previous_surface;
+  DibSurface animation_surface;
+  DibSurface mode_surface;
+  struct ActiveScrollAnimation {
+    bool active = false;
+    uint64_t started_ms = 0;
+    ScrollTransitionPlan plan{};
+    FamoLayoutResult target_layout{};
+    int margin = 0;
+    HWND foreground_window = nullptr;
+  } animation;
+  struct ActiveModeIndicator {
+    bool active = false;
+    uint64_t expires_ms = 0;
+    Correlation last_switch{};
+    HWND foreground_window = nullptr;
+  } mode_indicator;
   const FamoSkin fallback_skin = FamoSkinDefault();
   std::shared_ptr<const void> active_presentation;
-  std::shared_ptr<const FamoSkin> active_skin;
+  std::shared_ptr<const CandidateStylePresentation> active_style;
   FamoTextResources *resources = nullptr;
   uint32_t resource_dpi = 0;
   bool resource_skin_dirty = true;
@@ -478,10 +718,74 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   uint64_t presented_system_generation = 0;
   HANDLE events[] = {state->stop_event, state->update_event};
   for (;;) {
+    DWORD timeout = INFINITE;
+    if (animation.active) {
+      const uint64_t elapsed = GetTickCount64() - animation.started_ms;
+      timeout = elapsed >= kCandidateScrollTransitionMs
+                    ? 0
+                    : (std::min)(DWORD{16}, static_cast<DWORD>(
+                                                   kCandidateScrollTransitionMs -
+                                                   elapsed));
+    }
+    if (mode_indicator.active) {
+      const uint64_t now = GetTickCount64();
+      const DWORD remaining =
+          mode_indicator.expires_ms <= now
+              ? 0
+              : static_cast<DWORD>((std::min)(
+                    mode_indicator.expires_ms - now,
+                    static_cast<uint64_t>(MAXDWORD)));
+      timeout = timeout == INFINITE ? remaining : (std::min)(timeout, remaining);
+    }
     const DWORD wait =
-        MsgWaitForMultipleObjects(2, events, FALSE, INFINITE, QS_ALLINPUT);
+        MsgWaitForMultipleObjects(2, events, FALSE, timeout, QS_ALLINPUT);
     if (wait == WAIT_OBJECT_0)
       break;
+    if (wait == WAIT_TIMEOUT) {
+      const uint64_t now = GetTickCount64();
+      if (mode_indicator.active &&
+          (now >= mode_indicator.expires_ms ||
+           (mode_indicator.foreground_window &&
+            GetForegroundWindow() != mode_indicator.foreground_window))) {
+        ShowWindow(mode_window, SW_HIDE);
+        mode_indicator.active = false;
+      }
+      if (!animation.active)
+        continue;
+      if (animation.foreground_window &&
+          GetForegroundWindow() != animation.foreground_window) {
+        ShowWindow(window, SW_HIDE);
+        animation.active = false;
+        presented_snapshot.reset();
+        continue;
+      }
+      const uint64_t elapsed = GetTickCount64() - animation.started_ms;
+      const bool complete = elapsed >= kCandidateScrollTransitionMs;
+      const DibSurface *frame = &surface;
+      if (!complete) {
+        const int32_t offset = ScrollTransitionOffset(
+            static_cast<uint32_t>(elapsed), animation.plan.row_step);
+        if (!ComposeScrollFrame(&animation_surface, previous_surface, surface,
+                                animation.plan, animation.margin, offset)) {
+          animation.active = false;
+          continue;
+        }
+        frame = &animation_surface;
+      }
+      if (!SubmitLayered(window, *frame,
+                         animation.target_layout.origin_x - animation.margin,
+                         animation.target_layout.origin_y - animation.margin)) {
+        ShowWindow(window, SW_HIDE);
+        animation.active = false;
+        presented_snapshot.reset();
+        continue;
+      }
+      if (complete) {
+        animation.active = false;
+        notifications.layout = animation.target_layout;
+      }
+      continue;
+    }
     if (wait == WAIT_OBJECT_0 + 2) {
       MSG message{};
       while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -492,6 +796,16 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     }
     if (wait != WAIT_OBJECT_0 + 1)
       break;
+    if (animation.active) {
+      animation.active = false;
+      notifications.layout = animation.target_layout;
+      if (!SubmitLayered(window, surface,
+                         animation.target_layout.origin_x - animation.margin,
+                         animation.target_layout.origin_y - animation.margin)) {
+        ShowWindow(window, SW_HIDE);
+        presented_snapshot.reset();
+      }
+    }
     if (state->fault == Fault::Hang) {
       Sleep(5000);
       continue;
@@ -505,14 +819,19 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       next_presentation = state->presentation.load(std::memory_order_acquire);
     if (next_presentation != active_presentation) {
       active_presentation = std::move(next_presentation);
-      active_skin =
+      active_style =
           active_presentation
-              ? std::static_pointer_cast<const FamoSkin>(active_presentation)
+              ? std::static_pointer_cast<const CandidateStylePresentation>(
+                    active_presentation)
               : nullptr;
       resource_skin_dirty = true;
       resources_warmed = false;
     }
-    const FamoSkin &configured_skin = active_skin ? *active_skin : fallback_skin;
+    const bool system_dark = SystemUsesDarkPalette();
+    const FamoSkin &configured_skin = active_style
+                                          ? (system_dark ? active_style->dark
+                                                         : active_style->light)
+                                          : fallback_skin;
     FamoSkin resolved_skin = configured_skin;
     if (resolved_skin.layout_type == FAMO_LAYOUT_AUTO) {
       const bool vertical = snapshot &&
@@ -571,6 +890,33 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
                                      std::memory_order_release);
       SetEvent(state->prewarm_complete_event);
     }
+    if (mode_indicator.active &&
+        (!snapshot || !snapshot->ui_state.focused ||
+         (mode_indicator.foreground_window &&
+          GetForegroundWindow() != mode_indicator.foreground_window))) {
+      ShowWindow(mode_window, SW_HIDE);
+      mode_indicator.active = false;
+    }
+    if (mode_window && resources && snapshot &&
+        snapshot->mode_switch_sequence != 0 &&
+        snapshot->ui_sequence > snapshot->mode_switch_sequence &&
+        snapshot->ui_state.focused && snapshot->ui_state.layout_available) {
+      Correlation switch_id = snapshot->correlation;
+      switch_id.sequence = snapshot->mode_switch_sequence;
+      if (switch_id != mode_indicator.last_switch) {
+        mode_indicator.last_switch = switch_id;
+        HWND foreground = reinterpret_cast<HWND>(snapshot->source_window);
+        if ((!foreground || GetForegroundWindow() == foreground) &&
+            ShowModeIndicator(mode_window, &mode_surface, resources, skin,
+                              *snapshot)) {
+          mode_indicator.active = true;
+          mode_indicator.expires_ms =
+              GetTickCount64() + kModeIndicatorDurationMs;
+          mode_indicator.foreground_window = foreground;
+          state->mode_indicator_count.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
     if (!window || !snapshot || !should_show) {
       if (window)
         ShowWindow(window, SW_HIDE);
@@ -588,7 +934,8 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         presented_dpi == dpi &&
         presented_high_contrast == high_contrast &&
         presented_system_generation == current_system_generation &&
-        snapshot->source_window == presented_snapshot->source_window;
+        snapshot->source_window == presented_snapshot->source_window &&
+        snapshot->selection_owner == presented_snapshot->selection_owner;
     if (stable_presentation &&
         snapshot->composition == presented_snapshot->composition &&
         snapshot->ui_state == presented_snapshot->ui_state) {
@@ -650,8 +997,25 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       layout = presented_layout;
       layout.highlight = {};
       const uint32_t selected = snapshot->composition.highlighted_index;
-      if (selected < layout.candidate_count)
+      const uint32_t previous_selected =
+          presented_snapshot->composition.highlighted_index;
+      if (selected < layout.candidate_count &&
+          previous_selected < layout.candidate_count) {
+        const FamoRect previous_bounds =
+            layout.candidates[previous_selected].bounds;
+        const FamoRect selected_bounds = layout.candidates[selected].bounds;
+        layout.highlight = {
+            selected_bounds.left + presented_layout.highlight.left -
+                previous_bounds.left,
+            selected_bounds.top + presented_layout.highlight.top -
+                previous_bounds.top,
+            selected_bounds.right + presented_layout.highlight.right -
+                previous_bounds.right,
+            selected_bounds.bottom + presented_layout.highlight.bottom -
+                previous_bounds.bottom};
+      } else if (selected < layout.candidate_count) {
         layout.highlight = layout.candidates[selected].bounds;
+      }
       state->selection_only_count.fetch_add(1, std::memory_order_relaxed);
     } else {
       state->full_count.fetch_add(1, std::memory_order_relaxed);
@@ -663,9 +1027,21 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         continue;
       }
     }
+    ScrollTransitionPlan transition{};
+    bool animate_scroll =
+        !selection_only && stable_presentation &&
+        snapshot->ui_state == presented_snapshot->ui_state &&
+        PlanScrollTransition(presented_layout, layout,
+                             presented_snapshot->composition.page_index,
+                             snapshot->composition.page_index,
+                             SystemAnimationsEnabled(), &transition);
     const int margin = std::max(0, layout.shadow_margin);
     const int width = layout.content_size.cx + margin * 2;
     const int height = layout.content_size.cy + margin * 2;
+    if (animate_scroll &&
+        (surface.width() != width || surface.height() != height ||
+         !CopySurface(&previous_surface, surface)))
+      animate_scroll = false;
     if (!surface.Ensure(width, height)) {
       ShowWindow(window, SW_HIDE);
       continue;
@@ -706,8 +1082,16 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       presented_snapshot.reset();
       continue;
     }
+    const DibSurface *first_frame = &surface;
+    if (animate_scroll) {
+      if (ComposeScrollFrame(&animation_surface, previous_surface, surface,
+                             transition, margin, 0))
+        first_frame = &animation_surface;
+      else
+        animate_scroll = false;
+    }
     if (state->fault == Fault::Submit ||
-        !SubmitLayered(window, surface, layout.origin_x - margin,
+        !SubmitLayered(window, *first_frame, layout.origin_x - margin,
                        layout.origin_y - margin)) {
       ShowWindow(window, SW_HIDE);
       presented_snapshot.reset();
@@ -719,6 +1103,13 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     } else {
       state->submitted_visible = true;
       notifications.layout = layout;
+      if (animate_scroll)
+        notifications.layout.preview_candidate_count = 0;
+      notifications.selection_request =
+          {snapshot->correlation, snapshot->composition_sequence, 0, 0,
+           snapshot->ui_state.selection_capability};
+      notifications.selection_owner = snapshot->selection_owner;
+      notifications.page_index = snapshot->composition.page_index;
       notifications.page_size = snapshot->composition.page_size;
       notifications.shadow_margin = margin;
       notifications.foreground_window = frame_foreground;
@@ -728,13 +1119,28 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       presented_dpi = dpi;
       presented_high_contrast = high_contrast;
       presented_system_generation = current_system_generation;
+      if (animate_scroll) {
+        animation.active = true;
+        animation.started_ms = GetTickCount64();
+        animation.plan = transition;
+        animation.target_layout = layout;
+        animation.margin = margin;
+        animation.foreground_window = frame_foreground;
+      }
     }
   }
+  if (mode_window)
+    DestroyWindow(mode_window);
   if (window)
     DestroyWindow(window);
   FamoTextResourcesDestroy(resources);
   if (SUCCEEDED(com))
     CoUninitialize();
+  } catch (...) {
+    state->prewarm_succeeded.store(false, std::memory_order_release);
+    state->prewarm_requested.store(false, std::memory_order_release);
+    SetEvent(state->prewarm_complete_event);
+  }
 }
 
 } // namespace famo::runtime

@@ -56,6 +56,23 @@ public sealed class QuickPhraseStoreTests : IDisposable
     }
 
     [Fact]
+    public void RenameCollision_LeavesJsonAndTableUnchanged()
+    {
+        var store = new QuickPhraseStore(_json);
+        store.SaveEdit(new QuickPhraseEntry { Code = "aa", Text = "A" }, null, _table);
+        store.SaveEdit(new QuickPhraseEntry { Code = "bb", Text = "B" }, null, _table);
+        string jsonBefore = File.ReadAllText(_json);
+        string tableBefore = File.ReadAllText(_table);
+
+        InvalidDataException error = Assert.Throws<InvalidDataException>(() =>
+            store.SaveEdit(new QuickPhraseEntry { Code = " BB ", Text = "A2" }, "aa", _table));
+
+        Assert.Contains("bb", error.Message);
+        Assert.Equal(jsonBefore, File.ReadAllText(_json));
+        Assert.Equal(tableBefore, File.ReadAllText(_table));
+    }
+
+    [Fact]
     public void BuildTableDb_WritesBareCodesWithoutVCodeRows()
     {
         var entries = new[]
@@ -175,7 +192,7 @@ public sealed class QuickPhraseWinuiContractTests
         Assert.Contains(Famo.Settings.Core.SettingsNavigation.VisiblePages, page => page.Id == "quick-phrases" && page.Badge == "短");
         Assert.Contains("QuickPhraseStore", page);
         Assert.Contains("FamoPaths.QuickSendTableFile", page);
-        Assert.Contains("_store.WriteTableDb(FamoPaths.QuickSendTableFile)", page);
+        Assert.Contains("_store.SaveEdit(entry, _editingCode, FamoPaths.QuickSendTableFile)", page);
         Assert.Contains("App.SaveAndApplyDeploy();", page);
         Assert.Contains("App.ShowQuickPhrasePicker()", page);
         Assert.Contains("QuickPhraseStore.Validate", page);

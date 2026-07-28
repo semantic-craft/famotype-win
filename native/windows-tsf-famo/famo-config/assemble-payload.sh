@@ -36,8 +36,16 @@ WUBI_DIR="${CACHE_DIR}/rime-wubi86-jidian"
 OPENCC_STANDARD_DIR="${SCRIPT_DIR}/opencc-standard"
 
 ICE_REPO="https://github.com/iDvel/rime-ice.git"
+ICE_REF_PINNED=0
+if [ -n "${ICE_REF:-}" ]; then
+  ICE_REF_PINNED=1
+fi
 ICE_REF="${ICE_REF:-main}"   # 可用环境变量钉住特定 tag/commit
 WUBI_REPO="https://github.com/KyleBing/rime-wubi86-jidian.git"
+WUBI_REF_PINNED=0
+if [ -n "${WUBI_REF:-}" ]; then
+  WUBI_REF_PINNED=1
+fi
 WUBI_REF="${WUBI_REF:-master}"
 
 # 法学层防御式剔除模式(本应为空集，纯保险)。
@@ -50,11 +58,59 @@ die()  { printf '\033[1;31m[assemble] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 # ── 0. 前置检查 ─────────────────────────────────────────────────────────────
 command -v git >/dev/null 2>&1 || die "未找到 git，请先安装 git。"
 
+ensure_canonical_origin() {
+  local name="$1" repo="$2" dir="$3"
+  if git -C "${dir}" remote | grep -Fxq origin; then
+    git -C "${dir}" remote set-url origin "${repo}" \
+      || die "无法修正 ${name} origin：${repo}"
+  else
+    git -C "${dir}" remote add origin "${repo}" \
+      || die "无法配置 ${name} remote：${repo}"
+  fi
+}
+
+clean_managed_repo() {
+  local name="$1" dir="$2"
+  git -C "${dir}" clean -ffdx \
+    || die "无法清理 ${name} 缓存中的未跟踪/忽略文件：${dir}"
+}
+
+checkout_pinned_ref() {
+  local name="$1" repo="$2" ref="$3" dir="$4"
+  if [ -d "${dir}/.git" ]; then
+    log "更新缓存 ${name} (${dir}) 到显式 ref ${ref} …"
+  else
+    log "初始化 ${name} (${repo}@${ref}) → ${dir} …"
+    rm -rf "${dir}"
+    git init --quiet "${dir}" || die "无法初始化 ${name} 缓存：${dir}"
+  fi
+
+  ensure_canonical_origin "${name}" "${repo}" "${dir}"
+  git -C "${dir}" fetch --depth 1 origin "${ref}" \
+    || die "无法解析或 fetch ${name} 显式 ref：${ref}"
+  git -C "${dir}" reset --hard FETCH_HEAD \
+    || die "无法检出 ${name} 显式 ref：${ref}"
+
+  local expected_head actual_head
+  expected_head="$(git -C "${dir}" rev-parse --verify 'FETCH_HEAD^{commit}')"
+  actual_head="$(git -C "${dir}" rev-parse --verify HEAD)"
+  [ "${actual_head}" = "${expected_head}" ] \
+    || die "${name} 未检出显式 ref ${ref}（HEAD=${actual_head}，期望=${expected_head}）"
+  clean_managed_repo "${name}" "${dir}"
+  log "${name} HEAD = $(git -C "${dir}" rev-parse --short HEAD)"
+}
+
 # ── 1. 拉取 / 更新 rime-ice（幂等；网络不可用则优雅报错，回退已缓存 .cache）──────
 fetch_rime_ice() {
   mkdir -p "${CACHE_DIR}"
+  if [ "${ICE_REF_PINNED}" -eq 1 ]; then
+    checkout_pinned_ref "rime-ice" "${ICE_REPO}" "${ICE_REF}" "${ICE_DIR}"
+    return
+  fi
+
   if [ -d "${ICE_DIR}/.git" ]; then
     log "更新缓存 rime-ice (${ICE_DIR}) …"
+    ensure_canonical_origin "rime-ice" "${ICE_REPO}" "${ICE_DIR}"
     if git -C "${ICE_DIR}" fetch --depth 1 origin "${ICE_REF}"; then
       git -C "${ICE_DIR}" reset --hard FETCH_HEAD
     else
@@ -71,14 +127,21 @@ fetch_rime_ice() {
         2) 重跑本脚本(检测到 .cache/rime-ice/.git 即走更新分支)。"
     fi
   fi
+  clean_managed_repo "rime-ice" "${ICE_DIR}"
   log "rime-ice HEAD = $(git -C "${ICE_DIR}" rev-parse --short HEAD)"
 }
 
 # ── 1b. 拉取 / 更新 KyleBing 极点五笔（Apache-2.0；幂等）───────────────────────
 fetch_wubi() {
   mkdir -p "${CACHE_DIR}"
+  if [ "${WUBI_REF_PINNED}" -eq 1 ]; then
+    checkout_pinned_ref "rime-wubi86-jidian" "${WUBI_REPO}" "${WUBI_REF}" "${WUBI_DIR}"
+    return
+  fi
+
   if [ -d "${WUBI_DIR}/.git" ]; then
     log "更新缓存 rime-wubi86-jidian (${WUBI_DIR}) …"
+    ensure_canonical_origin "rime-wubi86-jidian" "${WUBI_REPO}" "${WUBI_DIR}"
     if git -C "${WUBI_DIR}" fetch --depth 1 origin "${WUBI_REF}"; then
       git -C "${WUBI_DIR}" reset --hard FETCH_HEAD
     else
@@ -94,6 +157,7 @@ fetch_wubi() {
         2) 重跑本脚本。"
     fi
   fi
+  clean_managed_repo "rime-wubi86-jidian" "${WUBI_DIR}"
   log "rime-wubi86-jidian HEAD = $(git -C "${WUBI_DIR}" rev-parse --short HEAD)"
 }
 
@@ -112,6 +176,13 @@ copy_base() {
         -cf - . ) | ( cd "${PAYLOAD_DIR}" && tar -xf - )
 
   log "rime-ice 基座已落地($(find "${PAYLOAD_DIR}" -type f | wc -l | tr -d ' ') 文件)。"
+}
+
+reject_payload_links() {
+  local link
+  link="$(find "${PAYLOAD_DIR}" -type l -print -quit)"
+  [ -z "${link}" ] \
+    || die "拒绝 payload 符号链接（Windows 发布包只允许普通文件/目录）：${link#${PAYLOAD_DIR}/}"
 }
 
 # rime-ice 只携带 emoji OpenCC 数据；s2t/s2hk 是前端通常预装的标准数据。
@@ -261,6 +332,7 @@ neutralize_payload_identity_text() {
 # ── 5. 体检：关键文件 + 出厂锚定就位 + 旧底座/限制残留断言 ──────────────────────
 verify() {
   local ok=1
+  reject_payload_links
   for f in rime_ice.schema.yaml rime_ice.dict.yaml \
            t9.schema.yaml melt_eng.schema.yaml \
            double_pinyin_flypy.schema.yaml \
@@ -300,6 +372,7 @@ main() {
   fetch_rime_ice
   fetch_wubi
   copy_base
+  reject_payload_links
   overlay_opencc_standard
   overlay_wubi
   ensure_wubi_pinyin_traditionalization

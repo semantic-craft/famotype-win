@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+#include "../famo_c_abi_boundary.h"
 #include "../famo_candidate_ui.h"
 
 namespace {
@@ -17,9 +18,8 @@ void SetFace(FamoFontSpec* f, const char* face, float pt) {
   std::memcpy(f->face, face, n);  // buffer zeroed above → NUL-terminated
   f->point_size = pt;
 }
-}  // namespace
 
-extern "C" FamoSkin FamoSkinDefault(void) {
+FamoSkin SkinDefaultImpl() {
   FamoSkin s;
   std::memset(&s, 0, sizeof(s));
   s.size = static_cast<uint32_t>(sizeof(FamoSkin));
@@ -47,7 +47,9 @@ extern "C" FamoSkin FamoSkinDefault(void) {
 
   s.margin_x          = 8;
   s.margin_y          = 8;
-  s.spacing           = 6;
+  // Band → list gap. Holds the hairline separator with ~6px of air either side;
+  // 12 also lands on the 4dp grid both Material and Apple layouts are built on.
+  s.spacing           = 12;
   s.candidate_spacing = 6;
   s.hilite_padding_x  = 8;
   s.hilite_padding_y  = 7;
@@ -71,4 +73,17 @@ extern "C" FamoSkin FamoSkinDefault(void) {
   s.preview_rows      = 2;
 
   return s;
+}
+
+FamoSkin SkinDefaultCpp() noexcept {
+  try {
+    return SkinDefaultImpl();
+  } catch (...) {
+    return {};
+  }
+}
+}  // namespace
+
+extern "C" FamoSkin FamoSkinDefault(void) noexcept {
+  FAMO_C_ABI_SEH_RETURN(SkinDefaultCpp(), FamoSkin{});
 }

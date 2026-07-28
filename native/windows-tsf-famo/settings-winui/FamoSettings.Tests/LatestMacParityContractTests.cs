@@ -11,6 +11,7 @@ public sealed class LatestMacParityContractTests
         string page = RepoText("native/windows-tsf-famo/settings-winui/FamoSettings/Views/CandidatePage.cs");
         string writer = RepoText("native/windows-tsf-famo/settings-winui/FamoSettings.Core/ConfigWriter.cs");
         string window = RepoText("native/windows-tsf-famo/runtime-protocol/src/candidate_window.cpp");
+        string keyPath = RepoText("native/windows-tsf-famo/text-service/src/text_service_key.cpp");
         string paint = RepoText("native/windows-tsf-famo/famo-candidate-ui/render/famo_paint.cpp");
 
         Assert.Contains("\"自动\", \"横排\", \"竖排\", \"卷轴\"", page);
@@ -18,7 +19,14 @@ public sealed class LatestMacParityContractTests
         Assert.DoesNotContain("不可点", page);
         Assert.Contains("a.Orientation == \"scroll\"", writer);
         Assert.Contains("PreviewSelectionAt", window);
-        Assert.Contains("SendPreviewSelectionKeys", window);
+        Assert.Contains("SendPreviewSelectionToOwner(window, request,", window);
+        Assert.Contains("AcquirePipeClientIdentityLease(selection_owner)", window);
+        Assert.Contains("reinterpret_cast<WPARAM>(source_window)", window);
+        Assert.Contains("WM_COPYDATA", window);
+        Assert.DoesNotContain("SendInput", window);
+        Assert.Contains("Command::SelectCandidateAbsolute", keyPath);
+        Assert.Contains("AcquirePipeClientIdentityLease(runtime_identity)", keyPath);
+        Assert.Contains("SelectionCapabilityMatches", keyPath);
         Assert.DoesNotContain("top_light", paint);
         Assert.DoesNotContain("edge_light", paint);
     }
@@ -42,7 +50,9 @@ public sealed class LatestMacParityContractTests
         Assert.Contains("BuildToolboxSkills", window);
         Assert.Contains("Grid.SetColumn", window);
         Assert.Contains("App.ShowAiSelectionSkill", window);
-        Assert.DoesNotContain("RunToolboxSkillAsync", window);
+        Assert.Contains("skill.Id is \"translation\" or \"research-assist\"", window);
+        Assert.Contains("await RunToolboxSkillAsync", window);
+        Assert.Contains("_result.Text = result", window);
         Assert.Contains("任意提问", window);
         Assert.Contains("AltDoubleTapDetector", statusHeader);
         Assert.Contains("GlobalHotKeyBindingMatches", statusHeader);

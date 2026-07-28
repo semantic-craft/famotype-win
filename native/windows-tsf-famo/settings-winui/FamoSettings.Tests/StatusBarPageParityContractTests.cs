@@ -21,7 +21,8 @@ public sealed class StatusBarPageParityContractTests
 
         Assert.Contains("悬浮状态栏", page);
         Assert.Contains("悬浮状态条", page);
-        Assert.Contains("语言栏菜单", page);
+        Assert.Contains("输入焦点", page);
+        Assert.Contains("自动显示", page);
         Assert.Contains("状态按钮", page);
         Assert.Contains("输入法设定放在最上面", page);
         Assert.Contains("三点菜单", page);
@@ -64,6 +65,8 @@ public sealed class StatusBarPageParityContractTests
 
         Assert.DoesNotContain("场景词库", page);
         Assert.DoesNotContain("术语", page);
+        Assert.DoesNotContain("语言栏菜单", candidate + page);
+        Assert.DoesNotContain("WeaselServer", candidate + page);
     }
 
     private static string RepoFile(string relativePath)

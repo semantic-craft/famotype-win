@@ -92,6 +92,35 @@ public sealed class RuntimeBoundaryAuditContractTests
         }
     }
 
+    [Fact]
+    public void CommittedCompositionIsEndedWithoutClearingCommittedText()
+    {
+        string source = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/text-service/src/composition_controller.cpp"));
+        int emptyPreedit = source.IndexOf("if (preedit.text.empty())", StringComparison.Ordinal);
+        Assert.True(emptyPreedit >= 0);
+        int nextPreedit = source.IndexOf("if (!composition_)", emptyPreedit, StringComparison.Ordinal);
+        Assert.True(nextPreedit > emptyPreedit);
+        string branch = source[emptyPreedit..nextPreedit];
+
+        int committed = branch.IndexOf("if (!plan.commit.empty())", StringComparison.Ordinal);
+        int end = branch.IndexOf("EndCurrent(cookie)", committed, StringComparison.Ordinal);
+        int clear = branch.IndexOf("ReplaceRange(cookie, context, range.get(), L\"\")", StringComparison.Ordinal);
+        Assert.True(committed >= 0 && end > committed && clear > end);
+    }
+
+    [Fact]
+    public void ProductionTsfAndRuntimeRejectInactiveInstallTargets()
+    {
+        string tsf = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/text-service/src/text_service.cpp"));
+        string runtime = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
+
+        Assert.Contains("ProductionInstallAllowed(ModuleDirectory())", tsf);
+        Assert.Contains("ProductionInstallAllowed(ModuleDirectory(), true)", runtime);
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Famo.Settings.Core;
 using Famo.Settings.Core.Prompts;
 using Famo.Settings.Theming;
 using Microsoft.UI.Text;
@@ -215,7 +216,8 @@ public sealed class PromptLibraryPage : UserControl
         IReadOnlyList<PromptLibraryEntry> prompts = PromptLibraryStore.FilterAndSort(
             _document.Prompts,
             _search?.Text,
-            string.IsNullOrEmpty(categoryId) ? null : categoryId);
+            string.IsNullOrEmpty(categoryId) ? null : categoryId,
+            includeDisabled: true);
 
         if (prompts.Count == 0)
         {
@@ -595,7 +597,9 @@ public sealed class PromptLibraryPage : UserControl
     private static string Preview(string text)
     {
         string oneLine = text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ');
-        return oneLine.Length <= 180 ? oneLine : oneLine[..180] + "...";
+        return oneLine.Length <= 180
+            ? oneLine
+            : TextElementTruncator.Truncate(oneLine, 180) + "...";
     }
 
     private static List<string> SplitTags(string text) =>
@@ -620,9 +624,7 @@ public sealed class PromptLibraryPage : UserControl
             .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None)
             .Select(line => line.Trim())
             .FirstOrDefault(line => line.Length > 0) ?? "选中文本提示词";
-        return title.Length <= PromptLibraryStore.MaxGeneratedTitleLength
-            ? title
-            : title[..PromptLibraryStore.MaxGeneratedTitleLength];
+        return TextElementTruncator.Truncate(title, PromptLibraryStore.MaxGeneratedTitleLength);
     }
 
     private static string? SelectedTag(ComboBox? combo)

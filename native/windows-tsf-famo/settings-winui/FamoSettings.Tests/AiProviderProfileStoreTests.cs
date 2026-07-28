@@ -140,26 +140,22 @@ public sealed class AiProviderProfileStoreTests : IDisposable
     }
 
     [Fact]
-    public void AddProfile_AllowsEmptyModel_AndSurvivesReload()
+    public void AddProfile_RejectsEmptyModel()
     {
-        var store = new AiProviderProfileStore(_file);
-        var service = new AiProviderProfileService(store, _secrets);
+        var service = new AiProviderProfileService(new AiProviderProfileStore(_file), _secrets);
 
-        AiProviderProfile profile = service.AddProfile(new AiProviderProfileDraft
-        {
-            DisplayName = "Fill In Later",
-            Endpoint = "https://api.example.test/v1/chat/completions",
-            Model = "",
-            ApiKey = "sk-test-secret",
-            MakeDefault = true,
-        });
+        InvalidDataException ex = Assert.Throws<InvalidDataException>(() =>
+            service.AddProfile(new AiProviderProfileDraft
+            {
+                DisplayName = "Fill In Later",
+                Endpoint = "https://api.example.test/v1/chat/completions",
+                Model = " ",
+                ApiKey = "sk-test-secret",
+                MakeDefault = true,
+            }));
 
-        Assert.Equal(string.Empty, profile.Model);
-
-        IReadOnlyList<AiProviderProfile> reloaded = store.Load();
-        Assert.Single(reloaded);
-        Assert.Equal(profile.Id, reloaded[0].Id);
-        Assert.Equal(string.Empty, reloaded[0].Model);
+        Assert.Contains("模型 ID", ex.Message);
+        Assert.False(File.Exists(_file));
     }
 
     private sealed class FakeSecretStore : ISecretStore

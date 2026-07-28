@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using Famo.Settings.Core;
 
 namespace Famo.Settings.Core.Ai;
 
@@ -30,6 +31,8 @@ internal sealed class AiProviderChatCompletionClient
         _http = http ?? new HttpClient { Timeout = TimeSpan.FromSeconds(45) };
     }
 
+    internal void EnsureReady() => _ = ResolveDefault();
+
     public async Task<AiProviderChatCompletionResult> SendAsync(
         IReadOnlyList<AiProviderChatMessage> messages,
         CancellationToken cancellationToken,
@@ -40,11 +43,7 @@ internal sealed class AiProviderChatCompletionClient
             throw new InvalidOperationException("AI 请求缺少消息。");
         }
 
-        AiProviderProfile profile = _profiles.DefaultProfile()
-            ?? throw new InvalidOperationException("尚未配置 AI 供应商。");
-        string apiKey = _secrets.GetSecret(profile.SecretName)
-            ?? throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
-        Uri endpoint = ParseEndpoint(profile.Endpoint);
+        var (profile, apiKey, endpoint) = ResolveDefault();
 
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         ApplyAuth(request, profile, apiKey);
@@ -53,14 +52,27 @@ internal sealed class AiProviderChatCompletionClient
             Encoding.UTF8,
             "application/json");
 
-        using HttpResponseMessage response = await _http.SendAsync(request, cancellationToken);
-        string json = await response.Content.ReadAsStringAsync(cancellationToken);
+        using HttpResponseMessage response = await _http.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        string json = await ReadResponseAsync(response, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException($"AI 请求失败：HTTP {(int)response.StatusCode} {ExtractErrorMessage(json)}".Trim());
         }
 
         return new AiProviderChatCompletionResult(ParseAssistantText(json), profile.Id, profile.Model);
+    }
+
+    private (AiProviderProfile Profile, string ApiKey, Uri Endpoint) ResolveDefault()
+    {
+        AiProviderProfile profile = _profiles.DefaultProfile()
+            ?? throw new InvalidOperationException("尚未配置 AI 供应商。");
+        if (string.IsNullOrWhiteSpace(profile.Model))
+            throw new InvalidOperationException("默认 AI 供应商缺少模型 ID，请先在设置中补全。");
+        string? apiKey = _secrets.GetSecret(profile.SecretName);
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
+        return (profile, apiKey, ParseEndpoint(profile.Endpoint));
     }
 
     public async Task<AiProviderChatCompletionResult> SendSourceVerificationAsync(
@@ -74,6 +86,10 @@ internal sealed class AiProviderChatCompletionClient
 
         AiProviderProfile profile = _profiles.DefaultProfile()
             ?? throw new InvalidOperationException("尚未配置 AI 供应商。");
+        if (string.IsNullOrWhiteSpace(profile.Model))
+        {
+            throw new InvalidOperationException("默认 AI 供应商缺少模型 ID，请先在设置中补全。");
+        }
         string provider = InferProvider(profile);
         if (provider is not ("qwen" or "mimo" or "doubao" or "openai"))
         {
@@ -92,14 +108,31 @@ internal sealed class AiProviderChatCompletionClient
             Encoding.UTF8,
             "application/json");
 
-        using HttpResponseMessage response = await _http.SendAsync(request, cancellationToken);
-        string json = await response.Content.ReadAsStringAsync(cancellationToken);
+        using HttpResponseMessage response = await _http.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        string json = await ReadResponseAsync(response, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException($"来源核验请求失败：HTTP {(int)response.StatusCode} {ExtractErrorMessage(json)}".Trim());
         }
 
         return new AiProviderChatCompletionResult(RenderSourceVerification(json), profile.Id, profile.Model);
+    }
+
+    private static async Task<string> ReadResponseAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await BoundedHttpContent.ReadUtf8Async(
+                response.Content, cancellationToken);
+        }
+        catch (InvalidDataException ex)
+        {
+            throw new InvalidOperationException(
+                "AI 响应过大，已停止读取。", ex);
+        }
     }
 
     private static string BuildRequestJson(
@@ -418,12 +451,12 @@ internal sealed class AiProviderChatCompletionClient
                 && error.TryGetProperty("message", out JsonElement message)
                 && message.ValueKind == JsonValueKind.String)
             {
-                return message.GetString() ?? "";
+                return TextElementTruncator.Truncate(message.GetString() ?? "", 160);
             }
         }
         catch (JsonException)
         {
-            return json.Length <= 160 ? json : json[..160];
+            return TextElementTruncator.Truncate(json, 160);
         }
 
         return "";

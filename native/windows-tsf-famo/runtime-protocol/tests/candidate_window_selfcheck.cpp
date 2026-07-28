@@ -22,6 +22,109 @@ using namespace famo::runtime;
 
 namespace {
 
+HANDLE g_preview_received_event = nullptr;
+HANDLE g_fake_preview_received_event = nullptr;
+HWND g_expected_preview_source = nullptr;
+PreviewSelectionRequest g_expected_preview_request{};
+
+LRESULT CALLBACK PreviewTargetProc(HWND window, UINT message, WPARAM wparam,
+                                   LPARAM lparam) {
+  if (message == WM_COPYDATA) {
+    const auto *copy = reinterpret_cast<const COPYDATASTRUCT *>(lparam);
+    if (!copy || copy->dwData != kPreviewSelectionCopyDataId ||
+        copy->cbData != sizeof(PreviewSelectionRequest) || !copy->lpData) {
+      return FALSE;
+    }
+    const auto &request =
+        *static_cast<const PreviewSelectionRequest *>(copy->lpData);
+    if (reinterpret_cast<HWND>(wparam) != g_expected_preview_source ||
+        request.correlation != g_expected_preview_request.correlation ||
+        request.composition_sequence !=
+            g_expected_preview_request.composition_sequence ||
+        request.absolute_index !=
+            g_expected_preview_request.absolute_index ||
+        request.reserved != 0 ||
+        request.selection_capability !=
+            g_expected_preview_request.selection_capability) {
+      return FALSE;
+    }
+    SetEvent(g_preview_received_event);
+    return TRUE;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+LRESULT CALLBACK FakePreviewTargetProc(HWND window, UINT message,
+                                       WPARAM wparam, LPARAM lparam) {
+  if (message == WM_COPYDATA) {
+    SetEvent(g_fake_preview_received_event);
+    return TRUE;
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+PipeClientIdentity ProcessIdentity(HANDLE process, DWORD process_id) {
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (!process ||
+      !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    return {};
+  }
+  ULARGE_INTEGER encoded{};
+  encoded.LowPart = created.dwLowDateTime;
+  encoded.HighPart = created.dwHighDateTime;
+  return {process_id, encoded.QuadPart};
+}
+
+PipeClientIdentity CurrentProcessIdentity() {
+  return ProcessIdentity(GetCurrentProcess(), GetCurrentProcessId());
+}
+
+int RunFakePreviewTarget(int argc, wchar_t **argv) {
+  if (argc != 6)
+    return 2;
+  HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[3]);
+  g_fake_preview_received_event =
+      OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[4]);
+  HANDLE stop = OpenEventW(SYNCHRONIZE, FALSE, argv[5]);
+  if (!ready || !g_fake_preview_received_event || !stop)
+    return 3;
+  WNDCLASSW window_class{};
+  window_class.lpfnWndProc = FakePreviewTargetProc;
+  window_class.hInstance = GetModuleHandleW(nullptr);
+  window_class.lpszClassName = kPreviewSelectionWindowClass;
+  if (!RegisterClassW(&window_class) &&
+      GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    return 4;
+  }
+  HWND target =
+      CreateWindowExW(0, kPreviewSelectionWindowClass, argv[2], 0, 0, 0, 0, 0,
+                      HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  if (!target)
+    return 5;
+  SetEvent(ready);
+  bool running = true;
+  while (running) {
+    const DWORD wait =
+        MsgWaitForMultipleObjects(1, &stop, FALSE, 1000, QS_ALLINPUT);
+    if (wait == WAIT_OBJECT_0) {
+      running = false;
+    } else if (wait == WAIT_OBJECT_0 + 1) {
+      MSG message{};
+      while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+      }
+    } else if (wait == WAIT_FAILED) {
+      running = false;
+    }
+  }
+  DestroyWindow(target);
+  CloseHandle(stop);
+  CloseHandle(g_fake_preview_received_event);
+  CloseHandle(ready);
+  return 0;
+}
+
 std::shared_ptr<RuntimeSnapshot> VisibleSnapshot(uint64_t sequence = 3) {
   auto snapshot = std::make_shared<RuntimeSnapshot>();
   snapshot->correlation = {1, 2, 3, 4, 5, sequence};
@@ -37,7 +140,8 @@ std::shared_ptr<RuntimeSnapshot> VisibleSnapshot(uint64_t sequence = 3) {
                         192,
                         true,
                         true,
-                        true};
+                        true,
+                        {sequence, sequence ^ 0xfeedbeefull}};
   snapshot->composition_sequence = sequence - 1;
   snapshot->ui_sequence = sequence;
   return snapshot;
@@ -89,19 +193,152 @@ bool WaitForVisibility(bool visible, WindowProbe *result = nullptr) {
   return false;
 }
 
-bool PreviewRowsMapToPageAndCandidateKeys() {
+bool PreviewRowsMapToAbsoluteCandidateIndexes() {
   FamoLayoutResult layout{};
   layout.preview_candidate_count = 3;
   layout.preview_candidates[0].bounds = {10, 20, 30, 40};
   layout.preview_candidates[1].bounds = {30, 20, 50, 40};
   layout.preview_candidates[2].bounds = {10, 40, 30, 60};
   PreviewSelection selection;
-  CHECK(PreviewSelectionAt(layout, 35, 25, 2, &selection));
-  CHECK(selection.pages_forward == 1 && selection.candidate_offset == 1);
-  CHECK(PreviewSelectionAt(layout, 15, 45, 2, &selection));
-  CHECK(selection.pages_forward == 2 && selection.candidate_offset == 0);
-  CHECK(!PreviewSelectionAt(layout, 5, 5, 2, &selection));
-  CHECK(!PreviewSelectionAt(layout, 15, 25, 10, &selection));
+  CHECK(PreviewSelectionAt(layout, 35, 25, 0, 2, &selection));
+  CHECK(selection.absolute_index == 3);
+  CHECK(PreviewSelectionAt(layout, 15, 45, 0, 2, &selection));
+  CHECK(selection.absolute_index == 4);
+  CHECK(PreviewSelectionAt(layout, 15, 25, 4, 2, &selection));
+  CHECK(selection.absolute_index == 10);
+  CHECK(!PreviewSelectionAt(layout, 5, 5, 0, 2, &selection));
+  CHECK(!PreviewSelectionAt(layout, 15, 25, 0, 0, &selection));
+  return true;
+}
+
+bool PreviewRoutingBindsExactOwnerAndSourceWindow() {
+  CandidateWindow candidate;
+  CHECK(candidate.Start());
+  auto snapshot = VisibleSnapshot(200);
+  snapshot->revision = 1;
+  snapshot->correlation.client_id =
+      0x70000000ull + static_cast<uint64_t>(GetCurrentProcessId());
+  snapshot->selection_owner = CurrentProcessIdentity();
+  CHECK(snapshot->selection_owner);
+  candidate.Publish(snapshot);
+  WindowProbe source;
+  CHECK(WaitForVisibility(true, &source));
+
+  const std::wstring nonce =
+      std::to_wstring(GetCurrentProcessId()) + L"-" +
+      std::to_wstring(GetTickCount64());
+  const std::wstring ready_name = L"Local\\FamoPreviewReady-" + nonce;
+  const std::wstring fake_hit_name = L"Local\\FamoPreviewHit-" + nonce;
+  const std::wstring stop_name = L"Local\\FamoPreviewStop-" + nonce;
+  HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, ready_name.c_str());
+  HANDLE fake_hit =
+      CreateEventW(nullptr, TRUE, FALSE, fake_hit_name.c_str());
+  HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, stop_name.c_str());
+  CHECK(ready && fake_hit && stop);
+
+  wchar_t module[32768]{};
+  CHECK(GetModuleFileNameW(nullptr, module,
+                           static_cast<DWORD>(std::size(module))) > 0);
+  const std::wstring title =
+      std::to_wstring(snapshot->correlation.client_id);
+  std::wstring command =
+      L"\"" + std::wstring(module) + L"\" --fake-preview-target " + title +
+      L" " + ready_name + L" " + fake_hit_name + L" " + stop_name;
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION fake{};
+  CHECK(CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &fake));
+  const PipeClientIdentity fake_identity =
+      ProcessIdentity(fake.hProcess, fake.dwProcessId);
+  CHECK(fake_identity);
+  CHECK(WaitForSingleObject(ready, 2000) == WAIT_OBJECT_0);
+
+  WNDCLASSW target_class{};
+  target_class.lpfnWndProc = PreviewTargetProc;
+  target_class.hInstance = GetModuleHandleW(nullptr);
+  target_class.lpszClassName = kPreviewSelectionWindowClass;
+  CHECK(RegisterClassW(&target_class) ||
+        GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+  HWND target = CreateWindowExW(
+      0, kPreviewSelectionWindowClass, title.c_str(), 0, 0, 0, 0, 0,
+      HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(target);
+  g_preview_received_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  CHECK(g_preview_received_event);
+  g_expected_preview_source = source.window;
+  g_expected_preview_request = {
+      snapshot->correlation,
+      snapshot->composition_sequence,
+      7,
+      0,
+      snapshot->ui_state.selection_capability,
+  };
+
+  CHECK(SendPreviewSelectionToOwner(
+      source.window, g_expected_preview_request, snapshot->selection_owner));
+  CHECK(WaitForSingleObject(g_preview_received_event, 0) == WAIT_OBJECT_0);
+  CHECK(WaitForSingleObject(fake_hit, 0) == WAIT_TIMEOUT);
+
+  ResetEvent(g_preview_received_event);
+  PipeClientIdentity wrong_creation = snapshot->selection_owner;
+  ++wrong_creation.process_creation_time;
+  CHECK(!SendPreviewSelectionToOwner(
+      source.window, g_expected_preview_request, wrong_creation));
+  CHECK(WaitForSingleObject(g_preview_received_event, 0) == WAIT_TIMEOUT);
+
+  SetEvent(stop);
+  CHECK(WaitForSingleObject(fake.hProcess, 2000) == WAIT_OBJECT_0);
+  CHECK(!SendPreviewSelectionToOwner(
+      source.window, g_expected_preview_request, fake_identity));
+
+  DestroyWindow(target);
+  CloseHandle(g_preview_received_event);
+  g_preview_received_event = nullptr;
+  g_expected_preview_source = nullptr;
+  CloseHandle(fake.hThread);
+  CloseHandle(fake.hProcess);
+  CloseHandle(stop);
+  CloseHandle(fake_hit);
+  CloseHandle(ready);
+  candidate.Stop();
+  return true;
+}
+
+bool ScrollTransitionIsBoundedAndOptional() {
+  FamoLayoutResult previous{};
+  previous.content_size = {240, 96};
+  previous.shadow_margin = 12;
+  previous.candidate_count = 2;
+  previous.candidates[0].bounds = {8, 15, 58, 35};
+  previous.candidates[1].bounds = {64, 15, 114, 35};
+  previous.highlight = {8, 11, 58, 37};
+  previous.preview_candidate_count = 4;
+  previous.preview_candidates[0].bounds = {8, 40, 58, 60};
+  previous.preview_candidates[1].bounds = {64, 40, 114, 60};
+  previous.preview_candidates[2].bounds = {8, 65, 58, 85};
+  previous.preview_candidates[3].bounds = {64, 65, 114, 85};
+  FamoLayoutResult next = previous;
+
+  ScrollTransitionPlan plan;
+  CHECK(PlanScrollTransition(previous, next, 4, 5, true, &plan));
+  CHECK(plan.direction == 1);
+  CHECK(plan.row_step == 25);
+  CHECK(plan.clip.left == 0 && plan.clip.top == 11 &&
+        plan.clip.right == 240 && plan.clip.bottom == 85);
+  CHECK(ScrollTransitionOffset(0, plan.row_step) == 0);
+  const int32_t halfway = ScrollTransitionOffset(
+      kCandidateScrollTransitionMs / 2, plan.row_step);
+  CHECK(halfway > 0 && halfway < plan.row_step);
+  CHECK(ScrollTransitionOffset(kCandidateScrollTransitionMs, plan.row_step) ==
+        plan.row_step);
+
+  CHECK(PlanScrollTransition(previous, next, 5, 4, true, &plan));
+  CHECK(plan.direction == -1);
+  CHECK(!PlanScrollTransition(previous, next, 4, 5, false, &plan));
+  CHECK(!PlanScrollTransition(previous, next, 4, 6, true, &plan));
+  next.content_size.cy++;
+  CHECK(!PlanScrollTransition(previous, next, 4, 5, true, &plan));
   return true;
 }
 
@@ -182,7 +419,9 @@ bool InlineHostPreeditStillShowsPanelHeader() {
   FamoSkin hidden_skin = FamoSkinDefault();
   hidden_skin.show_preedit = 0;
   auto hidden_style = std::make_shared<const RuntimeStyleState>(
-      RuntimeStyleState{0, std::make_shared<const FamoSkin>(hidden_skin)});
+      RuntimeStyleState{0, std::make_shared<const CandidateStylePresentation>(
+                               CandidateStylePresentation{hidden_skin,
+                                                          hidden_skin})});
   window.ActivateStyle(hidden_style);
   CHECK(WaitForCounters(window, [&](CandidateWindow::Counters counters) {
     return counters.full > full_before;
@@ -245,9 +484,12 @@ bool HealthyWindowAndHideRules() {
                    "placement outside work area: window=(%ld,%ld,%ld,%ld) "
                    "work=(%ld,%ld,%ld,%ld) dpi=%u\n",
                    probe.rect.left, probe.rect.top, probe.rect.right,
-                   probe.rect.bottom, placement.work_area.left,
-                   placement.work_area.top, placement.work_area.right,
-                   placement.work_area.bottom, placement.dpi);
+                   probe.rect.bottom,
+                   static_cast<long>(placement.work_area.left),
+                   static_cast<long>(placement.work_area.top),
+                   static_cast<long>(placement.work_area.right),
+                   static_cast<long>(placement.work_area.bottom),
+                   placement.dpi);
     }
     CHECK(probe.rect.left >= placement.work_area.left - 64);
     CHECK(probe.rect.top >= placement.work_area.top - 64);
@@ -277,10 +519,15 @@ bool HealthyWindowAndHideRules() {
   FamoSkin wide_skin = FamoSkinDefault();
   wide_skin.min_width = 600;
   auto independent_style = std::make_shared<const RuntimeStyleState>(
-      RuntimeStyleState{0, std::make_shared<const FamoSkin>(wide_skin)});
+      RuntimeStyleState{0, std::make_shared<const CandidateStylePresentation>(
+                               CandidateStylePresentation{wide_skin,
+                                                          wide_skin})});
   window.ActivateStyle(independent_style);
   auto snapshot_style = std::make_shared<const RuntimeStyleState>(
-      RuntimeStyleState{0, std::make_shared<const FamoSkin>(FamoSkinDefault())});
+      RuntimeStyleState{
+          0, std::make_shared<const CandidateStylePresentation>(
+                 CandidateStylePresentation{FamoSkinDefault(),
+                                            FamoSkinDefault()})});
   auto styled = VisibleSnapshot(placement_sequence++);
   styled->revision = 200;
   styled->style = snapshot_style;
@@ -368,6 +615,8 @@ bool FastPathsAndDeviceRecoveryAreObservable() {
 
   auto duplicate = VisibleSnapshot(31);
   duplicate->revision = 2;
+  duplicate->ui_state.selection_capability =
+      initial->ui_state.selection_capability;
   window.Publish(duplicate);
   CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
     return value.duplicate >= 1;
@@ -375,6 +624,8 @@ bool FastPathsAndDeviceRecoveryAreObservable() {
 
   auto moved = VisibleSnapshot(32);
   moved->revision = 3;
+  moved->ui_state.selection_capability =
+      duplicate->ui_state.selection_capability;
   moved->ui_state.caret = {700, 450, 702, 470};
   window.Publish(moved);
   CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
@@ -417,6 +668,52 @@ bool FastPathsAndDeviceRecoveryAreObservable() {
         return value.device_recovery == 1 && value.full >= 1;
       }));
   recovering.Stop();
+  return true;
+}
+
+bool ModeIndicatorRequiresFreshCaretAndDeduplicates() {
+  CandidateWindow window;
+  CHECK(window.Start());
+  CHECK(window.Prewarm());
+  auto stale = VisibleSnapshot(60);
+  stale->revision = 1;
+  stale->composition.candidates.clear();
+  stale->ui_state.show_allowed = false;
+  stale->composition.status_flags = FAMO_STATUS_ASCII_MODE;
+  stale->mode_switch_sequence = stale->ui_sequence;
+  window.Publish(stale);
+  Sleep(25);
+  CHECK(window.counters().mode_indicator == 0);
+
+  auto fresh = std::make_shared<RuntimeSnapshot>(*stale);
+  fresh->revision = 2;
+  fresh->correlation.sequence++;
+  fresh->ui_sequence++;
+  window.Publish(fresh);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.mode_indicator == 1;
+  }));
+
+  auto duplicate = std::make_shared<RuntimeSnapshot>(*fresh);
+  duplicate->revision = 3;
+  duplicate->correlation.sequence++;
+  duplicate->ui_sequence++;
+  window.Publish(duplicate);
+  Sleep(25);
+  CHECK(window.counters().mode_indicator == 1);
+
+  auto chinese = std::make_shared<RuntimeSnapshot>(*duplicate);
+  chinese->revision = 4;
+  chinese->correlation.sequence++;
+  chinese->composition_sequence = chinese->correlation.sequence;
+  chinese->mode_switch_sequence = chinese->composition_sequence;
+  chinese->ui_sequence = chinese->composition_sequence + 1;
+  chinese->composition.status_flags = 0;
+  window.Publish(chinese);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.mode_indicator == 2;
+  }));
+  window.Stop();
   return true;
 }
 
@@ -512,14 +809,19 @@ bool HangingUiDoesNotDelayEngine() {
 
 } // namespace
 
-int main() {
-  if (!PreviewRowsMapToPageAndCandidateKeys() ||
+int wmain(int argc, wchar_t **argv) {
+  if (argc > 1 && std::wstring_view(argv[1]) == L"--fake-preview-target")
+    return RunFakePreviewTarget(argc, argv);
+  if (!PreviewRowsMapToAbsoluteCandidateIndexes() ||
+      !PreviewRoutingBindsExactOwnerAndSourceWindow() ||
+      !ScrollTransitionIsBoundedAndOptional() ||
       !PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
       !InlineHostPreeditStillShowsPanelHeader() ||
       !HealthyWindowAndHideRules() ||
       !FirstVisibleBudgetAfterPrewarm() ||
       !FastPathsAndDeviceRecoveryAreObservable() ||
+      !ModeIndicatorRequiresFreshCaretAndDeduplicates() ||
       !PaintFailureHidesWithoutBlockingEngine() ||
       !FaultsNeverBlockPublisher() || !HangingUiDoesNotDelayEngine())
     return 1;

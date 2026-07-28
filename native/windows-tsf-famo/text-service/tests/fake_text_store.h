@@ -81,6 +81,7 @@ public:
   HRESULT STDMETHODCALLTYPE GetWnd(TsViewCookie view, HWND *window) override;
 
   const std::wstring &text() const { return text_; }
+  const TS_SELECTION_ACP &selection() const { return selection_; }
   size_t replace_count() const { return replace_count_; }
   void set_deny_locks(bool deny) { deny_locks_ = deny; }
 

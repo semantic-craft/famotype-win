@@ -1,5 +1,6 @@
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using Famo.Settings.Core;
 
 namespace Famo.Settings.Core.Clipboard;
 
@@ -63,7 +64,7 @@ public sealed class ClipboardHistoryStore
     {
         if (!enabled || string.IsNullOrEmpty(text)) return false;
 
-        string captured = text.Length > MaxTextLength ? text[..MaxTextLength] : text;
+        string captured = TextElementTruncator.Truncate(text, MaxTextLength);
         var entries = LoadOrThrow().Where(e => e.Text != captured).ToList();
         entries.Insert(0, new ClipboardHistoryEntry
         {

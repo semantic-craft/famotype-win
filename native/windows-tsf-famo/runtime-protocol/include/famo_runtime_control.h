@@ -23,17 +23,20 @@ public:
   RuntimeControlService &operator=(const RuntimeControlService &) = delete;
 
   bool Start();
-  void Stop();
-  Frame Dispatch(const Frame &request);
+  void Stop() noexcept;
+  Frame Dispatch(const Frame &request,
+                 const PipeClientIdentity &owner = {});
   void InvalidateConnection(uint64_t client_id,
                             uint64_t activation_generation,
-                            uint64_t connection_generation);
+                            uint64_t connection_generation,
+                            const PipeClientIdentity &owner = {});
 
 private:
   struct ClientState {
     uint64_t activation_generation = 0;
     uint64_t connection_generation = 0;
     uint64_t last_sequence = 0;
+    PipeClientIdentity owner;
   };
   struct Operation {
     uint64_t id = 0;
@@ -42,7 +45,7 @@ private:
 
   Frame Reply(const Frame &request, Status status) const;
   Frame ResultReply(const Frame &request, const ControlResult &result) const;
-  void WorkerMain();
+  void WorkerMain() noexcept;
 
   RuntimeService *runtime_ = nullptr;
   std::atomic<bool> *running_ = nullptr;
@@ -54,6 +57,7 @@ private:
   std::thread worker_;
   uint64_t next_operation_id_ = 1;
   bool stop_ = false;
+  static constexpr size_t kMaxClients = 64;
 };
 
 bool RunControlClient(const PipeEndpoint &endpoint,
