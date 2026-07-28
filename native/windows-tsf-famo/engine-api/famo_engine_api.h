@@ -117,6 +117,9 @@ typedef struct FamoCandidate {
   FamoUtf8String label;  // select label/key: select_labels -> select_keys -> (i+1)%10
 } FamoCandidate;
 
+// The size member is the caller-owned writable span. Set it before every query.
+// The engine rejects a span smaller than the v1.0 prefix, writes at most this
+// many bytes, and preserves the negotiated value across free_view for reuse.
 typedef struct FamoCompositionView {
   uint32_t size;
   FamoUtf8String preedit;
@@ -138,6 +141,22 @@ typedef struct FamoCompositionView {
   // ── v1.2 addition (append only; guard reads on view.size) ────────────────
   uint32_t is_last_page;          // menu.is_last_page — disambiguates a full last page
 } FamoCompositionView;
+
+// Stable field-span boundaries for FamoCompositionView negotiation. Use field
+// ends rather than sizeof an older source definition: tail padding is not a
+// version marker on every architecture.
+#define FAMO_COMPOSITION_VIEW_V1_REQUIRED_SIZE \
+  offsetof(FamoCompositionView, preedit_sel_start)
+#define FAMO_COMPOSITION_VIEW_V11_FIELD_SIZE \
+  offsetof(FamoCompositionView, is_last_page)
+#define FAMO_COMPOSITION_VIEW_V12_FIELD_SIZE \
+  (offsetof(FamoCompositionView, is_last_page) + sizeof(uint32_t))
+
+// Before v1.2, candidate arrays are packed with this stride and contain no
+// label. A view spanning the complete v1.2 is_last_page field uses the current
+// sizeof(FamoCandidate) stride. Engines must use the same derived stride for
+// allocation, indexing, and free_view.
+#define FAMO_CANDIDATE_V1_STRIDE offsetof(FamoCandidate, label)
 
 typedef struct FamoEngineApi {
   uint32_t size;

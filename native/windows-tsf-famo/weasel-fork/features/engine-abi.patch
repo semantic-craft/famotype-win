@@ -337,13 +337,13 @@ index 67e9b6d..61e4fa7 100644
 +  int32_t rc = ctx ? m_engine_host.api().process_key(ctx, &ke, &m_abi_view)
 +                   : FAMO_ENGINE_E_INVALID_ARGUMENT;
 +  m_abi_view_valid = (rc == FAMO_ENGINE_OK);
-+  // ABI-only pass-through rule: a non-empty returned view means RIME consumed the key; an empty view keeps host-app key handling.
-+  handled = (m_abi_view_valid &&
-+             (m_abi_view.state_flags & (FAMO_COMPOSITION_HAS_PREEDIT |
-+                                        FAMO_COMPOSITION_HAS_COMMIT |
-+                                        FAMO_COMPOSITION_HAS_CANDIDATES)))
-+                ? True
-+                : False;
++  // ABI-only pass-through rule: FAMO_COMPOSITION_HANDLED is independent of
++  // preedit, commit, and candidate content.
++  handled =
++      (m_abi_view_valid &&
++       (m_abi_view.state_flags & FAMO_COMPOSITION_HANDLED))
++          ? True
++          : False;
 +  if (!handled && !(keyEvent.mask & ibus::Modifier::RELEASE_MASK) && ctx) {
      bool isVimBackInCommandMode =
          (keyEvent.keycode == ibus::Keycode::Escape) ||

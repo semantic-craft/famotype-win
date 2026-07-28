@@ -68,6 +68,18 @@ int main() {
   // v1.1: the rebuilt engine must expose the full v1.1 surface.
   CHECK(host.AbiRunnable());
 
+  FamoUtf8String missing_schema;
+  missing_schema.size = static_cast<uint32_t>(sizeof(FamoUtf8String));
+  missing_schema.data = "famo_missing_schema";
+  missing_schema.length_bytes =
+      static_cast<uint32_t>(std::strlen(missing_schema.data));
+  auto* rejected_context =
+      reinterpret_cast<FamoEngineContext*>(static_cast<uintptr_t>(1));
+  const int32_t missing_schema_rc =
+      host.api().create_context(&missing_schema, &rejected_context);
+  CHECK(missing_schema_rc == FAMO_ENGINE_E_SCHEMA);
+  CHECK(rejected_context == nullptr);
+
   FamoEngineContext* ctx = nullptr;
   CHECK(host.api().create_context(&empty, &ctx) == FAMO_ENGINE_OK);
   CHECK(ctx != nullptr);
@@ -82,7 +94,8 @@ int main() {
     // rime keysym pass-through (engine no longer VK-maps): ascii 'a'-'z' == X11 keysym.
     k.virtual_key = static_cast<uint32_t>(static_cast<unsigned char>(*p));
     k.is_key_down = 1;
-    FamoCompositionView v;
+    FamoCompositionView v{};
+    v.size = static_cast<uint32_t>(sizeof(v));
     CHECK(host.api().process_key(ctx, &k, &v) == FAMO_ENGINE_OK);
     CHECK(v.size >= sizeof(FamoCompositionView));  // v1.2 fields are addressable
     // v1.2: is_last_page is a clean boolean; any candidate's label is
@@ -98,7 +111,8 @@ int main() {
 
   // get_status: OK, status_flags readable, schema strings non-garbage (with an
   // empty schema they may be empty, but the FamoUtf8String must be well-formed).
-  FamoCompositionView st;
+  FamoCompositionView st{};
+  st.size = static_cast<uint32_t>(sizeof(st));
   CHECK(host.api().get_status(ctx, &st) == FAMO_ENGINE_OK);
   CHECK(st.size >= sizeof(FamoCompositionView));
   const uint32_t known = FAMO_STATUS_ASCII_MODE | FAMO_STATUS_COMPOSING |
@@ -137,6 +151,23 @@ int main() {
 
   CHECK(host.api().destroy_context(ctx) == FAMO_ENGINE_OK);
   host.Unload();
+
+  // A regular file cannot be used as RIME's data root. Deployment must expose
+  // that synchronous failure instead of reporting that a background task
+  // merely started.
+  const fs::path blocked_root = fs::current_path() / "rime_smoke_blocked_root";
+  fs::remove_all(blocked_root, ec);
+  {
+    std::ofstream out(blocked_root);
+    out << "not a directory\n";
+  }
+  FamoEngineHost blocked_host;
+  CHECK(blocked_host.Load(L"FamoRimeEngine.dll",
+                          blocked_root.string().c_str()) == FAMO_ENGINE_OK);
+  CHECK(blocked_host.api().deploy_schema(&empty, &derr) ==
+        FAMO_ENGINE_E_RUNTIME);
+  blocked_host.Unload();
+  CHECK(fs::remove(blocked_root, ec));
 
   std::printf("rime_smoke: OK (build+link+load+init+deploy+roundtrip+v1.1, no crash)\n");
   return 0;

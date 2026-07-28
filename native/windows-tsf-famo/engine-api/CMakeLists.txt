@@ -29,6 +29,11 @@ add_executable(roundtrip_selfcheck tests/roundtrip_selfcheck.cpp)
 target_link_libraries(roundtrip_selfcheck PRIVATE famo_engine_host)
 add_dependencies(roundtrip_selfcheck FamoTestEngine)
 
+# Public-DLL ABI canary: a current engine must honor a smaller legacy view and
+# legacy candidate-array stride on both query and free paths.
+add_executable(view_abi_canary tests/view_abi_canary.cpp)
+add_dependencies(view_abi_canary FamoTestEngine)
+
 # Place FamoTestEngine.dll next to the exe so LoadLibraryW resolves it by name.
 add_custom_command(TARGET roundtrip_selfcheck POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -36,6 +41,8 @@ add_custom_command(TARGET roundtrip_selfcheck POST_BUILD
 
 enable_testing()
 add_test(NAME roundtrip COMMAND roundtrip_selfcheck)
+add_test(NAME view_abi_test_engine COMMAND
+  view_abi_canary $<TARGET_FILE:FamoTestEngine> --test-engine)
 
 # ---------------------------------------------------------------------------
 # Tier B: FamoRimeEngine.dll - librime adapter for FamoEngineApi.
@@ -57,6 +64,11 @@ if(FAMO_BUILD_RIME_ENGINE AND EXISTS "${FAMO_RIME_ROOT}/lib64/rime.lib")
   add_executable(rime_smoke tests/rime_smoke.cpp)
   target_link_libraries(rime_smoke PRIVATE famo_engine_host)
   add_dependencies(rime_smoke FamoRimeEngine)
+  add_dependencies(view_abi_canary FamoRimeEngine)
+  add_custom_command(TARGET view_abi_canary POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${FAMO_RIME_ROOT}/output/rime.dll"
+      $<TARGET_FILE_DIR:view_abi_canary>)
   # FamoRimeEngine.dll + rime.dll must sit next to the smoke exe.
   add_custom_command(TARGET rime_smoke POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -64,6 +76,8 @@ if(FAMO_BUILD_RIME_ENGINE AND EXISTS "${FAMO_RIME_ROOT}/lib64/rime.lib")
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${FAMO_RIME_ROOT}/output/rime.dll" $<TARGET_FILE_DIR:rime_smoke>)
   add_test(NAME rime_smoke COMMAND rime_smoke)
+  add_test(NAME view_abi_rime_engine COMMAND
+    view_abi_canary $<TARGET_FILE:FamoRimeEngine>)
 
   # Manual real-candidate verification tool (needs a deployed data root; not a
   # ctest). Usage: rime_verify <data_root> <schema_id> <ascii_keys>

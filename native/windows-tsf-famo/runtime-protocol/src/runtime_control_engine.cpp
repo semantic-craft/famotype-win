@@ -257,6 +257,18 @@ bool RuntimeService::ReplaceContextsLocked(
   std::vector<Replacement> replacements;
   replacements.reserve(sessions_.size());
   const FamoUtf8String engine_schema = EngineString(schema);
+  if (sessions_.empty()) {
+    FamoEngineContext *probe = nullptr;
+    Composition composition;
+    const bool valid =
+        engine_.api().create_context(&engine_schema, &probe) ==
+            FAMO_ENGINE_OK &&
+        probe && ApplyOptionsLocked(probe, options) &&
+        ReadStatusLocked(probe, &composition);
+    const int32_t destroy_rc =
+        probe ? engine_.api().destroy_context(probe) : FAMO_ENGINE_OK;
+    return valid && destroy_rc == FAMO_ENGINE_OK;
+  }
   for (auto &[key, session] : sessions_) {
     (void)key;
     FamoEngineContext *replacement = nullptr;

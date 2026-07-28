@@ -156,6 +156,7 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
   }
 
   FamoCompositionView view{};
+  view.size = static_cast<uint32_t>(sizeof(view));
   int32_t rc = FAMO_ENGINE_E_INVALID_ARGUMENT;
   std::string error;
   std::string explicit_commit;
@@ -205,7 +206,8 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
         return Reply(request, Status::EngineError);
       candidate_selection_handled = composition.handled;
     }
-    if (rc == FAMO_ENGINE_OK && composition.commit.empty()) {
+    if (rc == FAMO_ENGINE_OK && candidate_selection_handled &&
+        composition.commit.empty()) {
       // The Rime ABI intentionally leaves the selection commit pending so the
       // legacy Weasel host can retrieve it through its simulated VK_SELECT.
       // Reproduce that established response step inside the new runtime.
@@ -277,6 +279,7 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
         static_cast<uint64_t>(composition.page_size) * rows));
     if (start <= UINT32_MAX && count > 0) {
       FamoCompositionView preview_view{};
+      preview_view.size = static_cast<uint32_t>(sizeof(preview_view));
       if (engine_.api().peek_candidates(
               session.context, static_cast<uint32_t>(start), count,
               &preview_view) == FAMO_ENGINE_OK) {

@@ -560,7 +560,17 @@ int main() {
                        &process_ni.payload));
   CHECK(service.Dispatch(process_ni).status == Status::Ok);
 
-  Frame select = Request(Command::SelectCandidate, 12);
+  Frame unhandled_select = Request(Command::SelectCandidate, 12);
+  CHECK(EncodeCandidateIndex(0, &unhandled_select.payload));
+  _putenv_s("FAMO_TEST_UNHANDLED_SELECTION", "1");
+  reply = service.Dispatch(unhandled_select);
+  _putenv_s("FAMO_TEST_UNHANDLED_SELECTION", "");
+  CHECK(reply.status == Status::Ok);
+  CHECK(DecodeComposition(reply.payload, &composition, &error));
+  CHECK(!composition.handled && composition.commit.empty());
+  CHECK(composition.preedit == "ni");
+
+  Frame select = Request(Command::SelectCandidate, 13);
   CHECK(EncodeCandidateIndex(0, &select.payload));
   _putenv_s("FAMO_TEST_DEFER_SELECTION_COMMIT", "1");
   reply = service.Dispatch(select);
@@ -577,37 +587,46 @@ int main() {
   CHECK(sink.latest && sink.latest->ui_sequence == 101);
   CHECK(sink.latest->ui_state.caret.left == 5);
 
-  Frame stale_activation = Request(Command::ProcessKey, 13);
+  Frame stale_activation = Request(Command::ProcessKey, 14);
   --stale_activation.correlation.activation_generation;
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 3},
                        &stale_activation.payload));
   reply = service.Dispatch(stale_activation);
   CHECK(reply.status == Status::StaleRequest && reply.payload.empty());
 
-  Frame stale_session = Request(Command::ProcessKey, 13);
+  Frame stale_session = Request(Command::ProcessKey, 14);
   --stale_session.correlation.session_generation;
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 3},
                        &stale_session.payload));
   reply = service.Dispatch(stale_session);
   CHECK(reply.status == Status::StaleRequest && reply.payload.empty());
 
-  Frame stale_connection = Request(Command::ProcessKey, 13);
+  Frame stale_connection = Request(Command::ProcessKey, 14);
   --stale_connection.correlation.connection_generation;
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 3},
                        &stale_connection.payload));
   reply = service.Dispatch(stale_connection);
   CHECK(reply.status == Status::StaleRequest && reply.payload.empty());
 
-  Frame unhandled = Request(Command::ProcessKey, 13);
+  Frame unhandled = Request(Command::ProcessKey, 14);
   CHECK(EncodeKeyEvent({0x7b, 0, 0, 1, 4}, &unhandled.payload));
   reply = service.Dispatch(unhandled);
   CHECK(reply.status == Status::Ok);
   CHECK(DecodeComposition(reply.payload, &composition, &error));
   CHECK(!composition.handled);
 
-  Frame close = Request(Command::CloseSession, 14);
+  Frame close = Request(Command::CloseSession, 15);
   CHECK(service.Dispatch(close).status == Status::Ok);
   CHECK(service.Dispatch(close).status == Status::StaleRequest);
+
+  std::ofstream(data_root / "famo-select-schema.txt") << "missing\n";
+  _putenv_s("FAMO_TEST_FAIL_SCHEMA", "missing");
+  CHECK(service.ExecuteControl(Command::ControlSelectSchema) ==
+        ControlError::Engine);
+  _putenv_s("FAMO_TEST_FAIL_SCHEMA", "");
+  std::ofstream(data_root / "famo-select-schema.txt") << "test\n";
+  CHECK(service.ExecuteControl(Command::ControlSelectSchema) ==
+        ControlError::None);
 
   Frame newer = hello;
   newer.correlation.connection_generation = 15;

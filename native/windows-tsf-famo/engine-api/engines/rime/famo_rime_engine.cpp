@@ -13,6 +13,7 @@
 #include <string>
 
 #include "../../famo_engine_api.h"
+#include "../view_abi.h"
 #include "keymap.h"
 
 #include <rime_api.h>
@@ -64,22 +65,36 @@ inline uint32_t NonNeg(int v) { return static_cast<uint32_t>(v < 0 ? 0 : v); }
 
 // v1.1: fold RimeStatus into the view (schema id/name + status_flags). No commit
 // consume; safe to call from get_status and from the per-key fill alike.
-void FillStatus(RimeSessionId session, FamoCompositionView* out) {
+void FillStatus(RimeSessionId session, uint32_t view_size,
+                FamoCompositionView* out) {
+  const bool has_schema_id = famo_view_abi::HasField(
+      view_size, offsetof(FamoCompositionView, schema_id),
+      sizeof(out->schema_id));
+  const bool has_schema_name = famo_view_abi::HasField(
+      view_size, offsetof(FamoCompositionView, schema_name),
+      sizeof(out->schema_name));
+  const bool has_status_flags = famo_view_abi::HasField(
+      view_size, offsetof(FamoCompositionView, status_flags),
+      sizeof(out->status_flags));
+  if (!has_schema_id && !has_schema_name && !has_status_flags) return;
+
   RIME_STRUCT(RimeStatus, status);
   if (!g_rime->get_status(session, &status)) return;
-  out->schema_id = DupC(status.schema_id);
-  out->schema_name = DupC(status.schema_name);
-  uint32_t f = 0;
-  if (status.is_ascii_mode) f |= FAMO_STATUS_ASCII_MODE;
-  if (status.is_composing) f |= FAMO_STATUS_COMPOSING;
-  if (status.is_disabled) f |= FAMO_STATUS_DISABLED;
-  if (status.is_full_shape) f |= FAMO_STATUS_FULL_SHAPE;
-  if (status.is_ascii_punct) f |= FAMO_STATUS_ASCII_PUNCT;
-  const bool traditional =
-      g_rime->get_option(session, "traditionalization") ||
-      g_rime->get_option(session, "zh_trad");
-  if (!traditional) f |= FAMO_STATUS_SIMPLIFIED;
-  out->status_flags = f;
+  if (has_schema_id) out->schema_id = DupC(status.schema_id);
+  if (has_schema_name) out->schema_name = DupC(status.schema_name);
+  if (has_status_flags) {
+    uint32_t flags = 0;
+    if (status.is_ascii_mode) flags |= FAMO_STATUS_ASCII_MODE;
+    if (status.is_composing) flags |= FAMO_STATUS_COMPOSING;
+    if (status.is_disabled) flags |= FAMO_STATUS_DISABLED;
+    if (status.is_full_shape) flags |= FAMO_STATUS_FULL_SHAPE;
+    if (status.is_ascii_punct) flags |= FAMO_STATUS_ASCII_PUNCT;
+    const bool traditional =
+        g_rime->get_option(session, "traditionalization") ||
+        g_rime->get_option(session, "zh_trad");
+    if (!traditional) flags |= FAMO_STATUS_SIMPLIFIED;
+    out->status_flags = flags;
+  }
   g_rime->free_status(&status);
 }
 
@@ -87,75 +102,110 @@ void FillStatus(RimeSessionId session, FamoCompositionView* out) {
 // consume_commit: pull RimeCommit (true on the key hot path, false for a pure
 // status read that must not swallow pending commit text).
 int32_t FillFromSession(RimeSessionId session, FamoCompositionView* out,
-                        bool consume_commit) {
-  std::memset(out, 0, sizeof(*out));
-  out->size = static_cast<uint32_t>(sizeof(FamoCompositionView));
+                        uint32_t view_size, bool consume_commit) {
+  FamoCompositionView result;
+  famo_view_abi::BeginResult(&result, view_size);
 
   if (consume_commit) {
     RIME_STRUCT(RimeCommit, commit);
     if (g_rime->get_commit(session, &commit)) {
-      if (commit.text) out->commit = DupC(commit.text);
+      if (commit.text) result.commit = DupC(commit.text);
       g_rime->free_commit(&commit);
     }
   }
 
   RIME_STRUCT(RimeContext, ctx);
   if (g_rime->get_context(session, &ctx)) {
-    if (ctx.composition.preedit) out->preedit = DupC(ctx.composition.preedit);
-    out->preedit_sel_start = NonNeg(ctx.composition.sel_start);
-    out->preedit_sel_end = NonNeg(ctx.composition.sel_end);
-    out->preedit_cursor_pos = NonNeg(ctx.composition.cursor_pos);
-    if (ctx.commit_text_preview) out->commit_preview = DupC(ctx.commit_text_preview);
+    if (ctx.composition.preedit)
+      result.preedit = DupC(ctx.composition.preedit);
+    if (famo_view_abi::HasField(
+            view_size, offsetof(FamoCompositionView, preedit_sel_start),
+            sizeof(result.preedit_sel_start))) {
+      result.preedit_sel_start = NonNeg(ctx.composition.sel_start);
+    }
+    if (famo_view_abi::HasField(
+            view_size, offsetof(FamoCompositionView, preedit_sel_end),
+            sizeof(result.preedit_sel_end))) {
+      result.preedit_sel_end = NonNeg(ctx.composition.sel_end);
+    }
+    if (famo_view_abi::HasField(
+            view_size, offsetof(FamoCompositionView, preedit_cursor_pos),
+            sizeof(result.preedit_cursor_pos))) {
+      result.preedit_cursor_pos = NonNeg(ctx.composition.cursor_pos);
+    }
+    if (ctx.commit_text_preview &&
+        famo_view_abi::HasField(
+            view_size, offsetof(FamoCompositionView, commit_preview),
+            sizeof(result.commit_preview))) {
+      result.commit_preview = DupC(ctx.commit_text_preview);
+    }
     const int n = ctx.menu.num_candidates;
     if (n > 0 && g_host.alloc) {
-      auto* arr = static_cast<FamoCandidate*>(g_host.alloc(sizeof(FamoCandidate) * n));
-      if (arr) {
+      const size_t stride = famo_view_abi::CandidateStride(view_size);
+      void* candidates =
+          g_host.alloc(stride * static_cast<size_t>(n));
+      if (candidates) {
         // Length of the page's select-key string, hoisted so the per-candidate
         // fallback below indexes it in-bounds (a misconfigured schema can define
         // fewer select_keys than candidates on the page).
         const size_t n_keys =
             ctx.menu.select_keys ? std::strlen(ctx.menu.select_keys) : 0;
         for (int i = 0; i < n; ++i) {
-          std::memset(&arr[i], 0, sizeof(FamoCandidate));
-          arr[i].size = static_cast<uint32_t>(sizeof(FamoCandidate));
-          arr[i].text = DupC(ctx.menu.candidates[i].text);
-          arr[i].comment = DupC(ctx.menu.candidates[i].comment);
-          arr[i].flags = (i == ctx.menu.highlighted_candidate_index)
-                             ? FAMO_CANDIDATE_FLAG_DEFAULT
-                             : 0u;
+          FamoCandidate* candidate = famo_view_abi::CandidateAt(
+              candidates, static_cast<size_t>(i), stride);
+          std::memset(candidate, 0, stride);
+          candidate->size = static_cast<uint32_t>(stride);
+          candidate->text = DupC(ctx.menu.candidates[i].text);
+          candidate->comment = DupC(ctx.menu.candidates[i].comment);
+          candidate->flags =
+              (i == ctx.menu.highlighted_candidate_index)
+                  ? FAMO_CANDIDATE_FLAG_DEFAULT
+                  : 0u;
           // v1.2 label: per-candidate select_labels -> menu.select_keys[i] ->
           // (i+1)%10. select_labels/select_keys index the *page*, so use i.
-          if (ctx.select_labels && ctx.select_labels[i]) {
-            arr[i].label = DupC(ctx.select_labels[i]);
-          } else if (static_cast<size_t>(i) < n_keys) {
-            const char key[2] = {ctx.menu.select_keys[i], '\0'};
-            arr[i].label = DupC(key);
-          } else {
-            const char digit[2] = {static_cast<char>('0' + (i + 1) % 10), '\0'};
-            arr[i].label = DupC(digit);
+          if (famo_view_abi::HasV12Candidates(view_size)) {
+            if (ctx.select_labels && ctx.select_labels[i]) {
+              candidate->label = DupC(ctx.select_labels[i]);
+            } else if (static_cast<size_t>(i) < n_keys) {
+              const char key[2] = {ctx.menu.select_keys[i], '\0'};
+              candidate->label = DupC(key);
+            } else {
+              const char digit[2] = {
+                  static_cast<char>('0' + (i + 1) % 10), '\0'};
+              candidate->label = DupC(digit);
+            }
           }
         }
-        out->candidates = arr;
-        out->candidate_count = static_cast<uint32_t>(n);
+        result.candidates =
+            static_cast<const FamoCandidate*>(candidates);
+        result.candidate_count = static_cast<uint32_t>(n);
       }
     }
-    out->highlighted_index =
+    result.highlighted_index =
         static_cast<uint32_t>(ctx.menu.highlighted_candidate_index < 0
                                   ? 0
                                   : ctx.menu.highlighted_candidate_index);
-    out->page_index = static_cast<uint32_t>(ctx.menu.page_no < 0 ? 0 : ctx.menu.page_no);
-    out->page_size = static_cast<uint32_t>(ctx.menu.page_size < 0 ? 0 : ctx.menu.page_size);
-    out->is_last_page = ctx.menu.is_last_page ? 1u : 0u;  // v1.2
+    result.page_index =
+        static_cast<uint32_t>(ctx.menu.page_no < 0 ? 0 : ctx.menu.page_no);
+    result.page_size =
+        static_cast<uint32_t>(ctx.menu.page_size < 0 ? 0
+                                                     : ctx.menu.page_size);
+    if (famo_view_abi::HasField(
+            view_size, offsetof(FamoCompositionView, is_last_page),
+            sizeof(result.is_last_page))) {
+      result.is_last_page = ctx.menu.is_last_page ? 1u : 0u;  // v1.2
+    }
     g_rime->free_context(&ctx);
   }
 
-  FillStatus(session, out);
+  FillStatus(session, view_size, &result);
 
   uint32_t flags = 0;
-  if (out->preedit.length_bytes) flags |= FAMO_COMPOSITION_HAS_PREEDIT;
-  if (out->commit.length_bytes) flags |= FAMO_COMPOSITION_HAS_COMMIT;
-  if (out->candidate_count) flags |= FAMO_COMPOSITION_HAS_CANDIDATES;
-  out->state_flags = flags;
+  if (result.preedit.length_bytes) flags |= FAMO_COMPOSITION_HAS_PREEDIT;
+  if (result.commit.length_bytes) flags |= FAMO_COMPOSITION_HAS_COMMIT;
+  if (result.candidate_count) flags |= FAMO_COMPOSITION_HAS_CANDIDATES;
+  result.state_flags = flags;
+  famo_view_abi::Publish(out, result, view_size);
   return FAMO_ENGINE_OK;
 }
 
@@ -216,11 +266,30 @@ int32_t FAMO_ENGINE_CALL ReShutdown(void) {
 
 int32_t FAMO_ENGINE_CALL ReCreateContext(const FamoUtf8String* schema_id,
                                          FamoEngineContext** out_context) {
-  if (!out_context || !g_rime) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  if (!out_context) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  *out_context = nullptr;
+  if (!g_rime) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  const std::string schema = AsStd(schema_id);
+  if (!schema.empty()) {
+    RimeConfig config{};
+    if (!g_rime->schema_open(schema.c_str(), &config))
+      return FAMO_ENGINE_E_SCHEMA;
+    const char* configured_id =
+        g_rime->config_get_cstring(&config, "schema/schema_id");
+    const bool valid = configured_id && schema == configured_id;
+    const Bool closed = g_rime->config_close(&config);
+    if (!valid)
+      return FAMO_ENGINE_E_SCHEMA;
+    if (!closed)
+      return FAMO_ENGINE_E_RUNTIME;
+  }
   RimeSessionId session = g_rime->create_session();
   if (!session) return FAMO_ENGINE_E_RUNTIME;
-  const std::string schema = AsStd(schema_id);
-  if (!schema.empty()) g_rime->select_schema(session, schema.c_str());
+  if (!schema.empty() &&
+      !g_rime->select_schema(session, schema.c_str())) {
+    g_rime->destroy_session(session);
+    return FAMO_ENGINE_E_RUNTIME;
+  }
   auto* ctx = new (std::nothrow) FamoEngineContext();
   if (!ctx) {
     g_rime->destroy_session(session);
@@ -240,12 +309,18 @@ int32_t FAMO_ENGINE_CALL ReDestroyContext(FamoEngineContext* context) {
 
 int32_t FAMO_ENGINE_CALL ReProcessKey(FamoEngineContext* context, const FamoKeyEvent* key,
                                       FamoCompositionView* out_view) {
-  if (!context || !key || !out_view || !g_rime) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  uint32_t view_size = 0;
+  if (!context || !key || !g_rime ||
+      !famo_view_abi::Negotiate(out_view, &view_size)) {
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  }
   int keycode = 0, mask = 0;
   bool handled = false;
   if (famo_rime_keys::FamoKeyToRime(*key, &keycode, &mask))
     handled = g_rime->process_key(context->session, keycode, mask);
-  const int32_t rc = FillFromSession(context->session, out_view, /*consume_commit=*/true);
+  const int32_t rc =
+      FillFromSession(context->session, out_view, view_size,
+                      /*consume_commit=*/true);
   if (rc == FAMO_ENGINE_OK && handled)
     out_view->state_flags |= FAMO_COMPOSITION_HANDLED;
   return rc;
@@ -253,7 +328,11 @@ int32_t FAMO_ENGINE_CALL ReProcessKey(FamoEngineContext* context, const FamoKeyE
 
 int32_t FAMO_ENGINE_CALL ReSelectCandidate(FamoEngineContext* context, uint32_t index,
                                            FamoCompositionView* out_view) {
-  if (!context || !out_view || !g_rime) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  uint32_t view_size = 0;
+  if (!context || !g_rime ||
+      !famo_view_abi::Negotiate(out_view, &view_size)) {
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  }
   const bool handled = g_rime->select_candidate_on_current_page(
       context->session, static_cast<size_t>(index));
   // consume_commit=false, legacy-faithful: the reroute's SelectCandidateOnCurrentPage does
@@ -262,7 +341,9 @@ int32_t FAMO_ENGINE_CALL ReSelectCandidate(FamoEngineContext* context, uint32_t 
   // (CandidateList.cpp _SelectCandidateOnCurrentPage) via ProcessKeyEvent→_Respond→get_commit.
   // Consuming it here strands it in a view that SelectCandidateOnCurrentPage discards →
   // mouse-clicking a candidate drops the committed text under abi (byte-parity harness caught this).
-  const int32_t rc = FillFromSession(context->session, out_view, /*consume_commit=*/false);
+  const int32_t rc =
+      FillFromSession(context->session, out_view, view_size,
+                      /*consume_commit=*/false);
   if (rc == FAMO_ENGINE_OK && handled)
     out_view->state_flags |= FAMO_COMPOSITION_HANDLED;
   return rc;
@@ -287,40 +368,58 @@ int32_t FAMO_ENGINE_CALL ReSetOption(FamoEngineContext* context, const FamoUtf8S
 int32_t FAMO_ENGINE_CALL ReDeploySchema(const FamoUtf8String* /*schema_id*/,
                                         FamoUtf8String* /*out_error_message*/) {
   if (!g_rime) return FAMO_ENGINE_E_RUNTIME;
-  // MVP: run a full maintenance pass (compiles bundled schemas) and block until
-  // done. Empty data root -> nothing to build, returns promptly.
-  Bool started = g_rime->start_maintenance(True);
-  if (started) g_rime->join_maintenance_thread();
-  return FAMO_ENGINE_OK;
+  g_rime->deployer_initialize(nullptr);
+  return g_rime->deploy() ? FAMO_ENGINE_OK : FAMO_ENGINE_E_RUNTIME;
 }
 
 int32_t FAMO_ENGINE_CALL ReFreeView(FamoCompositionView* view) {
-  if (!view) return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  uint32_t view_size = 0;
+  if (!famo_view_abi::Negotiate(view, &view_size))
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
   FreeStr(&view->preedit);
   FreeStr(&view->commit);
   if (view->candidates && g_host.free) {
-    auto* arr = const_cast<FamoCandidate*>(view->candidates);
+    void* candidates =
+        const_cast<FamoCandidate*>(view->candidates);
+    const size_t stride = famo_view_abi::CandidateStride(view_size);
     for (uint32_t i = 0; i < view->candidate_count; ++i) {
-      FreeStr(&arr[i].text);
-      FreeStr(&arr[i].comment);
-      FreeStr(&arr[i].label);  // v1.2
+      FamoCandidate* candidate =
+          famo_view_abi::CandidateAt(candidates, i, stride);
+      FreeStr(&candidate->text);
+      FreeStr(&candidate->comment);
+      if (famo_view_abi::HasV12Candidates(view_size))
+        FreeStr(&candidate->label);
     }
-    g_host.free(arr);
+    g_host.free(candidates);
   }
-  // v1.1 strings: only touch them if the caller's struct actually spans them.
-  if (view->size >= offsetof(FamoCompositionView, status_flags)) {
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, commit_preview),
+          sizeof(view->commit_preview))) {
     FreeStr(&view->commit_preview);
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, schema_id),
+          sizeof(view->schema_id))) {
     FreeStr(&view->schema_id);
+  }
+  if (famo_view_abi::HasField(
+          view_size, offsetof(FamoCompositionView, schema_name),
+          sizeof(view->schema_name))) {
     FreeStr(&view->schema_name);
   }
-  std::memset(view, 0, sizeof(*view));
+  famo_view_abi::ClearPreservingSize(view, view_size);
   return FAMO_ENGINE_OK;
 }
 
 int32_t FAMO_ENGINE_CALL ReGetStatus(FamoEngineContext* context,
                                      FamoCompositionView* out_view) {
-  if (!context || !out_view || !g_rime) return FAMO_ENGINE_E_INVALID_ARGUMENT;
-  return FillFromSession(context->session, out_view, /*consume_commit=*/false);
+  uint32_t view_size = 0;
+  if (!context || !g_rime ||
+      !famo_view_abi::Negotiate(out_view, &view_size)) {
+    return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  }
+  return FillFromSession(context->session, out_view, view_size,
+                         /*consume_commit=*/false);
 }
 
 int32_t FAMO_ENGINE_CALL ReGetOption(FamoEngineContext* context,
@@ -359,21 +458,29 @@ int32_t FAMO_ENGINE_CALL ReChangePage(FamoEngineContext* context, int32_t backwa
 int32_t FAMO_ENGINE_CALL RePeekCandidates(FamoEngineContext* context,
                                           uint32_t index, uint32_t count,
                                           FamoCompositionView* out_view) {
-  if (!context || !out_view || !g_rime || count > 64)
+  uint32_t view_size = 0;
+  if (!context || !g_rime || count > 64 ||
+      !famo_view_abi::Negotiate(out_view, &view_size)) {
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
-  std::memset(out_view, 0, sizeof(*out_view));
-  out_view->size = static_cast<uint32_t>(sizeof(FamoCompositionView));
+  }
+  FamoCompositionView result;
+  famo_view_abi::BeginResult(&result, view_size);
   if (count == 0 || !RIME_API_AVAILABLE(g_rime, candidate_list_from_index) ||
       !RIME_API_AVAILABLE(g_rime, candidate_list_next) ||
-      !RIME_API_AVAILABLE(g_rime, candidate_list_end))
+      !RIME_API_AVAILABLE(g_rime, candidate_list_end)) {
+    famo_view_abi::Publish(out_view, result, view_size);
     return FAMO_ENGINE_OK;
+  }
 
   RimeCandidateListIterator iterator{};
   if (!g_rime->candidate_list_from_index(context->session, &iterator,
-                                          static_cast<int>(index)))
+                                          static_cast<int>(index))) {
+    famo_view_abi::Publish(out_view, result, view_size);
     return FAMO_ENGINE_OK;
-  auto* candidates = static_cast<FamoCandidate*>(
-      g_host.alloc(sizeof(FamoCandidate) * count));
+  }
+  const size_t stride = famo_view_abi::CandidateStride(view_size);
+  void* candidates =
+      g_host.alloc(stride * static_cast<size_t>(count));
   if (!candidates) {
     g_rime->candidate_list_end(&iterator);
     return FAMO_ENGINE_E_RUNTIME;
@@ -381,35 +488,44 @@ int32_t FAMO_ENGINE_CALL RePeekCandidates(FamoEngineContext* context,
 
   uint32_t size = 0;
   while (size < count && g_rime->candidate_list_next(&iterator)) {
-    FamoCandidate& candidate = candidates[size];
-    std::memset(&candidate, 0, sizeof(candidate));
-    candidate.size = static_cast<uint32_t>(sizeof(FamoCandidate));
-    candidate.text = DupC(iterator.candidate.text);
-    candidate.comment = DupC(iterator.candidate.comment);
-    const char digit[2] = {
-        static_cast<char>('0' + ((index + size + 1) % 10)), '\0'};
-    candidate.label = DupC(digit);
+    FamoCandidate* candidate =
+        famo_view_abi::CandidateAt(candidates, size, stride);
+    std::memset(candidate, 0, stride);
+    candidate->size = static_cast<uint32_t>(stride);
+    candidate->text = DupC(iterator.candidate.text);
+    candidate->comment = DupC(iterator.candidate.comment);
+    if (famo_view_abi::HasV12Candidates(view_size)) {
+      const char digit[2] = {
+          static_cast<char>('0' + ((index + size + 1) % 10)), '\0'};
+      candidate->label = DupC(digit);
+    }
     ++size;
   }
   g_rime->candidate_list_end(&iterator);
   if (size == 0) {
     g_host.free(candidates);
+    famo_view_abi::Publish(out_view, result, view_size);
     return FAMO_ENGINE_OK;
   }
-  out_view->candidates = candidates;
-  out_view->candidate_count = size;
+  result.candidates = static_cast<const FamoCandidate*>(candidates);
+  result.candidate_count = size;
+  famo_view_abi::Publish(out_view, result, view_size);
   return FAMO_ENGINE_OK;
 }
 
 int32_t FAMO_ENGINE_CALL ReSelectCandidateAbsolute(
     FamoEngineContext* context, uint32_t index,
     FamoCompositionView* out_view) {
-  if (!context || !out_view || !g_rime)
+  uint32_t view_size = 0;
+  if (!context || !g_rime ||
+      !famo_view_abi::Negotiate(out_view, &view_size)) {
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  }
   const bool handled =
       g_rime->select_candidate(context->session, static_cast<size_t>(index));
   const int32_t rc =
-      FillFromSession(context->session, out_view, /*consume_commit=*/false);
+      FillFromSession(context->session, out_view, view_size,
+                      /*consume_commit=*/false);
   if (rc == FAMO_ENGINE_OK && handled)
     out_view->state_flags |= FAMO_COMPOSITION_HANDLED;
   return rc;
