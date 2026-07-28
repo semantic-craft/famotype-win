@@ -57,9 +57,6 @@ struct FamoTextResources {
   ComPtr<ID2D1Factory> d2d;
   ComPtr<IDWriteFactory> dwrite;
   ComPtr<IDWriteTextFormat> fmt[3];  // 0=label 1=text 2=comment
-  // Dotted rule under the converting preedit segment. Factory-owned, so unlike
-  // the target/brush below it survives FamoTextResourcesDiscardDeviceResources.
-  ComPtr<ID2D1StrokeStyle> dot_style;
   // Device resources, not cached scene content: BindDC retargets them each frame.
   ComPtr<ID2D1DCRenderTarget> text_target;
   ComPtr<ID2D1SolidColorBrush> text_brush;
@@ -462,6 +459,47 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
         if (se > pw.size()) se = static_cast<uint32_t>(pw.size());
         if (ss > se) ss = se;
         const FamoRect& pr = layout->preedit;
+        // The converting segment is marked with a soft tint block BEHIND the
+        // glyphs, not a rule under them. Drawn before the run so the text sits on
+        // top; the run itself is one colour, so no glyph splitting is needed.
+        //
+        // This replaces a dotted ink rule (TSF ATTR_INPUT / TF_LS_DOT). That rule
+        // had to disable antialiasing to keep its dots from smearing, which at
+        // high DPI reads as a row of grit, and it now stacked as a second
+        // horizontal line 6px above the band separator. A block is also the same
+        // shape language as the selection pill below it, so the two read as one
+        // hierarchy.
+        //
+        // 10% is deliberate. An earlier SOLID accent block behind the preedit was
+        // removed because a third saturated use of the accent in one panel read as
+        // a spell-check error; at a tenth of that it is a wash, and the panel's
+        // saturated accent stays reserved for the pill and the caret — which
+        // check_soft_cursor still asserts pixel-wise.
+        if (!vertical && se > ss && !RectEmpty2(pr)) {
+          const int32_t before = MeasureW(res->dwrite.Get(), fText, pw.c_str(), ss);
+          const int32_t active =
+              MeasureW(res->dwrite.Get(), fText, pw.c_str() + ss, se - ss);
+          if (active > 0) {
+            rt->SetTransform(D2D1::Matrix3x2F::Translation(sm_f, sm_f));
+            const float pad_x = static_cast<float>(Scale(3, dpi));
+            const float pad_y = static_cast<float>(Scale(2, dpi));
+            const float radius = static_cast<float>(Scale(5, dpi));
+            D2D1_COLOR_F tint = ToColorF(Opaque(skin->hilited_back_color)
+                                             ? skin->hilited_back_color
+                                             : skin->text_color);
+            tint.a *= 0.10f;
+            brush->SetColor(tint);
+            rt->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(
+                        static_cast<float>(pr.left + before) - pad_x,
+                        static_cast<float>(pr.top) - pad_y,
+                        static_cast<float>(pr.left + before + active) + pad_x,
+                        static_cast<float>(pr.bottom) + pad_y),
+                    radius, radius),
+                brush);
+          }
+        }
         brush->SetColor(ToColorF(skin->text_color));
         DrawRun(rt, fText, brush, pw.c_str(),
                 static_cast<uint32_t>(pw.size()), pr, vertical, sm_f, sm_f);
@@ -470,41 +508,6 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
           const uint32_t accent = Opaque(skin->hilited_back_color)
                                       ? skin->hilited_back_color
                                       : skin->text_color;
-          if (se > ss) {
-            const int32_t before = MeasureW(res->dwrite.Get(), fText, pw.c_str(), ss);
-            const int32_t active =
-                MeasureW(res->dwrite.Get(), fText, pw.c_str() + ss, se - ss);
-            const float line = static_cast<float>((std::max)(1, Scale(1, dpi)));
-            if (!res->dot_style) {
-              // Round dash caps are load-bearing: D2D's DOT pattern is a
-              // zero-length dash, which paints nothing until a cap rounds it out.
-              D2D1_STROKE_STYLE_PROPERTIES sp = D2D1::StrokeStyleProperties();
-              sp.dashStyle = D2D1_DASH_STYLE_DOT;
-              sp.startCap = sp.endCap = sp.dashCap = D2D1_CAP_STYLE_ROUND;
-              res->d2d->CreateStrokeStyle(sp, nullptr, 0, &res->dot_style);
-            }
-            // Ink at 55%, not the accent: this mark means "provisional", while the
-            // accent is reserved for where the commit lands (the pill, the caret).
-            // Dotted-thin is also what both platforms spec for unconverted input —
-            // TSF ATTR_INPUT is TF_LS_DOT, and the Mac panel draws the same rule
-            // (FamoCandidatePanelView `.underline(pattern: .dot, ink2 @ 0.55)`).
-            D2D1_COLOR_F ink = ToColorF(skin->text_color);
-            ink.a *= 0.55f;
-            brush->SetColor(ink);
-            // Stroke is centred on y, so pull back half a line to sit in the last
-            // row. A null dot_style (creation failed) degrades to solid, not a crash.
-            const float y = static_cast<float>(pr.bottom) - line * 0.5f;
-            // ALIASED for the stroke only: antialiasing a 1px dot pattern spreads
-            // every dot across its gaps, collapsing the rule into a flat ~13% wash
-            // (measured) — dots on paper, a smear on screen. Restored right after,
-            // because the caret's rounded caps below DO need the coverage.
-            rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-            rt->DrawLine(
-                D2D1::Point2F(static_cast<float>(pr.left + before), y),
-                D2D1::Point2F(static_cast<float>(pr.left + before + active), y),
-                brush, line, res->dot_style.Get());
-            rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-          }
           uint32_t cursor = layout->preedit_cursor_wchar;
           if (cursor > pw.size()) cursor = static_cast<uint32_t>(pw.size());
           int32_t x = pr.left + MeasureW(res->dwrite.Get(), fText, pw.c_str(), cursor);
