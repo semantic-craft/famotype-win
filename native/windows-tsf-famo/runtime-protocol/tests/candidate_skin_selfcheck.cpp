@@ -68,6 +68,10 @@ int main() {
   CHECK(system_dark.hilited_back_color == 0xffe06a8eu);
   CHECK(ParseCandidateSkinForTheme(system_style, false, &system_light));
   CHECK(system_light.hilited_back_color == 0xffa82c53u);
+  const std::string reversed_system_style =
+      "style:\n  color_scheme_dark: shenda_dark\n  color_scheme: shenda\n";
+  CHECK(ParseCandidateSkinForTheme(reversed_system_style, true, &system_dark));
+  CHECK(system_dark.hilited_back_color == 0xffe06a8eu);
 
   struct PaletteCase {
     const char *name;

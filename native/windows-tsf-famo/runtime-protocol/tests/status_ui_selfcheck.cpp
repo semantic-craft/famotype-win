@@ -716,6 +716,8 @@ bool SchemaClickAlwaysHasADifferentTarget() {
         "wubi86_jidian");
   CHECK(StatusBarSchemaSwitchTarget("rime_ice", "rime_ice", schemas) ==
         "wubi86_jidian");
+  CHECK(StatusBarSchemaSwitchTarget("rime_ice", "removed_schema", schemas) ==
+        "wubi86_jidian");
   CHECK(StatusBarSchemaSwitchTarget("wubi86_jidian", "", schemas) ==
         "rime_ice");
   CHECK(StatusBarSchemaSwitchTarget("rime_ice", "", {"rime_ice"}).empty());

@@ -13,9 +13,11 @@
 // monospace fallback, so geometry is deterministic + unit-testable here.
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <string>
 
+#include "../famo_candidate_access.h"
 #include "../famo_candidate_ui.h"
 
 namespace {
@@ -322,9 +324,21 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
                                          const FamoSkin* skin,
                                          const FamoLayoutInput* input,
                                          FamoLayoutResult* out) {
-  if (!view || !skin || !input || !out) return FAMO_UI_E_INVALID_ARGUMENT;
-  if (skin->size < offsetof(FamoSkin, show_preedit) ||
+  if (!view || !skin || !input || !out)
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  if (view->size < offsetof(FamoCompositionView, preedit_sel_start) ||
+      skin->size < offsetof(FamoSkin, caret_width) ||
       input->size < offsetof(FamoLayoutInput, preview_candidates))
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  if (!famo_candidate_ui::ReadableUtf8(view->preedit) ||
+      !famo_candidate_ui::ReadableUtf8(input->aux) ||
+      (view->candidate_count > 0 && !view->candidates))
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  const bool has_preview_fields =
+      input->size >= offsetof(FamoLayoutInput, preview_page_size) +
+                         sizeof(input->preview_page_size);
+  if (has_preview_fields && input->preview_candidate_count > 0 &&
+      !input->preview_candidates)
     return FAMO_UI_E_INVALID_ARGUMENT;
 
   std::memset(out, 0, sizeof(*out));
@@ -361,6 +375,14 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
   const uint32_t n = view->candidate_count < FAMO_MAX_LAID_CANDIDATES
                          ? view->candidate_count
                          : FAMO_MAX_LAID_CANDIDATES;
+  std::array<FamoCandidate, FAMO_MAX_LAID_CANDIDATES> candidates{};
+  for (uint32_t i = 0; i < n; ++i) {
+    if (!famo_candidate_ui::ReadCandidate(view->candidates,
+                                           view->candidate_count, i,
+                                           &candidates[i]) ||
+        !famo_candidate_ui::ReadableCandidate(candidates[i]))
+      return FAMO_UI_E_INVALID_ARGUMENT;
+  }
   out->candidate_count = n;
 
   // Page affordances: previous if not the first page; next unless the engine
@@ -378,7 +400,8 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     // Candidates laid left→right on one row; page affordances flank the row.
     int32_t row_h = 0;
     for (uint32_t i = 0; i < n; ++i)
-      row_h = (std::max)(row_h, CandRowHeight(m, MeasureCand(sk, in, view->candidates[i])));
+      row_h =
+          (std::max)(row_h, CandRowHeight(m, MeasureCand(sk, in, candidates[i])));
     if (row_h == 0) row_h = m.text_h;
 
     int32_t x = x0;
@@ -387,7 +410,7 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
       x += m.page_glyph_w + m.cand_spacing;
     }
     for (uint32_t i = 0; i < n; ++i) {
-      CandExtent e = MeasureCand(sk, in, view->candidates[i]);
+      CandExtent e = MeasureCand(sk, in, candidates[i]);
       int32_t inline_w = CandInlineWidth(m, e);
       int32_t bx = x;
       int32_t bw = inline_w + 2 * m.hpad_x;
@@ -423,13 +446,22 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
       const uint32_t count = static_cast<uint32_t>((std::min)(
           static_cast<uint64_t>(max_preview),
           static_cast<uint64_t>(in.preview_page_size) * wanted_rows));
+      std::array<FamoCandidate, FAMO_MAX_PREVIEW_CANDIDATES>
+          preview_candidates{};
+      for (uint32_t i = 0; i < count; ++i) {
+        if (!famo_candidate_ui::ReadCandidate(
+                in.preview_candidates, in.preview_candidate_count, i,
+                &preview_candidates[i]) ||
+            !famo_candidate_ui::ReadableCandidate(preview_candidates[i]))
+          return FAMO_UI_E_INVALID_ARGUMENT;
+      }
       int32_t preview_y = list_bottom + m.cand_spacing;
       for (uint32_t base = 0; base < count; base += in.preview_page_size) {
         int32_t preview_x = x0;
         const uint32_t row_end =
             (std::min)(count, base + in.preview_page_size);
         for (uint32_t i = base; i < row_end; ++i) {
-          const FamoCandidate& candidate = in.preview_candidates[i];
+          const FamoCandidate& candidate = preview_candidates[i];
           const int32_t text_w =
               MeasureText(in, 1, sk.text_font, candidate.text);
           FamoCandidateRects& rect = out->preview_candidates[i];
@@ -468,7 +500,7 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     const int32_t row_spacing = 0;  // macOS vertical full-width rows abut
     const int32_t row_pad_x = m.hpad_x + Scale(2, in.dpi);
     for (uint32_t i = 0; i < n; ++i) {
-      CandExtent e = MeasureCand(sk, in, view->candidates[i], true);
+      CandExtent e = MeasureCand(sk, in, candidates[i], true);
       int32_t row_h = CandRowHeight(m, e);
       int32_t inline_w = CandInlineWidth(m, e);
       int32_t bw = inline_w + 2 * row_pad_x;
@@ -511,17 +543,6 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     int32_t content_w = max_content_w + 2 * panel_margin_x;
     int32_t content_h = y + m.margin_y;
     out->content_size = ClampSize(m, content_w, content_h);
-  }
-
-  // Hairline between the preedit/aux band and the candidate list, centred in
-  // `spacing` so it gets equal air above and below, and full-bleed edge-to-edge
-  // like a Fluent MenuFlyout separator. It does not compete with the preedit's
-  // dotted rule: that one is per-segment (it marks WHICH run is converting and
-  // is drawn under that run only), this one is the band boundary.
-  if (band_h > 0 && n > 0) {
-    const int32_t y = y0 + band_h + m.spacing / 2;
-    const int32_t thickness = (std::max)(1, Scale(1, in.dpi));
-    out->separator = FamoRect{0, y, out->content_size.cx, y + thickness};
   }
 
   // Status-icon slot (top-right of the panel) when the skin reserves one.
