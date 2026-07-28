@@ -144,11 +144,14 @@ static int check_shadow() {
   return 0;
 }
 
-// Preedit stays quiet: a converting sub-range gets a thin DOTTED INK rule and
-// the cursor gets a thin caret. Neither state may restore the old filled block,
-// and neither may spend the accent on the rule — the accent belongs to the
-// commit target (highlight pill) and the caret, so a third saturated use in the
-// same panel is what made the old solid rule read as a spell-check error.
+// Preedit stays quiet: a converting sub-range gets a SOFT TINT BLOCK behind its
+// glyphs and the cursor gets a thin caret. The block replaced a dotted ink rule
+// (grit at high DPI, and a second horizontal line stacked above the band
+// separator) — but the reason the ORIGINAL filled block was removed still binds:
+// a third saturated use of the accent in one panel read as a spell-check error.
+// So the block is asserted two ways below — solid across the segment (it is a
+// block, not a dotted rule), yet carrying no saturated accent pixels (it is a
+// 10% wash; the accent stays the pill's and the caret's alone).
 static int check_soft_cursor() {
   FamoSkin sk = FamoSkinDefault();
   sk.layout_type = FAMO_LAYOUT_VERTICAL;
@@ -213,21 +216,22 @@ static int check_soft_cursor() {
     CHECK(FamoCandidateUiPaint(&v, &sk, &in, &out, res, dib.dc) == FAMO_UI_OK);
     GdiFlush();
     CHECK(out.preedit.right > out.preedit.left);
-    const int row = out.preedit.bottom - 1;
-    // Scan the rule's OWN span, not the whole preedit row: "faop" puts a 'p'
-    // descender in this row too, and its whitespace would hand a whole-row scan
-    // a free "gap" — making the dotted assertion below pass on a solid bar.
+    // Scan one row ABOVE the glyphs: the block is inflated 2px past preedit.top,
+    // so this row carries block pixels and nothing else. A row inside the text
+    // would conflate the block with the glyph ink sitting on top of it.
+    const int row = out.preedit.top - 1;
     const int32_t before = FamoTextMeasure(res, 1, "f", 1);
     const int32_t active = FamoTextMeasure(res, 1, "ao", 2);
     CHECK(active > 4);
-    const int rule_l = out.preedit.left + before, rule_r = rule_l + active;
+    // The scanned span is the segment itself, 3px inside the block's horizontal
+    // padding — further in than the 5px corner radius bites at this row, so a
+    // correct block inks every pixel of it.
+    const int block_l = out.preedit.left + before, block_r = block_l + active;
     int inked = 0;
-    for (int x = rule_l; x < rule_r; ++x)
+    for (int x = block_l; x < block_r; ++x)
       if (Rgb(dib.At(x, row)) != Rgb(sk.back_color)) ++inked;
-    CHECK(inked > 2);          // the segment is marked at all
-    CHECK(inked < active - 1);  // dotted, not the old solid bar (which inked all)
-    // Accent is the caret's alone. Unlike before, the underline row is included
-    // in the sweep — that inclusion is the assertion that the rule dropped it.
+    CHECK(inked >= active - 1);  // solid block, not the old dotted rule
+    // ...but a wash, never the saturated fill: accent is the caret's alone.
     CHECK(max_accent_pixels(out, dib, true) <= sk.caret_width);
   }
   // Control: no converting sub-range → only the thin vertical caret remains.
