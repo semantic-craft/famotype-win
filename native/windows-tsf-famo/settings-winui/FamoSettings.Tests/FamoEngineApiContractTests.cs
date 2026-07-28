@@ -67,7 +67,7 @@ public sealed class FamoEngineApiContractTests
         Assert.Contains("free_result", header);
         Assert.Contains(
             "int32_t (FAMO_ENGINE_CALL *deploy_schema)(\n      const FamoUtf8String* schema_id);",
-            header);
+            header.ReplaceLineEndings("\n"));
     }
 
     [Fact]
