@@ -42,6 +42,90 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void InnoSetup_QuotesEveryMachineRuntimeRunCommand()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int writeActive = Position(iss, "procedure WriteActiveRegistry");
+        string writeActiveBody = iss[writeActive..Position(iss, "procedure RestorePreviousRegistry", writeActive)];
+        int restore = Position(iss, "procedure RestorePreviousRegistry");
+        string restoreBody = iss[restore..Position(iss, "function NormalizeDirectoryPath", restore)];
+
+        Assert.Contains(
+            "RegWriteStringValue(HKLM64, RunKey, 'FamoRuntime'," +
+            " AddQuotes(AddBackslash(Target) + 'FamoRuntime.exe'))",
+            writeActiveBody);
+        Assert.Contains(
+            "RegWriteStringValue(HKLM64, RunKey, 'FamoRuntime', AddQuotes(PreviousServer))",
+            restoreBody);
+        Assert.DoesNotContain(
+            "RegWriteStringValue(HKLM64, RunKey, 'FamoRuntime', PreviousServer)",
+            restoreBody);
+    }
+
+    [Fact]
+    public void InnoSetup_RejectsDuplicateManifestPathsAndNonHexHashes()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int segmentValidator = Position(iss, "function ValidManifestPathSegment");
+        int pathValidator = Position(iss, "function NormalizeSafeRelativePath", segmentValidator);
+        int hashValidator = Position(iss, "function IsSha256Hex", pathValidator);
+        int parseEntry = Position(iss, "function ParseFileEntry", hashValidator);
+        string parseBody = iss[segmentValidator..Position(iss, "procedure ReadPreviousHostMetadata", parseEntry)];
+        int verify = Position(iss, "procedure VerifyPayloadOrFail");
+        string verifyBody = iss[verify..Position(iss, "function RunRegSvr32", verify)];
+
+        // One accepted spelling per Windows path: no slash aliases, empty or
+        // dot segments, nor Win32-trimmed trailing dots/spaces.
+        Assert.Contains("NormalizedValue := PathNormalizeSlashes(Value)", parseBody);
+        Assert.Contains("if NormalizedValue <> Value then Exit", parseBody);
+        Assert.Contains("(Segment = '.') or (Segment = '..')", parseBody);
+        Assert.Contains("Result := (Segment[Length(Segment)] <> '.') and", parseBody);
+        Assert.Contains("(Segment[Length(Segment)] <> ' ')", parseBody);
+        Assert.Contains("NormalizeSafeRelativePath(RawRelativePath, RelativePath)", parseBody);
+
+        Assert.Contains("Length(Value) <> 64", parseBody);
+        Assert.Contains("(Value[I] >= '0') and (Value[I] <= '9')", parseBody);
+        Assert.Contains("(Value[I] >= 'A') and (Value[I] <= 'F')", parseBody);
+        Assert.Contains("(Value[I] >= 'a') and (Value[I] <= 'f')", parseBody);
+        Assert.Contains("Result := IsSha256Hex(ExpectedHash)", parseBody);
+
+        Assert.Contains("SeenPaths := TStringList.Create", verifyBody);
+        Assert.Contains("SeenPaths.CaseSensitive := False", verifyBody);
+        Assert.Contains("TransactionRoot := NormalizeDirectoryPath(EnsureTransactionTarget)", verifyBody);
+        Assert.Contains("FullPath := ExpandFileName(PathCombine(TransactionRoot, RelativePath))", verifyBody);
+        Assert.Contains("PathStartsWith(FullPath, AddBackslash(TransactionRoot), True)", verifyBody);
+        Assert.Contains("SeenPaths.IndexOf(FullPath) >= 0", verifyBody);
+        Assert.Contains("RaiseException('duplicate payload manifest path: ' + RelativePath)", verifyBody);
+        Assert.Contains("SeenPaths.Add(FullPath)", verifyBody);
+        Assert.Contains("SeenPaths.Free", verifyBody);
+    }
+
+    [Fact]
+    public void InnoSetup_MatchesManifestToCanonicalActualFileSet()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int pathLookup = Position(iss, "function FindPathInList");
+        int enumerate = Position(iss, "procedure VerifyActualPayloadFiles", pathLookup);
+        int verify = Position(iss, "procedure VerifyPayloadOrFail", enumerate);
+        string enumerationHelpers = iss[pathLookup..verify];
+        string verifyBody = iss[verify..Position(iss, "function RunRegSvr32", verify)];
+
+        Assert.Contains("(FindRec.Attributes and FileAttributeReparsePoint) <> 0", enumerationHelpers);
+        Assert.Contains("TryGetFinalObjectInfo(Path, FinalPath, ObjectId)", enumerationHelpers);
+        Assert.Contains("PathStartsWith(FinalPath, AddBackslash(FinalRoot), True)", enumerationHelpers);
+        Assert.Contains("FindPathInList(ManifestFinalPaths, FinalPath) < 0", enumerationHelpers);
+        Assert.Contains("FindPathInList(SeenActualPaths, FinalPath) >= 0", enumerationHelpers);
+        Assert.Contains("SeenActualObjectIds.IndexOf(ObjectId) >= 0", enumerationHelpers);
+
+        Assert.Contains("TryGetFinalObjectInfo(FullPath, FinalPath, ObjectId)", verifyBody);
+        Assert.Contains("FindPathInList(SeenFinalPaths, FinalPath) >= 0", verifyBody);
+        Assert.Contains("SeenObjectIds.IndexOf(ObjectId) >= 0", verifyBody);
+        Assert.Contains("VerifyActualPayloadFiles(TransactionRoot, FinalRoot,", verifyBody);
+        Assert.Contains("ActualCount <> EntryCount", verifyBody);
+        Assert.DoesNotContain("CountFiles(", verifyBody);
+    }
+
+    [Fact]
     public void BuildInstaller_CopiesRequiredWinuiResourcesAndPropagatesCompilerFailure()
     {
         string script = InstallerText("build-installer.ps1");
@@ -77,6 +161,106 @@ public sealed class InstallerContractTests
         Assert.DoesNotContain("GetDateTimeString('yyyymmddhhnnss', '', '')", iss);
         Assert.DoesNotContain("restartreplace", iss[..Position(iss, "function InitializeUninstall")], StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(@"DestDir: ""{app}""", EffectiveInnoContent(iss), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void InnoSetup_ValidatesPendingTargetBeforeRollbackOrResume()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int normalize = Position(iss, "function NormalizeDirectoryPath");
+        int validateTarget = Position(iss, "function ValidateTransactionTarget", normalize);
+        int validatePending = Position(iss, "function ValidatePendingTransaction", validateTarget);
+        int load = Position(iss, "function LoadPendingState", validatePending);
+        string validationHelpers = iss[normalize..load];
+        string loadBody = iss[load..Position(iss, "function InitializeSetup", load)];
+
+        // Canonicalization plus exact-parent equality rejects the versions root,
+        // other drives, and grandchildren instead of relying on a string prefix.
+        Assert.Contains("RemoveBackslashUnlessRoot(ExpandFileName(PathNormalizeSlashes(Path)))", validationHelpers);
+        Assert.Contains(@"Pos('\..\', '\' + PathNormalizeSlashes(Path) + '\') > 0", validationHelpers);
+        Assert.Contains("not PathIsRooted(Target)", validationHelpers);
+        Assert.Contains("ContainsParentTraversal(Target)", validationHelpers);
+        Assert.Contains("NormalizedTarget := NormalizeDirectoryPath(Target)", validationHelpers);
+        Assert.Contains("if PathSame(NormalizedTarget, VersionsRoot) or", validationHelpers);
+        Assert.Contains("PathSame(ExtractFileDir(NormalizedTarget), VersionsRoot)", validationHelpers);
+        Assert.Contains("'{#AppVersion}-{#ManifestPrefix}-' + ExpectedId", validationHelpers);
+        Assert.Contains("CompareText(ExtractFileName(NormalizedTarget), ExpectedLeaf)", validationHelpers);
+        Assert.Contains("ActiveTarget := ReadActiveTarget", validationHelpers);
+        Assert.Contains("ProtectedPathIsDifferent(NormalizedTarget, TargetExists,", validationHelpers);
+        Assert.Contains("TargetFinalPath, TargetObjectId, ActiveTarget", validationHelpers);
+        Assert.Contains("TargetFinalPath, TargetObjectId, ProtectedPreviousTarget", validationHelpers);
+
+        // Existing junctions/symlinks are rejected. A genuinely absent fresh
+        // transaction target remains valid so Setup can create it.
+        Assert.Contains("GetFileAttributesW", iss);
+        Assert.Contains("FileAttributeReparsePoint", validationHelpers);
+        Assert.Contains("InvalidFileAttributes", validationHelpers);
+        Assert.Contains("ErrorFileNotFound", validationHelpers);
+        Assert.Contains("ErrorPathNotFound", validationHelpers);
+        Assert.Contains("Attributes and FileAttributeReparsePoint", validationHelpers);
+        Assert.Contains("PathIsNonReparseOrMissing(VersionsRoot)", validationHelpers);
+        Assert.Contains("PathIsNonReparseOrMissing(NormalizedTarget)", validationHelpers);
+
+        int prepare = Position(iss, "procedure PrepareTransaction");
+        string prepareBody = iss[prepare..Position(iss, "procedure SwitchRegistration", prepare)];
+        int prepareValidation = Position(prepareBody,
+            "ValidateTransactionTarget(TransactionTarget, TransactionId,");
+        int freshTargetCheck = Position(prepareBody, "if DirExists(TransactionTarget)", prepareValidation);
+        Assert.True(prepareValidation < freshTargetCheck);
+        Assert.Contains("TransactionTarget := ValidatedTarget;", prepareBody);
+
+        Assert.Contains("CompareText(PendingManifest,", validationHelpers);
+        Assert.Contains("AddBackslash(NormalizedTarget) + 'payload-manifest.txt'", validationHelpers);
+        Assert.Contains("if not Result then NormalizedTarget := '';", validationHelpers);
+
+        // An untrusted registry value must not reach the global deletion target
+        // until the shared resume/rollback loader has validated it.
+        int validateCall = Position(loadBody,
+            "ValidatePendingTransaction(PendingTarget, PendingManifest, StoredId,");
+        Assert.Contains("PendingPreviousTarget, NormalizedTarget", loadBody);
+        int targetAssignment = Position(loadBody, "TransactionTarget := NormalizedTarget;", validateCall);
+        Assert.True(validateCall < targetAssignment);
+        Assert.DoesNotContain(
+            "RegQueryStringValue(HKLM64, BrandKey, 'PendingTarget', TransactionTarget)",
+            loadBody);
+
+        // Re-check the mutable filesystem boundary immediately before recursive
+        // deletion instead of trusting only the earlier pending-state load.
+        int rollback = Position(iss, "procedure RollbackTransaction");
+        string rollbackBody = iss[rollback..Position(iss, "procedure VerifyActiveInstall", rollback)];
+        int deleteValidation = Position(rollbackBody,
+            "ValidateTransactionTarget(TransactionTarget, TransactionId,");
+        Assert.Contains("PreviousTarget, ValidatedTarget", rollbackBody);
+        int deleteTree = Position(rollbackBody, "DelTree(ValidatedTarget", deleteValidation);
+        Assert.True(deleteValidation < deleteTree);
+        Assert.DoesNotContain("DelTree(TransactionTarget", rollbackBody);
+    }
+
+    [Fact]
+    public void InnoSetup_ProtectsExistingTargetsByFinalObjectIdentity()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int finalObject = Position(iss, "function NormalizeFinalObjectPath");
+        int validateTarget = Position(iss, "function ValidateTransactionTarget", finalObject);
+        string finalObjectHelpers = iss[finalObject..validateTarget];
+        string validateTargetBody = iss[validateTarget..Position(iss, "procedure PrepareTransaction", validateTarget)];
+
+        Assert.Contains("CreateFileW", iss);
+        Assert.Contains("GetFinalPathNameByHandleW", iss);
+        Assert.Contains("GetFileInformationByHandle", iss);
+        Assert.Contains("CloseHandle", iss);
+        Assert.Contains("FileFlagBackupSemantics", finalObjectHelpers);
+        Assert.Contains(@"PathStartsWith(Result, '\\?\UNC\', True)", finalObjectHelpers);
+        Assert.Contains(@"Result := '\\' + Copy(Result, 9, Length(Result))", finalObjectHelpers);
+        Assert.Contains(@"PathStartsWith(Result, '\\?\', True)", finalObjectHelpers);
+        Assert.Contains("PathSame(FirstFinalPath, SecondFinalPath)", finalObjectHelpers);
+        Assert.Contains("FirstObjectId <> ''", finalObjectHelpers);
+        Assert.Contains("CompareText(FirstObjectId, SecondObjectId) = 0", finalObjectHelpers);
+
+        Assert.Contains("ProtectedPathIsDifferent(NormalizedTarget, TargetExists,", validateTargetBody);
+        Assert.Contains("ActiveTarget", validateTargetBody);
+        Assert.Contains("ProtectedPreviousTarget", validateTargetBody);
+        Assert.Contains("PathSame(ExtractFileDir(TargetFinalPath), VersionsFinalPath)", validateTargetBody);
     }
 
     [Fact]
@@ -217,7 +401,7 @@ public sealed class InstallerContractTests
     {
         string iss = InstallerText("famo-setup.iss");
         int snapshot = Position(iss, "procedure SnapshotPreviousState");
-        int next = Position(iss, "function CountFiles", snapshot);
+        int next = Position(iss, "function FindPathInList", snapshot);
         string body = iss[snapshot..next].Replace("\r\n", "\n");
 
         Assert.Contains("PreviousHost := '';", body);

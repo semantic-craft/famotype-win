@@ -48,6 +48,20 @@ Source: "{#StagingDir}\payload\*"; DestDir: "{code:GetTransactionTarget}"; Flags
 Name: "{autoprograms}\法墨设置"; Filename: "{code:GetActiveSettings}"; IconFilename: "{code:GetActiveSettings}"; Check: ShouldInstallPayload
 
 [Code]
+type
+  TFamoByHandleFileInformation = record
+    FileAttributes: Cardinal;
+    CreationTime: TFileTime;
+    LastAccessTime: TFileTime;
+    LastWriteTime: TFileTime;
+    VolumeSerialNumber: Cardinal;
+    FileSizeHigh: Cardinal;
+    FileSizeLow: Cardinal;
+    NumberOfLinks: Cardinal;
+    FileIndexHigh: Cardinal;
+    FileIndexLow: Cardinal;
+  end;
+
 const
   BrandKey = 'Software\Famo\InputMethod';
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
@@ -58,6 +72,19 @@ const
   StateRolledBack = 'RolledBack';
   StatePendingReboot = 'PendingReboot';
   StateNotInstalled = 'NotInstalled';
+  FileAttributeDirectory = $10;
+  FileAttributeNormal = $80;
+  FileAttributeReparsePoint = $400;
+  FileFlagBackupSemantics = $02000000;
+  FileShareRead = $1;
+  FileShareWrite = $2;
+  FileShareDelete = $4;
+  OpenExisting = 3;
+  FinalPathBufferChars = 32768;
+  InvalidHandleValue = -1;
+  InvalidFileAttributes = $FFFFFFFF;
+  ErrorFileNotFound = 2;
+  ErrorPathNotFound = 3;
 
 var
   TransactionId: String;
@@ -87,6 +114,25 @@ var
   DeleteUserData: Boolean;
   UninstallPrepared: Boolean;
   UninstallRestartPending: Boolean;
+
+function GetFileAttributesW(FileName: String): Cardinal;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+
+function CreateFileW(FileName: String; DesiredAccess, ShareMode: Cardinal;
+  SecurityAttributes: INT_PTR; CreationDisposition, FlagsAndAttributes: Cardinal;
+  TemplateFile: THandle): THandle;
+  external 'CreateFileW@kernel32.dll stdcall';
+
+function GetFinalPathNameByHandleW(FileHandle: THandle; FilePath: String;
+  FilePathChars, Flags: Cardinal): Cardinal;
+  external 'GetFinalPathNameByHandleW@kernel32.dll stdcall';
+
+function GetFileInformationByHandle(FileHandle: THandle;
+  var FileInformation: TFamoByHandleFileInformation): BOOL;
+  external 'GetFileInformationByHandle@kernel32.dll stdcall';
+
+function CloseHandle(Handle: THandle): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 function EnsureTransactionTarget: String;
 begin
@@ -219,7 +265,7 @@ begin
   RegWriteStringValue(HKLM64, BrandKey, 'PreviousTarget', PreviousTarget);
   RegWriteStringValue(HKLM64, BrandKey, 'PreviousDefault', PreviousDefault);
   RegWriteStringValue(HKLM64, BrandKey, 'InstallState', State);
-  RegWriteStringValue(HKLM64, RunKey, 'FamoRuntime', AddBackslash(Target) + 'FamoRuntime.exe');
+  RegWriteStringValue(HKLM64, RunKey, 'FamoRuntime', AddQuotes(AddBackslash(Target) + 'FamoRuntime.exe'));
 end;
 
 procedure RestorePreviousRegistry;
@@ -237,7 +283,7 @@ begin
     RegWriteStringValue(HKLM64, BrandKey, 'PreviousDefault', PreviousDefault);
     RegWriteStringValue(HKLM64, BrandKey, 'InstallState', StateRolledBack);
     if PreviousServer <> '' then
-      RegWriteStringValue(HKLM64, RunKey, 'FamoRuntime', PreviousServer)
+      RegWriteStringValue(HKLM64, RunKey, 'FamoRuntime', AddQuotes(PreviousServer))
     else
       RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
   end
@@ -254,27 +300,181 @@ begin
   ClearPendingRegistry;
 end;
 
-function SafeRelativePath(const Value: String): Boolean;
+function NormalizeDirectoryPath(const Path: String): String;
 begin
-  Result := (Value <> '') and (Pos('..', Value) = 0) and
-    (Pos(':', Value) = 0) and (Value[1] <> '\') and (Value[1] <> '/');
+  Result := RemoveBackslashUnlessRoot(ExpandFileName(PathNormalizeSlashes(Path)));
+end;
+
+function TryGetPathAttributes(const Path: String; var Exists: Boolean;
+  var Attributes: Cardinal): Boolean;
+var
+  ErrorCode: LongInt;
+begin
+  Attributes := GetFileAttributesW(Path);
+  Exists := Attributes <> InvalidFileAttributes;
+  if Exists then
+  begin
+    Result := True;
+    Exit;
+  end;
+  ErrorCode := DLLGetLastError;
+  Result := (ErrorCode = ErrorFileNotFound) or
+    (ErrorCode = ErrorPathNotFound);
+end;
+
+function NormalizeFinalObjectPath(const Path: String): String;
+begin
+  Result := PathNormalizeSlashes(Path);
+  if PathStartsWith(Result, '\\?\UNC\', True) then
+    Result := '\\' + Copy(Result, 9, Length(Result))
+  else if PathStartsWith(Result, '\\?\', True) or
+          PathStartsWith(Result, '\??\', True) then
+    Result := Copy(Result, 5, Length(Result));
+  Result := RemoveBackslashUnlessRoot(Result);
+end;
+
+function TryGetFinalObjectInfo(const Path: String;
+  var FinalPath, ObjectId: String): Boolean;
+var
+  Attributes, Flags, FinalLength: Cardinal;
+  Exists: Boolean;
+  FileHandle: THandle;
+  Buffer: String;
+  FileInformation: TFamoByHandleFileInformation;
+begin
+  Result := False;
+  FinalPath := '';
+  ObjectId := '';
+  if not TryGetPathAttributes(Path, Exists, Attributes) or not Exists then Exit;
+
+  Flags := FileAttributeNormal;
+  if (Attributes and FileAttributeDirectory) <> 0 then
+    Flags := Flags or FileFlagBackupSemantics;
+  FileHandle := CreateFileW(Path, 0,
+    FileShareRead or FileShareWrite or FileShareDelete, 0, OpenExisting,
+    Flags, 0);
+  if FileHandle = InvalidHandleValue then Exit;
+  try
+    SetLength(Buffer, FinalPathBufferChars);
+    FinalLength := GetFinalPathNameByHandleW(FileHandle, Buffer,
+      FinalPathBufferChars, 0);
+    if (FinalLength = 0) or (FinalLength >= FinalPathBufferChars) then Exit;
+    SetLength(Buffer, FinalLength);
+    FinalPath := NormalizeFinalObjectPath(Buffer);
+    if FinalPath = '' then Exit;
+    if not GetFileInformationByHandle(FileHandle, FileInformation) then Exit;
+    if (FileInformation.FileIndexHigh <> 0) or
+       (FileInformation.FileIndexLow <> 0) then
+      ObjectId := IntToStr(FileInformation.VolumeSerialNumber) + ':' +
+        IntToStr(FileInformation.FileIndexHigh) + ':' +
+        IntToStr(FileInformation.FileIndexLow);
+    Result := True;
+  finally
+    CloseHandle(FileHandle);
+  end;
+end;
+
+function FinalObjectsSame(const FirstFinalPath, FirstObjectId,
+  SecondFinalPath, SecondObjectId: String): Boolean;
+begin
+  Result := PathSame(FirstFinalPath, SecondFinalPath) or
+    ((FirstObjectId <> '') and (SecondObjectId <> '') and
+     (CompareText(FirstObjectId, SecondObjectId) = 0));
+end;
+
+function ProtectedPathIsDifferent(const Target: String; TargetExists: Boolean;
+  const TargetFinalPath, TargetObjectId, ProtectedPath: String): Boolean;
+var
+  ProtectedExists: Boolean;
+  ProtectedAttributes: Cardinal;
+  ProtectedFinalPath, ProtectedObjectId: String;
+begin
+  Result := False;
+  if ProtectedPath = '' then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if PathSame(NormalizeDirectoryPath(ProtectedPath), Target) then Exit;
+  if not TryGetPathAttributes(ProtectedPath, ProtectedExists,
+    ProtectedAttributes) then Exit;
+  if not ProtectedExists or not TargetExists then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if not TryGetFinalObjectInfo(ProtectedPath, ProtectedFinalPath,
+    ProtectedObjectId) then Exit;
+  Result := not FinalObjectsSame(TargetFinalPath, TargetObjectId,
+    ProtectedFinalPath, ProtectedObjectId);
+end;
+
+function ValidManifestPathSegment(const Segment: String): Boolean;
+begin
+  Result := False;
+  if Segment = '' then Exit;
+  if (Segment = '.') or (Segment = '..') then Exit;
+  Result := (Segment[Length(Segment)] <> '.') and
+    (Segment[Length(Segment)] <> ' ');
+end;
+
+function NormalizeSafeRelativePath(const Value: String;
+  var NormalizedValue: String): Boolean;
+var
+  I, SegmentStart: Integer;
+  Segment: String;
+begin
+  Result := False;
+  NormalizedValue := PathNormalizeSlashes(Value);
+  if Value = '' then Exit;
+  if NormalizedValue <> Value then Exit;
+  if (Pos(':', Value) <> 0) or (Value[1] = '\') then Exit;
+  SegmentStart := 1;
+  for I := 1 to Length(NormalizedValue) do
+  begin
+    if NormalizedValue[I] = '\' then
+    begin
+      Segment := Copy(NormalizedValue, SegmentStart, I - SegmentStart);
+      if not ValidManifestPathSegment(Segment) then Exit;
+      SegmentStart := I + 1;
+    end;
+  end;
+  Segment := Copy(NormalizedValue, SegmentStart, Length(NormalizedValue));
+  Result := ValidManifestPathSegment(Segment);
+end;
+
+function IsSha256Hex(const Value: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  if Length(Value) <> 64 then Exit;
+  for I := 1 to Length(Value) do
+  begin
+    if not (((Value[I] >= '0') and (Value[I] <= '9')) or
+            ((Value[I] >= 'A') and (Value[I] <= 'F')) or
+            ((Value[I] >= 'a') and (Value[I] <= 'f'))) then
+      Exit;
+  end;
+  Result := True;
 end;
 
 function ParseFileEntry(const Line: String; var RelativePath, ExpectedHash: String): Boolean;
 var
-  Payload, Rest: String;
+  Payload, Rest, RawRelativePath: String;
   FirstBar, SecondBar: Integer;
 begin
   Result := False;
   Payload := Copy(Line, 6, Length(Line));
   FirstBar := Pos('|', Payload);
   if FirstBar = 0 then Exit;
-  RelativePath := Copy(Payload, 1, FirstBar - 1);
+  RawRelativePath := Copy(Payload, 1, FirstBar - 1);
   Rest := Copy(Payload, FirstBar + 1, Length(Payload));
   SecondBar := Pos('|', Rest);
   if SecondBar = 0 then Exit;
   ExpectedHash := Copy(Rest, SecondBar + 1, Length(Rest));
-  Result := SafeRelativePath(RelativePath) and (Length(ExpectedHash) = 64);
+  if not NormalizeSafeRelativePath(RawRelativePath, RelativePath) then Exit;
+  Result := IsSha256Hex(ExpectedHash);
 end;
 
 procedure ReadPreviousHostMetadata;
@@ -341,12 +541,28 @@ begin
   ReadPreviousHostMetadata;
 end;
 
-function CountFiles(const Directory: String): Integer;
+function FindPathInList(Paths: TStringList; const Path: String): Integer;
+var
+  I: Integer;
+begin
+  Result := -1;
+  for I := 0 to Paths.Count - 1 do
+  begin
+    if PathSame(Paths[I], Path) then
+    begin
+      Result := I;
+      Exit;
+    end;
+  end;
+end;
+
+procedure VerifyActualPayloadFiles(const Directory, FinalRoot,
+  FinalManifest: String; ManifestFinalPaths, SeenActualPaths,
+  SeenActualObjectIds: TStringList; var ActualCount: Integer);
 var
   FindRec: TFindRec;
-  Path: String;
+  Path, FinalPath, ObjectId: String;
 begin
-  Result := 0;
   if FindFirst(AddBackslash(Directory) + '*', FindRec) then
   begin
     try
@@ -354,10 +570,33 @@ begin
         if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
         begin
           Path := AddBackslash(Directory) + FindRec.Name;
-          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
-            Result := Result + CountFiles(Path)
+          if (FindRec.Attributes and FileAttributeReparsePoint) <> 0 then
+            RaiseException('payload contains a reparse point: ' + Path);
+          if (FindRec.Attributes and FileAttributeDirectory) <> 0 then
+            VerifyActualPayloadFiles(Path, FinalRoot, FinalManifest,
+              ManifestFinalPaths, SeenActualPaths, SeenActualObjectIds,
+              ActualCount)
           else
-            Result := Result + 1;
+          begin
+            if not TryGetFinalObjectInfo(Path, FinalPath, ObjectId) then
+              RaiseException('payload file identity unavailable: ' + Path);
+            if not PathStartsWith(FinalPath, AddBackslash(FinalRoot), True) then
+              RaiseException('payload file resolves outside transaction root: ' +
+                Path);
+            if not PathSame(FinalPath, FinalManifest) then
+            begin
+              if (FindPathInList(SeenActualPaths, FinalPath) >= 0) or
+                 ((ObjectId <> '') and
+                  (SeenActualObjectIds.IndexOf(ObjectId) >= 0)) then
+                RaiseException('payload contains duplicate file objects: ' +
+                  Path);
+              SeenActualPaths.Add(FinalPath);
+              if ObjectId <> '' then SeenActualObjectIds.Add(ObjectId);
+              if FindPathInList(ManifestFinalPaths, FinalPath) < 0 then
+                RaiseException('payload file missing from manifest: ' + Path);
+              ActualCount := ActualCount + 1;
+            end;
+          end;
         end;
       until not FindNext(FindRec);
     finally
@@ -369,8 +608,12 @@ end;
 procedure VerifyPayloadOrFail;
 var
   Lines: TArrayOfString;
-  Manifest, RelativePath, ExpectedHash, ActualHash: String;
-  I, DeclaredCount, EntryCount: Integer;
+  Manifest, TransactionRoot, FinalRoot, RootObjectId, FinalManifest,
+    ManifestObjectId, RelativePath, FullPath, FinalPath, ObjectId,
+    ExpectedHash, ActualHash: String;
+  SeenPaths, SeenFinalPaths, SeenObjectIds, SeenActualPaths,
+    SeenActualObjectIds: TStringList;
+  I, DeclaredCount, EntryCount, ActualCount: Integer;
   HasFormat, HasProduct, HasVersion, HasProtocol, HasArch, HasIdentity: Boolean;
 begin
   Manifest := AddBackslash(EnsureTransactionTarget) + 'payload-manifest.txt';
@@ -380,32 +623,79 @@ begin
     RaiseException('payload manifest identity mismatch');
   if not LoadStringsFromFile(Manifest, Lines) then RaiseException('payload manifest unreadable');
 
-  DeclaredCount := -1;
-  EntryCount := 0;
-  for I := 0 to GetArrayLength(Lines) - 1 do
-  begin
-    HasFormat := HasFormat or (Lines[I] = 'format=1');
-    HasProduct := HasProduct or (Lines[I] = 'product=Famo');
-    HasVersion := HasVersion or (Lines[I] = 'version={#AppVersion}');
-    HasProtocol := HasProtocol or (Lines[I] = 'protocol=1');
-    HasArch := HasArch or (Lines[I] = 'architecture=x64');
-    HasIdentity := HasIdentity or (Lines[I] = 'identity={#Identity}');
-    if Pos('file_count=', Lines[I]) = 1 then
-      DeclaredCount := StrToInt(Copy(Lines[I], 12, Length(Lines[I])));
-    if Pos('file=', Lines[I]) = 1 then
+  TransactionRoot := NormalizeDirectoryPath(EnsureTransactionTarget);
+  if not TryGetFinalObjectInfo(TransactionRoot, FinalRoot, RootObjectId) then
+    RaiseException('transaction root identity unavailable');
+  if not TryGetFinalObjectInfo(Manifest, FinalManifest, ManifestObjectId) or
+     not PathSame(ExtractFileDir(FinalManifest), FinalRoot) then
+    RaiseException('payload manifest resolves outside transaction root');
+  SeenPaths := TStringList.Create;
+  SeenFinalPaths := TStringList.Create;
+  SeenObjectIds := TStringList.Create;
+  SeenActualPaths := TStringList.Create;
+  SeenActualObjectIds := TStringList.Create;
+  try
+    SeenPaths.CaseSensitive := False;
+    SeenObjectIds.CaseSensitive := True;
+    SeenActualObjectIds.CaseSensitive := True;
+    DeclaredCount := -1;
+    EntryCount := 0;
+    ActualCount := 0;
+    HasFormat := False;
+    HasProduct := False;
+    HasVersion := False;
+    HasProtocol := False;
+    HasArch := False;
+    HasIdentity := False;
+    for I := 0 to GetArrayLength(Lines) - 1 do
     begin
-      if not ParseFileEntry(Lines[I], RelativePath, ExpectedHash) then
-        RaiseException('invalid payload manifest entry');
-      ActualHash := Uppercase(GetSHA256OfFile(AddBackslash(EnsureTransactionTarget) + RelativePath));
-      if CompareText(ActualHash, ExpectedHash) <> 0 then
-        RaiseException('payload hash mismatch: ' + RelativePath);
-      EntryCount := EntryCount + 1;
+      HasFormat := HasFormat or (Lines[I] = 'format=1');
+      HasProduct := HasProduct or (Lines[I] = 'product=Famo');
+      HasVersion := HasVersion or (Lines[I] = 'version={#AppVersion}');
+      HasProtocol := HasProtocol or (Lines[I] = 'protocol=1');
+      HasArch := HasArch or (Lines[I] = 'architecture=x64');
+      HasIdentity := HasIdentity or (Lines[I] = 'identity={#Identity}');
+      if Pos('file_count=', Lines[I]) = 1 then
+        DeclaredCount := StrToInt(Copy(Lines[I], 12, Length(Lines[I])));
+      if Pos('file=', Lines[I]) = 1 then
+      begin
+        if not ParseFileEntry(Lines[I], RelativePath, ExpectedHash) then
+          RaiseException('invalid payload manifest entry');
+        FullPath := ExpandFileName(PathCombine(TransactionRoot, RelativePath));
+        if not PathStartsWith(FullPath, AddBackslash(TransactionRoot), True) then
+          RaiseException('payload path escapes transaction root: ' + RelativePath);
+        if SeenPaths.IndexOf(FullPath) >= 0 then
+          RaiseException('duplicate payload manifest path: ' + RelativePath);
+        SeenPaths.Add(FullPath);
+        if not TryGetFinalObjectInfo(FullPath, FinalPath, ObjectId) then
+          RaiseException('payload file identity unavailable: ' + RelativePath);
+        if not PathStartsWith(FinalPath, AddBackslash(FinalRoot), True) then
+          RaiseException('payload file resolves outside transaction root: ' +
+            RelativePath);
+        if (FindPathInList(SeenFinalPaths, FinalPath) >= 0) or
+           ((ObjectId <> '') and (SeenObjectIds.IndexOf(ObjectId) >= 0)) then
+          RaiseException('duplicate payload manifest object: ' + RelativePath);
+        SeenFinalPaths.Add(FinalPath);
+        if ObjectId <> '' then SeenObjectIds.Add(ObjectId);
+        ActualHash := Uppercase(GetSHA256OfFile(FullPath));
+        if CompareText(ActualHash, ExpectedHash) <> 0 then
+          RaiseException('payload hash mismatch: ' + RelativePath);
+        EntryCount := EntryCount + 1;
+      end;
     end;
+    if not (HasFormat and HasProduct and HasVersion and HasProtocol and HasArch and HasIdentity) then
+      RaiseException('payload manifest header mismatch');
+    VerifyActualPayloadFiles(TransactionRoot, FinalRoot, FinalManifest,
+      SeenFinalPaths, SeenActualPaths, SeenActualObjectIds, ActualCount);
+    if (DeclaredCount <> EntryCount) or (ActualCount <> EntryCount) then
+      RaiseException('payload file_count mismatch');
+  finally
+    SeenActualObjectIds.Free;
+    SeenActualPaths.Free;
+    SeenObjectIds.Free;
+    SeenFinalPaths.Free;
+    SeenPaths.Free;
   end;
-  if not (HasFormat and HasProduct and HasVersion and HasProtocol and HasArch and HasIdentity) then
-    RaiseException('payload manifest header mismatch');
-  if (DeclaredCount <> EntryCount) or (CountFiles(EnsureTransactionTarget) <> EntryCount + 1) then
-    RaiseException('payload file_count mismatch');
 end;
 
 function RunRegSvr32(const DllPath: String; Unregister: Boolean): Boolean;
@@ -475,9 +765,88 @@ begin
     LoadedHostExpectedHash + '; loaded=' + IntToStr(Ord(Result)));
 end;
 
+function ContainsParentTraversal(const Path: String): Boolean;
+begin
+  Result := Pos('\..\', '\' + PathNormalizeSlashes(Path) + '\') > 0;
+end;
+
+function PathIsNonReparseOrMissing(const Path: String): Boolean;
+var
+  Attributes: Cardinal;
+  Exists: Boolean;
+begin
+  Result := TryGetPathAttributes(Path, Exists, Attributes) and
+    (not Exists or ((Attributes and FileAttributeReparsePoint) = 0));
+end;
+
+function ValidateTransactionTarget(const Target, ExpectedId,
+  ProtectedPreviousTarget: String; var NormalizedTarget: String): Boolean;
+var
+  VersionsRoot, ExpectedLeaf, ActiveTarget, VersionsFinalPath,
+    VersionsObjectId, TargetFinalPath, TargetObjectId: String;
+  VersionsAttributes, TargetAttributes: Cardinal;
+  VersionsExists, TargetExists: Boolean;
+begin
+  Result := False;
+  NormalizedTarget := '';
+  if (Target = '') or (ExpectedId = '') or not PathIsRooted(Target) or
+     ContainsParentTraversal(Target) then
+    Exit;
+  try
+    VersionsRoot := NormalizeDirectoryPath(
+      AddBackslash(ExpandConstant('{app}')) + 'versions');
+    NormalizedTarget := NormalizeDirectoryPath(Target);
+    ExpectedLeaf := '{#AppVersion}-{#ManifestPrefix}-' + ExpectedId;
+    if PathSame(NormalizedTarget, VersionsRoot) or
+       not PathSame(ExtractFileDir(NormalizedTarget), VersionsRoot) or
+       (CompareText(ExtractFileName(NormalizedTarget), ExpectedLeaf) <> 0) then
+      Exit;
+    if not TryGetPathAttributes(VersionsRoot, VersionsExists,
+       VersionsAttributes) or
+       not TryGetPathAttributes(NormalizedTarget, TargetExists,
+       TargetAttributes) then
+      Exit;
+    if not PathIsNonReparseOrMissing(VersionsRoot) or
+       not PathIsNonReparseOrMissing(NormalizedTarget) then
+      Exit;
+    if VersionsExists then
+    begin
+      if (VersionsAttributes and FileAttributeDirectory) = 0 then Exit;
+      if not TryGetFinalObjectInfo(VersionsRoot, VersionsFinalPath,
+        VersionsObjectId) then Exit;
+    end;
+    if TargetExists then
+    begin
+      if not VersionsExists or
+         ((TargetAttributes and FileAttributeDirectory) = 0) then Exit;
+      if not TryGetFinalObjectInfo(NormalizedTarget, TargetFinalPath,
+        TargetObjectId) then Exit;
+      if not PathSame(ExtractFileDir(TargetFinalPath), VersionsFinalPath) or
+         (CompareText(ExtractFileName(TargetFinalPath), ExpectedLeaf) <> 0) then
+        Exit;
+    end;
+    ActiveTarget := ReadActiveTarget;
+    if not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
+       TargetFinalPath, TargetObjectId, ActiveTarget) or
+       not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
+       TargetFinalPath, TargetObjectId, ProtectedPreviousTarget) then
+      Exit;
+    Result := True;
+  except
+    Result := False;
+  end;
+  if not Result then NormalizedTarget := '';
+end;
+
 procedure PrepareTransaction;
+var
+  ValidatedTarget: String;
 begin
   EnsureTransactionTarget;
+  if not ValidateTransactionTarget(TransactionTarget, TransactionId,
+    PreviousTarget, ValidatedTarget) then
+    RaiseException('unsafe transaction target refused during prepare');
+  TransactionTarget := ValidatedTarget;
   if ResumeMode or RollbackMode then
   begin
     if not DirExists(TransactionTarget) then
@@ -668,7 +1037,7 @@ end;
 procedure RollbackTransaction;
 var
   ResultCode: Integer;
-  RestoreSettings: String;
+  RestoreSettings, ValidatedTarget: String;
 begin
   if RollbackComplete then Exit;
   if RuntimeStarted then
@@ -705,7 +1074,13 @@ begin
         RaiseException('previous runtime health readback failed');
     end;
   end;
-  if DirExists(TransactionTarget) then DelTree(TransactionTarget, True, True, True);
+  if DirExists(TransactionTarget) then
+  begin
+    if not ValidateTransactionTarget(TransactionTarget, TransactionId,
+      PreviousTarget, ValidatedTarget) then
+      RaiseException('unsafe transaction target refused during rollback');
+    DelTree(ValidatedTarget, True, True, True);
+  end;
   RollbackComplete := True;
 end;
 
@@ -756,25 +1131,42 @@ begin
   InstallReady := True;
 end;
 
+function ValidatePendingTransaction(const PendingTarget, PendingManifest,
+  ExpectedId, ProtectedPreviousTarget: String;
+  var NormalizedTarget: String): Boolean;
+begin
+  Result := ValidateTransactionTarget(PendingTarget, ExpectedId,
+    ProtectedPreviousTarget, NormalizedTarget) and
+    (CompareText(PendingManifest,
+      AddBackslash(NormalizedTarget) + 'payload-manifest.txt') = 0);
+  if not Result then NormalizedTarget := '';
+end;
+
 function LoadPendingState(const ExpectedId: String): Boolean;
 var
-  StoredId, State, ActiveText, PendingManifest: String;
+  StoredId, State, ActiveText, PendingTarget, PendingManifest,
+    PendingPreviousTarget, NormalizedTarget: String;
 begin
+  TransactionTarget := '';
   Result := RegQueryStringValue(HKLM64, BrandKey, 'InstallState', State) and
     (CompareText(State, StatePendingReboot) = 0) and
     RegQueryStringValue(HKLM64, BrandKey, 'TransactionId', StoredId) and
     (CompareText(StoredId, ExpectedId) = 0) and
-    RegQueryStringValue(HKLM64, BrandKey, 'PendingTarget', TransactionTarget) and
+    RegQueryStringValue(HKLM64, BrandKey, 'PendingTarget', PendingTarget) and
     RegQueryStringValue(HKLM64, BrandKey, 'PendingManifest', PendingManifest);
   if not Result then Exit;
-  TransactionId := StoredId;
-  if CompareText(PendingManifest,
-    AddBackslash(TransactionTarget) + 'payload-manifest.txt') <> 0 then
+  PendingPreviousTarget := '';
+  RegQueryStringValue(HKLM64, BrandKey, 'PreviousTarget',
+    PendingPreviousTarget);
+  if not ValidatePendingTransaction(PendingTarget, PendingManifest, StoredId,
+    PendingPreviousTarget, NormalizedTarget) then
   begin
     Result := False;
     Exit;
   end;
-  RegQueryStringValue(HKLM64, BrandKey, 'PreviousTarget', PreviousTarget);
+  TransactionTarget := NormalizedTarget;
+  TransactionId := StoredId;
+  PreviousTarget := PendingPreviousTarget;
   RegQueryStringValue(HKLM64, BrandKey, 'PreviousDefault', PreviousDefault);
   RegQueryStringValue(HKLM64, BrandKey, 'PreviousHost', PreviousHost);
   RegQueryStringValue(HKLM64, BrandKey, 'PreviousManifest', PreviousManifest);
