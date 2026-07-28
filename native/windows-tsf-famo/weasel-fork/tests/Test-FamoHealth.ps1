@@ -43,6 +43,48 @@ function Same-Path {
     [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Invoke-ProfileTool {
+  param(
+    [Parameter(Mandatory)]
+    [string] $Path,
+    [Parameter(Mandatory)]
+    [string] $Argument
+  )
+
+  # FamoProfileTool is a Windows-subsystem executable. PowerShell does not wait
+  # for such applications when they are invoked directly, and rejects them in
+  # the middle of a pipeline. Use Process so health checks receive the real
+  # output and exit code without changing registration or input-method state.
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $Path
+  $startInfo.Arguments = $Argument
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  try {
+    if (-not $process.Start()) {
+      throw "Failed to start profile tool: $Path"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $output = @(
+      $stdoutTask.GetAwaiter().GetResult().Trim()
+      $stderrTask.GetAwaiter().GetResult().Trim()
+    ) | Where-Object { $_ }
+    return [pscustomobject]@{
+      ExitCode = $process.ExitCode
+      Output = ($output -join [Environment]::NewLine)
+    }
+  } finally {
+    $process.Dispose()
+  }
+}
+
 function Test-Manifest {
   param([string] $Target, [string] $Manifest)
   $problems = New-Object System.Collections.Generic.List[string]
@@ -164,8 +206,9 @@ $profileOutput = ''
 $profileExit = -1
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
   $profileCommand = if ($isPending) { 'check-absent' } else { 'check' }
-  $profileOutput = (& $profileTool $profileCommand 2>&1 | Out-String).Trim()
-  $profileExit = $LASTEXITCODE
+  $profileResult = Invoke-ProfileTool -Path $profileTool -Argument $profileCommand
+  $profileOutput = $profileResult.Output
+  $profileExit = $profileResult.ExitCode
 }
 Add-Check 'H5' 'S0' ($notInstalled -or $profileExit -eq 0) `
   $(if ($notInstalled) { 'TSF profile absent with clean uninstall' } else { "profile command=$profileCommand; exit=$profileExit; $profileOutput" })

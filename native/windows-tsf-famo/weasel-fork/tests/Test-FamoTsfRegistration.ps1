@@ -56,6 +56,48 @@ function Same-Path {
     [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Invoke-ProfileTool {
+  param(
+    [Parameter(Mandatory)]
+    [string] $Path,
+    [Parameter(Mandatory)]
+    [string] $Argument
+  )
+
+  # FamoProfileTool is a Windows-subsystem executable. PowerShell does not wait
+  # for such applications when they are invoked directly, and rejects them in
+  # the middle of a pipeline. Use Process so the audit receives the real output
+  # and exit code without changing registration or the active input method.
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $Path
+  $startInfo.Arguments = $Argument
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  try {
+    if (-not $process.Start()) {
+      throw "Failed to start profile tool: $Path"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $output = @(
+      $stdoutTask.GetAwaiter().GetResult().Trim()
+      $stderrTask.GetAwaiter().GetResult().Trim()
+    ) | Where-Object { $_ }
+    return [pscustomobject]@{
+      ExitCode = $process.ExitCode
+      Output = ($output -join [Environment]::NewLine)
+    }
+  } finally {
+    $process.Dispose()
+  }
+}
+
 $brandPresent = Test-Path -LiteralPath $brandKey
 $machineComPresent = Test-Path -LiteralPath $machineComKey
 $userComPresent = Test-Path -LiteralPath $userComKey
@@ -89,8 +131,9 @@ $profileOutput = ''
 $profileExit = -1
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
   $profileCommand = if ($isPending) { 'check-absent' } else { 'check' }
-  $profileOutput = (& $profileTool $profileCommand 2>&1 | Out-String).Trim()
-  $profileExit = $LASTEXITCODE
+  $profileResult = Invoke-ProfileTool -Path $profileTool -Argument $profileCommand
+  $profileOutput = $profileResult.Output
+  $profileExit = $profileResult.ExitCode
 }
 Add-Audit 'TSF-PROFILE' 'profile registration' ($notInstalled -or $profileExit -eq 0) `
   'FamoProfileTool verifies registry, Simplified Chinese profile, expected enabled state, and keyboard category.' `
@@ -99,8 +142,8 @@ Add-Audit 'TSF-PROFILE' 'profile registration' ($notInstalled -or $profileExit -
 
 $profileActive = $false
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
-  & $profileTool is-active *> $null
-  $profileActive = $LASTEXITCODE -eq 0
+  $activeResult = Invoke-ProfileTool -Path $profileTool -Argument 'is-active'
+  $profileActive = $activeResult.ExitCode -eq 0
 }
 $activeStateOk = $notInstalled -or -not $isPending -or -not $profileActive
 Add-Audit 'TSF-ACTIVE' 'current profile' $activeStateOk `

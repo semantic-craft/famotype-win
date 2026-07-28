@@ -1,3 +1,4 @@
+using Famo.Settings.Core;
 using Famo.Settings.Core.Clipboard;
 using Famo.Settings.Interop;
 using Famo.Settings.Theming;
@@ -163,6 +164,8 @@ public sealed class ClipboardPage : UserControl
     private static string Preview(string text)
     {
         string oneLine = text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ');
-        return oneLine.Length <= 140 ? oneLine : oneLine[..140] + "...";
+        return oneLine.Length <= 140
+            ? oneLine
+            : TextElementTruncator.Truncate(oneLine, 140) + "...";
     }
 }

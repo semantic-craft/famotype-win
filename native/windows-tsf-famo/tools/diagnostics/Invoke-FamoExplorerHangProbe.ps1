@@ -7,6 +7,7 @@ param(
   [ValidateRange(10, 1000)]
   [int] $PressureIntervalMs = 40,
   [string] $EvidenceDirectory = (Join-Path $env:LOCALAPPDATA 'Famo\diagnostics\explorer-hang-probes'),
+  [string] $FamoModulePath,
   [switch] $MonitorOnly,
   [switch] $GeneratePressure,
   [switch] $CaptureDumpOnHang,
@@ -81,6 +82,28 @@ function Resolve-ProbeVerdict {
   return 'green'
 }
 
+function Test-FamoModuleMatch {
+  param(
+    [object] $Module,
+    [string] $ExpectedPath
+  )
+
+  $expected = if ($ExpectedPath) { $ExpectedPath } else { 'FamoTextService.dll' }
+  $expectedLeaf = Split-Path -Leaf $expected
+  if ([string]$Module.name -ine $expectedLeaf) { return $false }
+  if (-not [System.IO.Path]::IsPathRooted($expected) -or -not [string]$Module.path) {
+    return $true
+  }
+  try {
+    return [string]::Equals(
+      [System.IO.Path]::GetFullPath([string]$Module.path),
+      [System.IO.Path]::GetFullPath($expected),
+      [System.StringComparison]::OrdinalIgnoreCase)
+  } catch {
+    return $false
+  }
+}
+
 function Invoke-SelfCheck {
   $missingOverride = Get-OptionalRegistryValue `
     -Path 'HKCU:\Control Panel\International\User Profile' `
@@ -91,6 +114,14 @@ function Invoke-SelfCheck {
     [pscustomobject]@{ Id = 2; SessionId = 1; StartTime = [datetime]'2026-01-02' },
     [pscustomobject]@{ Id = 1; SessionId = 1; StartTime = [datetime]'2026-01-01' }
   ) -SessionId 1
+  $currentModule = [pscustomobject]@{
+    name = 'FamoTextService.dll'
+    path = 'C:\Program Files\Famo\versions\fixture\FamoTextService.dll'
+  }
+  $legacyModule = [pscustomobject]@{
+    name = 'FamoTsf.dll'
+    path = 'C:\Program Files\Famo\FamoTsf.dll'
+  }
   $cases = @(
     @{ name = 'event-is-red'; expected = 'red'; actual = Resolve-ProbeVerdict 1 $false $false $true },
     @{ name = 'hang-restart-is-red'; expected = 'red'; actual = Resolve-ProbeVerdict 0 $true $true $true },
@@ -99,7 +130,9 @@ function Invoke-SelfCheck {
     @{ name = 'full-clean-run-is-green'; expected = 'green'; actual = Resolve-ProbeVerdict 0 $false $false $true },
     @{ name = 'missing-optional-registry-value-is-null'; expected = $true; actual = ($null -eq $missingOverride) },
     @{ name = 'boot-time-has-bounded-fallback'; expected = $true; actual = ($bootTime -is [datetime] -and $bootTime -lt (Get-Date).AddSeconds(-1)) },
-    @{ name = 'explorer-fallback-is-current-session-oldest'; expected = 1; actual = $fallbackExplorer.Id }
+    @{ name = 'explorer-fallback-is-current-session-oldest'; expected = 1; actual = $fallbackExplorer.Id },
+    @{ name = 'transactional-text-service-matches'; expected = $true; actual = (Test-FamoModuleMatch $currentModule $currentModule.path) },
+    @{ name = 'legacy-text-service-does-not-match'; expected = $false; actual = (Test-FamoModuleMatch $legacyModule $currentModule.path) }
   )
 
   $failures = @($cases | Where-Object { $_.actual -ne $_.expected })
@@ -117,6 +150,13 @@ if ($SelfCheck) { Invoke-SelfCheck }
 if ($MonitorOnly -and $GeneratePressure) {
   throw '-MonitorOnly and -GeneratePressure are mutually exclusive.'
 }
+if (-not $FamoModulePath) {
+  $registrationPath = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{54EAD76A-B864-4A6D-9C82-148E3352BEE7}\InProcServer32'
+  if (Test-Path -LiteralPath $registrationPath) {
+    $FamoModulePath = [string](Get-Item -LiteralPath $registrationPath).GetValue('')
+  }
+}
+if (-not $FamoModulePath) { $FamoModulePath = 'FamoTextService.dll' }
 
 function Initialize-NativeProbe {
   if ('FamoExplorerNativeProbe' -as [type]) { return }
@@ -314,7 +354,8 @@ function Save-HangDump {
 
 function Test-ProfileEvidence {
   param([string] $RunLabel, $InputState, $Explorer)
-  $hasFamo = @($Explorer.imeModules | Where-Object { $_.name -ieq 'FamoTsf.dll' }).Count -gt 0
+  $hasFamo = @($Explorer.imeModules |
+    Where-Object { Test-FamoModuleMatch $_ $FamoModulePath }).Count -gt 0
   if ($RunLabel -eq 'famo') {
     return [pscustomobject]@{ pass = ($InputState.defaultOverride -ieq $FamoTip -and $hasFamo); expectedTip = $FamoTip; famoModuleExpected = $true; famoModuleLoaded = $hasFamo }
   }

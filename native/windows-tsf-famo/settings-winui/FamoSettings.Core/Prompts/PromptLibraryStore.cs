@@ -1,5 +1,6 @@
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using Famo.Settings.Core;
 
 namespace Famo.Settings.Core.Prompts;
 
@@ -272,12 +273,14 @@ public sealed class PromptLibraryStore
     public static IReadOnlyList<PromptLibraryEntry> FilterAndSort(
         IEnumerable<PromptLibraryEntry> prompts,
         string? searchTerm = null,
-        string? categoryId = null)
+        string? categoryId = null,
+        bool includeDisabled = false)
     {
         string query = (searchTerm ?? string.Empty).Trim();
         string category = (categoryId ?? string.Empty).Trim();
 
-        IEnumerable<PromptLibraryEntry> filtered = prompts.Where(p => p.Enabled);
+        IEnumerable<PromptLibraryEntry> filtered =
+            includeDisabled ? prompts : prompts.Where(p => p.Enabled);
         if (!string.IsNullOrEmpty(category))
         {
             filtered = filtered.Where(p => string.Equals(p.CategoryId, category, StringComparison.Ordinal));
@@ -430,9 +433,7 @@ public sealed class PromptLibraryStore
                 .FirstOrDefault(line => line.Length > 0) ?? "未命名提示词";
         }
 
-        return clean.Length <= MaxGeneratedTitleLength
-            ? clean
-            : clean[..MaxGeneratedTitleLength];
+        return TextElementTruncator.Truncate(clean, MaxGeneratedTitleLength);
     }
 
     private static List<string> NormalizeTags(IEnumerable<string>? tags)

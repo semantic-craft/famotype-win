@@ -153,6 +153,34 @@ public sealed class AiChatClientTests : IDisposable
     }
 
     [Fact]
+    public async Task SendAsync_WhenMalformedErrorPreviewEndsInsideEmoji_DoesNotReturnUnpairedSurrogate()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile("sk-secret");
+        string malformed = new string('x', 159) + "😀tail";
+        var http = new HttpClient(new CaptureHandler(_ =>
+            new HttpResponseMessage(HttpStatusCode.BadGateway)
+            {
+                Content = new StringContent(malformed, Encoding.UTF8, "text/plain"),
+            }));
+        var client = new AiChatClient(settings, new AiProviderProfileStore(_file), _secrets, http);
+
+        InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => client.SendAsync("hello", CancellationToken.None));
+
+        for (int index = 0; index < ex.Message.Length; index++)
+        {
+            if (char.IsSurrogatePair(ex.Message, index))
+            {
+                index++;
+                continue;
+            }
+            Assert.False(char.IsSurrogate(ex.Message[index]));
+        }
+    }
+
+    [Fact]
     public async Task SendAsync_WithDoubaoSearch_GroundsDefaultModelAndReportsRoute()
     {
         FamoSettings settings = SettingsStore.CreateDefault();

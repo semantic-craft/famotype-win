@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Famo.Settings.Core;
 using Famo.Settings.Core.Insertion;
 using Famo.Settings.Core.Prompts;
 using Famo.Settings.Theming;
@@ -258,7 +259,8 @@ public sealed class PromptPickerWindow : Window
             });
             var box = new TextBox
             {
-                PlaceholderText = variable.DefaultValue ?? variable.Name,
+                Text = variable.DefaultValue ?? string.Empty,
+                PlaceholderText = variable.Name,
                 MinWidth = 320,
             };
             fields[variable.Name] = box;
@@ -293,7 +295,9 @@ public sealed class PromptPickerWindow : Window
     private static string Preview(string text)
     {
         string oneLine = text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ');
-        return oneLine.Length <= 220 ? oneLine : oneLine[..220] + "...";
+        return oneLine.Length <= 220
+            ? oneLine
+            : TextElementTruncator.Truncate(oneLine, 220) + "...";
     }
 
     private void HideWindow() => AppWindow.Hide();

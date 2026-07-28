@@ -368,7 +368,20 @@ public static class DeployService
             changed = QueueChanged;
         }
 
-        changed?.Invoke(snapshot);
+        if (changed is null) return;
+
+        foreach (Action<DeployQueueSnapshot> handler in changed.GetInvocationList())
+        {
+            try
+            {
+                handler(snapshot);
+            }
+            catch (Exception ex)
+            {
+                try { FailureLogger($"deploy queue observer failed: {ex.Message}"); }
+                catch { }
+            }
+        }
     }
 
     private static void RememberFailure(long requestId, string args, string? baseDirectory)

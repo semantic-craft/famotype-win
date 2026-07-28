@@ -406,6 +406,50 @@ public class DeployServiceTests
     }
 
     [Fact]
+    public void ReloadQueue_SubscriberExceptionDoesNotEscapeOrStallWorker()
+    {
+        ClearEnv();
+        string dir = Path.Combine(Path.GetTempPath(), $"famo-observer-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "FamoRuntime.exe"), "stub");
+        int processCalls = 0;
+        int healthyNotifications = 0;
+
+        using IDisposable reset = DeployService.UseProcessRunnerForTests((_, _) =>
+        {
+            Interlocked.Increment(ref processCalls);
+            return 0;
+        });
+        Action<DeployQueueSnapshot> broken = _ => throw new InvalidOperationException("observer boom");
+        Action<DeployQueueSnapshot> healthy = _ => Interlocked.Increment(ref healthyNotifications);
+
+        DeployService.QueueChanged += broken;
+        DeployService.QueueChanged += healthy;
+        try
+        {
+            ReloadResult result = default;
+            Exception? error = Record.Exception(() =>
+            {
+                result = DeployService.ReloadOptions(dir);
+            });
+
+            Assert.Null(error);
+            Assert.True(result.Started);
+            Assert.True(DeployService.WaitForIdleForTests(TimeSpan.FromSeconds(2)));
+            Assert.Equal(1, processCalls);
+            Assert.True(healthyNotifications >= 3);
+            Assert.Equal(DeployQueueStatus.Succeeded, DeployService.GetQueueSnapshot().Status);
+        }
+        finally
+        {
+            DeployService.QueueChanged -= broken;
+            DeployService.QueueChanged -= healthy;
+            ClearEnv();
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
     public void ReloadQueue_WhileRunning_CoalescesPerCommandKind()
     {
         ClearEnv();
