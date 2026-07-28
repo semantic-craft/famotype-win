@@ -88,22 +88,14 @@ public sealed class QuickPhrasesPage : UserControl
             return;
         }
 
-        if (_editingCode is null)
-        {
-            QuickPhraseEntry? existing = _store.Load().FirstOrDefault(e => e.Code == entry.Code);
-            if (existing != null)
-            {
-                SetStatus($"编码「{entry.Code}」已用于「{existing.Text}」，如需替换请先点该条目的编辑按钮再保存。");
-                return;
-            }
-        }
-
         try
         {
-            if (_editingCode is not null && !string.Equals(_editingCode, entry.Code, StringComparison.OrdinalIgnoreCase))
-                _store.Delete(_editingCode);
-            _store.Upsert(entry);
-            _store.WriteTableDb(FamoPaths.QuickSendTableFile);
+            _store.SaveEdit(entry, _editingCode, FamoPaths.QuickSendTableFile);
+        }
+        catch (InvalidDataException ex)
+        {
+            SetStatus("未保存改动：" + ex.Message);
+            return;
         }
         catch (Exception ex)
         {

@@ -31,6 +31,7 @@ public sealed class PromptLibraryPageContractTests
         Assert.Contains("ExportJson", page);
         Assert.Contains("App.ShowPromptPicker", page);
         Assert.Contains("App.ShowPromptSaveSelection", page);
+        Assert.Contains("includeDisabled: true", page);
         Assert.Contains("AcceptsReturn = true", page);
         Assert.Contains("不进入 Rime 热路径", page);
         Assert.Contains("不自动同步、不上传、不触发 AI 请求", page);
@@ -53,6 +54,7 @@ public sealed class PromptLibraryPageContractTests
         Assert.Contains("PromptLibraryStore", picker);
         Assert.Contains("PromptVariableParser.Extract", picker);
         Assert.Contains("PromptRenderer.Render", picker);
+        Assert.Contains("Text = variable.DefaultValue ?? string.Empty", picker);
         Assert.Contains("Variable", picker);
         Assert.Contains("ITextInsertionService", picker);
 

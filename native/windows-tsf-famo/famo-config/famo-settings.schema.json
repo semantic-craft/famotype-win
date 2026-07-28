@@ -379,6 +379,19 @@
           "x-famo-bucket": "local",
           "x-famo-target": { "file": "famo-settings.json", "key": "ai/cloudEnabled" }
         },
+        "askWebSearchEnabled": {
+          "description": "任意提问联网搜索开关，出厂关。只影响任意提问，不影响划词技能与输入候选。",
+          "type": "boolean",
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/askWebSearchEnabled" }
+        },
+        "webSearchBackend": {
+          "description": "独立搜索服务。doubao=豆包搜索 Global，perplexity=Perplexity Search。",
+          "type": "string",
+          "enum": ["doubao", "perplexity"],
+          "x-famo-bucket": "local",
+          "x-famo-target": { "file": "famo-settings.json", "key": "ai/webSearchBackend" }
+        },
         "selectionMenuEnabled": {
           "description": "划词菜单总开关，出厂开。false 时任意技能菜单项点击都必须提示已关闭，不再逐个检查具体技能开关。可选(向后兼容旧 store)。",
           "type": "boolean",

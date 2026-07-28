@@ -48,6 +48,7 @@ public sealed class KeyboardPage : UserControl
     private readonly FrameworkElement _doublePinyinRow;
     private readonly FrameworkElement _wubiSchemeRow;
     private readonly Border _wubiCard;
+    private readonly Border _fuzzyCard;
     private readonly TextBlock _applyStatus;
 
     public KeyboardPage()
@@ -101,7 +102,7 @@ public sealed class KeyboardPage : UserControl
         sp.Children.Add(_wubiCard);
 
         var fz = E.FuzzyPinyin;
-        sp.Children.Add(FamoUI.Card("模糊拼音",
+        _fuzzyCard = FamoUI.Card("模糊拼音",
             FuzzyRow("zh = z", "翘舌不分", fz.ZhZ, v => { fz.ZhZ = v; ApplyDeploy(); }, divider: false),
             FuzzyRow("ch = c", "翘舌不分", fz.ChC, v => { fz.ChC = v; ApplyDeploy(); }),
             FuzzyRow("sh = s", "翘舌不分", fz.ShS, v => { fz.ShS = v; ApplyDeploy(); }),
@@ -110,7 +111,8 @@ public sealed class KeyboardPage : UserControl
             FuzzyRow("f = h", "声母混淆（双向）", fz.FH, v => { fz.FH = v; ApplyDeploy(); }),
             FuzzyRow("an = ang", "前后鼻音不分（双向）", fz.AnAng, v => { fz.AnAng = v; ApplyDeploy(); }),
             FuzzyRow("en = eng", "前后鼻音不分（双向）", fz.EnEng, v => { fz.EnEng = v; ApplyDeploy(); }),
-            FuzzyRow("in = ing", "前后鼻音不分（双向）", fz.InIng, v => { fz.InIng = v; ApplyDeploy(); })));
+            FuzzyRow("in = ing", "前后鼻音不分（双向）", fz.InIng, v => { fz.InIng = v; ApplyDeploy(); }));
+        sp.Children.Add(_fuzzyCard);
 
         sp.Children.Add(FamoUI.Card("符号",
             FamoUI.Row("中文下使用英文标点", "开=输入英文标点（, . ?），关=中文标点（，。？）。",
@@ -302,6 +304,7 @@ public sealed class KeyboardPage : UserControl
         _doublePinyinRow.Visibility = M.Method == "double_pinyin" ? Visibility.Visible : Visibility.Collapsed;
         _wubiSchemeRow.Visibility = M.Method == "wubi" ? Visibility.Visible : Visibility.Collapsed;
         _wubiCard.Visibility = M.Method == "wubi" ? Visibility.Visible : Visibility.Collapsed;
+        _fuzzyCard.Visibility = M.Method == "pinyin" ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private static Grid FuzzyRow(string title, string desc, bool on, Action<bool> changed, bool divider = true)

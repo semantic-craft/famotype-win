@@ -33,9 +33,12 @@
 #include <cstddef>  // offsetof — FamoSkin size negotiation for caret_width
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
+#include "../famo_candidate_access.h"
+#include "../famo_c_abi_boundary.h"
 #include "../famo_candidate_ui.h"
 
 #ifdef FAMO_CANDIDATE_UI_BENCHMARK_COUNTERS
@@ -57,9 +60,6 @@ struct FamoTextResources {
   ComPtr<ID2D1Factory> d2d;
   ComPtr<IDWriteFactory> dwrite;
   ComPtr<IDWriteTextFormat> fmt[3];  // 0=label 1=text 2=comment
-  // Dotted rule under the converting preedit segment. Factory-owned, so unlike
-  // the target/brush below it survives FamoTextResourcesDiscardDeviceResources.
-  ComPtr<ID2D1StrokeStyle> dot_style;
   // Device resources, not cached scene content: BindDC retargets them each frame.
   ComPtr<ID2D1DCRenderTarget> text_target;
   ComPtr<ID2D1SolidColorBrush> text_brush;
@@ -174,6 +174,62 @@ void CompositePremultiplied(uint32_t* target, int target_stride,
 inline bool Opaque(uint32_t argb) { return (argb >> 24) != 0u; }  // alpha != 0
 inline bool RectEmpty2(const FamoRect& r) {
   return r.right <= r.left || r.bottom <= r.top;
+}
+
+bool SkinResourceInputsValid(const FamoSkin* skin) {
+  if (!skin || skin->size < offsetof(FamoSkin, caret_width)) return false;
+  return std::memchr(skin->label_font.face, '\0', FAMO_FONT_FACE_MAX) &&
+         std::memchr(skin->text_font.face, '\0', FAMO_FONT_FACE_MAX) &&
+         std::memchr(skin->comment_font.face, '\0', FAMO_FONT_FACE_MAX);
+}
+
+bool CandidatePaintInputsValid(const FamoCompositionView* view,
+                               const FamoSkin* skin,
+                               const FamoLayoutInput* input,
+                               const FamoLayoutResult* layout) {
+  if (view->size < offsetof(FamoCompositionView, preedit_sel_start) ||
+      skin->size < offsetof(FamoSkin, caret_width) ||
+      input->size < offsetof(FamoLayoutInput, preview_candidates) ||
+      layout->size <
+          offsetof(FamoLayoutResult, flipped) + sizeof(layout->flipped))
+    return false;
+  if (!famo_candidate_ui::ReadableUtf8(view->preedit) ||
+      !famo_candidate_ui::ReadableUtf8(input->aux) ||
+      layout->candidate_count > FAMO_MAX_LAID_CANDIDATES ||
+      layout->candidate_count > view->candidate_count ||
+      (view->candidate_count > 0 && !view->candidates))
+    return false;
+
+  for (uint32_t i = 0; i < layout->candidate_count; ++i) {
+    FamoCandidate candidate{};
+    if (!famo_candidate_ui::ReadCandidate(
+            view->candidates, view->candidate_count, i, &candidate) ||
+        !famo_candidate_ui::ReadableCandidate(candidate))
+      return false;
+  }
+
+  const bool has_preview_fields =
+      input->size >= offsetof(FamoLayoutInput, preview_page_size) +
+                         sizeof(input->preview_page_size);
+  if (has_preview_fields && input->preview_candidate_count > 0 &&
+      !input->preview_candidates)
+    return false;
+  if (layout->preview_candidate_count > FAMO_MAX_PREVIEW_CANDIDATES)
+    return false;
+  if (layout->preview_candidate_count > 0) {
+    if (!has_preview_fields || !input->preview_candidates ||
+        layout->preview_candidate_count > input->preview_candidate_count)
+      return false;
+    for (uint32_t i = 0; i < layout->preview_candidate_count; ++i) {
+      FamoCandidate candidate{};
+      if (!famo_candidate_ui::ReadCandidate(
+              input->preview_candidates, input->preview_candidate_count, i,
+              &candidate) ||
+          !famo_candidate_ui::ReadableCandidate(candidate))
+        return false;
+    }
+  }
+  return true;
 }
 
 // Skin metric (logical px @96) → device px, dpi/96 round-to-nearest (matches the
@@ -311,7 +367,6 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
   const int border_dev = Scale(skin->border, dpi);
   const bool vertical = skin->layout_type == FAMO_LAYOUT_VERTICAL_TEXT;
   const bool vertical_list = skin->layout_type != FAMO_LAYOUT_HORIZONTAL;
-  const bool mist = (skin->back_color >> 24) < 0xffu;
 
   // Drop-shadow margin: content is drawn at (sm,sm); the buffer is content+2*sm
   // (host sizes the DIB to match) with the gaussian shadow in the ring. sm==0 → no
@@ -319,6 +374,8 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
   const int sm = layout->shadow_margin > 0 ? layout->shadow_margin : 0;
   const int fcx = cx + 2 * sm;
   const int fcy = cy + 2 * sm;
+  if (ds.dsBm.bmWidth != fcx || ds.dsBm.bmHeight != fcy)
+    return FAMO_UI_E_INVALID_ARGUMENT;
   const float sm_f = static_cast<float>(sm);
 
   // ── 1. GDI+ shapes into the DC's premultiplied buffer ───────────────────────
@@ -386,22 +443,29 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
       Gdiplus::SolidBrush brush(ToGdiColor(skin->back_color));
       g.FillPath(&brush, &path);
     }
-    if (mist) {
+    // Derive the band → list hairline from stable layout fields. The public
+    // output has no caller-capacity parameter, so carrying an appended rect
+    // there would make a current Layout overwrite an older caller's buffer.
+    const int32_t band_bottom =
+        (std::max)(layout->preedit.bottom, layout->aux.bottom);
+    FamoRect separator{};
+    if (band_bottom > 0 && layout->candidate_count > 0) {
+      const int32_t list_top = layout->candidates[0].bounds.top;
+      if (list_top > band_bottom) {
+        const int32_t top = band_bottom + (list_top - band_bottom) / 2;
+        separator = {0, top, cx, top + (std::max)(1, Scale(1, dpi))};
+      }
+    }
+    // Clip to the panel path so the full-bleed rule cannot poke out of a large
+    // corner radius on a short panel.
+    if (!RectEmpty2(separator) && Opaque(skin->border_color)) {
+      const FamoRect& s = separator;
       Gdiplus::GraphicsPath panel;
       AddRoundRect(panel, 0, 0, cx, cy, rc_dev);
-      const uint32_t rgb = skin->back_color & 0x00ffffffu;
-      const int luminance =
-          ((rgb >> 16) & 0xff) * 3 + ((rgb >> 8) & 0xff) * 6 + (rgb & 0xff);
-      const BYTE top_alpha = luminance < 1280 ? 20 : 77;
-      const int sheen_h = (std::max)(1, cy / 4);
-      Gdiplus::LinearGradientBrush sheen(
-          Gdiplus::Rect(0, 0, cx, sheen_h),
-          Gdiplus::Color(top_alpha, 255, 255, 255),
-          Gdiplus::Color(0, 255, 255, 255),
-          Gdiplus::LinearGradientModeVertical);
+      Gdiplus::SolidBrush brush(ToGdiColor(skin->border_color));
       const Gdiplus::GraphicsState saved = g.Save();
       g.SetClip(&panel);
-      g.FillRectangle(&sheen, 0, 0, cx, sheen_h);
+      g.FillRectangle(&brush, s.left, s.top, s.right - s.left, s.bottom - s.top);
       g.Restore(saved);
     }
     if (!RectEmpty2(layout->highlight) && Opaque(skin->hilited_back_color)) {
@@ -469,6 +533,47 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
         if (se > pw.size()) se = static_cast<uint32_t>(pw.size());
         if (ss > se) ss = se;
         const FamoRect& pr = layout->preedit;
+        // The converting segment is marked with a soft tint block BEHIND the
+        // glyphs, not a rule under them. Drawn before the run so the text sits on
+        // top; the run itself is one colour, so no glyph splitting is needed.
+        //
+        // This replaces a dotted ink rule (TSF ATTR_INPUT / TF_LS_DOT). That rule
+        // had to disable antialiasing to keep its dots from smearing, which at
+        // high DPI reads as a row of grit, and it now stacked as a second
+        // horizontal line 6px above the band separator. A block is also the same
+        // shape language as the selection pill below it, so the two read as one
+        // hierarchy.
+        //
+        // 10% is deliberate. An earlier SOLID accent block behind the preedit was
+        // removed because a third saturated use of the accent in one panel read as
+        // a spell-check error; at a tenth of that it is a wash, and the panel's
+        // saturated accent stays reserved for the pill and the caret — which
+        // check_soft_cursor still asserts pixel-wise.
+        if (!vertical && se > ss && !RectEmpty2(pr)) {
+          const int32_t before = MeasureW(res->dwrite.Get(), fText, pw.c_str(), ss);
+          const int32_t active =
+              MeasureW(res->dwrite.Get(), fText, pw.c_str() + ss, se - ss);
+          if (active > 0) {
+            rt->SetTransform(D2D1::Matrix3x2F::Translation(sm_f, sm_f));
+            const float pad_x = static_cast<float>(Scale(3, dpi));
+            const float pad_y = static_cast<float>(Scale(2, dpi));
+            const float radius = static_cast<float>(Scale(5, dpi));
+            D2D1_COLOR_F tint = ToColorF(Opaque(skin->hilited_back_color)
+                                             ? skin->hilited_back_color
+                                             : skin->text_color);
+            tint.a *= 0.10f;
+            brush->SetColor(tint);
+            rt->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(
+                        static_cast<float>(pr.left + before) - pad_x,
+                        static_cast<float>(pr.top) - pad_y,
+                        static_cast<float>(pr.left + before + active) + pad_x,
+                        static_cast<float>(pr.bottom) + pad_y),
+                    radius, radius),
+                brush);
+          }
+        }
         brush->SetColor(ToColorF(skin->text_color));
         DrawRun(rt, fText, brush, pw.c_str(),
                 static_cast<uint32_t>(pw.size()), pr, vertical, sm_f, sm_f);
@@ -477,41 +582,6 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
           const uint32_t accent = Opaque(skin->hilited_back_color)
                                       ? skin->hilited_back_color
                                       : skin->text_color;
-          if (se > ss) {
-            const int32_t before = MeasureW(res->dwrite.Get(), fText, pw.c_str(), ss);
-            const int32_t active =
-                MeasureW(res->dwrite.Get(), fText, pw.c_str() + ss, se - ss);
-            const float line = static_cast<float>((std::max)(1, Scale(1, dpi)));
-            if (!res->dot_style) {
-              // Round dash caps are load-bearing: D2D's DOT pattern is a
-              // zero-length dash, which paints nothing until a cap rounds it out.
-              D2D1_STROKE_STYLE_PROPERTIES sp = D2D1::StrokeStyleProperties();
-              sp.dashStyle = D2D1_DASH_STYLE_DOT;
-              sp.startCap = sp.endCap = sp.dashCap = D2D1_CAP_STYLE_ROUND;
-              res->d2d->CreateStrokeStyle(sp, nullptr, 0, &res->dot_style);
-            }
-            // Ink at 55%, not the accent: this mark means "provisional", while the
-            // accent is reserved for where the commit lands (the pill, the caret).
-            // Dotted-thin is also what both platforms spec for unconverted input —
-            // TSF ATTR_INPUT is TF_LS_DOT, and the Mac panel draws the same rule
-            // (FamoCandidatePanelView `.underline(pattern: .dot, ink2 @ 0.55)`).
-            D2D1_COLOR_F ink = ToColorF(skin->text_color);
-            ink.a *= 0.55f;
-            brush->SetColor(ink);
-            // Stroke is centred on y, so pull back half a line to sit in the last
-            // row. A null dot_style (creation failed) degrades to solid, not a crash.
-            const float y = static_cast<float>(pr.bottom) - line * 0.5f;
-            // ALIASED for the stroke only: antialiasing a 1px dot pattern spreads
-            // every dot across its gaps, collapsing the rule into a flat ~13% wash
-            // (measured) — dots on paper, a smear on screen. Restored right after,
-            // because the caret's rounded caps below DO need the coverage.
-            rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-            rt->DrawLine(
-                D2D1::Point2F(static_cast<float>(pr.left + before), y),
-                D2D1::Point2F(static_cast<float>(pr.left + before + active), y),
-                brush, line, res->dot_style.Get());
-            rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-          }
           uint32_t cursor = layout->preedit_cursor_wchar;
           if (cursor > pw.size()) cursor = static_cast<uint32_t>(pw.size());
           int32_t x = pr.left + MeasureW(res->dwrite.Get(), fText, pw.c_str(), cursor);
@@ -552,7 +622,11 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
       // candidates
       const uint32_t n = layout->candidate_count;
       for (uint32_t i = 0; i < n && view->candidates; ++i) {
-        const FamoCandidate& cand = view->candidates[i];
+        FamoCandidate cand{};
+        if (!famo_candidate_ui::ReadCandidate(
+                view->candidates, view->candidate_count, i, &cand) ||
+            !famo_candidate_ui::ReadableCandidate(cand))
+          return FAMO_UI_E_INVALID_ARGUMENT;
         const FamoCandidateRects& r = layout->candidates[i];
         const bool hl = (i == view->highlighted_index);
         if (!RectEmpty2(r.label) && Opaque(skin->label_color)) {
@@ -591,10 +665,16 @@ int32_t PaintImpl(const FamoCompositionView* view, const FamoSkin* skin,
             layout->preview_candidate_count,
             static_cast<uint32_t>(FAMO_MAX_PREVIEW_CANDIDATES));
         for (uint32_t i = 0; i < preview_count; ++i) {
+          FamoCandidate candidate{};
+          if (!famo_candidate_ui::ReadCandidate(
+                  input->preview_candidates, input->preview_candidate_count, i,
+                  &candidate) ||
+              !famo_candidate_ui::ReadableCandidate(candidate))
+            return FAMO_UI_E_INVALID_ARGUMENT;
           D2D1_COLOR_F color = ToColorF(skin->candidate_text_color);
           color.a *= 0.75f;
           brush->SetColor(color);
-          DrawUtf8(rt, fText, brush, input->preview_candidates[i].text,
+          DrawUtf8(rt, fText, brush, candidate.text,
                    layout->preview_candidates[i].text, false, sm_f, sm_f);
         }
       }
@@ -739,6 +819,8 @@ int32_t StatusBarPaintImpl(const FamoStatusBarSpec* spec, const FamoSkin* skin,
       ds.dsBm.bmBitsPixel != 32 || !ds.dsBm.bmBits) {
     return FAMO_UI_E_INVALID_ARGUMENT;  // needs a 32-bit top-down DIB section
   }
+  if (ds.dsBm.bmWidth != cx || ds.dsBm.bmHeight != cy)
+    return FAMO_UI_E_INVALID_ARGUMENT;
   const uint32_t dpi = spec->dpi ? spec->dpi : 96u;
   const int32_t rc_dev = Scale(skin->round_corner, dpi);
   const float panel_r = static_cast<float>(rc_dev);
@@ -852,37 +934,37 @@ int32_t StatusBarPaintImpl(const FamoStatusBarSpec* spec, const FamoSkin* skin,
   return FAMO_UI_E_PAINT_FAILED;  // no C++ exception escapes the paint (R6)
 }
 
-}  // namespace
-
-// ── FamoTextResources lifecycle + measurement callback ───────────────────────
-extern "C" FamoTextResources* FamoTextResourcesCreate(const FamoSkin* skin,
-                                                       uint32_t dpi) {
-  if (!skin) return nullptr;
-  FamoTextResources* res = new (std::nothrow) FamoTextResources();
-  if (!res) return nullptr;
-
-  Gdiplus::GdiplusStartupInput gsi;
-  if (Gdiplus::GdiplusStartup(&res->gdiplus_token, &gsi, nullptr) != Gdiplus::Ok) {
-    delete res;
-    return nullptr;
-  }
-  if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                               res->d2d.GetAddressOf())) ||
-      FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                                 reinterpret_cast<IUnknown**>(res->dwrite.GetAddressOf())))) {
-    ULONG_PTR tok = res->gdiplus_token;
-    delete res;
-    Gdiplus::GdiplusShutdown(tok);
-    return nullptr;
-  }
-  FamoTextResourcesReconfigure(res, skin, dpi);
-  return res;
+bool ResourceFailureIs(const char* phase) noexcept {
+  char value[32]{};
+  const DWORD length = GetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", value,
+      static_cast<DWORD>(std::size(value)));
+  return length > 0 && length < std::size(value) &&
+         std::strcmp(value, phase) == 0;
 }
 
-extern "C" int32_t FamoTextResourcesReconfigure(FamoTextResources* res,
-                                                  const FamoSkin* skin,
-                                                  uint32_t dpi) {
-  if (!res || !skin || !res->dwrite) return FAMO_UI_E_INVALID_ARGUMENT;
+void TextResourcesDiscardImpl(FamoTextResources* res) {
+  if (!res) return;
+  res->text_brush.Reset();
+  res->text_target.Reset();
+}
+
+void TextResourcesDestroyImpl(FamoTextResources* res) {
+  if (!res) return;
+  const ULONG_PTR token = res->gdiplus_token;
+  ReleaseTextSurface(res);
+  delete res;  // releases the D2D/DWrite ComPtrs
+  if (token)
+    Gdiplus::GdiplusShutdown(token);
+}
+
+int32_t TextResourcesReconfigureImpl(FamoTextResources* res,
+                                     const FamoSkin* skin,
+                                     uint32_t dpi) {
+  if (!res || !SkinResourceInputsValid(skin) || !res->dwrite)
+    return FAMO_UI_E_INVALID_ARGUMENT;
+  if (ResourceFailureIs("reconfigure"))
+    throw std::bad_alloc();
   if (dpi == 0) dpi = 96;
   ComPtr<IDWriteTextFormat> formats[3];
   const FamoFontSpec* specs[3] = {&skin->label_font, &skin->text_font,
@@ -897,76 +979,208 @@ extern "C" int32_t FamoTextResourcesReconfigure(FamoTextResources* res,
   return FAMO_UI_OK;
 }
 
-extern "C" void FamoTextResourcesDiscardDeviceResources(
-    FamoTextResources* res) {
-  if (!res) return;
-  res->text_brush.Reset();
-  res->text_target.Reset();
+FamoTextResources* TextResourcesCreateCpp(const FamoSkin* skin,
+                                          uint32_t dpi) noexcept {
+  FamoTextResources* resources = nullptr;
+  try {
+    if (!SkinResourceInputsValid(skin))
+      return nullptr;
+    if (ResourceFailureIs("create"))
+      throw std::bad_alloc();
+    resources = new FamoTextResources();
+
+    Gdiplus::GdiplusStartupInput startup;
+    if (Gdiplus::GdiplusStartup(
+            &resources->gdiplus_token, &startup, nullptr) != Gdiplus::Ok) {
+      TextResourcesDestroyImpl(resources);
+      return nullptr;
+    }
+    if (FAILED(D2D1CreateFactory(
+            D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            resources->d2d.GetAddressOf())) ||
+        FAILED(DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(
+                resources->dwrite.GetAddressOf()))) ||
+        TextResourcesReconfigureImpl(resources, skin, dpi) != FAMO_UI_OK) {
+      TextResourcesDestroyImpl(resources);
+      return nullptr;
+    }
+    return resources;
+  } catch (...) {
+    TextResourcesDestroyImpl(resources);
+    return nullptr;
+  }
 }
 
-extern "C" void FamoTextResourcesDestroy(FamoTextResources* res) {
-  if (!res) return;
-  ULONG_PTR tok = res->gdiplus_token;
-  ReleaseTextSurface(res);
-  delete res;  // releases the D2D/DWrite ComPtrs
-  Gdiplus::GdiplusShutdown(tok);
+int32_t TextResourcesReconfigureCpp(FamoTextResources* resources,
+                                    const FamoSkin* skin,
+                                    uint32_t dpi) noexcept {
+  try {
+    return TextResourcesReconfigureImpl(resources, skin, dpi);
+  } catch (...) {
+    return FAMO_UI_E_PAINT_FAILED;
+  }
 }
 
-extern "C" int32_t FamoTextMeasure(void* user, int32_t which, const char* utf8,
-                                   uint32_t utf8_len) {
-  FamoTextResources* res = static_cast<FamoTextResources*>(user);
-  if (!res || which < 0 || which > 2 || !utf8 || utf8_len == 0) return 0;
-  IDWriteTextFormat* fmt = res->fmt[which].Get();
-  if (!fmt) return 0;
-  std::wstring w = Widen(utf8, utf8_len);
-  if (w.empty()) return 0;
-  ComPtr<IDWriteTextLayout> tl;
-  if (FAILED(res->dwrite->CreateTextLayout(w.c_str(), static_cast<UINT32>(w.size()),
-                                           fmt, 1e6f, 1e6f, &tl)))
+void TextResourcesDiscardCpp(FamoTextResources* resources) noexcept {
+  try {
+    TextResourcesDiscardImpl(resources);
+  } catch (...) {
+  }
+}
+
+void TextResourcesDestroyCpp(FamoTextResources* resources) noexcept {
+  try {
+    TextResourcesDestroyImpl(resources);
+  } catch (...) {
+  }
+}
+
+int32_t TextMeasureCpp(void* user, int32_t which, const char* utf8,
+                       uint32_t utf8_len) noexcept {
+  try {
+    if (ResourceFailureIs("measure"))
+      throw std::bad_alloc();
+    auto* resources = static_cast<FamoTextResources*>(user);
+    if (!resources || which < 0 || which > 2 || !utf8 || utf8_len == 0)
+      return 0;
+    IDWriteTextFormat* format = resources->fmt[which].Get();
+    if (!format)
+      return 0;
+    std::wstring wide = Widen(utf8, utf8_len);
+    if (wide.empty())
+      return 0;
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(resources->dwrite->CreateTextLayout(
+            wide.c_str(), static_cast<UINT32>(wide.size()), format,
+            1e6f, 1e6f, &layout)))
+      return 0;
+    FAMO_BENCHMARK_COUNT(text_layout);
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(layout->GetMetrics(&metrics)))
+      return 0;
+    return static_cast<int32_t>(
+        metrics.widthIncludingTrailingWhitespace + 0.5f);
+  } catch (...) {
     return 0;
-  FAMO_BENCHMARK_COUNT(text_layout);
-  DWRITE_TEXT_METRICS tm = {};
-  if (FAILED(tl->GetMetrics(&tm))) return 0;
-  return static_cast<int32_t>(tm.widthIncludingTrailingWhitespace + 0.5f);
+  }
 }
 
 #ifdef FAMO_CANDIDATE_UI_BENCHMARK_COUNTERS
-extern "C" void FamoBenchmarkRenderCountersReset() {
-  g_benchmark_counters = {};
+void BenchmarkCountersResetCpp() noexcept {
+  try {
+    g_benchmark_counters = {};
+  } catch (...) {
+  }
 }
 
-extern "C" FamoBenchmarkRenderCounters FamoBenchmarkRenderCountersSnapshot() {
-  return g_benchmark_counters;
+FamoBenchmarkRenderCounters BenchmarkCountersSnapshotCpp() noexcept {
+  try {
+    return g_benchmark_counters;
+  } catch (...) {
+    return {};
+  }
+}
+#endif
+
+int32_t CandidateUiPaintCpp(const FamoCompositionView* view,
+                            const FamoSkin* skin,
+                            const FamoLayoutInput* input,
+                            const FamoLayoutResult* layout,
+                            FamoTextResources* resources,
+                            void* memory_dc) noexcept {
+  try {
+    if (!view || !skin || !input || !layout || !resources || !memory_dc)
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    if (!CandidatePaintInputsValid(view, skin, input, layout))
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    return PaintImpl(view, skin, input, layout, resources,
+                     static_cast<HDC>(memory_dc));
+  } catch (...) {
+    return FAMO_UI_E_PAINT_FAILED;
+  }
+}
+
+int32_t StatusBarPaintCpp(const FamoStatusBarSpec* spec,
+                          const FamoSkin* skin,
+                          FamoTextResources* resources,
+                          void* memory_dc) noexcept {
+  try {
+    if (!spec || !skin || !resources || !memory_dc)
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    if (spec->size < sizeof(FamoStatusBarSpec) ||
+        skin->size < offsetof(FamoSkin, caret_width) ||
+        (spec->button_count > 0 && !spec->buttons))
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    return StatusBarPaintImpl(
+        spec, skin, resources, static_cast<HDC>(memory_dc));
+  } catch (...) {
+    return FAMO_UI_E_PAINT_FAILED;
+  }
+}
+
+}  // namespace
+
+// ── FamoTextResources lifecycle + measurement callback ───────────────────────
+extern "C" FamoTextResources* FamoTextResourcesCreate(
+    const FamoSkin* skin, uint32_t dpi) noexcept {
+  FAMO_C_ABI_SEH_RETURN(TextResourcesCreateCpp(skin, dpi), nullptr);
+}
+
+extern "C" int32_t FamoTextResourcesReconfigure(
+    FamoTextResources* resources, const FamoSkin* skin,
+    uint32_t dpi) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      TextResourcesReconfigureCpp(resources, skin, dpi),
+      FAMO_UI_E_PAINT_FAILED);
+}
+
+extern "C" void FamoTextResourcesDiscardDeviceResources(
+    FamoTextResources* resources) noexcept {
+  FAMO_C_ABI_SEH_VOID(TextResourcesDiscardCpp(resources));
+}
+
+extern "C" void FamoTextResourcesDestroy(
+    FamoTextResources* resources) noexcept {
+  FAMO_C_ABI_SEH_VOID(TextResourcesDestroyCpp(resources));
+}
+
+extern "C" int32_t FamoTextMeasure(
+    void* user, int32_t which, const char* utf8,
+    uint32_t utf8_len) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      TextMeasureCpp(user, which, utf8, utf8_len), 0);
+}
+
+#ifdef FAMO_CANDIDATE_UI_BENCHMARK_COUNTERS
+extern "C" void FamoBenchmarkRenderCountersReset() noexcept {
+  FAMO_C_ABI_SEH_VOID(BenchmarkCountersResetCpp());
+}
+
+extern "C" FamoBenchmarkRenderCounters
+FamoBenchmarkRenderCountersSnapshot() noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      BenchmarkCountersSnapshotCpp(), FamoBenchmarkRenderCounters{});
 }
 #endif
 
 // ── Paint entry point: SEH-wraps PaintImpl so a hard fault can't drop a key ────
-extern "C" int32_t FamoCandidateUiPaint(const FamoCompositionView* view,
-                                        const FamoSkin* skin,
-                                        const FamoLayoutInput* input,
-                                        const FamoLayoutResult* layout,
-                                        FamoTextResources* res, void* mem_dc) {
-  if (!view || !skin || !input || !layout || !res || !mem_dc)
-    return FAMO_UI_E_INVALID_ARGUMENT;
-  // This frame has no unwinding locals → legal to guard with SEH; PaintImpl holds
-  // the C++ objects and catches C++ exceptions itself. __except only sees hard
-  // faults (e.g. a bogus DC), so a paint crash degrades to a hidden popup, never
-  // a dropped keystroke or corrupted session (design §6 crash isolation, R6).
-  __try {
-    return PaintImpl(view, skin, input, layout, res, static_cast<HDC>(mem_dc));
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return FAMO_UI_E_PAINT_FAILED;
-  }
+extern "C" int32_t FamoCandidateUiPaint(
+    const FamoCompositionView* view, const FamoSkin* skin,
+    const FamoLayoutInput* input, const FamoLayoutResult* layout,
+    FamoTextResources* resources, void* memory_dc) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      CandidateUiPaintCpp(
+          view, skin, input, layout, resources, memory_dc),
+      FAMO_UI_E_PAINT_FAILED);
 }
 
 // ── Status bar paint entry point: same SEH contract as the candidate paint ────
-extern "C" int32_t FamoStatusBarPaint(const FamoStatusBarSpec* spec,
-                                      const FamoSkin* skin,
-                                      FamoTextResources* res, void* mem_dc) {
-  if (!spec || !skin || !res || !mem_dc) return FAMO_UI_E_INVALID_ARGUMENT;
-  __try {
-    return StatusBarPaintImpl(spec, skin, res, static_cast<HDC>(mem_dc));
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return FAMO_UI_E_PAINT_FAILED;
-  }
+extern "C" int32_t FamoStatusBarPaint(
+    const FamoStatusBarSpec* spec, const FamoSkin* skin,
+    FamoTextResources* resources, void* memory_dc) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      StatusBarPaintCpp(spec, skin, resources, memory_dc),
+      FAMO_UI_E_PAINT_FAILED);
 }

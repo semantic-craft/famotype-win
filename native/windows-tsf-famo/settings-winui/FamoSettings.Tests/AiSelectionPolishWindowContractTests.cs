@@ -28,18 +28,42 @@ public sealed class AiSelectionPolishWindowContractTests
     }
 
     [Fact]
-    public void Toolbox_RoutesEveryConcreteActionToItsIndependentWindow()
+    public void Toolbox_KeepsTranslationAndResearchInlineButRoutesOtherSkillsToIndependentWindows()
     {
         string toolbox = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AiConversationWindow.cs"));
         string app = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/App.xaml.cs"));
 
         Assert.Contains("Grid.SetRow", toolbox);
         Assert.Contains("Grid.SetColumn", toolbox);
-        Assert.Contains("App.ShowAiSelectionSkill(skill, _selectedText!, _replacement)", toolbox);
-        Assert.DoesNotContain("RunToolboxSkillAsync", toolbox);
+        Assert.Contains("skill.Id is \"translation\" or \"research-assist\"", toolbox);
+        Assert.Contains("RunToolboxSkillAsync", toolbox);
+        Assert.Contains("_turns.Add", toolbox);
+        Assert.Contains("可继续追问或选择其他技能", toolbox);
+        Assert.Contains("App.ShowAiSelectionSkill(skill, _selectedText!, _replacement, _focusTarget)", toolbox);
+        Assert.Contains("Close();", toolbox);
         Assert.Contains("任意提问", toolbox);
         Assert.Contains("ShowCapturedAiSelectionSkillAsync", app);
         Assert.Contains("LoadCapturedSelection", app);
+    }
+
+    [Fact]
+    public void SelectionWindows_RestoreOnlyTheCapturedLiveHost()
+    {
+        string app = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/App.xaml.cs"));
+        string toolbox = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AiConversationWindow.cs"));
+        string skill = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AiSelectionPolishWindow.cs"));
+        string target = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings.Core/Insertion/WindowsForegroundWindowTarget.cs"));
+
+        int selectionFlow = app.IndexOf("ShowAiConversationForSelectionAsync", StringComparison.Ordinal);
+        int captureTarget = app.IndexOf("WindowsForegroundWindowTarget.CaptureForeground()", selectionFlow, StringComparison.Ordinal);
+        int clipboardFallback = app.IndexOf("CaptureSelectionForReplacementAsync()", selectionFlow, StringComparison.Ordinal);
+        Assert.True(captureTarget >= 0 && captureTarget < clipboardFallback);
+        Assert.Contains("Closed += (_, _) => _focusTarget?.TryRestore()", toolbox);
+        Assert.Contains("Closed += (_, _) => _focusTarget?.TryRestore()", skill);
+        Assert.Contains("GetWindowThreadProcessId", target);
+        Assert.Contains("process.StartTime", target);
+        Assert.Contains("GetClassNameW", target);
+        Assert.Contains("IsStillValid() && SetForegroundWindow", target);
     }
 
     [Fact]

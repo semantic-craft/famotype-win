@@ -17,7 +17,10 @@
 #include "../engine-api/famo_engine_api.h"  // FamoCompositionView (neutral input)
 
 #ifdef __cplusplus
+#define FAMO_CANDIDATE_UI_NOEXCEPT noexcept
 extern "C" {
+#else
+#define FAMO_CANDIDATE_UI_NOEXCEPT
 #endif
 
 #define FAMO_CANDIDATE_UI_VERSION 1u
@@ -26,7 +29,8 @@ typedef enum FamoCandidateUiResult {
   FAMO_UI_OK = 0,
   FAMO_UI_E_INVALID_ARGUMENT = 0x00010001,
   FAMO_UI_E_NOT_IMPLEMENTED = 0x00010002,
-  FAMO_UI_E_PAINT_FAILED = 0x00010003  // paint caught a fault → host hides popup
+  FAMO_UI_E_PAINT_FAILED = 0x00010003,  // paint caught a fault → host hides popup
+  FAMO_UI_E_LAYOUT_FAILED = 0x00010004  // layout caught callback/allocation failure
 } FamoCandidateUiResult;
 
 // The three layout families (research §1.3), selected by FamoSkin.layout_type.
@@ -133,7 +137,7 @@ typedef struct FamoSkin {
 } FamoSkin;
 
 // Compiled-in neutral default skin (Vertical, opaque dark-on-light).
-FamoSkin FamoSkinDefault(void);
+FamoSkin FamoSkinDefault(void) FAMO_CANDIDATE_UI_NOEXCEPT;
 
 // ─── Text measurement seam ───────────────────────────────────────────────────
 // Layout is headless (no DirectWrite device), yet needs text extents. The host
@@ -231,6 +235,12 @@ typedef struct FamoLayoutResult {
   uint32_t flipped;
 } FamoLayoutResult;
 
+// FamoCandidateUiLayout has no caller-capacity parameter: unlike the input
+// structs, this output is not size-negotiated and must not grow in-place.
+// Keep a fixed span so the ABI canary detects any future wider write.
+#define FAMO_LAYOUT_RESULT_STABLE_SIZE \
+  (offsetof(FamoLayoutResult, flipped) + sizeof(uint32_t))
+
 // ─── DirectWrite/D2D text resources (B5) ─────────────────────────────────────
 // Opaque rendering resources shared by Paint and the measurement callback. The
 // host creates one instance, then reconfigures its DPI-dependent text formats
@@ -238,20 +248,24 @@ typedef struct FamoLayoutResult {
 // are stable across BindDC calls stay warm. Returns NULL on creation failure.
 typedef struct FamoTextResources FamoTextResources;
 
-FamoTextResources* FamoTextResourcesCreate(const FamoSkin* skin, uint32_t dpi);
+FamoTextResources* FamoTextResourcesCreate(
+    const FamoSkin* skin, uint32_t dpi) FAMO_CANDIDATE_UI_NOEXCEPT;
 int32_t FamoTextResourcesReconfigure(FamoTextResources* res,
-                                     const FamoSkin* skin, uint32_t dpi);
+                                     const FamoSkin* skin,
+                                     uint32_t dpi) FAMO_CANDIDATE_UI_NOEXCEPT;
 // Drop only target-bound D2D resources after a device-loss style paint failure.
 // Stable factories, formats, the bounded surface and static shadow stay warm.
-void FamoTextResourcesDiscardDeviceResources(FamoTextResources* res);
-void FamoTextResourcesDestroy(FamoTextResources* res);
+void FamoTextResourcesDiscardDeviceResources(
+    FamoTextResources* res) FAMO_CANDIDATE_UI_NOEXCEPT;
+void FamoTextResourcesDestroy(
+    FamoTextResources* res) FAMO_CANDIDATE_UI_NOEXCEPT;
 
 // FamoMeasureTextFn-compatible measurement over the cached formats. Wire this as
 // FamoLayoutInput.measure with a live FamoTextResources* as measure_user.
 // which: 0=label 1=text 2=comment. Returns advance width in device px (0 on any
 // error / empty), so a failed measure degrades to a zero-width, never a crash.
 int32_t FamoTextMeasure(void* user, int32_t which, const char* utf8,
-                        uint32_t utf8_len);
+                        uint32_t utf8_len) FAMO_CANDIDATE_UI_NOEXCEPT;
 
 // ─── Public entry points ─────────────────────────────────────────────────────
 
@@ -259,7 +273,8 @@ int32_t FamoTextMeasure(void* user, int32_t which, const char* utf8,
 int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
                               const FamoSkin* skin,
                               const FamoLayoutInput* input,
-                              FamoLayoutResult* out);
+                              FamoLayoutResult* out)
+    FAMO_CANDIDATE_UI_NOEXCEPT;
 
 // Paint a computed layout onto a 32-bit top-down premultiplied-alpha memory DC:
 // GDI+ shapes (background / highlight / round-rect / border) + D2D/DirectWrite
@@ -279,7 +294,7 @@ int32_t FamoCandidateUiPaint(const FamoCompositionView* view,
                              const FamoLayoutInput* input,
                              const FamoLayoutResult* layout,
                              FamoTextResources* res,
-                             void* mem_dc);
+                             void* mem_dc) FAMO_CANDIDATE_UI_NOEXCEPT;
 
 // ─── Floating status bar ─────────────────────────────────────────────────────
 // The always-visible toggle bar is a second consumer of the skin and the text
@@ -325,7 +340,8 @@ typedef struct FamoStatusBarSpec {
 // Returns FAMO_UI_OK, or FAMO_UI_E_PAINT_FAILED on a caught fault — a failed
 // bar paint must never take the input method with it.
 int32_t FamoStatusBarPaint(const FamoStatusBarSpec* spec, const FamoSkin* skin,
-                           FamoTextResources* res, void* mem_dc);
+                           FamoTextResources* res,
+                           void* mem_dc) FAMO_CANDIDATE_UI_NOEXCEPT;
 
 // ─── Standalone helpers (exposed so tests can exercise the correctness trap) ──
 
@@ -334,14 +350,17 @@ int32_t FamoStatusBarPaint(const FamoStatusBarSpec* spec, const FamoSkin* skin,
 // wchar_t on Windows. Clamps a byte offset landing mid-sequence to the code-point
 // boundary at/after it. Out-of-range byte_off clamps to the full wchar length.
 uint32_t FamoUtf8ByteToWchar(const char* utf8, uint32_t utf8_len,
-                             uint32_t byte_off);
+                             uint32_t byte_off)
+    FAMO_CANDIDATE_UI_NOEXCEPT;
 
 // The screen-edge flip decision (research §1.3): given caret + content size +
 // work area, produce the anchored origin and the flipped flag. Pure function.
 void FamoComputeAnchor(const FamoRect* caret, const FamoRect* work_area,
                        FamoSize content, int32_t* out_x, int32_t* out_y,
-                       uint32_t* out_flipped);
+                       uint32_t* out_flipped) FAMO_CANDIDATE_UI_NOEXCEPT;
 
 #ifdef __cplusplus
 }
 #endif
+
+#undef FAMO_CANDIDATE_UI_NOEXCEPT

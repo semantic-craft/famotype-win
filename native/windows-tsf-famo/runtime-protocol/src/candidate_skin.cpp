@@ -149,16 +149,15 @@ bool ApplyPalette(std::string_view name, FamoSkin *skin) {
   const Palette &p = found->second;
   const bool dark = name.size() >= 5 && name.substr(name.size() - 5) == "_dark";
   skin->text_color = p.ink2;
-  DWORD transparency = 1;
-  DWORD transparency_size = sizeof(transparency);
-  const bool transparent =
-      RegGetValueW(HKEY_CURRENT_USER,
-                   L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-                   L"EnableTransparency", RRF_RT_REG_DWORD, nullptr,
-                   &transparency, &transparency_size) != ERROR_SUCCESS ||
-      transparency != 0;
-  skin->back_color = (p.card & 0x00ffffffu) |
-                     (transparent ? 0xb8000000u : 0xff000000u);
+  // Opaque, always — the panel no longer follows EnableTransparency.
+  //
+  // This is a layered window with nothing blurred behind it, so a translucent
+  // back_color was never Fluent acrylic (recipe: background + BLUR + exclusion
+  // blend + tint + noise) — only its tint layer. The result was raw see-through:
+  // a caret-following popup over live text at 72%, with the eye refocusing
+  // between two planes. Depth now comes from the drop shadow + hairline border,
+  // which is what Fluent itself falls back to when transparency is off.
+  skin->back_color = (p.card & 0x00ffffffu) | 0xff000000u;
   skin->card2_color = p.card2;
   skin->border_color = (p.deep & 0x00ffffffu) | 0x29000000u;
   skin->hilited_text_color = p.on_accent;
@@ -184,13 +183,18 @@ bool UseDarkPalette() {
 }
 
 bool ApplyScalar(std::string_view key, std::string_view value, bool dark,
-                 FamoSkin *skin) {
+                 bool *dark_palette_applied, FamoSkin *skin) {
   if (key == "color_scheme" || key == "color_scheme_dark") {
     const std::string_view name = Trim(value);
     if (!Palettes().contains(std::string(name)))
       return false;
-    if ((key == "color_scheme" || dark) && !ApplyPalette(name, skin))
-      return false;
+    const bool dark_scheme = key == "color_scheme_dark";
+    if ((!dark_scheme && (!dark || !*dark_palette_applied)) ||
+        (dark_scheme && dark)) {
+      if (!ApplyPalette(name, skin))
+        return false;
+      *dark_palette_applied = dark_scheme;
+    }
   } else if (key == "font_face") {
     const std::string face = Unquote(value);
     if (!IsValidUtf8(face) || face.empty() || face.size() >= FAMO_FONT_FACE_MAX)
@@ -308,7 +312,8 @@ int32_t SystemCaretWidth() {
 
 } // namespace
 
-bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
+bool ParseCandidateSkinForTheme(std::string_view text, bool dark,
+                                FamoSkin *skin) {
   if (!skin)
     return false;
   *skin = FamoSkinDefault();
@@ -316,8 +321,8 @@ bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
   std::istringstream input{std::string(text)};
   std::string line;
   bool saw_style = false;
+  bool dark_palette_applied = false;
   std::set<std::string> seen;
-  const bool dark = UseDarkPalette();
   while (std::getline(input, line)) {
     if (!line.empty() && line.back() == '\r')
       line.pop_back();
@@ -337,13 +342,20 @@ bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
                                      ? std::string_view{}
                                      : child.substr(0, colon);
     if (key.empty() || !seen.emplace(key).second ||
-        !ApplyScalar(key, child.substr(colon + 1), dark, skin))
+        !ApplyScalar(key, child.substr(colon + 1), dark,
+                     &dark_palette_applied, skin))
       return false;
   }
   if (skin->layout_type != FAMO_LAYOUT_HORIZONTAL) {
     skin->min_width = (std::max)(64, static_cast<int>(skin->text_font.point_size * 4.0f + 0.5f));
   }
   return input.eof() && saw_style;
+}
+
+bool SystemUsesDarkPalette() { return UseDarkPalette(); }
+
+bool ParseCandidateSkin(std::string_view text, FamoSkin *skin) {
+  return ParseCandidateSkinForTheme(text, SystemUsesDarkPalette(), skin);
 }
 
 bool LoadCandidateSkin(std::string_view data_root, FamoSkin *skin) {

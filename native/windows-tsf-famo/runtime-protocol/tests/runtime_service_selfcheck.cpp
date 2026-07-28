@@ -12,6 +12,7 @@
 
 #include "famo_runtime_control.h"
 #include "famo_runtime_service.h"
+#include "famo_user_data_lock.h"
 
 #define CHECK(x)                                                               \
   do {                                                                         \
@@ -23,6 +24,24 @@
   } while (0)
 
 using namespace famo::runtime;
+
+namespace famo::runtime {
+struct RuntimeServiceTestAccess {
+  static bool CopyInvalidResultWithoutError(RuntimeService &service) {
+    FamoEngineActionResultV2 invalid{};
+    Composition composition;
+    return service.CopyResult(
+        invalid, FAMO_ENGINE_ACTION_STATUS,
+        FAMO_ENGINE_V2_MAX_VIEW_CANDIDATES, &composition, nullptr);
+  }
+  static size_t RetiredContextCount(const RuntimeService &service) {
+    return service.retired_contexts_.size();
+  }
+  static size_t SessionCount(const RuntimeService &service) {
+    return service.sessions_.size();
+  }
+};
+} // namespace famo::runtime
 
 uint64_t g_connection_generation = 13;
 
@@ -123,6 +142,21 @@ private:
   bool released_value_ = false;
 };
 
+class ScopedUserDataLockRoot {
+public:
+  explicit ScopedUserDataLockRoot(std::filesystem::path path)
+      : path_(std::move(path)) {}
+  ~ScopedUserDataLockRoot() {
+    (void)_wputenv_s(L"FAMO_TEST_USER_DATA_LOCK_LOCALAPPDATA", L"");
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+  const std::filesystem::path &path() const noexcept { return path_; }
+
+private:
+  std::filesystem::path path_;
+};
+
 Frame Request(Command command, uint64_t sequence) {
   Frame frame;
   frame.command = command;
@@ -130,7 +164,101 @@ Frame Request(Command command, uint64_t sequence) {
   return frame;
 }
 
+std::string ReadFileText(const std::filesystem::path &path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
 int main() {
+  ScopedUserDataLockRoot lock_root(
+      std::filesystem::temp_directory_path() /
+      ("famo-runtime-lock-" + std::to_string(GetCurrentProcessId()) + "-" +
+       std::to_string(GetTickCount64())));
+  std::filesystem::create_directories(lock_root.path());
+  CHECK(_wputenv_s(L"FAMO_TEST_USER_DATA_LOCK_LOCALAPPDATA",
+                   lock_root.path().c_str()) == 0);
+  constexpr uint32_t kRimeShiftLeft = 0xffe1;
+  constexpr uint32_t kRimeShiftRight = 0xffe2;
+  CHECK(IsShiftModeSwitch({kRimeShiftLeft, 0, 0, 0, 1}, 0,
+                          FAMO_STATUS_ASCII_MODE));
+  CHECK(IsShiftModeSwitch({kRimeShiftRight, 0, 0, 0, 1},
+                          FAMO_STATUS_ASCII_MODE, 0));
+  CHECK(!IsShiftModeSwitch({kRimeShiftLeft, 0, 0, 1, 1}, 0,
+                           FAMO_STATUS_ASCII_MODE));
+  CHECK(!IsShiftModeSwitch({'A', 0, 0, 0, 1}, 0,
+                           FAMO_STATUS_ASCII_MODE));
+  CHECK(!IsShiftModeSwitch({kRimeShiftLeft, 0, 0, 0, 1}, 0, 0));
+
+  {
+    UserDataTransactionLock transaction;
+    std::string lock_error;
+    if (!transaction.Acquire(&lock_error))
+      std::fprintf(stderr, "user-data lock failed: %s\n",
+                   lock_error.c_str());
+    CHECK(transaction.held());
+  }
+
+  {
+    RuntimeService allocation_start;
+    TestSink allocation_sink;
+    allocation_start.SetSnapshotSink(&allocation_sink);
+    std::string allocation_error;
+    CHECK(_wputenv_s(
+              L"FAMO_TEST_RUNTIME_START_PARAMETER_ALLOCATION_FAILURE",
+              L"1") == 0);
+    CHECK(!allocation_start.Start(L"FamoTestEngine.dll", "",
+                                  &allocation_error));
+    CHECK(allocation_start.readiness() == RuntimeReadiness::Unavailable);
+    CHECK(_wputenv_s(
+              L"FAMO_TEST_RUNTIME_START_PARAMETER_ALLOCATION_FAILURE",
+              L"") == 0);
+    CHECK(allocation_start.Start(L"FamoTestEngine.dll", "",
+                                 &allocation_error));
+    CHECK(allocation_start.InitializeControlState() == ControlError::None);
+    allocation_start.Stop();
+  }
+
+  // Deploy may only enter librime deployment after every old context is
+  // physically gone. A transient destroy failure retains the exact pointer for
+  // the next control attempt and makes the runtime unavailable in between.
+  {
+    RuntimeService destroy_retry;
+    std::string destroy_error;
+    CHECK(destroy_retry.Start(L"FamoTestEngine.dll", "", &destroy_error));
+    CHECK(destroy_retry.InitializeControlState() == ControlError::None);
+    Frame hello;
+    hello.command = Command::Hello;
+    hello.correlation = {700, 701, 702, 0, 0, 0};
+    CHECK(destroy_retry.Dispatch(hello).status == Status::Ok);
+    Frame open;
+    open.command = Command::OpenSession;
+    open.correlation = {700, 701, 702, 703, 704, 1};
+    CHECK(EncodeOpenSession("test", &open.payload, &destroy_error));
+    CHECK(destroy_retry.Dispatch(open).status == Status::Ok);
+    const uint64_t before = destroy_retry.engine_generation();
+    CHECK(_putenv_s("FAMO_TEST_DESTROY_RETRY_OBSERVED", "") == 0);
+    CHECK(_putenv_s("FAMO_TEST_FAIL_DESTROY", "1") == 0);
+    CHECK(destroy_retry.ExecuteControl(Command::ControlDeploy) ==
+          ControlError::Engine);
+    CHECK(destroy_retry.readiness() == RuntimeReadiness::Unavailable);
+    CHECK(destroy_retry.engine_generation() == before);
+    CHECK(RuntimeServiceTestAccess::SessionCount(destroy_retry) == 0);
+    CHECK(RuntimeServiceTestAccess::RetiredContextCount(destroy_retry) == 1);
+    CHECK(_putenv_s("FAMO_TEST_FAIL_DESTROY", "") == 0);
+    CHECK(destroy_retry.ExecuteControl(Command::ControlDeploy) ==
+          ControlError::None);
+    CHECK(destroy_retry.readiness() == RuntimeReadiness::Ready);
+    CHECK(RuntimeServiceTestAccess::RetiredContextCount(destroy_retry) == 0);
+    char retried[2]{};
+    CHECK(GetEnvironmentVariableA("FAMO_TEST_DESTROY_RETRY_OBSERVED", retried,
+                                  static_cast<DWORD>(std::size(retried))) ==
+          1);
+    CHECK(retried[0] == '1');
+    CHECK(_putenv_s("FAMO_TEST_DESTROY_RETRY_OBSERVED", "") == 0);
+    destroy_retry.Stop();
+  }
+
   const std::filesystem::path data_root =
       std::filesystem::temp_directory_path() /
       ("famo-runtime-service-" + std::to_string(GetCurrentProcessId()));
@@ -151,13 +279,18 @@ int main() {
          "  famo_cjk_number_spacing: true\n";
 
   RuntimeService service;
+  CHECK(!RuntimeServiceTestAccess::CopyInvalidResultWithoutError(service));
   TestSink sink;
   service.SetSnapshotSink(&sink);
   std::string error;
   const std::string data_root_utf8 = data_root.string();
   CHECK(service.Start(L"FamoTestEngine.dll", data_root_utf8.c_str(), &error));
   CHECK(service.readiness() == RuntimeReadiness::Starting);
-  CHECK(service.InitializeControlState() == ControlError::None);
+  const ControlError initialized = service.InitializeControlState();
+  if (initialized != ControlError::None)
+    std::fprintf(stderr, "InitializeControlState failed: %u\n",
+                 static_cast<unsigned>(initialized));
+  CHECK(initialized == ControlError::None);
   CHECK(sink.runtime_ready_count == 1);
   CHECK(sink.reloads == 1);
   CHECK(sink.active_style);
@@ -184,7 +317,7 @@ int main() {
   Frame open = Request(Command::OpenSession, 1);
   CHECK(EncodeOpenSession("test", &open.payload, &error));
   CHECK(service.Dispatch(open).status == Status::Ok);
-  CHECK(service.Dispatch(open).status == Status::StaleRequest);
+  CHECK(service.Dispatch(open).status == Status::Ok);
 
   std::ofstream(data_root / "famo-options.yaml")
       << "options:\n  ascii_mode: false\noutside: true\n";
@@ -212,8 +345,12 @@ int main() {
         all_host_flags);
   Frame clear_after_option_failure = Request(Command::ClearComposition, 3);
   CHECK(service.Dispatch(clear_after_option_failure).status == Status::Ok);
+  _putenv_s("FAMO_TEST_SIMPLIFIED", "1");
   CHECK(service.ExecuteControl(Command::ControlReloadOptions) ==
         ControlError::None);
+  CHECK(sink.latest &&
+        (sink.latest->composition.status_flags & FAMO_STATUS_SIMPLIFIED) != 0);
+  _putenv_s("FAMO_TEST_SIMPLIFIED", "");
 
   std::atomic<bool> runtime_running{true};
   RuntimeControlService control(&service, &runtime_running);
@@ -383,6 +520,52 @@ int main() {
            options_result.state == ControlState::Running);
   CHECK(options_result.state == ControlState::Succeeded);
   CHECK(!options_result.retryable);
+
+  _putenv_s("FAMO_TEST_CONTROL_THROW", "1");
+  Frame throwing_options = control_hello;
+  throwing_options.command = Command::ControlReloadOptions;
+  throwing_options.correlation.sequence = control_sequence++;
+  Frame throwing_reply = control.Dispatch(throwing_options);
+  CHECK(DecodeControlResult(throwing_reply.payload, &options_result,
+                            &error));
+  do {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    Frame status = control_hello;
+    status.command = Command::ControlStatus;
+    status.correlation.sequence = control_sequence++;
+    CHECK(
+        EncodeControlOperationId(options_result.operation_id, &status.payload));
+    Frame status_reply = control.Dispatch(status);
+    CHECK(status_reply.status == Status::Ok);
+    CHECK(DecodeControlResult(status_reply.payload, &options_result, &error));
+  } while (options_result.state == ControlState::Pending ||
+           options_result.state == ControlState::Running);
+  CHECK(options_result.state == ControlState::Failed);
+  CHECK(options_result.error == ControlError::Runtime);
+  CHECK(options_result.readiness == RuntimeReadiness::Unavailable);
+  _putenv_s("FAMO_TEST_CONTROL_THROW", "");
+
+  Frame worker_recovery = control_hello;
+  worker_recovery.command = Command::ControlReloadOptions;
+  worker_recovery.correlation.sequence = control_sequence++;
+  Frame worker_recovery_reply = control.Dispatch(worker_recovery);
+  CHECK(DecodeControlResult(worker_recovery_reply.payload, &options_result,
+                            &error));
+  do {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    Frame status = control_hello;
+    status.command = Command::ControlStatus;
+    status.correlation.sequence = control_sequence++;
+    CHECK(
+        EncodeControlOperationId(options_result.operation_id, &status.payload));
+    Frame status_reply = control.Dispatch(status);
+    CHECK(status_reply.status == Status::Ok);
+    CHECK(DecodeControlResult(status_reply.payload, &options_result, &error));
+  } while (options_result.state == ControlState::Pending ||
+           options_result.state == ControlState::Running);
+  CHECK(options_result.state == ControlState::Succeeded);
+  CHECK(options_result.readiness == RuntimeReadiness::Ready);
+
   _putenv_s("FAMO_TEST_DEPLOY_DELAY_MS", "");
   control.Stop();
 
@@ -392,8 +575,9 @@ int main() {
   std::ofstream(data_root / "wubi86_jidian.userdb" / "CURRENT") << "wubi-marker";
   std::ofstream(data_root / "quick-phrases.json") << "keep-me";
   const uint64_t generation_before_reset = service.engine_generation();
-  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
-        ControlError::None);
+  const ControlError first_reset =
+      service.ExecuteControl(Command::ControlResetUserDictionary);
+  CHECK(first_reset == ControlError::None);
   CHECK(service.readiness() == RuntimeReadiness::Ready);
   CHECK(service.engine_generation() == generation_before_reset + 1);
   CHECK(!std::filesystem::exists(data_root / "rime_ice.userdb"));
@@ -412,6 +596,78 @@ int main() {
   CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
         ControlError::None);
   CHECK(service.engine_generation() == generation_before_reset + 1);
+
+  std::filesystem::create_directories(data_root / "rime_ice.userdb");
+  std::filesystem::create_directories(data_root / "wubi86_jidian.userdb");
+  std::ofstream(data_root / "rime_ice.userdb" / "CURRENT") << "rime-marker";
+  std::ofstream(data_root / "wubi86_jidian.userdb" / "CURRENT") << "wubi-marker";
+  _putenv_s("FAMO_TEST_USERDB_ENUMERATION_DENIED", "1");
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::UserDictionaryEnumeration);
+  CHECK(std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root / "wubi86_jidian.userdb" / "CURRENT"));
+  _putenv_s("FAMO_TEST_USERDB_ENUMERATION_DENIED", "");
+
+  const std::filesystem::path outside_userdb =
+      std::filesystem::temp_directory_path() /
+      ("famo-runtime-userdb-outside-" +
+       std::to_string(GetCurrentProcessId()));
+  std::filesystem::create_directories(outside_userdb);
+  std::ofstream(outside_userdb / "CURRENT") << "outside-marker";
+  const std::filesystem::path linked_userdb =
+      data_root / "linked.userdb";
+  std::error_code symlink_error;
+  std::filesystem::create_directory_symlink(
+      outside_userdb, linked_userdb, symlink_error);
+  if (!symlink_error) {
+    CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+          ControlError::UserDictionaryEnumeration);
+    CHECK(std::filesystem::exists(outside_userdb / "CURRENT"));
+    std::error_code remove_link_error;
+    CHECK(std::filesystem::remove(linked_userdb, remove_link_error));
+    CHECK(!remove_link_error);
+  }
+  std::filesystem::remove_all(outside_userdb);
+
+  const std::filesystem::path collision_backup =
+      data_root / ".famo-backup" / "userdb-reset-collision";
+  std::filesystem::create_directories(collision_backup);
+  std::ofstream(collision_backup / "sentinel") << "older-backup";
+  _putenv_s("FAMO_TEST_USERDB_BACKUP_NAME", "userdb-reset-collision");
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::Runtime);
+  CHECK(std::filesystem::exists(collision_backup / "sentinel"));
+  CHECK(std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root /
+                                "wubi86_jidian.userdb" / "CURRENT"));
+  _putenv_s("FAMO_TEST_USERDB_BACKUP_NAME", "");
+  std::filesystem::remove_all(collision_backup);
+
+  _putenv_s("FAMO_TEST_USERDB_PARTIAL_DELETE_FAILURE", "1");
+  const ControlError partial_reset =
+      service.ExecuteControl(Command::ControlResetUserDictionary);
+  if (partial_reset != ControlError::Runtime)
+    std::fprintf(stderr, "partial userdb reset failed: %u readiness=%u\n",
+                 static_cast<unsigned>(partial_reset),
+                 static_cast<unsigned>(service.readiness()));
+  CHECK(partial_reset == ControlError::Runtime);
+  CHECK(std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root / "wubi86_jidian.userdb" / "CURRENT"));
+
+  _putenv_s("FAMO_TEST_USERDB_RESTORE_FAILURE", "1");
+  CHECK(service.ExecuteControl(Command::ControlResetUserDictionary) ==
+        ControlError::UserDictionaryRollback);
+  CHECK(service.readiness() == RuntimeReadiness::Unavailable);
+  CHECK(!std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root / "wubi86_jidian.userdb" / "CURRENT"));
+  _putenv_s("FAMO_TEST_USERDB_PARTIAL_DELETE_FAILURE", "");
+  _putenv_s("FAMO_TEST_USERDB_RESTORE_FAILURE", "");
+  CHECK(service.ExecuteControl(Command::ControlDeploy) ==
+        ControlError::None);
+  CHECK(service.readiness() == RuntimeReadiness::Ready);
+  CHECK(std::filesystem::exists(data_root / "rime_ice.userdb" / "CURRENT"));
+  CHECK(std::filesystem::exists(data_root /
+                                "wubi86_jidian.userdb" / "CURRENT"));
 
   Frame invalidated_key = Request(Command::ProcessKey, 4);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 1},
@@ -449,14 +705,20 @@ int main() {
   CHECK(composition.preview_candidates.empty());
   CHECK(sink.latest && sink.latest->composition.preview_candidates.size() == 2);
   CHECK(sink.latest->composition.preview_candidates[0].text == "\xe5\xb0\xbc");
-  _putenv_s("FAMO_TEST_MULTIPAGE", "");
 
+  // A PEEK result is bounded by this request's count, not merely by the
+  // runtime-wide candidate cap. An over-return is ignored instead of leaking
+  // extra candidates into the UI snapshot.
+  _putenv_s("FAMO_TEST_PEEK_OVERRUN", "1");
   Frame highlight = Request(Command::HighlightCandidate, 4);
   CHECK(EncodeCandidateIndex(1, &highlight.payload));
   reply = service.Dispatch(highlight);
   CHECK(reply.status == Status::Ok);
   CHECK(DecodeComposition(reply.payload, &composition, &error));
   CHECK(composition.preedit == "ni");
+  CHECK(sink.latest && sink.latest->composition.preview_candidates.empty());
+  _putenv_s("FAMO_TEST_PEEK_OVERRUN", "");
+  _putenv_s("FAMO_TEST_MULTIPAGE", "");
 
   Frame page = Request(Command::ChangePage, 5);
   CHECK(EncodePageDirection(false, &page.payload));
@@ -477,14 +739,25 @@ int main() {
   CHECK(service.Dispatch(process_n_again).status == Status::Ok);
 
   Frame commit = Request(Command::CommitComposition, 8);
+  _putenv_s("FAMO_TEST_FORMAT_COMMIT", "1");
   reply = service.Dispatch(commit);
+  _putenv_s("FAMO_TEST_FORMAT_COMMIT", "");
   CHECK(reply.status == Status::Ok);
   CHECK(DecodeComposition(reply.payload, &composition, &error));
   CHECK(composition.preedit.empty());
-  CHECK(composition.handled && composition.commit == "n");
+  CHECK(composition.handled &&
+        composition.commit == "\xe3\x80\x8c" "n" "\xe3\x80\x8d");  // 「n」
+
+  Frame after_commit = Request(Command::ProcessKey, 9);
+  CHECK(EncodeKeyEvent({0x7b, 0, 0, 1, 3}, &after_commit.payload));
+  reply = service.Dispatch(after_commit);
+  CHECK(reply.status == Status::Ok);
+  CHECK(DecodeComposition(reply.payload, &composition, &error));
+  CHECK(!composition.handled && composition.commit.empty());
 
   Frame update_ui = Request(Command::UpdateUiState, 100);
-  CHECK(EncodeUiState({{1, 2, 3, 4}, {0, 0, 1920, 1080}, 96, true, true, true},
+  CHECK(EncodeUiState({{1, 2, 3, 4}, {0, 0, 1920, 1080}, 96, true, true, true,
+                       {1, 100}},
                       &update_ui.payload, &error));
   CHECK(service.Dispatch(update_ui).status == Status::Ok);
   CHECK(sink.latest && sink.latest->ui_sequence == 100);
@@ -494,7 +767,7 @@ int main() {
   service.SetSnapshotSink(&blocking_ui_sink);
   Frame blocking_ui = Request(Command::UpdateUiState, 101);
   CHECK(EncodeUiState({{5, 6, 7, 8}, {0, 0, 1920, 1080}, 96, true, true,
-                       true},
+                       true, {2, 101}},
                       &blocking_ui.payload, &error));
   Frame process_n_final = Request(Command::ProcessKey, 10);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 4},
@@ -518,7 +791,17 @@ int main() {
                        &process_ni.payload));
   CHECK(service.Dispatch(process_ni).status == Status::Ok);
 
-  Frame select = Request(Command::SelectCandidate, 12);
+  Frame unhandled_select = Request(Command::SelectCandidate, 12);
+  CHECK(EncodeCandidateIndex(0, &unhandled_select.payload));
+  _putenv_s("FAMO_TEST_UNHANDLED_SELECTION", "1");
+  reply = service.Dispatch(unhandled_select);
+  _putenv_s("FAMO_TEST_UNHANDLED_SELECTION", "");
+  CHECK(reply.status == Status::Ok);
+  CHECK(DecodeComposition(reply.payload, &composition, &error));
+  CHECK(!composition.handled && composition.commit.empty());
+  CHECK(composition.preedit == "ni");
+
+  Frame select = Request(Command::SelectCandidate, 13);
   CHECK(EncodeCandidateIndex(0, &select.payload));
   _putenv_s("FAMO_TEST_DEFER_SELECTION_COMMIT", "1");
   reply = service.Dispatch(select);
@@ -529,43 +812,90 @@ int main() {
 
   Frame stale_ui = Request(Command::UpdateUiState, 99);
   CHECK(EncodeUiState({{100, 200, 300, 400}, {0, 0, 1920, 1080}, 96, true,
-                       true, true},
+                       true, true, {3, 99}},
                       &stale_ui.payload, &error));
   CHECK(service.Dispatch(stale_ui).status == Status::StaleRequest);
   CHECK(sink.latest && sink.latest->ui_sequence == 101);
   CHECK(sink.latest->ui_state.caret.left == 5);
 
-  Frame stale_activation = Request(Command::ProcessKey, 13);
+  Frame stale_activation = Request(Command::ProcessKey, 14);
   --stale_activation.correlation.activation_generation;
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 3},
                        &stale_activation.payload));
   reply = service.Dispatch(stale_activation);
   CHECK(reply.status == Status::StaleRequest && reply.payload.empty());
 
-  Frame stale_session = Request(Command::ProcessKey, 13);
+  Frame stale_session = Request(Command::ProcessKey, 14);
   --stale_session.correlation.session_generation;
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 3},
                        &stale_session.payload));
   reply = service.Dispatch(stale_session);
   CHECK(reply.status == Status::StaleRequest && reply.payload.empty());
 
-  Frame stale_connection = Request(Command::ProcessKey, 13);
+  Frame stale_connection = Request(Command::ProcessKey, 14);
   --stale_connection.correlation.connection_generation;
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('X'), 0, 0, 1, 3},
                        &stale_connection.payload));
   reply = service.Dispatch(stale_connection);
   CHECK(reply.status == Status::StaleRequest && reply.payload.empty());
 
-  Frame unhandled = Request(Command::ProcessKey, 13);
+  Frame unhandled = Request(Command::ProcessKey, 14);
   CHECK(EncodeKeyEvent({0x7b, 0, 0, 1, 4}, &unhandled.payload));
   reply = service.Dispatch(unhandled);
   CHECK(reply.status == Status::Ok);
   CHECK(DecodeComposition(reply.payload, &composition, &error));
-  CHECK(!composition.handled);
+  CHECK(!composition.handled && composition.commit.empty());
 
-  Frame close = Request(Command::CloseSession, 14);
+  Frame close = Request(Command::CloseSession, 15);
   CHECK(service.Dispatch(close).status == Status::Ok);
   CHECK(service.Dispatch(close).status == Status::StaleRequest);
+
+  std::atomic<bool> schema_finished{false};
+  ControlError locked_schema_result = ControlError::Runtime;
+  std::thread locked_schema_worker;
+  bool schema_waited_for_lock = false;
+  {
+    UserDataTransactionLock held;
+    CHECK(held.Acquire());
+    locked_schema_worker = std::thread([&] {
+      locked_schema_result = service.SelectSchemaAndPersist("next");
+      schema_finished.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    schema_waited_for_lock = !schema_finished.load();
+  }
+  locked_schema_worker.join();
+  CHECK(schema_waited_for_lock);
+  CHECK(locked_schema_result == ControlError::None);
+  CHECK(ReadFileText(data_root / "famo-select-schema.txt") == "next");
+  CHECK(!std::filesystem::exists(
+      data_root / "famo-select-schema.txt.famo-write.tmp"));
+  CHECK(service.SelectSchemaAndPersist("test") == ControlError::None);
+
+  _putenv_s("FAMO_TEST_FAIL_SCHEMA", "missing");
+  CHECK(service.SelectSchemaAndPersist("missing") == ControlError::Engine);
+  CHECK(service.readiness() == RuntimeReadiness::Ready);
+  CHECK(ReadFileText(data_root / "famo-select-schema.txt") == "test");
+  _putenv_s("FAMO_TEST_SCHEMA_ROLLBACK_FAILURE", "1");
+  CHECK(service.SelectSchemaAndPersist("missing") == ControlError::Runtime);
+  CHECK(service.readiness() == RuntimeReadiness::Unavailable);
+  CHECK(ReadFileText(data_root / "famo-select-schema.txt") == "missing");
+  _putenv_s("FAMO_TEST_SCHEMA_ROLLBACK_FAILURE", "");
+  _putenv_s("FAMO_TEST_FAIL_SCHEMA", "");
+  std::ofstream(data_root / "famo-select-schema.txt", std::ios::binary)
+      << "test";
+  CHECK(service.ExecuteControl(Command::ControlDeploy) ==
+        ControlError::None);
+  CHECK(service.readiness() == RuntimeReadiness::Ready);
+
+  std::ofstream(data_root / "famo-select-schema.txt") << "missing\n";
+  _putenv_s("FAMO_TEST_FAIL_SCHEMA", "missing");
+  CHECK(service.ExecuteControl(Command::ControlSelectSchema) ==
+        ControlError::Engine);
+  _putenv_s("FAMO_TEST_FAIL_SCHEMA", "");
+  std::ofstream(data_root / "famo-select-schema.txt") << "test\n";
+  CHECK(service.ExecuteControl(Command::ControlSelectSchema) ==
+        ControlError::None);
 
   Frame newer = hello;
   newer.correlation.connection_generation = 15;

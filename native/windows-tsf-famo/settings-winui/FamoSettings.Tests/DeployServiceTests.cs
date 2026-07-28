@@ -270,6 +270,34 @@ public class DeployServiceTests
         }
     }
 
+    [Theory]
+    [InlineData(16, "无法读取用户词典目录", true)]
+    [InlineData(17, "用户词典可能不完整", false)]
+    public void ResetUserDictionary_MapsNativeFailureToActionableStatus(
+        int exitCode, string expected, bool retryAvailable)
+    {
+        ClearEnv();
+        string dir = Path.Combine(Path.GetTempPath(), $"famo-userdb-fail-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "FamoRuntime.exe"), "stub");
+        using IDisposable reset = DeployService.UseProcessRunnerForTests((_, _) => exitCode);
+
+        try
+        {
+            Assert.True(DeployService.ResetUserDictionary(dir).Started);
+            Assert.True(DeployService.WaitForIdleForTests(TimeSpan.FromSeconds(2)));
+            DeployQueueSnapshot snapshot = DeployService.GetQueueSnapshot();
+            Assert.Equal(DeployQueueStatus.Failed, snapshot.Status);
+            Assert.Equal(retryAvailable, snapshot.RetryAvailable);
+            Assert.Contains(expected, snapshot.Error);
+        }
+        finally
+        {
+            ClearEnv();
+            Directory.Delete(dir, true);
+        }
+    }
+
     [Fact]
     public void RetryFailed_RequeuesSameOperation_WithNewRequestIdentity()
     {
@@ -372,6 +400,50 @@ public class DeployServiceTests
         finally
         {
             DeployService.QueueChanged -= handler;
+            ClearEnv();
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void ReloadQueue_SubscriberExceptionDoesNotEscapeOrStallWorker()
+    {
+        ClearEnv();
+        string dir = Path.Combine(Path.GetTempPath(), $"famo-observer-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "FamoRuntime.exe"), "stub");
+        int processCalls = 0;
+        int healthyNotifications = 0;
+
+        using IDisposable reset = DeployService.UseProcessRunnerForTests((_, _) =>
+        {
+            Interlocked.Increment(ref processCalls);
+            return 0;
+        });
+        Action<DeployQueueSnapshot> broken = _ => throw new InvalidOperationException("observer boom");
+        Action<DeployQueueSnapshot> healthy = _ => Interlocked.Increment(ref healthyNotifications);
+
+        DeployService.QueueChanged += broken;
+        DeployService.QueueChanged += healthy;
+        try
+        {
+            ReloadResult result = default;
+            Exception? error = Record.Exception(() =>
+            {
+                result = DeployService.ReloadOptions(dir);
+            });
+
+            Assert.Null(error);
+            Assert.True(result.Started);
+            Assert.True(DeployService.WaitForIdleForTests(TimeSpan.FromSeconds(2)));
+            Assert.Equal(1, processCalls);
+            Assert.True(healthyNotifications >= 3);
+            Assert.Equal(DeployQueueStatus.Succeeded, DeployService.GetQueueSnapshot().Status);
+        }
+        finally
+        {
+            DeployService.QueueChanged -= broken;
+            DeployService.QueueChanged -= healthy;
             ClearEnv();
             Directory.Delete(dir, true);
         }

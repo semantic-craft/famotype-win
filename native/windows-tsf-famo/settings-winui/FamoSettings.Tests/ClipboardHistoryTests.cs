@@ -61,6 +61,36 @@ public sealed class ClipboardHistoryStoreTests : IDisposable
     }
 
     [Fact]
+    public void AddText_TruncationDoesNotPersistHalfOfAnEmoji()
+    {
+        var store = new ClipboardHistoryStore(_file);
+        string prefix = new('a', ClipboardHistoryStore.MaxTextLength - 1);
+        string text = prefix + "😀";
+
+        Assert.True(store.AddText(text, enabled: true));
+
+        ClipboardHistoryEntry saved = Assert.Single(new ClipboardHistoryStore(_file).Load());
+        Assert.Equal(prefix, saved.Text);
+        Assert.True(saved.Text.Length <= ClipboardHistoryStore.MaxTextLength);
+        Assert.DoesNotContain('\uFFFD', saved.Text);
+    }
+
+    [Fact]
+    public void AddText_TruncationKeepsAWholeEmojiThatFitsBeforeTheLimit()
+    {
+        var store = new ClipboardHistoryStore(_file);
+        string prefix = new('a', ClipboardHistoryStore.MaxTextLength - 2);
+        string expected = prefix + "😀";
+
+        Assert.True(store.AddText(expected + "x", enabled: true));
+
+        ClipboardHistoryEntry saved = Assert.Single(new ClipboardHistoryStore(_file).Load());
+        Assert.Equal(expected, saved.Text);
+        Assert.Equal(ClipboardHistoryStore.MaxTextLength, saved.Text.Length);
+        Assert.DoesNotContain('\uFFFD', saved.Text);
+    }
+
+    [Fact]
     public void Clear_RemovesPersistedHistory()
     {
         var store = new ClipboardHistoryStore(_file);

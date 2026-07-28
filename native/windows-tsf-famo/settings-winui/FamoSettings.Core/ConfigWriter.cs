@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace Famo.Settings.Core;
@@ -208,7 +209,10 @@ public static class ConfigWriter
     private static string SetScalar(string yaml, string key, string value)
     {
         // 匹配：缩进 + key: + 值（到行尾注释或行尾），保留缩进与 ` # 注释`。
-        var rx = new Regex($@"(?m)^(?<indent>[ \t]*{Regex.Escape(key)}:[ \t]*)(?<val>[^\r\n#]*?)(?<trail>[ \t]*(#[^\r\n]*)?)$");
+        var rx = new Regex(
+            $@"(?m)^(?<indent>[ \t]*{Regex.Escape(key)}:[ \t]*)" +
+            @"(?<val>""(?:\\.|[^""\\])*""|'(?:''|[^'])*'|[^#\r\n]*?)" +
+            @"(?<trail>[ \t]*(#[^\r\n]*)?)$");
         Match m = rx.Match(yaml);
         if (!m.Success)
         {
@@ -474,7 +478,15 @@ public static class ConfigWriter
         return merged + block;
     }
 
-    /// <summary>部署桶落盘：写 default.custom.yaml + rime_ice.custom.yaml + wubi86_jidian.custom.yaml 到 famoDir。</summary>
+    private static readonly string[] WubiCustomFiles =
+    {
+        "wubi86_jidian.custom.yaml",
+        "wubi86_jidian_pinyin.custom.yaml",
+        "wubi86_jidian_trad.custom.yaml",
+        "wubi86_jidian_trad_pinyin.custom.yaml",
+    };
+
+    /// <summary>部署桶落盘：写 default/rime_ice 与全部五笔方案的 Famo 托管块。</summary>
     public static void WriteDeployBucket(FamoSettings settings, string famoDir)
     {
         Directory.CreateDirectory(famoDir);
@@ -484,9 +496,12 @@ public static class ConfigWriter
         string? baseIce = File.Exists(icePath) ? File.ReadAllText(icePath) : null;
         WriteAtomic(icePath, BuildRimeIceCustom(settings, baseIce));
 
-        string wubiPath = Path.Combine(famoDir, "wubi86_jidian.custom.yaml");
-        string? baseWubi = File.Exists(wubiPath) ? File.ReadAllText(wubiPath) : null;
-        WriteAtomic(wubiPath, BuildWubiCustom(settings, baseWubi));
+        foreach (string fileName in WubiCustomFiles)
+        {
+            string wubiPath = Path.Combine(famoDir, fileName);
+            string? baseWubi = File.Exists(wubiPath) ? File.ReadAllText(wubiPath) : null;
+            WriteAtomic(wubiPath, BuildWubiCustom(settings, baseWubi));
+        }
     }
 
     private static void WriteAtomic(string path, string content) => SafeJsonFile.WriteAtomic(path, content);
@@ -498,7 +513,7 @@ public static class ConfigWriter
         return rx.Replace(yaml, m => m.Groups[1].Value + value.ToString(CultureInfo.InvariantCulture), 1);
     }
 
-    private static string Quote(string s) => "\"" + s.Replace("\"", "\\\"") + "\"";
+    private static string Quote(string s) => JsonSerializer.Serialize(s, SettingsStore.JsonOptions);
 
     private static string Int(int v) => v.ToString(CultureInfo.InvariantCulture);
 

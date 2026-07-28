@@ -29,8 +29,8 @@ Windows 10 / 11 (x64).
 > published in the release notes before running it.
 
 If an old TSF DLL is still loaded by a running desktop app, the installer safely enters
-`PendingReboot` and lets RunOnce finish the swap after a restart, rather than force-closing your
-applications.
+`PendingReboot` and creates a one-user logon recovery task bound to the exact SID that started the
+install. That task finishes the swap after a restart rather than force-closing your applications.
 
 **Updates:** there is no background auto-update on Windows. The "检查更新" button on the settings
 panel's About page opens this repository's Releases page; downloading and installing over the top
@@ -76,7 +76,8 @@ on-device smoke run as described in
 [`native/windows-tsf-famo/installer/smoke_test.md`](native/windows-tsf-famo/installer/smoke_test.md).
 A macOS machine must never fabricate a Windows binary release.
 
-The settings-panel tests are plain .NET and run anywhere:
+Run the settings-panel tests on Windows. They include Win32 / NTFS crash-safe
+transaction, object-identity and atomic-rename checks:
 
 ```powershell
 dotnet test native/windows-tsf-famo/settings-winui/FamoSettings.Tests

@@ -4,6 +4,7 @@
 
 #include <msctf.h>
 
+#include "abi_boundary.h"
 #include "com_ptr.h"
 #include "famo_guids.h"
 #include "module_state.h"
@@ -82,7 +83,7 @@ std::wstring TipKey() {
 // registration is machine-scoped — an HKCU-only Famo is invisible in
 // Win+Space even with the profile enabled. Registration therefore requires
 // elevation; the installer runs it elevated.
-HRESULT RegisterComServer() {
+HRESULT RegisterComServer(bool cleanup_current_user) {
   const std::wstring module = ModulePath();
   if (module.empty())
     return HRESULT_FROM_WIN32(GetLastError());
@@ -104,20 +105,21 @@ HRESULT RegisterComServer() {
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str());
     return result;
   }
-  const LSTATUS removed =
-      RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str());
-  if (removed == ERROR_SUCCESS || removed == ERROR_FILE_NOT_FOUND)
-    return S_OK;
-  RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str());
-  return HRESULT_FROM_WIN32(removed);
+  if (cleanup_current_user) {
+    const LSTATUS removed =
+        RegDeleteTreeW(HKEY_CURRENT_USER, root.c_str());
+    if (removed != ERROR_SUCCESS && removed != ERROR_FILE_NOT_FOUND) {
+      RegDeleteTreeW(HKEY_LOCAL_MACHINE, root.c_str());
+      return HRESULT_FROM_WIN32(removed);
+    }
+  }
+  return S_OK;
 }
 
-void UnregisterComServer() {
-  // Delete both roots: HKLM is the current registration; HKCU covers machines
-  // that still carry the legacy per-user development registration, which
-  // would otherwise shadow HKLM at COM activation time.
+void UnregisterComServer(bool cleanup_current_user) {
   RegDeleteTreeW(HKEY_LOCAL_MACHINE, ComKey().c_str());
-  RegDeleteTreeW(HKEY_CURRENT_USER, ComKey().c_str());
+  if (cleanup_current_user)
+    RegDeleteTreeW(HKEY_CURRENT_USER, ComKey().c_str());
 }
 
 HRESULT CreateProfiles(ComPtr<ITfInputProcessorProfiles> *profiles) {
@@ -149,7 +151,7 @@ const GUID kProfileCategories[] = {
     GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
 };
 
-HRESULT RegisterTsfProfile() {
+HRESULT RegisterTsfProfile(bool enable_current_user) {
   ComScope com;
   if (FAILED(com.result()))
     return com.result();
@@ -165,10 +167,12 @@ HRESULT RegisterTsfProfile() {
       static_cast<ULONG>(std::size(kProfileName) - 1), L"", 0, 0);
   if (FAILED(result))
     return result;
-  result = profiles->EnableLanguageProfile(
-      kTextServiceClsid, kLanguageId, kLanguageProfileGuid, TRUE);
-  if (FAILED(result))
-    return result;
+  if (enable_current_user) {
+    result = profiles->EnableLanguageProfile(
+        kTextServiceClsid, kLanguageId, kLanguageProfileGuid, TRUE);
+    if (FAILED(result))
+      return result;
+  }
   // Machine-default enable flag on the HKLM profile key. EnableLanguageProfile
   // above only writes the calling user's HKCU preference; without this value a
   // fresh user account sees the profile disabled, and Win11 treats the profile
@@ -198,7 +202,7 @@ HRESULT RegisterTsfProfile() {
   return S_OK;
 }
 
-void UnregisterTsfProfile() {
+void UnregisterTsfProfile(bool cleanup_current_user) {
   {
     ComScope com;
     if (SUCCEEDED(com.result())) {
@@ -210,47 +214,79 @@ void UnregisterTsfProfile() {
       }
       ComPtr<ITfInputProcessorProfiles> profiles;
       if (SUCCEEDED(CreateProfiles(&profiles))) {
-        profiles->EnableLanguageProfile(kTextServiceClsid, kLanguageId,
-                                        kLanguageProfileGuid, FALSE);
+        if (cleanup_current_user) {
+          profiles->EnableLanguageProfile(kTextServiceClsid, kLanguageId,
+                                          kLanguageProfileGuid, FALSE);
+        }
         profiles->RemoveLanguageProfile(kTextServiceClsid, kLanguageId,
                                         kLanguageProfileGuid);
         profiles->Unregister(kTextServiceClsid);
       }
     }
   }
-  // Windows can retain a disabled per-user preference after profile removal.
-  // Delete it only after the TSF manager has been released; otherwise its
-  // destructor can write the disabled preference back. The key is scoped to
-  // this development CLSID, so unregister restores the exact prior state.
-  RegDeleteTreeW(HKEY_CURRENT_USER, TipKey().c_str());
+  if (cleanup_current_user) {
+    // Delete only after the TSF manager has been released; its destructor can
+    // otherwise write the disabled preference back.
+    RegDeleteTreeW(HKEY_CURRENT_USER, TipKey().c_str());
+  }
 }
 
 } // namespace
 
 HRESULT RegisterDevelopmentProfile() {
-  HRESULT result = RegisterComServer();
+  HRESULT result = RegisterComServer(true);
   if (FAILED(result))
     return result;
-  result = RegisterTsfProfile();
+  result = RegisterTsfProfile(true);
   if (FAILED(result)) {
-    UnregisterTsfProfile();
-    UnregisterComServer();
+    UnregisterTsfProfile(true);
+    UnregisterComServer(true);
+  }
+  return result;
+}
+
+HRESULT RegisterMachineProfile() {
+  HRESULT result = RegisterComServer(false);
+  if (FAILED(result))
+    return result;
+  result = RegisterTsfProfile(false);
+  if (FAILED(result)) {
+    UnregisterTsfProfile(false);
+    UnregisterComServer(false);
   }
   return result;
 }
 
 HRESULT UnregisterDevelopmentProfile() {
-  UnregisterTsfProfile();
-  UnregisterComServer();
+  UnregisterTsfProfile(true);
+  UnregisterComServer(true);
+  return S_OK;
+}
+
+HRESULT UnregisterMachineProfile() {
+  UnregisterTsfProfile(false);
+  UnregisterComServer(false);
   return S_OK;
 }
 
 } // namespace famo::tsf
 
 STDAPI DllRegisterServer() {
-  return famo::tsf::RegisterDevelopmentProfile();
+  return famo::tsf::ComBoundary(
+      [] { return famo::tsf::RegisterDevelopmentProfile(); });
+}
+
+STDAPI DllRegisterMachine() {
+  return famo::tsf::ComBoundary(
+      [] { return famo::tsf::RegisterMachineProfile(); });
 }
 
 STDAPI DllUnregisterServer() {
-  return famo::tsf::UnregisterDevelopmentProfile();
+  return famo::tsf::ComBoundary(
+      [] { return famo::tsf::UnregisterDevelopmentProfile(); });
+}
+
+STDAPI DllUnregisterMachine() {
+  return famo::tsf::ComBoundary(
+      [] { return famo::tsf::UnregisterMachineProfile(); });
 }

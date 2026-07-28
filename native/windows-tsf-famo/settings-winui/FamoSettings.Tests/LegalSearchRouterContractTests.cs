@@ -62,6 +62,19 @@ public sealed class LegalSearchRouterContractTests
     }
 
     [Fact]
+    public void NormalizeSelection_TruncationDoesNotSplitAnEmoji()
+    {
+        string prefix = new('a', LegalSearchRouter.MaxQueryLength - 1);
+        string selection = prefix + "😀";
+
+        string query = LegalSearchRouter.NormalizeSelection(selection);
+
+        Assert.Equal(prefix, query);
+        Assert.True(query.Length <= LegalSearchRouter.MaxQueryLength);
+        Assert.DoesNotContain('\uFFFD', LegalSearchRouter.SearchUrl(Site("cnki"), query));
+    }
+
+    [Fact]
     public void PolishWindow_WiresTheJumpRowForRetrievalSkillsOnly()
     {
         string window = File.ReadAllText(RepoFile(

@@ -31,6 +31,7 @@ using CreateFn = int32_t(FAMO_ENGINE_CALL *)(uint32_t, FamoEngineApi *);
 
 const char kNi[] = "\xE4\xBD\xA0"; // 你
 const char kNiSecond[] = "\xE5\xB0\xBC"; // 尼
+const char kNiThird[] = "\xE6\xB3\xA5"; // 泥
 
 FamoUtf8String Str(const char *s) {
   FamoUtf8String v;
@@ -101,7 +102,8 @@ int main() {
   CHECK(host.api().create_context(&schema, &ctx) == FAMO_ENGINE_OK);
   CHECK(ctx != nullptr);
 
-  FamoCompositionView view;
+  FamoCompositionView view{};
+  view.size = static_cast<uint32_t>(sizeof(view));
 
   FamoKeyEvent kn = KeyDown('n');
   CHECK(host.api().process_key(ctx, &kn, &view) == FAMO_ENGINE_OK);
@@ -117,16 +119,32 @@ int main() {
   CHECK(view.candidates != nullptr);
   CHECK(Eq(view.candidates[0].text, kNi)); // 你 is the default candidate
   CHECK(host.CanPeekCandidates());
-  FamoCompositionView preview;
+  FamoCompositionView preview{};
+  preview.size = static_cast<uint32_t>(sizeof(preview));
   CHECK(host.api().peek_candidates(ctx, 1, 2, &preview) == FAMO_ENGINE_OK);
   CHECK(preview.candidate_count == 2);
   CHECK(Eq(preview.candidates[0].text, kNiSecond));
   CHECK(Eq(preview.candidates[0].label, "2"));
   host.FreeView(&preview);
   host.FreeView(&view);
-  CHECK(view.preedit.data == nullptr); // free_view zeroed the view
+  CHECK(view.preedit.data == nullptr); // free_view cleared owned fields
+  CHECK(view.size == sizeof(view));     // and preserved the reusable span
 
-  FamoCompositionView sel;
+  CHECK(host.CanSelectCandidateAbsolute());
+  FamoCompositionView absolute{};
+  absolute.size = static_cast<uint32_t>(sizeof(absolute));
+  CHECK(host.api().select_candidate_absolute(ctx, 2, &absolute) ==
+        FAMO_ENGINE_OK);
+  CHECK(Eq(absolute.commit, kNiThird));
+  host.FreeView(&absolute);
+
+  CHECK(host.api().process_key(ctx, &kn, &view) == FAMO_ENGINE_OK);
+  host.FreeView(&view);
+  CHECK(host.api().process_key(ctx, &ki, &view) == FAMO_ENGINE_OK);
+  host.FreeView(&view);
+
+  FamoCompositionView sel{};
+  sel.size = static_cast<uint32_t>(sizeof(sel));
   CHECK(host.api().select_candidate(ctx, 0, &sel) == FAMO_ENGINE_OK);
   CHECK(Eq(sel.commit, kNi));
   CHECK((sel.state_flags & FAMO_COMPOSITION_HAS_COMMIT) != 0);
@@ -164,7 +182,8 @@ int main() {
   CHECK(view.schema_id.data == nullptr); // free_view cleared v1.1 strings too
 
   // get_status: same view shape, no commit consumed.
-  FamoCompositionView st;
+  FamoCompositionView st{};
+  st.size = static_cast<uint32_t>(sizeof(st));
   CHECK(host.api().get_status(ctx, &st) == FAMO_ENGINE_OK);
   CHECK(Eq(st.schema_id, "test"));
   CHECK((st.state_flags & FAMO_COMPOSITION_HAS_COMMIT) == 0);

@@ -13,6 +13,11 @@ namespace Famo.Settings.Theming;
 /// </summary>
 public static class FamoTheme
 {
+    private static FrameworkElement? _systemThemeRoot;
+    private static string _currentSkin = "shenda";
+    private static string _currentMode = "system";
+    private static bool _applying;
+
     // skin → (light 8 token, dark 8 token)，顺序 accent/accentDeep/onAccent/card/card2/ink/ink2/ink3。
     private static readonly Dictionary<string, (string[] Light, string[] Dark)> Palettes = new()
     {
@@ -70,13 +75,29 @@ public static class FamoTheme
     /// <summary>把 skin+mode 解析为一套调色板并原地写入笔刷；mode=system 跟随应用主题。</summary>
     public static void Apply(string skin, string mode)
     {
+        _currentSkin = skin;
+        _currentMode = mode;
+        if (_applying) return;
+        _applying = true;
+        try
+        {
         if (!Palettes.TryGetValue(skin, out var pal)) pal = Palettes["shenda"];
+
+        FrameworkElement? root = Application.Current is App && App.Window?.Content is FrameworkElement content
+            ? content
+            : null;
+        bool followsSystem = mode is not ("dark" or "light");
+        TrackSystemTheme(followsSystem ? root : null);
+        if (root is not null)
+            root.RequestedTheme = followsSystem ? ElementTheme.Default
+                : mode == "dark" ? ElementTheme.Dark : ElementTheme.Light;
 
         bool dark = mode switch
         {
             "dark" => true,
             "light" => false,
-            _ => (Application.Current.RequestedTheme == ApplicationTheme.Dark),
+            _ when root is not null => root.ActualTheme == ElementTheme.Dark,
+            _ => Application.Current.RequestedTheme == ApplicationTheme.Dark,
         };
         IsDark = dark;
         string[] t = dark ? pal.Dark : pal.Light;
@@ -102,12 +123,26 @@ public static class FamoTheme
         Brush("Famo.BannerDeployBg").Color = Mix(accent, Hex(t[3]), 0.11); // accent 11% over card
         Brush("Famo.BannerDeployBorder").Color = WithAlpha(accent, 0.26);
 
-        // 让窗口 light/dark 系统部件（滚动条等）也跟随
-        if (Application.Current is App && App.Window?.Content is FrameworkElement root)
-            root.RequestedTheme = dark ? ElementTheme.Dark : ElementTheme.Light;
-
         Changed?.Invoke();
+        }
+        finally
+        {
+            _applying = false;
+        }
     }
+
+    private static void TrackSystemTheme(FrameworkElement? root)
+    {
+        if (ReferenceEquals(_systemThemeRoot, root)) return;
+        if (_systemThemeRoot is not null)
+            _systemThemeRoot.ActualThemeChanged -= OnActualThemeChanged;
+        _systemThemeRoot = root;
+        if (_systemThemeRoot is not null)
+            _systemThemeRoot.ActualThemeChanged += OnActualThemeChanged;
+    }
+
+    private static void OnActualThemeChanged(FrameworkElement sender, object args) =>
+        Apply(_currentSkin, _currentMode);
 
     /// <summary>取某皮肤某明暗的 token 色（供候选窗预览等自绘用）。idx 见 TokenKeys 顺序。</summary>
     public static Color Token(string skin, bool dark, int idx)

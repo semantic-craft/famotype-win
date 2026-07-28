@@ -1,6 +1,9 @@
 #include "text_service.h"
 
+#include <new>
 #include <utility>
+
+#include "abi_boundary.h"
 
 namespace famo::tsf {
 
@@ -34,6 +37,30 @@ constexpr uint32_t kRimeF1 = 0xffbe;
 // so a release must use librime's expanded bit rather than Weasel's wire bit 14.
 constexpr uint32_t kRimeReleaseMask = 1u << 30;
 constexpr UINT kToUnicodeNoStateChange = 1u << 2;
+
+class ScopedKernelHandle {
+public:
+  explicit ScopedKernelHandle(HANDLE value) : value_(value) {}
+  ~ScopedKernelHandle() {
+    if (value_)
+      CloseHandle(value_);
+  }
+  ScopedKernelHandle(const ScopedKernelHandle &) = delete;
+  ScopedKernelHandle &operator=(const ScopedKernelHandle &) = delete;
+  explicit operator bool() const { return value_ != nullptr; }
+
+private:
+  HANDLE value_ = nullptr;
+};
+
+bool SameSession(const runtime::Correlation &left,
+                 const runtime::Correlation &right) {
+  return left.client_id == right.client_id &&
+         left.activation_generation == right.activation_generation &&
+         left.connection_generation == right.connection_generation &&
+         left.session_id == right.session_id &&
+         left.session_generation == right.session_generation;
+}
 
 uint32_t SpecialKey(WPARAM key, LPARAM key_data) {
   const bool extended = (key_data & (1ll << 24)) != 0;
@@ -139,83 +166,10 @@ HostKey TextService::MakeKey(WPARAM key, LPARAM key_data, bool down,
           static_cast<uint32_t>(GetMessageTime())};
 }
 
-HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
-                               LPARAM key_data, bool down, bool test_only,
-                               BOOL *eaten) {
-  if (!eaten)
-    return E_POINTER;
-  *eaten = FALSE;
-  if (!context || !OnActivationThread())
-    return S_OK;
-  ApplySessionResult();
-  ContextEntry *entry = FindContext(context);
-  if (!entry)
-    return S_OK;
-  if (entry->recovery_cleanup_required) {
-    PostRecoveryWork();
-    return S_OK;
-  }
-  if (entry->state.phase() != ContextPhase::Ready) {
-    if (!entry->session_pending && entry->ui_state.focused)
-      ScheduleSession(entry, SessionWarmupReason::Recovery);
-    return S_OK;
-  }
-  const HostKey host_key =
-      MakeKey(key, key_data, down, test_only);
-  if (test_only) {
-    *eaten = entry->state.TestKey(host_key) ? TRUE : FALSE;
-    return S_OK;
-  }
-
-  const KeyPlan plan = entry->state.PlanKey(host_key);
-  if (!plan.sends_request())
-    return S_OK;
-  runtime::Frame request;
-  request.correlation = plan.correlation;
-  bool encoded = false;
-  if (plan.request == RequestKind::ProcessKey) {
-    request.command = runtime::Command::ProcessKey;
-    encoded = runtime::EncodeKeyEvent(plan.key, &request.payload);
-  } else {
-    request.command = runtime::Command::SelectCandidate;
-    encoded = runtime::EncodeCandidateIndex(plan.candidate_index,
-                                            &request.payload);
-  }
-  if (!encoded) {
-    RecoverConnection();
-    return S_OK;
-  }
-
-  runtime::CallResult result =
-      runtime_port_.Call(std::move(request), runtime::kHardCallDeadline);
-  if (plan.request == RequestKind::ProcessKey) {
-    ReportTiming(entry->first_key_pending ? "firstKey" : "steadyProcessKey",
-                 result.elapsed, plan.correlation, result.status);
-    entry->first_key_pending = false;
-  }
-  if (plan.request == RequestKind::ProcessKey &&
-      result.status == runtime::Status::Unavailable &&
-      runtime_port_.state() == runtime::ChannelState::Ready) {
-    entry->state.CompleteUnhandled();
-    entry->composition.ObserveUnhandledKey(key, down);
-    return S_OK;
-  }
-  if (result.status != runtime::Status::Ok ||
-      !entry->state.AcceptReply(result.reply.correlation)) {
-    RecoverConnection();
-    return S_OK;
-  }
-  runtime::Composition composition;
-  std::string error;
-  if (!runtime::DecodeComposition(result.reply.payload, &composition, &error)) {
-    RecoverConnection();
-    return S_OK;
-  }
-  if (!composition.handled) {
-    entry->state.CompleteUnhandled();
-    entry->composition.ObserveUnhandledKey(key, down);
-    return S_OK;
-  }
+HRESULT TextService::ApplyRuntimeComposition(
+    ContextEntry *entry, const runtime::Composition &composition) {
+  if (!entry || !entry->context)
+    return E_INVALIDARG;
   runtime::Composition host_composition = composition;
   if ((composition.state_flags & runtime::kHostInlinePreedit) == 0) {
     host_composition.preedit.clear();
@@ -230,15 +184,236 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
         static_cast<uint32_t>(host_composition.preedit.size());
     host_composition.preedit_cursor_pos = host_composition.preedit_sel_end;
   }
-  const HRESULT applied = entry->composition.Apply(
-      context, client_id_, host_composition,
+  return entry->composition.Apply(
+      entry->context.get(), client_id_, host_composition,
       static_cast<ITfCompositionSink *>(this));
-  if (FAILED(applied)) {
+}
+
+bool TextService::HandlePreviewSelection(
+    HWND source_window,
+    const runtime::PreviewSelectionRequest &selection) {
+  if (!OnActivationThread() || !source_window || !IsWindow(source_window) ||
+      selection.reserved != 0)
+    return false;
+  const runtime::PipeClientIdentity runtime_identity =
+      runtime_port_.server_identity();
+  ScopedKernelHandle runtime_process(
+      runtime::AcquirePipeClientIdentityLease(runtime_identity));
+  DWORD source_process_id = 0;
+  if (!runtime_process ||
+      GetWindowThreadProcessId(source_window, &source_process_id) == 0 ||
+      source_process_id != runtime_identity.process_id) {
+    return false;
+  }
+  ContextEntry *entry = nullptr;
+  for (auto &owned : contexts_) {
+    if (!owned->close_requested && owned->ui_state.focused &&
+        SameSession(owned->state.session_identity(), selection.correlation) &&
+        owned->selection_capability_sequence ==
+            selection.composition_sequence &&
+        runtime::SelectionCapabilityMatches(
+            owned->ui_state.selection_capability,
+            selection.selection_capability)) {
+      entry = owned.get();
+      break;
+    }
+  }
+  if (!entry)
+    return false;
+  const auto correlation =
+      entry->state.PlanAbsoluteCandidate(selection.composition_sequence);
+  if (!correlation)
+    return false;
+  // Consume before crossing another fallible boundary. A fresh opaque value
+  // keeps later layout/focus UiState encodable, but sequence zero makes it
+  // unusable for this already-clicked composition.
+  (void)RenewSelectionCapability(entry, 0);
+
+  runtime::Frame request;
+  request.command = runtime::Command::SelectCandidateAbsolute;
+  request.correlation = *correlation;
+  if (!runtime::EncodeAbsoluteCandidateSelection(
+          selection.absolute_index, selection.composition_sequence,
+          &request.payload)) {
+    entry->state.CompleteUnhandled();
+    return false;
+  }
+  DeliveryAttempt attempt = SendDelivery(entry, std::move(request));
+  if (attempt.state == DeliveryAttemptState::Rejected) {
+    entry->state.CompleteUnhandled();
+    return false;
+  }
+  if (attempt.state == DeliveryAttemptState::PrepareUnknown) {
+    entry->pending_delivery = attempt.reference;
+    entry->pending_physical_key = false;
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Cancel,
+                         attempt.reference);
+    return false;
+  }
+  if (attempt.state == DeliveryAttemptState::PreparedAmbiguous) {
+    entry->pending_delivery = attempt.reference;
+    entry->pending_physical_key = false;
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Recover,
+                         attempt.reference);
+    return true;
+  }
+  const runtime::Frame &reply = attempt.final_reply;
+  if (reply.flags != runtime::kFlagResponse ||
+      reply.command != attempt.reference.command ||
+      reply.correlation != attempt.reference.correlation ||
+      !entry->state.AcceptReply(reply.correlation)) {
+    entry->pending_delivery = attempt.reference;
+    QuarantineDelivery(entry);
+    return true;
+  }
+  if (reply.status != runtime::Status::Ok) {
+    // This is an exact terminal reply, not an ambiguous execution. Complete
+    // the host plan and retain it for the normal ACK path without poisoning
+    // the runtime connection; the next valid key can continue in-place.
+    entry->state.CompleteUnhandled();
+    entry->applied_delivery = attempt.reference;
+    return false;
+  }
+  runtime::Composition composition;
+  std::string error;
+  if (!runtime::DecodeComposition(reply.payload, &composition, &error)) {
+    entry->pending_delivery = attempt.reference;
+    QuarantineDelivery(entry);
+    return true;
+  }
+  if (!composition.handled) {
+    entry->state.CompleteUnhandled();
+    entry->applied_delivery = attempt.reference;
+    return false;
+  }
+  if (FAILED(ApplyRuntimeComposition(entry, composition))) {
+    entry->pending_delivery = attempt.reference;
+    entry->deferred_delivery_composition = std::move(composition);
+    return true;
+  }
+  entry->state.ApplySucceeded(composition);
+  UpdateCandidates(entry, composition);
+  entry->applied_delivery = attempt.reference;
+  return true;
+}
+
+HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
+                               LPARAM key_data, bool down, bool test_only,
+                               BOOL *eaten) {
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  if (!context || !OnActivationThread())
+    return S_OK;
+  ApplyDeliveryResult();
+  ApplySessionResult();
+  ContextEntry *entry = FindContext(context);
+  if (!entry)
+    return S_OK;
+  if (entry->close_requested)
+    return S_OK;
+  if (entry->delivery_quarantined)
+    return S_OK;
+  if (!ApplyDeferredDelivery(entry))
+    return S_OK;
+  if (entry->recovery_cleanup_required) {
+    PostRecoveryWork();
+    return S_OK;
+  }
+  if (entry->state.phase() != ContextPhase::Ready) {
+    if (!entry->session_pending && entry->ui_state.focused)
+      ScheduleSession(entry, SessionWarmupReason::Recovery);
+    return S_OK;
+  }
+  const HostKey host_key =
+      MakeKey(key, key_data, down, test_only);
+  if (test_only) {
+    if (entry->pending_delivery || entry->delivery_work_pending ||
+        entry->state.pending_sequence() != 0) {
+      return S_OK;
+    }
+    *eaten = entry->state.TestKey(host_key) ? TRUE : FALSE;
+    return S_OK;
+  }
+
+  const KeyPlan plan = entry->state.PlanKey(host_key);
+  if (!plan.sends_request())
+    return S_OK;
+  runtime::Frame request;
+  request.command = runtime::Command::ProcessKey;
+  request.correlation = plan.correlation;
+  const bool encoded = runtime::EncodeKeyEvent(plan.key, &request.payload);
+  if (!encoded) {
     RecoverConnection();
+    return S_OK;
+  }
+
+  DeliveryAttempt attempt = SendDelivery(entry, std::move(request));
+  ReportTiming(entry->first_key_pending ? "firstKey" : "steadyProcessKey",
+               attempt.elapsed, plan.correlation, attempt.status);
+  entry->first_key_pending = false;
+  if (attempt.state == DeliveryAttemptState::Rejected) {
+    entry->state.CompleteUnhandled();
+    entry->composition.ObserveUnhandledKey(key, down);
+    return S_OK;
+  }
+  if (attempt.state == DeliveryAttemptState::PrepareUnknown) {
+    entry->pending_delivery = attempt.reference;
+    entry->pending_windows_key = key;
+    entry->pending_key_down = down;
+    entry->pending_physical_key = true;
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Cancel,
+                         attempt.reference);
+    return S_OK;
+  }
+  if (attempt.state == DeliveryAttemptState::PreparedAmbiguous) {
+    entry->pending_delivery = attempt.reference;
+    entry->pending_physical_key = false;
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Recover,
+                         attempt.reference);
+    *eaten = TRUE;
+    return S_OK;
+  }
+  const runtime::Frame &reply = attempt.final_reply;
+  if (reply.flags != runtime::kFlagResponse ||
+      reply.command != attempt.reference.command ||
+      reply.correlation != attempt.reference.correlation ||
+      !entry->state.AcceptReply(reply.correlation)) {
+    entry->pending_delivery = attempt.reference;
+    QuarantineDelivery(entry);
+    *eaten = TRUE;
+    return S_OK;
+  }
+  if (reply.status != runtime::Status::Ok) {
+    entry->pending_delivery = attempt.reference;
+    QuarantineDelivery(entry);
+    *eaten = TRUE;
+    return S_OK;
+  }
+  runtime::Composition composition;
+  std::string error;
+  if (!runtime::DecodeComposition(reply.payload, &composition, &error)) {
+    entry->pending_delivery = attempt.reference;
+    QuarantineDelivery(entry);
+    *eaten = TRUE;
+    return S_OK;
+  }
+  if (!composition.handled) {
+    entry->state.CompleteUnhandled();
+    entry->composition.ObserveUnhandledKey(key, down);
+    entry->applied_delivery = attempt.reference;
+    return S_OK;
+  }
+  const HRESULT applied = ApplyRuntimeComposition(entry, composition);
+  if (FAILED(applied)) {
+    entry->pending_delivery = attempt.reference;
+    entry->deferred_delivery_composition = std::move(composition);
+    *eaten = TRUE;
     return S_OK;
   }
   entry->state.ApplySucceeded(composition);
   UpdateCandidates(entry, composition);
+  entry->applied_delivery = attempt.reference;
   *eaten = TRUE;
   return S_OK;
 }
@@ -281,6 +456,10 @@ void TextService::UpdateCandidates(
     ContextEntry *entry, const runtime::Composition &composition) {
   if (!entry || !entry->candidates)
     return;
+  if (!RenewSelectionCapability(entry, entry->state.displayed_sequence())) {
+    entry->ui_state.show_allowed = false;
+    return;
+  }
   BOOL show_allowed = FALSE;
   if (FAILED(entry->candidates->Update(composition, &show_allowed))) {
     entry->candidates->End();
@@ -292,22 +471,49 @@ void TextService::UpdateCandidates(
 
 HRESULT TextService::OnTestKeyDown(ITfContext *context, WPARAM key,
                                    LPARAM key_data, BOOL *eaten) {
-  return HandleKey(context, key, key_data, true, true, eaten);
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  return BoundaryOr<HRESULT>(S_OK, [&] {
+    if (GetEnvironmentVariableA("FAMO_TEST_KEY_CALLBACK_ALLOCATION_FAILURE",
+                                nullptr, 0) != 0) {
+      throw std::bad_alloc();
+    }
+    return HandleKey(context, key, key_data, true, true, eaten);
+  });
 }
 
 HRESULT TextService::OnTestKeyUp(ITfContext *context, WPARAM key,
                                  LPARAM key_data, BOOL *eaten) {
-  return HandleKey(context, key, key_data, false, true, eaten);
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  return BoundaryOr<HRESULT>(
+      S_OK, [&] { return HandleKey(context, key, key_data, false, true, eaten); });
 }
 
 HRESULT TextService::OnKeyDown(ITfContext *context, WPARAM key,
                                LPARAM key_data, BOOL *eaten) {
-  return HandleKey(context, key, key_data, true, false, eaten);
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  return BoundaryOr<HRESULT>(S_OK, [&] {
+    if (GetEnvironmentVariableA("FAMO_TEST_KEY_CALLBACK_ALLOCATION_FAILURE",
+                                nullptr, 0) != 0) {
+      throw std::bad_alloc();
+    }
+    return HandleKey(context, key, key_data, true, false, eaten);
+  });
 }
 
 HRESULT TextService::OnKeyUp(ITfContext *context, WPARAM key,
                              LPARAM key_data, BOOL *eaten) {
-  return HandleKey(context, key, key_data, false, false, eaten);
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  return BoundaryOr<HRESULT>(
+      S_OK,
+      [&] { return HandleKey(context, key, key_data, false, false, eaten); });
 }
 
 HRESULT TextService::OnPreservedKey(ITfContext *, REFGUID, BOOL *eaten) {

@@ -4,6 +4,7 @@
 
 #include <oleauto.h>
 
+#include "abi_boundary.h"
 #include "famo_guids.h"
 #include "famo_utf_conversion.h"
 #include "module_state.h"
@@ -177,18 +178,20 @@ HRESULT CandidateUiElement::GetPageIndex(UINT *indices, UINT size,
 }
 
 HRESULT CandidateUiElement::SetPageIndex(UINT *indices, UINT page_count) {
-  if (page_count == 0 || !indices)
-    return E_INVALIDARG;
-  if (indices[0] != 0)
-    return E_INVALIDARG;
-  for (UINT index = 1; index < page_count; ++index) {
-    if (indices[index] <= indices[index - 1] ||
-        indices[index] >= candidates_.size())
+  return ComBoundary([&] {
+    if (page_count == 0 || !indices)
       return E_INVALIDARG;
-  }
-  pages_.assign(indices, indices + page_count);
-  current_page_ = std::min(current_page_, page_count - 1);
-  return S_OK;
+    if (indices[0] != 0)
+      return E_INVALIDARG;
+    for (UINT index = 1; index < page_count; ++index) {
+      if (indices[index] <= indices[index - 1] ||
+          indices[index] >= candidates_.size())
+        return E_INVALIDARG;
+    }
+    pages_.assign(indices, indices + page_count);
+    current_page_ = std::min(current_page_, page_count - 1);
+    return S_OK;
+  });
 }
 
 HRESULT CandidateUiElement::GetCurrentPage(UINT *page) {

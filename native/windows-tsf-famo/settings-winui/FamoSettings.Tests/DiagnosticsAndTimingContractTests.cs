@@ -96,6 +96,26 @@ public sealed class DiagnosticsAndTimingContractTests
         Assert.DoesNotContain("Remove-Item", script);
     }
 
+    [Fact]
+    public void ExplorerHangDiagnosticsUseTheActiveTransactionalTextService()
+    {
+        string orchestrator = File.ReadAllText(
+            RepoFile("native/windows-tsf-famo/tools/diagnostics/Invoke-FamoExplorerHangAB.ps1"));
+        string probe = File.ReadAllText(
+            RepoFile("native/windows-tsf-famo/tools/diagnostics/Invoke-FamoExplorerHangProbe.ps1"));
+
+        Assert.Contains("FamoTextService.dll", orchestrator);
+        Assert.Contains(@"SOFTWARE\Classes\CLSID\", orchestrator);
+        Assert.Contains("InProcServer32", orchestrator, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(@"installer\staging\payload", orchestrator);
+        Assert.Contains("PreflightOnly", orchestrator);
+        Assert.DoesNotContain(@"$FamoDll = 'C:\Program Files\Famo\FamoTsf.dll'", orchestrator);
+
+        Assert.Contains("FamoModulePath", probe);
+        Assert.Contains("FamoTextService.dll", probe);
+        Assert.DoesNotContain("$_.name -ieq 'FamoTsf.dll'", probe);
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;

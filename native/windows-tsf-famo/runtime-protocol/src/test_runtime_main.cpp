@@ -11,7 +11,31 @@
 
 using namespace famo::runtime;
 
+namespace famo::runtime {
+
+struct RuntimeServiceTestAccess {
+  static size_t ClientCount(RuntimeService &service) {
+    std::lock_guard lock(service.mutex_);
+    return service.clients_.size();
+  }
+
+  static size_t SessionCount(RuntimeService &service) {
+    std::lock_guard lock(service.mutex_);
+    return service.sessions_.size();
+  }
+};
+
+} // namespace famo::runtime
+
 namespace {
+
+constexpr wchar_t kTestRuntimePreviewSourceClass[] =
+    L"FamoTestRuntimePreviewSource";
+
+LRESULT CALLBACK PreviewSourceProc(HWND window, UINT message, WPARAM wparam,
+                                   LPARAM lparam) {
+  return DefWindowProcW(window, message, wparam, lparam);
+}
 
 std::wstring ModuleDirectory() {
   std::wstring path(32768, L'\0');
@@ -42,6 +66,10 @@ int wmain(int argc, wchar_t **argv) {
   int fault_after = 0;
   bool parallel = false;
   bool inline_preedit = true;
+  int preview_rows = 0;
+  int expected_terminal_abandons = -1;
+  int expected_clients = -1;
+  int expected_sessions = -1;
   for (int i = 1; i < argc; ++i) {
     const std::wstring_view argument(argv[i]);
     if (argument == L"--endpoint-suffix" && i + 1 < argc) {
@@ -61,6 +89,15 @@ int wmain(int argc, wchar_t **argv) {
         return 2;
       }
       inline_preedit = value == L"true";
+    } else if (argument == L"--preview-rows" && i + 1 < argc) {
+      preview_rows = _wtoi(argv[++i]);
+    } else if (argument == L"--expected-terminal-abandons" &&
+               i + 1 < argc) {
+      expected_terminal_abandons = _wtoi(argv[++i]);
+    } else if (argument == L"--expected-clients" && i + 1 < argc) {
+      expected_clients = _wtoi(argv[++i]);
+    } else if (argument == L"--expected-sessions" && i + 1 < argc) {
+      expected_sessions = _wtoi(argv[++i]);
     } else {
       std::fprintf(stderr, "invalid arguments\n");
       return 2;
@@ -69,28 +106,89 @@ int wmain(int argc, wchar_t **argv) {
   ServerFault fault;
   PipeEndpoint endpoint;
   std::string error;
-  const int max_connections = parallel ? 64 : 4;
+  const int max_connections =
+      parallel ? static_cast<int>(kRuntimeClientCapacity * 2) : 4;
   if (connections < 1 || connections > max_connections || fault_after < 0 ||
       fault_after > 100 ||
+      preview_rows < 0 || preview_rows > 2 ||
+      expected_terminal_abandons < -1 ||
+      expected_terminal_abandons > 100 ||
+      expected_clients < -1 || expected_clients > 100 ||
+      expected_sessions < -1 || expected_sessions > 100 ||
       !ParseServerFault(fault_name, &fault) ||
       !BuildCurrentPipeEndpoint(suffix, &endpoint, &error)) {
     std::fprintf(stderr, "runtime setup failed: %s\n", error.c_str());
     return 2;
   }
   const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
+  WNDCLASSW preview_source_class{};
+  preview_source_class.lpfnWndProc = PreviewSourceProc;
+  preview_source_class.hInstance = GetModuleHandleW(nullptr);
+  preview_source_class.lpszClassName = kTestRuntimePreviewSourceClass;
+  if (!RegisterClassW(&preview_source_class) &&
+      GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    std::fprintf(stderr, "preview source class registration failed\n");
+    return 2;
+  }
+  const std::wstring preview_source_title =
+      std::to_wstring(GetCurrentProcessId());
+  HWND preview_source = CreateWindowExW(
+      0, kTestRuntimePreviewSourceClass, preview_source_title.c_str(), 0, 0, 0,
+      0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  if (!preview_source) {
+    std::fprintf(stderr, "preview source window creation failed\n");
+    return 2;
+  }
 
+  if (preview_rows > 0)
+    _putenv_s("FAMO_TEST_MULTIPAGE", "1");
   const std::wstring engine = ModuleDirectory() + L"\\FamoTestEngine.dll";
   RuntimeService service;
   if (!service.Start(engine.c_str(), "", &error)) {
     std::fprintf(stderr, "engine setup failed: %s\n", error.c_str());
     return 3;
   }
-  const uint32_t behavior_flags =
-      inline_preedit ? kHostInlinePreedit : 0;
+  uint32_t behavior_flags = inline_preedit ? kHostInlinePreedit : 0;
+  if (preview_rows > 0)
+    behavior_flags |= kHostPreviewPages;
+  if (preview_rows == 2)
+    behavior_flags |= kHostPreviewRowsTwo;
   if (service.InitializeControlState(behavior_flags) != ControlError::None) {
     std::fprintf(stderr, "runtime control state setup failed\n");
     return 3;
   }
+  std::atomic<uint32_t> terminal_abandon_count{0};
+  const auto final_state_matches = [&] {
+    if (expected_terminal_abandons >= 0 &&
+        terminal_abandon_count.load() !=
+            static_cast<uint32_t>(expected_terminal_abandons)) {
+      std::fprintf(stderr, "unexpected terminal abandon count: %u\n",
+                   terminal_abandon_count.load());
+      return false;
+    }
+    if (expected_clients >= 0 &&
+        RuntimeServiceTestAccess::ClientCount(service) !=
+            static_cast<size_t>(expected_clients)) {
+      std::fprintf(stderr, "unexpected runtime client count: %zu\n",
+                   RuntimeServiceTestAccess::ClientCount(service));
+      return false;
+    }
+    if (expected_sessions >= 0 &&
+        RuntimeServiceTestAccess::SessionCount(service) !=
+            static_cast<size_t>(expected_sessions)) {
+      std::fprintf(stderr, "unexpected runtime session count: %zu\n",
+                   RuntimeServiceTestAccess::SessionCount(service));
+      return false;
+    }
+    if ((fault == ServerFault::CopyFailureAfterMutation ||
+         fault == ServerFault::CopyFailureAfterMutationSticky) &&
+        terminal_abandon_count.load() == 0) {
+      std::fprintf(stderr,
+                   "copy-failure runtime never received terminal abandon\n");
+      return false;
+    }
+    return true;
+  };
   if (parallel) {
     std::vector<std::atomic<bool>> served(static_cast<size_t>(connections));
     std::vector<std::string> errors(static_cast<size_t>(connections));
@@ -103,7 +201,8 @@ int wmain(int argc, wchar_t **argv) {
             (connection % 2) == 0 ? endpoint : ui_endpoint;
         served[connection].store(server.ServeOnce(
             active_endpoint, &service, fault, std::chrono::seconds(60),
-            &errors[connection], static_cast<uint32_t>(fault_after)));
+            &errors[connection], static_cast<uint32_t>(fault_after), nullptr,
+            (connection % 2) != 0, &terminal_abandon_count));
       });
     }
     for (std::thread &worker : workers)
@@ -115,6 +214,9 @@ int wmain(int argc, wchar_t **argv) {
         return 4;
       }
     }
+    DestroyWindow(preview_source);
+    if (!final_state_matches())
+      return 4;
     return 0;
   }
   RuntimePipeServer server;
@@ -123,10 +225,14 @@ int wmain(int argc, wchar_t **argv) {
         connection == 0 ? fault : ServerFault::None;
     if (!server.ServeOnce(endpoint, &service, active_fault,
                           std::chrono::seconds(10), &error,
-                          static_cast<uint32_t>(fault_after))) {
+                          static_cast<uint32_t>(fault_after), nullptr, false,
+                          &terminal_abandon_count)) {
       std::fprintf(stderr, "runtime serve failed: %s\n", error.c_str());
       return 4;
     }
   }
+  DestroyWindow(preview_source);
+  if (!final_state_matches())
+    return 4;
   return 0;
 }

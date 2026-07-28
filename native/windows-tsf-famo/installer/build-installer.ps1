@@ -177,7 +177,7 @@ $iscc = @(
   "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 if (-not $iscc) { throw '未找到 ISCC.exe。' }
-& $iscc "/DAppVersion=$AppVersion" "/DManifestPrefix=$manifestPrefix" "/DIdentity=$Identity" $Iss
+& $iscc "/DAppVersion=$AppVersion" "/DManifestPrefix=$manifestPrefix" "/DManifestHash=$manifestHash" "/DIdentity=$Identity" $Iss
 if ($LASTEXITCODE -ne 0) { throw 'ISCC 编译失败。' }
 
 $exe = Get-ChildItem -LiteralPath (Join-Path $InstallerDir 'dist') -Filter "Famo-Setup-$AppVersion.exe" | Select-Object -First 1

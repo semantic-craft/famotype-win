@@ -7,11 +7,32 @@
 // UTF-8 literals are explicit byte escapes so correctness does not depend on the
 // compiler's source charset.
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
+
+#include <windows.h>
 
 #include "../famo_candidate_ui.h"
+
+static_assert(noexcept(FamoSkinDefault()));
+static_assert(noexcept(FamoUtf8ByteToWchar(nullptr, 0, 0)));
+static_assert(noexcept(FamoComputeAnchor(
+    nullptr, nullptr, {}, nullptr, nullptr, nullptr)));
+static_assert(noexcept(FamoCandidateUiLayout(
+    nullptr, nullptr, nullptr, nullptr)));
+static_assert(noexcept(FamoTextResourcesCreate(nullptr, 0)));
+static_assert(noexcept(FamoTextResourcesReconfigure(nullptr, nullptr, 0)));
+static_assert(noexcept(FamoTextResourcesDiscardDeviceResources(nullptr)));
+static_assert(noexcept(FamoTextResourcesDestroy(nullptr)));
+static_assert(noexcept(FamoTextMeasure(nullptr, 0, nullptr, 0)));
+static_assert(noexcept(FamoCandidateUiPaint(
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)));
+static_assert(noexcept(FamoStatusBarPaint(
+    nullptr, nullptr, nullptr, nullptr)));
 
 #define CHECK(cond)                                                       \
   do {                                                                    \
@@ -80,12 +101,33 @@ int32_t Measure(void* /*user*/, int32_t /*which*/, const char* s, uint32_t len) 
   return static_cast<int32_t>(units) * 10;
 }
 
+int32_t ThrowingMeasure(void*, int32_t, const char*, uint32_t) {
+  throw std::bad_alloc();
+}
+
+int32_t FaultingMeasure(void*, int32_t, const char*, uint32_t) {
+  RaiseException(0xE0424D4Fu, 0, 0, nullptr);
+  return 0;
+}
+
 // Build a candidate array (caller owns storage). label/text/comment as given.
 struct Cand {
   const char* label;
   const char* text;
   const char* comment;
 };
+
+// Exact pre-v1.2 candidate layout. A legacy engine packs arrays with this
+// stride; the v1.2 label was appended after flags.
+struct LegacyCandidate {
+  uint32_t size;
+  FamoUtf8String text;
+  FamoUtf8String comment;
+  uint32_t quality;
+  uint32_t flags;
+};
+
+static_assert(sizeof(LegacyCandidate) == offsetof(FamoCandidate, label));
 
 void FillCands(FamoCandidate* arr, const Cand* src, uint32_t n) {
   for (uint32_t i = 0; i < n; ++i) {
@@ -188,8 +230,13 @@ int RunFamily(FamoLayoutType type) {
     if (CheckCommon(out, 3)) return 1;
     CHECK(NonEmpty(out.preedit));                 // multibyte preedit band shown
     CHECK(NonEmpty(out.highlight));
-    // highlight == the highlighted candidate (index 1) bounds
-    CHECK(std::memcmp(&out.highlight, &out.candidates[1].bounds, sizeof(FamoRect)) == 0);
+    // Every family: the pill is exactly its row — no bleed into the panel's
+    // outer padding, so it never clamps flush to an edge.
+    CHECK(std::memcmp(&out.highlight, &out.candidates[1].bounds,
+                      sizeof(FamoRect)) == 0);
+    // The stable band/list gap gives Paint enough information to derive its
+    // full-bleed hairline without appending to this output ABI.
+    CHECK(out.candidates[0].bounds.top > out.preedit.bottom);
     CHECK(NonEmpty(out.prev_page));               // page_index>0 → "<"
     CHECK(NonEmpty(out.next_page));               // !is_last_page → ">"
 
@@ -215,7 +262,8 @@ int RunFamily(FamoLayoutType type) {
     if (CheckCommon(out, 3)) return 1;
     CHECK(IsEmpty(out.prev_page));                // page_index==0 → no "<"
     CHECK(IsEmpty(out.next_page));                // is_last_page → no ">"
-    CHECK(std::memcmp(&out.highlight, &out.candidates[0].bounds, sizeof(FamoRect)) == 0);
+    CHECK(std::memcmp(&out.highlight, &out.candidates[0].bounds,
+                      sizeof(FamoRect)) == 0);
   }
 
   return 0;
@@ -355,6 +403,9 @@ int RunPreeditAndPreview() {
   CHECK(shown.preview_candidate_count == 4);
   CHECK(shown.preview_candidates[2].bounds.top >
         shown.preview_candidates[0].bounds.top);
+  CHECK(std::memcmp(&shown.highlight, &shown.candidates[0].bounds,
+                    sizeof(FamoRect)) == 0);
+  CHECK(shown.candidates[0].bounds.top > shown.preedit.bottom);
 
   skin.show_preedit = 0;
   FamoLayoutResult hidden{};
@@ -371,6 +422,59 @@ int RunPreeditAndPreview() {
   return 0;
 }
 
+int RunLegacyCandidateAbi() {
+  // Padding makes the pre-fix current-stride over-read deterministic instead of
+  // depending on adjacent stack objects. Candidate 1 deliberately has empty
+  // text plus a visible comment: the correct legacy stride yields an empty text
+  // rect and a comment rect; current-size indexing mistakes the comment for text.
+  struct {
+    LegacyCandidate candidates[2];
+    unsigned char guard[sizeof(FamoCandidate)];
+  } storage{};
+  for (LegacyCandidate& candidate : storage.candidates) {
+    candidate.size = static_cast<uint32_t>(sizeof(LegacyCandidate));
+    candidate.text = Empty();
+    candidate.comment = Empty();
+  }
+  storage.candidates[0].text = Str("A");
+  storage.candidates[1].comment = Str("second-comment");
+
+  FamoSkin skin = FamoSkinDefault();
+  skin.layout_type = FAMO_LAYOUT_VERTICAL;
+  skin.comment_color = 0xFF808080u;
+  FamoLayoutInput input =
+      MakeInput(R(400, 300, 402, 320), R(0, 0, 1920, 1080));
+  FamoCompositionView view = MakeView(
+      reinterpret_cast<FamoCandidate*>(storage.candidates), 2, 0, 0, 1);
+  view.size = static_cast<uint32_t>(
+      offsetof(FamoCompositionView, preedit_sel_start));
+
+  FamoLayoutResult out{};
+  CHECK(FamoCandidateUiLayout(&view, &skin, &input, &out) == FAMO_UI_OK);
+  CHECK(IsEmpty(out.candidates[0].label));
+  CHECK(W(out.candidates[1].text) == 0);
+  CHECK(out.candidates[1].has_comment == 1);
+  CHECK(NonEmpty(out.candidates[1].comment));
+
+  FamoCandidate main_candidate[1];
+  const Cand main_source[1] = {{"1", "main", nullptr}};
+  FillCands(main_candidate, main_source, 1);
+  skin.layout_type = FAMO_LAYOUT_HORIZONTAL;
+  skin.preview_pages = 1;
+  skin.preview_rows = 1;
+  input.preview_candidates =
+      reinterpret_cast<FamoCandidate*>(storage.candidates);
+  input.preview_candidate_count = 2;
+  input.preview_page_size = 2;
+  view = MakeView(main_candidate, 1, 0, 0, 0);
+
+  FamoLayoutResult preview{};
+  CHECK(FamoCandidateUiLayout(&view, &skin, &input, &preview) == FAMO_UI_OK);
+  CHECK(preview.preview_candidate_count == 2);
+  CHECK(W(preview.preview_candidates[1].text) == 0);
+  return 0;
+}
+
 int RunArgGuards() {
   FamoSkin sk = FamoSkinDefault();
   FamoLayoutInput in = MakeInput(R(0, 0, 2, 20), R(0, 0, 1920, 1080));
@@ -383,7 +487,108 @@ int RunArgGuards() {
   CHECK(FamoCandidateUiLayout(&v, nullptr, &in, &out) == FAMO_UI_E_INVALID_ARGUMENT);
   CHECK(FamoCandidateUiLayout(&v, &sk, nullptr, &out) == FAMO_UI_E_INVALID_ARGUMENT);
   CHECK(FamoCandidateUiLayout(&v, &sk, &in, nullptr) == FAMO_UI_E_INVALID_ARGUMENT);
+  v.candidates = nullptr;
+  CHECK(FamoCandidateUiLayout(&v, &sk, &in, &out) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  v = MakeView(arr, 1, 0, 0, 1);
+  FamoSkin legacy_skin = sk;
+  legacy_skin.size = static_cast<uint32_t>(offsetof(FamoSkin, caret_width));
+  CHECK(FamoCandidateUiLayout(&v, &legacy_skin, &in, &out) == FAMO_UI_OK);
+  legacy_skin.size -= 1;
+  CHECK(FamoCandidateUiLayout(&v, &legacy_skin, &in, &out) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoCompositionView short_view = v;
+  short_view.size =
+      static_cast<uint32_t>(offsetof(FamoCompositionView, preedit_sel_start) - 1);
+  CHECK(FamoCandidateUiLayout(&short_view, &sk, &in, &out) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoLayoutInput legacy_input = in;
+  legacy_input.size =
+      static_cast<uint32_t>(offsetof(FamoLayoutInput, preview_candidates));
+  CHECK(FamoCandidateUiLayout(&v, &sk, &legacy_input, &out) == FAMO_UI_OK);
+  legacy_input.size -= 1;
+  CHECK(FamoCandidateUiLayout(&v, &sk, &legacy_input, &out) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoCompositionView bad_string = v;
+  bad_string.preedit.data = nullptr;
+  bad_string.preedit.length_bytes = 1;
+  CHECK(FamoCandidateUiLayout(&bad_string, &sk, &in, &out) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoCandidate bad_candidate = arr[0];
+  bad_candidate.text.data = nullptr;
+  bad_candidate.text.length_bytes = 1;
+  FamoCompositionView bad_candidate_view =
+      MakeView(&bad_candidate, 1, 0, 0, 1);
+  CHECK(FamoCandidateUiLayout(&bad_candidate_view, &sk, &in, &out) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
+
+  FamoLayoutInput bad_preview = in;
+  bad_preview.preview_candidates = nullptr;
+  bad_preview.preview_candidate_count = 1;
+  bad_preview.preview_page_size = 1;
+  CHECK(FamoCandidateUiLayout(&v, &sk, &bad_preview, &out) ==
+        FAMO_UI_E_INVALID_ARGUMENT);
   // Paint (B5) needs a device → covered by the bitmap_smoke ctest, not here.
+  return 0;
+}
+
+int RunLayoutOutputAbiCanary() {
+  constexpr size_t kLegacyResultSize = FAMO_LAYOUT_RESULT_STABLE_SIZE;
+  constexpr size_t kGuardSize = 32;
+  constexpr unsigned char kGuard = 0xA7;
+  alignas(FamoLayoutResult)
+      unsigned char storage[kLegacyResultSize + kGuardSize]{};
+  std::memset(storage + kLegacyResultSize, kGuard, kGuardSize);
+
+  FamoSkin skin = FamoSkinDefault();
+  FamoLayoutInput input =
+      MakeInput(R(400, 300, 402, 320), R(0, 0, 1920, 1080));
+  FamoCandidate candidate;
+  const Cand source[1] = {{"1", kNiHao, nullptr}};
+  FillCands(&candidate, source, 1);
+  FamoCompositionView view = MakeView(&candidate, 1, 0, 0, 1);
+  auto* result = reinterpret_cast<FamoLayoutResult*>(storage);
+
+  CHECK(FamoCandidateUiLayout(&view, &skin, &input, result) == FAMO_UI_OK);
+  for (size_t i = 0; i < kGuardSize; ++i)
+    CHECK(storage[kLegacyResultSize + i] == kGuard);
+  return 0;
+}
+
+int RunLayoutExceptionBoundary() {
+  FamoSkin skin = FamoSkinDefault();
+  FamoLayoutInput input =
+      MakeInput(R(400, 300, 402, 320), R(0, 0, 1920, 1080));
+  input.measure = &ThrowingMeasure;
+  FamoCandidate candidate;
+  const Cand source[1] = {{"1", kNiHao, nullptr}};
+  FillCands(&candidate, source, 1);
+  FamoCompositionView view = MakeView(&candidate, 1, 0, 0, 1);
+
+  FamoLayoutResult output;
+  std::memset(&output, 0xA5, sizeof(output));
+  const FamoLayoutResult original = output;
+  int32_t result = FAMO_UI_OK;
+  bool escaped = false;
+  try {
+    result = FamoCandidateUiLayout(&view, &skin, &input, &output);
+  } catch (...) {
+    escaped = true;
+  }
+  CHECK(!escaped);
+  CHECK(result == FAMO_UI_E_LAYOUT_FAILED);
+  CHECK(std::memcmp(&output, &original, sizeof(output)) == 0);
+
+  input.measure = &FaultingMeasure;
+  output = original;
+  result = FamoCandidateUiLayout(&view, &skin, &input, &output);
+  CHECK(result == FAMO_UI_E_LAYOUT_FAILED);
+  CHECK(std::memcmp(&output, &original, sizeof(output)) == 0);
   return 0;
 }
 
@@ -396,7 +601,10 @@ int main() {
   if (RunFlip()) return 1;
   if (RunOffsetConversion()) return 1;
   if (RunPreeditAndPreview()) return 1;
+  if (RunLegacyCandidateAbi()) return 1;
   if (RunArgGuards()) return 1;
+  if (RunLayoutOutputAbiCanary()) return 1;
+  if (RunLayoutExceptionBoundary()) return 1;
   std::printf("geometry_selfcheck: OK\n");
   return 0;
 }

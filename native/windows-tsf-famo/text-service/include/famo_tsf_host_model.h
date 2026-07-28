@@ -10,7 +10,7 @@
 namespace famo::tsf {
 
 enum class ContextPhase { Unopened, Ready, Poisoned, Closed };
-enum class RequestKind { None, ProcessKey, SelectCandidate };
+enum class RequestKind { None, ProcessKey };
 
 struct HostKey {
   uint32_t virtual_key = 0;
@@ -24,7 +24,6 @@ struct KeyPlan {
   RequestKind request = RequestKind::None;
   runtime::Correlation correlation;
   runtime::KeyEvent key;
-  uint32_t candidate_index = 0;
 
   bool sends_request() const { return request != RequestKind::None; }
 };
@@ -40,6 +39,8 @@ public:
 
   bool TestKey(const HostKey &key) const;
   KeyPlan PlanKey(const HostKey &key);
+  std::optional<runtime::Correlation>
+  PlanAbsoluteCandidate(uint64_t composition_sequence);
   std::optional<runtime::Correlation> PlanUiState();
   std::optional<runtime::Correlation> PlanClose();
   bool AcceptReply(const runtime::Correlation &reply) const;
@@ -49,17 +50,19 @@ public:
 
   ContextPhase phase() const { return phase_; }
   uint64_t pending_sequence() const { return pending_sequence_; }
+  uint64_t displayed_sequence() const { return displayed_sequence_; }
   const runtime::Correlation &session_identity() const { return identity_; }
   const runtime::Composition &displayed() const { return displayed_; }
 
 private:
-  bool Classifies(const HostKey &key, uint32_t *candidate_index) const;
+  bool Classifies(const HostKey &key) const;
 
   ContextPhase phase_ = ContextPhase::Unopened;
   runtime::Correlation identity_;
   runtime::Composition displayed_;
   uint64_t next_sequence_ = 1;
   uint64_t pending_sequence_ = 0;
+  uint64_t displayed_sequence_ = 0;
   bool recovery_emitted_ = false;
 };
 

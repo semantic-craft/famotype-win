@@ -10,7 +10,11 @@ public sealed class MaintenanceSafeTypingContractTests
         string control = File.ReadAllText(RepoFile("native/windows-tsf-famo/runtime-protocol/src/runtime_control_engine.cpp"));
 
         Assert.Contains("readiness_.exchange(RuntimeReadiness::Maintenance)", control);
-        Assert.Contains("engine_.api().destroy_context", control);
+        Assert.Contains("engine_.DestroyContext", control);
+        Assert.Contains("engine_.LoadV2", control);
+        Assert.Contains("engine_.V2Runnable", control);
+        Assert.DoesNotContain("engine_.Load(", control);
+        Assert.DoesNotContain("engine_.api()", control);
         Assert.Contains("sessions_.clear()", control);
         Assert.Contains("clients_.clear()", control);
         Assert.Contains("if (deploy_rc == FAMO_ENGINE_OK)", control);

@@ -15,7 +15,9 @@ namespace Famo.Settings;
 public static class Program
 {
     private const string SingleInstanceKeyPrefix = "Famo.Settings.SingleInstance";
+    private const uint RedirectTimeoutMilliseconds = 10_000;
     private static string SingleInstanceKey => $"{SingleInstanceKeyPrefix}.{BuildKeySegment()}";
+    private enum RedirectionDecision { Primary, Redirected, Failed }
 
     [STAThread]
     private static int Main(string[] args)
@@ -25,6 +27,35 @@ public static class Program
         if (HasFlag(args, "--seed-only"))
         {
             return RunSeedOnly(args);
+        }
+        if (TryGetOption(args, "--prepare-seed-transaction", out string? prepareId))
+        {
+            return PrepareSeedTransaction(prepareId!);
+        }
+        if (TryGetTwoOptions(args, "--apply-seed-transaction",
+                out string? applyId, out string? applyHash))
+        {
+            return ApplySeedTransaction(args, applyId!, applyHash!);
+        }
+        if (TryGetTwoOptions(args, "--rollback-seed-transaction",
+                out string? rollbackId, out string? rollbackHash))
+        {
+            return SeedFileTransaction.Rollback(rollbackId!, rollbackHash!) ? 0 : 1;
+        }
+        if (TryGetTwoOptions(args, "--commit-seed-transaction",
+                out string? commitId, out string? commitHash))
+        {
+            return SeedFileTransaction.Commit(commitId!, commitHash!) ? 0 : 1;
+        }
+        if (TryGetOption(args, "--discard-seed-transaction", out string? discardId))
+        {
+            return SeedFileTransaction.DiscardPrepared(discardId!) ? 0 : 1;
+        }
+        if (HasFlag(args, "--is-input-tip"))
+        {
+            return InputMethodList.TryIsFamoInUserList(out bool present)
+                ? (present ? 0 : 1)
+                : 2;
         }
         if (HasFlag(args, "--remove-input-tip"))
         {
@@ -42,10 +73,10 @@ public static class Program
 
         WinRT.ComWrappersSupport.InitializeComWrappers();
 
-        bool isRedirect = DecideRedirection();
-        if (isRedirect)
+        RedirectionDecision redirection = DecideRedirection();
+        if (redirection != RedirectionDecision.Primary)
         {
-            return 0; // 已重定向到主实例，本进程退出。
+            return redirection == RedirectionDecision.Redirected ? 0 : 2;
         }
 
         Microsoft.UI.Xaml.Application.Start(p =>
@@ -85,6 +116,62 @@ public static class Program
         }
     }
 
+    private static int PrepareSeedTransaction(string transactionId)
+    {
+        try
+        {
+            string installedData = FirstLaunchSeeder.ResolveInstalledDataDir();
+            string receiptHash = SeedFileTransaction.Prepare(
+                transactionId,
+                installedData,
+                stagedRoot =>
+                {
+                    FirstLaunchSeeder.Seed(installedData, stagedRoot);
+                    var stagedStore = new SettingsStore(
+                        Path.Combine(stagedRoot, "famo-settings.json"));
+                    FamoSettings settings = stagedStore.Load();
+                    WriteHeadlessOverlays(settings, stagedRoot);
+                });
+            Console.WriteLine($"seed_receipt_hash={receiptHash}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"--prepare-seed-transaction failed: {ex.Message}");
+            return 1;
+        }
+    }
+
+    private static int ApplySeedTransaction(
+        string[] args, string transactionId, string receiptHash)
+    {
+        try
+        {
+            if (!SeedFileTransaction.ApplyPrepared(transactionId, receiptHash))
+            {
+                return 1;
+            }
+            if (!InputMethodList.EnsureFamoInUserList(logFailures: false))
+            {
+                Console.Error.WriteLine(
+                    "transactional EnsureFamoInUserList returned false");
+                return 1;
+            }
+            if (!HasFlag(args, "--no-activate") &&
+                !InputMethodList.ActivateFamoForCurrentDesktop(logFailures: false))
+            {
+                Console.Error.WriteLine(
+                    "transactional ActivateFamoForCurrentDesktop returned false");
+            }
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"--apply-seed-transaction failed: {ex.Message}");
+            return 1;
+        }
+    }
+
     private static int RunDemoAppearance()
     {
         try
@@ -107,15 +194,52 @@ public static class Program
         }
     }
 
-    private static void WriteHeadlessOverlays(FamoSettings settings)
+    private static void WriteHeadlessOverlays(FamoSettings settings, string? famoDir = null)
     {
-        ConfigWriter.WriteStyleOverlay(settings, FamoPaths.FamoDir);
-        ConfigWriter.WriteOptionsOverlay(settings, FamoPaths.FamoDir);
-        ConfigWriter.WriteSelectSchema(settings, FamoPaths.FamoDir);
+        string target = famoDir ?? FamoPaths.FamoDir;
+        ConfigWriter.WriteStyleOverlay(settings, target);
+        ConfigWriter.WriteOptionsOverlay(settings, target);
+        ConfigWriter.WriteSelectSchema(settings, target);
+        ConfigWriter.WriteDeployBucket(settings, target);
+    }
+
+    private static bool HasOption(string[] args, string name) =>
+        TryGetOption(args, name, out _);
+
+    private static bool TryGetOption(string[] args, string name, out string? value)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = args[i + 1];
+                return !string.IsNullOrWhiteSpace(value);
+            }
+        }
+        value = null;
+        return false;
+    }
+
+    private static bool TryGetTwoOptions(
+        string[] args, string name, out string? first, out string? second)
+    {
+        for (int i = 0; i < args.Length - 2; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+            {
+                first = args[i + 1];
+                second = args[i + 2];
+                return !string.IsNullOrWhiteSpace(first) &&
+                    !string.IsNullOrWhiteSpace(second);
+            }
+        }
+        first = null;
+        second = null;
+        return false;
     }
 
     /// <summary>注册单实例 key。本实例为主 → 订阅 Activated 返 false；否则写 handoff + 重定向返 true。</summary>
-    private static bool DecideRedirection()
+    private static RedirectionDecision DecideRedirection()
     {
         AppActivationArguments activation = AppInstance.GetCurrent().GetActivatedEventArgs();
         AppInstance keyInstance = AppInstance.FindOrRegisterForKey(SingleInstanceKey);
@@ -123,13 +247,25 @@ public static class Program
         if (keyInstance.IsCurrent)
         {
             keyInstance.Activated += OnActivated;
-            return false;
+            return RedirectionDecision.Primary;
         }
 
         // 已有主实例：把本次请求的 page 交给主实例（handoff 文件，不依赖激活参数携带命令行）。
         App.WritePendingPage(GetPageArg(Environment.GetCommandLineArgs()));
-        RedirectActivationTo(activation, keyInstance);
-        return true;
+        if (RedirectActivationTo(activation, keyInstance))
+        {
+            return RedirectionDecision.Redirected;
+        }
+
+        // The old primary may have exited while redirection was in flight. Try
+        // once to take ownership; otherwise exit with a visible failure code.
+        AppInstance retry = AppInstance.FindOrRegisterForKey(SingleInstanceKey);
+        if (retry.IsCurrent)
+        {
+            retry.Activated += OnActivated;
+            return RedirectionDecision.Primary;
+        }
+        return RedirectionDecision.Failed;
     }
 
     private static string BuildKeySegment()
@@ -172,25 +308,52 @@ public static class Program
         argv.Any(a => string.Equals(a, flag, StringComparison.OrdinalIgnoreCase));
 
     // ── 重定向需在 STA Main 内同步等待 async 完成（官方模式：事件 + CoWaitForMultipleObjects 泵消息）──
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string? lpName);
-
-    [DllImport("kernel32.dll")]
-    private static extern bool SetEvent(IntPtr hEvent);
-
     [DllImport("ole32.dll")]
     private static extern uint CoWaitForMultipleObjects(uint dwFlags, uint dwMilliseconds, ulong nHandles, IntPtr[] pHandles, out uint dwIndex);
 
-    private static void RedirectActivationTo(AppActivationArguments args, AppInstance keyInstance)
+    private static bool RedirectActivationTo(AppActivationArguments args, AppInstance keyInstance)
     {
-        IntPtr eventHandle = CreateEvent(IntPtr.Zero, true, false, null);
-        Task.Run(() =>
+        try
         {
-            keyInstance.RedirectActivationToAsync(args).AsTask().Wait();
-            SetEvent(eventHandle);
-        });
-        const uint CWMO_DEFAULT = 0;
-        const uint INFINITE = 0xFFFFFFFF;
-        _ = CoWaitForMultipleObjects(CWMO_DEFAULT, INFINITE, 1, new[] { eventHandle }, out _);
+            using var completed = new EventWaitHandle(false, EventResetMode.ManualReset);
+            if (completed.SafeWaitHandle.IsInvalid)
+            {
+                FamoLog.Append("single-instance redirect event creation failed");
+                return false;
+            }
+
+            int result = 0;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await keyInstance.RedirectActivationToAsync(args).AsTask();
+                    Volatile.Write(ref result, 1);
+                }
+                catch (Exception ex)
+                {
+                    FamoLog.Append($"single-instance redirect failed: {ex.Message}");
+                    Volatile.Write(ref result, -1);
+                }
+                finally
+                {
+                    try { completed.Set(); }
+                    catch (ObjectDisposedException) { }
+                }
+            });
+
+            const uint CWMO_DEFAULT = 0;
+            uint wait = CoWaitForMultipleObjects(
+                CWMO_DEFAULT, RedirectTimeoutMilliseconds, 1,
+                new[] { completed.SafeWaitHandle.DangerousGetHandle() }, out _);
+            if (wait == 0 && Volatile.Read(ref result) == 1) return true;
+            if (wait != 0) FamoLog.Append($"single-instance redirect timed out or wait failed: 0x{wait:X8}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            FamoLog.Append($"single-instance redirect setup failed: {ex.Message}");
+            return false;
+        }
     }
 }

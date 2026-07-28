@@ -8,6 +8,7 @@ param(
   [switch] $CaptureDumpOnHang,
   [switch] $AllowExplorerRestart,
   [switch] $AllowTemporaryRegistration,
+  [switch] $PreflightOnly,
   [switch] $SelfCheck
 )
 
@@ -17,11 +18,12 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $FamoClsid = '{54EAD76A-B864-4A6D-9C82-148E3352BEE7}'
 $FamoTip = '0804:{54EAD76A-B864-4A6D-9C82-148E3352BEE7}{0158C2BA-4E96-4BA8-B505-E1BBEBB3FA33}'
 $MicrosoftPinyinTip = '0804:{81D4E9C9-1D3B-41BC-9E6C-4B40BF79E35E}{FA550B04-5AD7-411F-A5AC-CA038EC515D7}'
-$FamoDll = 'C:\Program Files\Famo\FamoTsf.dll'
 $ProbeScript = Join-Path $PSScriptRoot 'Invoke-FamoExplorerHangProbe.ps1'
-$ActivationAssembly = Join-Path $PSScriptRoot '..\..\installer\staging\settings\Famo.Settings.Core.dll'
 $RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..\..'))
 $RegistrationPath = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\$FamoClsid\InProcServer32"
+$BrandPath = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Famo\InputMethod'
+$StagingPayload = [System.IO.Path]::GetFullPath(
+  (Join-Path $PSScriptRoot '..\..\installer\staging\payload'))
 $TipRegistrationPath = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\CTF\TIP\$FamoClsid"
 $TipRegistrationKey = "HKLM\SOFTWARE\Microsoft\CTF\TIP\$FamoClsid"
 
@@ -41,6 +43,46 @@ function Resolve-ExitCode {
   return 2
 }
 
+function Resolve-FamoArtifactPaths {
+  param(
+    [Parameter(Mandatory = $true)][bool] $RegistrationPresent,
+    [string] $RegisteredDll,
+    [string] $InstallDir,
+    [Parameter(Mandatory = $true)][string] $FallbackPayload
+  )
+
+  if ($RegistrationPresent) {
+    if ([string]::IsNullOrWhiteSpace($RegisteredDll)) {
+      throw 'Famo COM registration exists without an InProcServer32 default value.'
+    }
+    if (-not $InstallDir) {
+      throw 'Famo COM registration exists without a machine InstallDir.'
+    }
+    $dll = [System.IO.Path]::GetFullPath($RegisteredDll.Trim('"'))
+    $target = [System.IO.Path]::GetFullPath($InstallDir.Trim('"')).TrimEnd('\')
+    if ((Split-Path -Leaf $dll) -ine 'FamoTextService.dll') {
+      throw "Famo COM registration points to an unsupported text service: $dll"
+    }
+    if (-not [string]::Equals(
+        (Split-Path -Parent $dll).TrimEnd('\'),
+        $target,
+        [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Famo COM registration does not match InstallDir: $dll <> $target"
+    }
+    $source = 'RegisteredInstall'
+  } else {
+    $target = [System.IO.Path]::GetFullPath($FallbackPayload).TrimEnd('\')
+    $dll = Join-Path $target 'FamoTextService.dll'
+    $source = 'StagingPayload'
+  }
+
+  return [pscustomobject]@{
+    source = $source
+    dll = $dll
+    activationAssembly = Join-Path $target 'settings\Famo.Settings.Core.dll'
+  }
+}
+
 if ($SelfCheck) {
   $cases = @(
     @{ expected='famo-only-red-needs-dump-analysis'; actual=(Resolve-Comparison green red) },
@@ -51,14 +93,48 @@ if ($SelfCheck) {
     @{ expected=1; actual=(Resolve-ExitCode 'famo-only-red-needs-dump-analysis' $true) },
     @{ expected=2; actual=(Resolve-ExitCode 'not-reproduced' $false) }
   )
+  $fixtureArgs = @{
+    RegistrationPresent = $true
+    RegisteredDll = 'C:\Program Files\Famo\versions\1.5.3-fixture\FamoTextService.dll'
+    InstallDir = 'C:\Program Files\Famo\versions\1.5.3-fixture'
+    FallbackPayload = 'C:\staging\payload'
+  }
+  $fixture = Resolve-FamoArtifactPaths @fixtureArgs
+  $legacyRejected = $false
+  try {
+    $legacyArgs = @{
+      RegistrationPresent = $true
+      RegisteredDll = 'C:\Program Files\Famo\FamoTsf.dll'
+      InstallDir = 'C:\Program Files\Famo'
+      FallbackPayload = 'C:\staging\payload'
+    }
+    [void](Resolve-FamoArtifactPaths @legacyArgs)
+  } catch {
+    $legacyRejected = $true
+  }
+  $emptyRegistrationRejected = $false
+  try {
+    $emptyRegistrationArgs = @{
+      RegistrationPresent = $true
+      RegisteredDll = ''
+      InstallDir = 'C:\Program Files\Famo\versions\1.5.3-fixture'
+      FallbackPayload = 'C:\staging\payload'
+    }
+    [void](Resolve-FamoArtifactPaths @emptyRegistrationArgs)
+  } catch {
+    $emptyRegistrationRejected = $true
+  }
+  $cases += @(
+    @{ expected='RegisteredInstall'; actual=$fixture.source },
+    @{ expected='FamoTextService.dll'; actual=(Split-Path -Leaf $fixture.dll) },
+    @{ expected='Famo.Settings.Core.dll'; actual=(Split-Path -Leaf $fixture.activationAssembly) },
+    @{ expected=$true; actual=$legacyRejected },
+    @{ expected=$true; actual=$emptyRegistrationRejected }
+  )
   $failures = @($cases | Where-Object { $_.actual -ne $_.expected })
   [pscustomobject]@{ mode='SelfCheck'; passed=($failures.Count -eq 0); cases=$cases } | ConvertTo-Json -Depth 4
   if ($failures.Count -gt 0) { exit 1 }
   exit 0
-}
-
-if ($PSVersionTable.PSEdition -ne 'Core') {
-  throw 'Run this A/B orchestrator with pwsh; Windows PowerShell 5.1 cannot load the .NET 8 activation assembly.'
 }
 
 $evidenceFull = [System.IO.Path]::GetFullPath($EvidenceDirectory)
@@ -68,10 +144,41 @@ if ($evidenceFull.TrimEnd('\') -ieq $RepoRoot.TrimEnd('\') -or $evidenceFull.Sta
 }
 $EvidenceDirectory = $evidenceFull
 
-if (-not $AllowExplorerRestart) { throw 'Pass -AllowExplorerRestart after saving open Explorer work.' }
+$registrationWasPresent = Test-Path -LiteralPath $RegistrationPath
+$registeredDll = if ($registrationWasPresent) {
+  [string](Get-Item -LiteralPath $RegistrationPath).GetValue('')
+} else { '' }
+$installDir = if (Test-Path -LiteralPath $BrandPath) {
+  [string](Get-ItemPropertyValue -LiteralPath $BrandPath -Name InstallDir -ErrorAction SilentlyContinue)
+} else { '' }
+$artifactArgs = @{
+  RegistrationPresent = $registrationWasPresent
+  RegisteredDll = $registeredDll
+  InstallDir = $installDir
+  FallbackPayload = $StagingPayload
+}
+$artifacts = Resolve-FamoArtifactPaths @artifactArgs
+$FamoDll = $artifacts.dll
+$ActivationAssembly = $artifacts.activationAssembly
+
 if (-not (Test-Path -LiteralPath $ProbeScript)) { throw "Probe script missing: $ProbeScript" }
 if (-not (Test-Path -LiteralPath $FamoDll)) { throw "Installed Famo DLL missing: $FamoDll" }
 if (-not (Test-Path -LiteralPath $ActivationAssembly)) { throw "Famo activation assembly missing: $ActivationAssembly" }
+if ($PreflightOnly) {
+  [pscustomobject]@{
+    mode = 'Preflight'
+    passed = $true
+    source = $artifacts.source
+    registered = $registrationWasPresent
+    dll = $FamoDll
+    activationAssembly = $ActivationAssembly
+  } | ConvertTo-Json -Depth 3
+  exit 0
+}
+if ($PSVersionTable.PSEdition -ne 'Core') {
+  throw 'Run this A/B orchestrator with pwsh; Windows PowerShell 5.1 cannot load the .NET 8 activation assembly.'
+}
+if (-not $AllowExplorerRestart) { throw 'Pass -AllowExplorerRestart after saving open Explorer work.' }
 
 function Restart-ShellExplorer {
   Write-Warning 'Explorer will restart now. Open Explorer windows may close.'
@@ -118,6 +225,7 @@ function Invoke-ProfileProbe {
     '-DurationSeconds', $DurationSeconds,
     '-PressureIntervalMs', $PressureIntervalMs,
     '-EvidenceDirectory', $EvidenceDirectory,
+    '-FamoModulePath', $FamoDll,
     '-GeneratePressure'
   )
   if ($CaptureDumpOnHang) { $arguments += '-CaptureDumpOnHang' }
@@ -144,7 +252,6 @@ function Remove-ElevatedTipRegistration {
 
 $originalLanguages = Get-WinUserLanguageList
 $originalOverride = [string](Get-ItemPropertyValue -Path 'HKCU:\Control Panel\International\User Profile' -Name InputMethodOverride -ErrorAction SilentlyContinue)
-$registrationWasPresent = Test-Path -LiteralPath $RegistrationPath
 $temporaryRegistration = $false
 $inputStateChanged = $false
 $runs = New-Object System.Collections.Generic.List[object]

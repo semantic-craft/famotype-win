@@ -8,12 +8,16 @@ namespace Famo.Settings.Core;
 /// </summary>
 public static class SafeJsonFile
 {
-    /// <summary>原子写：先写 .tmp 再 rename 替换目标路径，避免半写损坏。</summary>
+    /// <summary>
+    /// 耐久原子写：用唯一、句柄固定且由内核负责崩溃清理的临时文件，
+    /// flush 后再从同一句柄 rename 替换目标路径。
+    /// </summary>
     public static void WriteAtomic(string path, string content)
     {
-        string tmp = path + ".tmp";
-        File.WriteAllText(tmp, content);
-        File.Move(tmp, path, overwrite: true);
+        using IDisposable held = UserDataTransactionLock.Acquire(
+            Path.GetDirectoryName(Path.GetFullPath(path)));
+        SeedFileTransaction.WriteDurableAtomic(
+            path, content, overwrite: true);
     }
 
     /// <summary>
@@ -23,6 +27,8 @@ public static class SafeJsonFile
     /// </summary>
     public static T Read<T>(string path, Func<string, T> parse)
     {
+        using IDisposable held = UserDataTransactionLock.Acquire(
+            Path.GetDirectoryName(Path.GetFullPath(path)));
         string content = File.ReadAllText(path);
         try
         {

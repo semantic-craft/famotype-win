@@ -56,17 +56,6 @@ bool IsCompositionKey(uint32_t key) {
   }
 }
 
-std::optional<uint32_t> CandidateIndex(uint32_t key, size_t count) {
-  uint32_t index = 0;
-  if (key >= '1' && key <= '9')
-    index = key - '1';
-  else if (key == '0')
-    index = 9;
-  else
-    return std::nullopt;
-  return index < count ? std::optional<uint32_t>(index) : std::nullopt;
-}
-
 } // namespace
 
 void ContextState::Open(const runtime::Correlation &session_identity) {
@@ -75,6 +64,7 @@ void ContextState::Open(const runtime::Correlation &session_identity) {
   identity_.sequence = 0;
   displayed_ = {};
   pending_sequence_ = 0;
+  displayed_sequence_ = 0;
   recovery_emitted_ = false;
   phase_ = ContextPhase::Ready;
 }
@@ -85,8 +75,7 @@ void ContextState::Close() {
   displayed_ = {};
 }
 
-bool ContextState::Classifies(const HostKey &key,
-                              uint32_t *candidate_index) const {
+bool ContextState::Classifies(const HostKey &key) const {
   if (phase_ != ContextPhase::Ready || key.virtual_key == 0)
     return false;
   if (!key.is_key_down)
@@ -95,49 +84,47 @@ bool ContextState::Classifies(const HostKey &key,
     return true;
   if (IsLetter(key.virtual_key))
     return true;
-  if (key.virtual_key >= 0x21 && key.virtual_key <= 0x7e &&
-      !(key.virtual_key >= '0' && key.virtual_key <= '9'))
+  // Printable keys, including digits, are schema input even with an empty
+  // preedit. Digit-start schemes must get the physical key before there is a
+  // composition; the engine remains the sole authority on whether it handles
+  // that key or uses it as a candidate selector.
+  if (key.virtual_key >= 0x21 && key.virtual_key <= 0x7e)
     return true;
   const bool composing = !displayed_.preedit.empty();
   if (!composing)
     return false;
-  if (IsCompositionKey(key.virtual_key) || key.virtual_key == ' ')
-    return true;
-  const auto selected = CandidateIndex(key.virtual_key,
-                                       displayed_.candidates.size());
-  if (!selected)
-    return false;
-  if (candidate_index)
-    *candidate_index = *selected;
-  return true;
+  return IsCompositionKey(key.virtual_key) || key.virtual_key == ' ';
 }
 
 bool ContextState::TestKey(const HostKey &key) const {
-  return Classifies(key, nullptr);
+  return Classifies(key);
 }
 
 KeyPlan ContextState::PlanKey(const HostKey &key) {
   KeyPlan plan;
-  uint32_t candidate_index = 0;
-  if (pending_sequence_ != 0 || !Classifies(key, &candidate_index))
+  if (pending_sequence_ != 0 || !Classifies(key))
     return plan;
 
   plan.correlation = identity_;
   plan.correlation.sequence = next_sequence_++;
   pending_sequence_ = plan.correlation.sequence;
 
-  const auto selected = CandidateIndex(key.virtual_key,
-                                       displayed_.candidates.size());
-  if (selected && !displayed_.preedit.empty()) {
-    plan.request = RequestKind::SelectCandidate;
-    plan.candidate_index = candidate_index;
-    return plan;
-  }
-
   plan.request = RequestKind::ProcessKey;
   plan.key = {key.virtual_key, key.scan_code, key.modifiers,
               key.is_key_down ? 1u : 0u, key.timestamp_ms};
   return plan;
+}
+
+std::optional<runtime::Correlation>
+ContextState::PlanAbsoluteCandidate(uint64_t composition_sequence) {
+  if (phase_ != ContextPhase::Ready || pending_sequence_ != 0 ||
+      composition_sequence == 0 ||
+      composition_sequence != displayed_sequence_)
+    return std::nullopt;
+  runtime::Correlation correlation = identity_;
+  correlation.sequence = next_sequence_++;
+  pending_sequence_ = correlation.sequence;
+  return correlation;
 }
 
 std::optional<runtime::Correlation> ContextState::PlanUiState() {
@@ -175,6 +162,7 @@ void ContextState::ApplySucceeded(
   if (phase_ != ContextPhase::Ready || pending_sequence_ == 0)
     return;
   displayed_ = composition;
+  displayed_sequence_ = pending_sequence_;
   pending_sequence_ = 0;
 }
 

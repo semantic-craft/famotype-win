@@ -27,9 +27,9 @@
     "pipeName": "FamoNamedPipe",
     "deployerMutex": "FamoDeployerMutex",
     "deployerExclusiveMutex": "FamoDeployerExclusiveMutex",
-    "runtimeEndpointSuffix": "runtime-v1",
-    "controlEndpointSuffix": "control-v1",
-    "runtimeSingletonPrefix": "Famo.Runtime.v1"
+    "runtimeEndpointSuffix": "runtime-v2",
+    "controlEndpointSuffix": "control-v2",
+    "runtimeSingletonPrefix": "Famo.Runtime.v2"
   },
   "upstream": {
     "repo": "https://github.com/rime/weasel.git",

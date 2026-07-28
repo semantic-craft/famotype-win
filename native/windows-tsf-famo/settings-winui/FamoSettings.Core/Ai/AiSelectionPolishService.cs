@@ -2,6 +2,7 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text;
 using System.Text.RegularExpressions;
+using Famo.Settings.Core.Selection;
 
 namespace Famo.Settings.Core.Ai;
 
@@ -145,6 +146,31 @@ public static class AiSelectionSkills
             "prompt-optimize" => settings.Ai.PromptOptimizeSkillEnabled,
             _ => true,
         };
+    }
+}
+
+public static class AiSelectionToolboxEligibility
+{
+    public static string? RejectionReason(FamoSettings settings, SelectedTextCaptureResult capture)
+    {
+        if (capture.Status != SelectedTextCaptureStatus.Success)
+        {
+            return capture.Status switch
+            {
+                SelectedTextCaptureStatus.SecureField => "当前焦点位于密码或安全输入框，已取消划词工具箱。",
+                SelectedTextCaptureStatus.NoSelection => "未选中文本。",
+                _ => string.IsNullOrWhiteSpace(capture.Error) ? "未能读取选中文本。" : capture.Error,
+            };
+        }
+
+        string selection = capture.Text?.Trim() ?? "";
+        if (selection.Length == 0) return "未选中文本。";
+        if (selection.Length > AiSelectionSkillService.MaxSelectionLength)
+            return $"选中文本超过 {AiSelectionSkillService.MaxSelectionLength} 字，已取消划词工具箱。";
+        if (!settings.Ai.AskAnythingSkillEnabled
+            && !AiSelectionSkills.BuiltIn.Any(skill => AiSelectionSkills.IsEnabled(settings, skill.Id)))
+            return "技能平台中没有已启用的划词技能。";
+        return null;
     }
 }
 
