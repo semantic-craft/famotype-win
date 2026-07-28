@@ -1,6 +1,7 @@
 #include "tsf_integration_support.h"
 
 #include <chrono>
+#include <cstdio>
 #include <string>
 
 #include "famo_runtime_pipe.h"
@@ -23,14 +24,21 @@ RuntimeProcess::~RuntimeProcess() { Stop(); }
 
 bool RuntimeProcess::Start(const wchar_t *path, std::wstring_view fault,
                            uint32_t fault_after, uint32_t connections,
-                           bool inline_preedit, uint32_t preview_rows) {
+                           bool inline_preedit, uint32_t preview_rows,
+                           int32_t expected_terminal_abandons,
+                           int32_t expected_clients,
+                           int32_t expected_sessions) {
   std::wstring command =
       L"\"" + std::wstring(path) + L"\" --endpoint-suffix " +
       TestEndpointSuffix() + L" --fault " + std::wstring(fault) +
       L" --fault-after " + std::to_wstring(fault_after) +
       L" --connections " + std::to_wstring(connections) +
       L" --inline-preedit " + (inline_preedit ? L"true" : L"false") +
-      L" --preview-rows " + std::to_wstring(preview_rows);
+      L" --preview-rows " + std::to_wstring(preview_rows) +
+      L" --expected-terminal-abandons " +
+      std::to_wstring(expected_terminal_abandons) +
+      L" --expected-clients " + std::to_wstring(expected_clients) +
+      L" --expected-sessions " + std::to_wstring(expected_sessions);
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
@@ -66,7 +74,13 @@ bool RuntimeProcess::Finish() {
   GetExitCodeProcess(process_.hProcess, &exit_code);
   CloseHandle(process_.hProcess);
   process_.hProcess = nullptr;
-  return wait == WAIT_OBJECT_0 && exit_code == 0;
+  const bool finished = wait == WAIT_OBJECT_0 && exit_code == 0;
+  if (!finished) {
+    std::fprintf(stderr, "runtime finish failed: wait=%lu exit=%lu\n",
+                 static_cast<unsigned long>(wait),
+                 static_cast<unsigned long>(exit_code));
+  }
+  return finished;
 }
 
 HWND RuntimeProcess::PreviewSourceWindow() const {
@@ -119,11 +133,21 @@ bool TextServiceModule::Load(const wchar_t *path) {
   preview_selection_state_for_test_ =
       reinterpret_cast<PreviewSelectionStateForTestFn>(
           GetProcAddress(module_, "FamoGetPreviewSelectionStateForTest"));
+  terminal_cleanup_connect_attempts_for_test_ =
+      reinterpret_cast<TerminalCleanupConnectAttemptsForTestFn>(GetProcAddress(
+          module_, "FamoGetTerminalCleanupConnectAttemptsForTest"));
   return can_unload_ && create_for_test_ && reactivate_for_test_ &&
-         preview_selection_state_for_test_;
+         preview_selection_state_for_test_ &&
+         terminal_cleanup_connect_attempts_for_test_;
 }
 
 bool TextServiceModule::CanUnload() const { return can_unload_() == S_OK; }
+
+uint32_t TextServiceModule::TerminalCleanupConnectAttemptsForTest() const {
+  return terminal_cleanup_connect_attempts_for_test_
+             ? terminal_cleanup_connect_attempts_for_test_()
+             : 0;
+}
 
 HRESULT TextServiceModule::CreateForTest(
     ITfThreadMgr *thread_manager, TfClientId client_id,

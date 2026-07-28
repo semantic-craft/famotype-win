@@ -131,3 +131,8 @@ extern "C" BOOL STDAPICALLTYPE FamoGetPreviewSelectionStateForTest(
                : FALSE;
   });
 }
+
+extern "C" uint32_t STDAPICALLTYPE
+FamoGetTerminalCleanupConnectAttemptsForTest() {
+  return famo::tsf::TerminalCleanupConnectAttemptsForTest();
+}

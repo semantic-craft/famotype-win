@@ -18,7 +18,9 @@
 4. 以原始用户身份准备 seed 事务；安装器把收据的完整 SHA-256 写入并 flush 到提权 journal 后，才按 CAS 规则应用用户文件。
 5. 启动 `FamoRuntime.exe` 并通过 `--control deploy` 部署；验证 COM/profile/manifest 回读后才写入 `InstallState=Ready`，随后提交并清除已认证的 seed 收据。
 
-任何阶段失败都按反向顺序停止新 runtime、反注册新 profile、恢复旧注册/激活/runtime，并以 CAS 回滚 seed：安装后出现的用户修改会被保留，不会被备份覆盖。所有延迟工作都使用 `famo-debt-v2|<transaction-id>|<kind>` 类型化债务；写入和删除均 flush 并精确回读，foreign、malformed 或同事务未知 kind 一律阻断。普通安装启动会先恢复终态债务，不会先创建新事务；用户、目标和恢复工件按顺序清完后，恢复任务和保留安装器才最后删除。若精确用户暂不可用、文件发生冲突或版本目录仍被占用，journal 会保留 cleanup/rollback debt 和精确 SID 恢复任务，在后续该用户登录时重试；债务清除前不删除恢复锚。对外终态只有 `Ready`、`RolledBack`、`PendingReboot` 和 `NotInstalled`。
+任何阶段失败都按反向顺序停止新 runtime、反注册新 profile、恢复旧注册/激活/runtime，并以 CAS 回滚 seed：安装后出现的用户修改会被保留，不会被备份覆盖。所有延迟工作都使用 `famo-debt-v2|<transaction-id>|<kind>` 类型化债务；写入和删除均 flush 并精确回读，foreign、malformed 或同事务未知 kind 一律阻断。身份捕获和机器清理 helper 还会在创建目录前持久化 `famo-debt-v2|<transaction-id>|identity-helper:<nonce>` 或 `famo-debt-v2|<transaction-id>|machine-cleanup-helper:<nonce>` 的 `HelperCleanupDebt`；普通安装或卸载启动时先验证固定父目录、非 reparse 最终路径和两个允许的精确文件名，再逐个回收，不使用通配删除。普通安装启动会先恢复这些 helper 残留和终态债务，不会先创建新事务；用户、目标和恢复工件按顺序清完后，恢复任务和保留安装器才最后删除。若精确用户暂不可用、文件发生冲突或版本目录仍被占用，journal 会保留 cleanup/rollback debt 和精确 SID 恢复任务，在后续该用户登录时重试；债务清除前不删除恢复锚。对外终态只有 `Ready`、`RolledBack`、`PendingReboot` 和 `NotInstalled`。
+
+setup 与 uninstall 从各自初始化入口的第一步起就持有同一个独立的全局事务互斥量，任何恢复或 journal 变更之前即拒绝并发进程。helper 回收会持有 `{app}`、`pending` 和精确 helper 目录的非共享删除句柄；精确文件和目录消失后，先对 `{app}` 所在卷执行 `FlushFileBuffers`，成功后才清除 `HelperCleanupDebt`。卷刷新失败会保留债务供下次恢复。
 
 如果注册表指向的旧 `FamoTextService.dll` 仍被任一宿主进程加载，安装器不会形成新旧混用的 `Ready`：它记录旧 DLL 的路径、SHA-256 和文件版本，切离并反注册旧输入法，保持稳定 COM/profile 未注册，移除用户 TIP 和 runtime 自启，然后进入 `PendingReboot`。保留安装器及其完整 SHA-256 写入 copy-on-write v2 journal，并创建只对最初用户 SID 生效的 Task Scheduler 登录任务（`InteractiveToken`、`HighestAvailable`）；任务 XML 会在切离旧注册前完整读回。重启后只有旧 DLL 已卸载才注册新 profile，并在 manifest/COM/profile/runtime 全部回读成功后转为 `Ready`。继续失败时恢复为未注册的 `PendingReboot`，不会反复自启。
 

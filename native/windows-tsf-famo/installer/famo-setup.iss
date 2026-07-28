@@ -116,7 +116,10 @@ type
   end;
 
 const
+  FamoRootKey = 'Software\Famo';
   BrandKey = 'Software\Famo\InputMethod';
+  UninstallDeleteAnchorKey = 'Software\Famo\UninstallRecovery';
+  UninstallDeleteAnchorSchema = 'famo-uninstall-delete-anchor-v1';
   JournalVersion = '2';
   DebtSchema = 'famo-debt-v2';
   DebtKindSeedCommit = 'seed-commit';
@@ -124,6 +127,10 @@ const
   DebtKindTargetCleanup = 'target-cleanup';
   DebtKindRecoveryArtifacts = 'recovery-artifacts';
   DebtKindVersionRetention = 'version-retention';
+  DebtKindIdentityHelper = 'identity-helper';
+  DebtKindMachineCleanupHelper = 'machine-cleanup-helper';
+  HelperCleanupDebtName = 'HelperCleanupDebt';
+  UninstallIntentSchema = 'famo-uninstall-intent-v1';
   PhasePrepared = 'Prepared';
   PhasePayloadVerified = 'PayloadVerified';
   PhaseResumeArmed = 'ResumeArmed';
@@ -148,15 +155,20 @@ const
   FileAttributeNormal = $80;
   FileAttributeReparsePoint = $400;
   FileFlagBackupSemantics = $02000000;
+  FileFlagOpenReparsePoint = $00200000;
   FileShareRead = $1;
   FileShareWrite = $2;
   FileShareDelete = $4;
+  GenericWrite = $40000000;
   OpenExisting = 3;
   FinalPathBufferChars = 32768;
   InvalidHandleValue = -1;
   InvalidFileAttributes = $FFFFFFFF;
   ErrorFileNotFound = 2;
   ErrorPathNotFound = 3;
+  ErrorAlreadyExists = 183;
+  EarlyTransactionMutexName =
+    'Global\FamoInstallerEarlyTransactionV2';
   KeyRead = $20019;
   KeyWow6464Key = $0100;
   DaclSecurityInformation = $4;
@@ -219,9 +231,19 @@ var
   DeleteUserData: Boolean;
   UninstallPrepared: Boolean;
   UninstallRestartPending: Boolean;
+  UninstallDeleteArmed: Boolean;
+  UninstallOwner: String;
+  EarlyTransactionMutex: THandle;
 
 function GetFileAttributesW(FileName: String): Cardinal;
   external 'GetFileAttributesW@kernel32.dll stdcall';
+
+function CreateMutexW(SecurityAttributes: INT_PTR; InitialOwner: BOOL;
+  Name: String): THandle;
+  external 'CreateMutexW@kernel32.dll stdcall';
+
+procedure SetLastError(ErrorCode: Cardinal);
+  external 'SetLastError@kernel32.dll stdcall';
 
 function CreateFileW(FileName: String; DesiredAccess, ShareMode: Cardinal;
   SecurityAttributes: INT_PTR; CreationDisposition, FlagsAndAttributes: Cardinal;
@@ -238,6 +260,9 @@ function GetFileInformationByHandle(FileHandle: THandle;
 
 function GetFileSizeEx(FileHandle: THandle; var FileSize: Int64): BOOL;
   external 'GetFileSizeEx@kernel32.dll stdcall';
+
+function FlushFileBuffers(FileHandle: THandle): BOOL;
+  external 'FlushFileBuffers@kernel32.dll stdcall';
 
 function CloseHandle(Handle: THandle): BOOL;
   external 'CloseHandle@kernel32.dll stdcall';
@@ -268,6 +293,41 @@ function IsValidSid(Sid: INT_PTR): BOOL;
 
 function LocalFree(Memory: INT_PTR): INT_PTR;
   external 'LocalFree@kernel32.dll stdcall';
+
+function AcquireEarlyTransactionMutex: Boolean;
+var
+  Candidate: THandle;
+  ErrorCode: LongInt;
+begin
+  Result := EarlyTransactionMutex <> 0;
+  if Result then Exit;
+
+  SetLastError(0);
+  Candidate := CreateMutexW(0, False, EarlyTransactionMutexName);
+  if Candidate = 0 then
+  begin
+    Log('cannot create the early installer transaction mutex');
+    Exit;
+  end;
+  ErrorCode := DLLGetLastError;
+  if ErrorCode = ErrorAlreadyExists then
+  begin
+    CloseHandle(Candidate);
+    Log('another Famo setup or uninstall transaction is active');
+    Exit;
+  end;
+  EarlyTransactionMutex := Candidate;
+  Result := True;
+end;
+
+procedure ReleaseEarlyTransactionMutex;
+begin
+  if EarlyTransactionMutex <> 0 then
+  begin
+    CloseHandle(EarlyTransactionMutex);
+    EarlyTransactionMutex := 0;
+  end;
+end;
 
 function NewIdentityNonce: String;
 var
@@ -870,6 +930,11 @@ function ValidatePinnedBrokerForExecution(const Broker,
   ExpectedHash, PinnedFinalPath, PinnedObjectId,
   PinnedDirectoryFinalPath, PinnedDirectoryObjectId: String;
   ExpectedSize: Int64): Boolean; forward;
+procedure ArmHelperCleanupDebt(const Kind, Nonce: String); forward;
+procedure ClearHelperCleanupDebt(const Owner, Kind, Nonce: String); forward;
+function CleanupExactHelperAndDebt(
+  const Owner, Kind, Nonce: String; MaxDeleteAttempts: Integer;
+  var Failure: String): Boolean; forward;
 
 function ValidateLegacyPreviousSnapshot: Boolean;
 var
@@ -1486,7 +1551,7 @@ var
     BrokerFinalPath, BrokerObjectId, DirectoryFinalPath,
     DirectoryObjectId: String;
   Lines: TArrayOfString;
-  ServerResult, Attempts, CleanupAttempts: Integer;
+  ServerResult, Attempts: Integer;
   ExpectedBrokerSize, ActualBrokerSize: Int64;
 begin
   PipeId := NewIdentityNonce;
@@ -1495,16 +1560,19 @@ begin
     RaiseException('original-user identity nonces collided');
 
   PendingRoot := AddBackslash(ExpandConstant('{app}')) + 'pending';
+  PendingDirectory := AddBackslash(PendingRoot) + 'identity-' + PipeId;
+  ArmHelperCleanupDebt(DebtKindIdentityHelper, PipeId);
+  FailIfRequested('after-identity-helper-debt');
   if (DirExists(PendingRoot) and not PathIsNonReparseOrMissing(PendingRoot)) or
      not ForceDirectories(PendingRoot) or
      not PathIsNonReparseOrMissing(PendingRoot) then
     RaiseException('cannot create protected identity directory');
-  PendingDirectory := AddBackslash(PendingRoot) + 'identity-' + PipeId;
   if DirExists(PendingDirectory) or
      not ForceDirectories(PendingDirectory) or
      not PathIsNonReparseOrMissing(PendingDirectory) then
     RaiseException('cannot create fresh identity directory');
   HardenPendingDirectory(PendingDirectory, '');
+  FailIfRequested('after-identity-helper-create');
 
   ExtractTemporaryFile('FamoEmbeddedManifest.txt');
   EmbeddedManifest := ExpandConstant('{tmp}\FamoEmbeddedManifest.txt');
@@ -1602,25 +1670,8 @@ begin
   end;
 
   CleanupFailure := '';
-  if FileExists(IdentityRecord) and not DeleteFile(IdentityRecord) then
-    CleanupFailure := 'cannot remove original-user identity record';
-  for CleanupAttempts := 1 to 150 do
-  begin
-    if not FileExists(Broker) or DeleteFile(Broker) then Break;
-    Sleep(100);
-  end;
-  if FileExists(Broker) then
-  begin
-    if CleanupFailure <> '' then
-      CleanupFailure := CleanupFailure + '; ';
-    CleanupFailure := CleanupFailure + 'cannot remove identity broker';
-  end;
-  if DirExists(PendingDirectory) and not RemoveDir(PendingDirectory) then
-  begin
-    if CleanupFailure <> '' then
-      CleanupFailure := CleanupFailure + '; ';
-    CleanupFailure := CleanupFailure + 'cannot remove identity directory';
-  end;
+  CleanupExactHelperAndDebt(TransactionId,
+    DebtKindIdentityHelper, PipeId, 150, CleanupFailure);
   if Failure <> '' then
   begin
     if CleanupFailure <> '' then Failure := Failure + '; ' + CleanupFailure;
@@ -1663,8 +1714,9 @@ var
   PendingRoot, ProtectedDirectory, Nonce, EmbeddedManifest,
     ProtectedManifest, EmbeddedBroker, ProtectedBroker,
     ExpectedBrokerHash, BrokerFinalPath, BrokerObjectId,
-    DirectoryFinalPath, DirectoryObjectId, Failure: String;
+    DirectoryFinalPath, DirectoryObjectId, Failure, CleanupFailure: String;
   ExpectedBrokerSize, ActualBrokerSize: Int64;
+  CleanupSucceeded: Boolean;
 begin
   Result := False;
   Nonce := NewIdentityNonce;
@@ -1676,6 +1728,8 @@ begin
   ProtectedBroker := AddBackslash(ProtectedDirectory) +
     'FamoMachineCleanup.exe';
   Failure := '';
+  ArmHelperCleanupDebt(DebtKindMachineCleanupHelper, Nonce);
+  FailIfRequested('after-machine-helper-debt');
   try
     if not ValidTransactionId(Nonce) or
        not IsSha256Hex(JournalManifestHash) or
@@ -1688,6 +1742,7 @@ begin
        not PathIsNonReparseOrMissing(ProtectedDirectory) then
       RaiseException('cannot create trusted machine cleanup directory');
     HardenPendingDirectory(ProtectedDirectory, OriginalUserSid);
+    FailIfRequested('after-machine-helper-create');
 
     ExtractTemporaryFile('FamoEmbeddedManifest.txt');
     EmbeddedManifest := ExpandConstant('{tmp}\FamoEmbeddedManifest.txt');
@@ -1722,13 +1777,14 @@ begin
     Result := False;
   end;
 
-  if FileExists(ProtectedBroker) and not DeleteFile(ProtectedBroker) then
-    Result := False;
-  if FileExists(ProtectedManifest) and not DeleteFile(ProtectedManifest) then
-    Result := False;
-  if DirExists(ProtectedDirectory) and
-     not RemoveDir(ProtectedDirectory) then
-    Result := False;
+  CleanupSucceeded := CleanupExactHelperAndDebt(TransactionId,
+    DebtKindMachineCleanupHelper, Nonce, 1, CleanupFailure);
+  if not CleanupSucceeded then
+  begin
+    if Failure <> '' then Failure := Failure + '; ';
+    Failure := Failure + CleanupFailure;
+  end;
+  if not CleanupSucceeded then Result := False;
   if Failure <> '' then
     Log('trusted direct machine cleanup failed: ' + Failure);
 end;
@@ -1899,6 +1955,471 @@ begin
   FlushMachineRegistryKey(BrandKey);
   if RegQueryStringValue(HKLM64, BrandKey, Name, Existing) then
     RaiseException('transaction debt clear readback failed: ' + Name);
+end;
+
+function ParseHelperCleanupDebt(const Value: String;
+  var Owner, Kind, Nonce: String): Boolean;
+var
+  TypedKind: String;
+  Separator: Integer;
+begin
+  Result := False;
+  Owner := '';
+  Kind := '';
+  Nonce := '';
+  if not ParseTransactionDebt(Value, Owner, TypedKind) then Exit;
+  Separator := Pos(':', TypedKind);
+  if Separator <= 1 then Exit;
+  Kind := Copy(TypedKind, 1, Separator - 1);
+  Nonce := Copy(TypedKind, Separator + 1, Length(TypedKind));
+  Result :=
+    ((Kind = DebtKindIdentityHelper) or
+     (Kind = DebtKindMachineCleanupHelper)) and
+    ValidTransactionId(Nonce) and
+    (Nonce = Lowercase(Nonce)) and
+    (TypedKind = Kind + ':' + Nonce);
+  if not Result then
+  begin
+    Owner := '';
+    Kind := '';
+    Nonce := '';
+  end;
+end;
+
+procedure ArmHelperCleanupDebt(const Kind, Nonce: String);
+var
+  Existing, Expected, Readback: String;
+begin
+  if not ValidTransactionId(TransactionId) or
+     not ValidTransactionId(Nonce) or
+     ((Kind <> DebtKindIdentityHelper) and
+      (Kind <> DebtKindMachineCleanupHelper)) then
+    RaiseException('invalid helper cleanup debt identity');
+  Expected := TransactionDebtValue(TransactionId, Kind + ':' + Nonce);
+  if RegQueryStringValue(HKLM64, BrandKey,
+       HelperCleanupDebtName, Existing) and
+     (Existing <> Expected) then
+    RaiseException('foreign or malformed helper cleanup debt blocks write');
+  RequireJournalWrite(BrandKey, HelperCleanupDebtName, Expected);
+  FlushMachineRegistryKey(BrandKey);
+  if not RegQueryStringValue(HKLM64, BrandKey,
+       HelperCleanupDebtName, Readback) or
+     (Readback <> Expected) then
+    RaiseException('helper cleanup debt durability readback failed');
+end;
+
+procedure ClearHelperCleanupDebt(
+  const Owner, Kind, Nonce: String);
+var
+  Existing, Expected: String;
+begin
+  Expected := TransactionDebtValue(Owner, Kind + ':' + Nonce);
+  if not RegQueryStringValue(HKLM64, BrandKey,
+       HelperCleanupDebtName, Existing) then
+    RaiseException('helper cleanup debt missing before clear');
+  if Existing <> Expected then
+    RaiseException('foreign or malformed helper cleanup debt blocks clear');
+  if not RegDeleteValue(HKLM64, BrandKey, HelperCleanupDebtName) then
+    RaiseException('cannot clear helper cleanup debt');
+  FlushMachineRegistryKey(BrandKey);
+  if RegQueryStringValue(HKLM64, BrandKey,
+       HelperCleanupDebtName, Existing) then
+    RaiseException('helper cleanup debt clear readback failed');
+end;
+
+procedure ClosePinnedHelperHandle(var Handle: THandle);
+begin
+  if (Handle <> 0) and (Handle <> InvalidHandleValue) then
+    CloseHandle(Handle);
+  Handle := InvalidHandleValue;
+end;
+
+function TryOpenPinnedHelperDirectory(const Directory: String;
+  var DirectoryHandle: THandle; var FinalPath, ObjectId: String): Boolean;
+var
+  Attributes, FinalLength: Cardinal;
+  Exists: Boolean;
+  Buffer: String;
+  FileInformation: TFamoByHandleFileInformation;
+begin
+  Result := False;
+  DirectoryHandle := InvalidHandleValue;
+  FinalPath := '';
+  ObjectId := '';
+  if not TryGetPathAttributes(Directory, Exists, Attributes) or
+     not Exists or
+     ((Attributes and
+       (FileAttributeDirectory or FileAttributeReparsePoint)) <>
+       FileAttributeDirectory) then
+    Exit;
+
+  DirectoryHandle := CreateFileW(Directory, 0,
+    FileShareRead or FileShareWrite, 0, OpenExisting,
+    FileFlagBackupSemantics or FileFlagOpenReparsePoint, 0);
+  if DirectoryHandle = InvalidHandleValue then Exit;
+
+  SetLength(Buffer, FinalPathBufferChars);
+  FinalLength := GetFinalPathNameByHandleW(DirectoryHandle, Buffer,
+    FinalPathBufferChars, 0);
+  if (FinalLength = 0) or (FinalLength >= FinalPathBufferChars) then
+  begin
+    ClosePinnedHelperHandle(DirectoryHandle);
+    Exit;
+  end;
+  if not GetFileInformationByHandle(DirectoryHandle, FileInformation) then
+  begin
+    ClosePinnedHelperHandle(DirectoryHandle);
+    Exit;
+  end;
+  if ((FileInformation.FileAttributes and
+       (FileAttributeDirectory or FileAttributeReparsePoint)) <>
+       FileAttributeDirectory) then
+  begin
+    ClosePinnedHelperHandle(DirectoryHandle);
+    Exit;
+  end;
+  SetLength(Buffer, FinalLength);
+  FinalPath := NormalizeFinalObjectPath(Buffer);
+  if FinalPath = '' then
+  begin
+    ClosePinnedHelperHandle(DirectoryHandle);
+    Exit;
+  end;
+  if (FileInformation.FileIndexHigh <> 0) or
+     (FileInformation.FileIndexLow <> 0) then
+    ObjectId := IntToStr(FileInformation.VolumeSerialNumber) + ':' +
+      IntToStr(FileInformation.FileIndexHigh) + ':' +
+      IntToStr(FileInformation.FileIndexLow);
+  Result := ObjectId <> '';
+  if not Result then
+    ClosePinnedHelperHandle(DirectoryHandle);
+end;
+
+function PinExactHelperTree(const PendingRoot, HelperDirectory: String;
+  var AppHandle, PendingHandle, HelperHandle: THandle;
+  var HelperFinalPath: String): Boolean;
+var
+  AppRoot, ExpectedPendingRoot, AppFinalPath, AppObjectId,
+    PendingFinalPath, PendingObjectId, HelperObjectId: String;
+begin
+  Result := False;
+  AppHandle := InvalidHandleValue;
+  PendingHandle := InvalidHandleValue;
+  HelperHandle := InvalidHandleValue;
+  HelperFinalPath := '';
+  AppRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
+  ExpectedPendingRoot := NormalizeDirectoryPath(
+    AddBackslash(AppRoot) + 'pending');
+  if not PathSame(PendingRoot, ExpectedPendingRoot) or
+     not PathSame(ExtractFileDir(HelperDirectory), PendingRoot) then
+    Exit;
+
+  if not TryOpenPinnedHelperDirectory(AppRoot, AppHandle,
+       AppFinalPath, AppObjectId) or
+     not TryOpenPinnedHelperDirectory(PendingRoot, PendingHandle,
+       PendingFinalPath, PendingObjectId) or
+     not TryOpenPinnedHelperDirectory(HelperDirectory, HelperHandle,
+       HelperFinalPath, HelperObjectId) or
+     not PathSame(ExtractFileDir(PendingFinalPath), AppFinalPath) or
+     (CompareText(ExtractFileName(PendingFinalPath), 'pending') <> 0) or
+     not PathSame(ExtractFileDir(HelperFinalPath), PendingFinalPath) or
+     (CompareText(ExtractFileName(HelperFinalPath),
+       ExtractFileName(HelperDirectory)) <> 0) then
+  begin
+    ClosePinnedHelperHandle(HelperHandle);
+    ClosePinnedHelperHandle(PendingHandle);
+    ClosePinnedHelperHandle(AppHandle);
+    Exit;
+  end;
+  Result := True;
+end;
+
+procedure FlushHelperCleanupVolume;
+var
+  AppRoot, Drive, VolumePath: String;
+  VolumeHandle: THandle;
+begin
+  AppRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
+  Drive := ExtractFileDrive(AppRoot);
+  if Length(Drive) <> 2 then
+    RaiseException('helper cleanup volume is not a fixed drive');
+  if Drive[2] <> ':' then
+    RaiseException('helper cleanup volume is not a fixed drive');
+  VolumePath := '\\.\' + Uppercase(Drive);
+  VolumeHandle := CreateFileW(VolumePath, GenericWrite,
+    FileShareRead or FileShareWrite or FileShareDelete, 0, OpenExisting,
+    FileAttributeNormal, 0);
+  if VolumeHandle = InvalidHandleValue then
+    RaiseException('cannot open helper cleanup volume for flush');
+  try
+    if not FlushFileBuffers(VolumeHandle) then
+      RaiseException('cannot flush helper cleanup filesystem metadata');
+  finally
+    CloseHandle(VolumeHandle);
+  end;
+end;
+
+function ValidateExactHelperFile(const FileName,
+  HelperFinalPath: String): Boolean;
+var
+  Exists: Boolean;
+  Attributes: Cardinal;
+  FinalPath, ObjectId: String;
+begin
+  Result := False;
+  if not TryGetPathAttributes(FileName, Exists, Attributes) then Exit;
+  if not Exists then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if ((Attributes and
+       (FileAttributeDirectory or FileAttributeReparsePoint)) <> 0) or
+     not TryGetFinalObjectInfo(FileName, FinalPath, ObjectId) then
+    Exit;
+  Result :=
+    PathSame(ExtractFileDir(FinalPath), HelperFinalPath) and
+    (CompareText(ExtractFileName(FinalPath),
+      ExtractFileName(FileName)) = 0);
+end;
+
+function ValidateExactHelperDirectory(const PendingRoot, HelperDirectory,
+  FirstFile, SecondFile: String): Boolean;
+var
+  AppRoot, ExpectedPendingRoot, AppFinalPath, AppObjectId,
+    PendingFinalPath, PendingObjectId, HelperFinalPath,
+    HelperObjectId, Path: String;
+  AppExists, PendingExists, HelperExists: Boolean;
+  AppAttributes, PendingAttributes, HelperAttributes: Cardinal;
+  FindRec: TFindRec;
+begin
+  Result := False;
+  AppRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
+  ExpectedPendingRoot := NormalizeDirectoryPath(
+    AddBackslash(AppRoot) + 'pending');
+  if not PathSame(PendingRoot, ExpectedPendingRoot) or
+     not PathSame(ExtractFileDir(HelperDirectory), PendingRoot) or
+     not TryGetPathAttributes(AppRoot, AppExists, AppAttributes) or
+     not TryGetPathAttributes(PendingRoot, PendingExists,
+       PendingAttributes) or
+     not TryGetPathAttributes(HelperDirectory, HelperExists,
+       HelperAttributes) or
+     not AppExists or not PendingExists or not HelperExists or
+     ((AppAttributes and
+       (FileAttributeDirectory or FileAttributeReparsePoint)) <>
+       FileAttributeDirectory) or
+     ((PendingAttributes and
+       (FileAttributeDirectory or FileAttributeReparsePoint)) <>
+       FileAttributeDirectory) or
+     ((HelperAttributes and
+       (FileAttributeDirectory or FileAttributeReparsePoint)) <>
+       FileAttributeDirectory) or
+     not TryGetFinalObjectInfo(AppRoot, AppFinalPath, AppObjectId) or
+     not TryGetFinalObjectInfo(PendingRoot, PendingFinalPath,
+       PendingObjectId) or
+     not TryGetFinalObjectInfo(HelperDirectory, HelperFinalPath,
+       HelperObjectId) or
+     not PathSame(ExtractFileDir(PendingFinalPath), AppFinalPath) or
+     (CompareText(ExtractFileName(PendingFinalPath), 'pending') <> 0) or
+     not PathSame(ExtractFileDir(HelperFinalPath),
+       PendingFinalPath) or
+     (CompareText(ExtractFileName(HelperFinalPath),
+       ExtractFileName(HelperDirectory)) <> 0) then
+    Exit;
+
+  if FindFirst(AddBackslash(HelperDirectory) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Path := AddBackslash(HelperDirectory) + FindRec.Name;
+          if ((CompareText(Path, FirstFile) <> 0) and
+              (CompareText(Path, SecondFile) <> 0)) or
+             not ValidateExactHelperFile(Path, HelperFinalPath) then
+            Exit;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  Result :=
+    ValidateExactHelperFile(FirstFile, HelperFinalPath) and
+    ValidateExactHelperFile(SecondFile, HelperFinalPath);
+end;
+
+function DeleteExactHelperFile(const FileName,
+  HelperFinalPath: String): Boolean;
+var
+  Exists: Boolean;
+  Attributes: Cardinal;
+begin
+  Result := False;
+  if not TryGetPathAttributes(FileName, Exists, Attributes) then Exit;
+  if not Exists then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if not ValidateExactHelperFile(FileName, HelperFinalPath) or
+     not DeleteFile(FileName) or
+     not TryGetPathAttributes(FileName, Exists, Attributes) then
+    Exit;
+  Result := not Exists;
+end;
+
+function DeleteExactHelperFileWithRetries(const FileName,
+  HelperFinalPath: String; MaxAttempts: Integer): Boolean;
+var
+  Attempt: Integer;
+begin
+  Result := False;
+  if MaxAttempts < 1 then Exit;
+  for Attempt := 1 to MaxAttempts do
+  begin
+    if DeleteExactHelperFile(FileName, HelperFinalPath) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    if Attempt < MaxAttempts then Sleep(100);
+  end;
+end;
+
+function CleanupExactHelperAndDebt(
+  const Owner, Kind, Nonce: String; MaxDeleteAttempts: Integer;
+  var Failure: String): Boolean;
+var
+  PendingRoot, HelperDirectory, FirstFile, SecondFile,
+    HelperFinalPath: String;
+  HelperExists: Boolean;
+  HelperAttributes: Cardinal;
+  AppHandle, PendingHandle, HelperHandle: THandle;
+begin
+  Result := False;
+  Failure := '';
+  AppHandle := InvalidHandleValue;
+  PendingHandle := InvalidHandleValue;
+  HelperHandle := InvalidHandleValue;
+  if not ValidTransactionId(Owner) or
+     not ValidTransactionId(Nonce) or
+     (MaxDeleteAttempts < 1) or
+     ((Kind <> DebtKindIdentityHelper) and
+      (Kind <> DebtKindMachineCleanupHelper)) then
+  begin
+    Failure := 'invalid helper cleanup request';
+    Exit;
+  end;
+
+  PendingRoot := NormalizeDirectoryPath(
+    AddBackslash(ExpandConstant('{app}')) + 'pending');
+  if Kind = DebtKindIdentityHelper then
+  begin
+    HelperDirectory := NormalizeDirectoryPath(
+      AddBackslash(PendingRoot) + 'identity-' + Nonce);
+    FirstFile := AddBackslash(HelperDirectory) +
+      'FamoIdentityBroker-' + Nonce + '.exe';
+    SecondFile := AddBackslash(HelperDirectory) +
+      'identity-' + Nonce + '.txt';
+  end
+  else
+  begin
+    HelperDirectory := NormalizeDirectoryPath(
+      AddBackslash(PendingRoot) + 'machine-cleanup-' + Nonce);
+    FirstFile := AddBackslash(HelperDirectory) +
+      'payload-manifest.txt';
+    SecondFile := AddBackslash(HelperDirectory) +
+      'FamoMachineCleanup.exe';
+  end;
+
+  if not TryGetPathAttributes(HelperDirectory, HelperExists,
+       HelperAttributes) then
+  begin
+    Failure := 'helper cleanup path state is unavailable';
+    Exit;
+  end;
+  if not HelperExists then
+  begin
+    try
+      FailIfRequested('after-helper-remove-before-volume-flush');
+      FlushHelperCleanupVolume;
+      FailIfRequested('after-helper-volume-flush-before-debt-clear');
+      ClearHelperCleanupDebt(Owner, Kind, Nonce);
+      Result := True;
+    except
+      Failure := GetExceptionMessage;
+    end;
+    Exit;
+  end;
+
+  if not PinExactHelperTree(PendingRoot, HelperDirectory,
+       AppHandle, PendingHandle, HelperHandle, HelperFinalPath) then
+  begin
+    Failure := 'helper cleanup directory identity is invalid';
+    Exit;
+  end;
+  try
+    if not ValidateExactHelperDirectory(PendingRoot, HelperDirectory,
+         FirstFile, SecondFile) then
+    begin
+      Failure := 'helper cleanup directory contents are invalid';
+      Exit;
+    end;
+    if not DeleteExactHelperFileWithRetries(
+         FirstFile, HelperFinalPath, MaxDeleteAttempts) or
+       not DeleteExactHelperFileWithRetries(
+         SecondFile, HelperFinalPath, MaxDeleteAttempts) then
+    begin
+      Failure := 'cannot remove an exact helper cleanup file';
+      Exit;
+    end;
+
+    ClosePinnedHelperHandle(HelperHandle);
+    if not RemoveDir(HelperDirectory) or
+       not TryGetPathAttributes(HelperDirectory, HelperExists,
+         HelperAttributes) or HelperExists then
+    begin
+      Failure := 'cannot remove the exact helper cleanup directory';
+      Exit;
+    end;
+    try
+      FailIfRequested('after-helper-remove-before-volume-flush');
+      FlushHelperCleanupVolume;
+      FailIfRequested('after-helper-volume-flush-before-debt-clear');
+      ClearHelperCleanupDebt(Owner, Kind, Nonce);
+      Result := True;
+    except
+      Failure := GetExceptionMessage;
+    end;
+  finally
+    ClosePinnedHelperHandle(HelperHandle);
+    ClosePinnedHelperHandle(PendingHandle);
+    ClosePinnedHelperHandle(AppHandle);
+  end;
+end;
+
+function RecoverHelperCleanupDebt: Boolean;
+var
+  Stored, Owner, Kind, Nonce, Failure: String;
+begin
+  Result := False;
+  if not RegQueryStringValue(HKLM64, BrandKey,
+       HelperCleanupDebtName, Stored) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if not ParseHelperCleanupDebt(Stored, Owner, Kind, Nonce) then
+  begin
+    Log('foreign or malformed helper cleanup debt blocks recovery');
+    Exit;
+  end;
+
+  Result := CleanupExactHelperAndDebt(
+    Owner, Kind, Nonce, 1, Failure);
+  if not Result then
+    Log('cannot recover exact helper cleanup debt: ' + Failure);
 end;
 
 function TransactionDebtPresent(const Name, Kind: String): Boolean;
@@ -3982,6 +4503,8 @@ begin
     ClearTransactionDebt('UserCleanupDebt', DebtKindSeedCommit);
 end;
 
+function RetryRolledBackCleanupDebt: Boolean; forward;
+
 procedure RollbackTransaction;
 var
   ResultCode: Integer;
@@ -3994,6 +4517,9 @@ begin
   if JournalPhase = PhaseRolledBack then
   begin
     CommitRollbackActiveProjection;
+    if not RetryRolledBackCleanupDebt then
+      RaiseException(
+        'rolled-back cleanup debt remains durably recoverable');
     RollbackComplete := True;
     Exit;
   end;
@@ -4016,6 +4542,11 @@ begin
   if (JournalResumeInstaller <> '') or (JournalTaskName <> '') then
     ArmTransactionDebt(
       'RecoveryCleanupDebt', DebtKindRecoveryArtifacts);
+  { UserCleanupDebt is the forward Ready/seed-commit obligation. Once the
+    rollback debts are durable, rollback supersedes that forward intent; unlike
+    compensation debts it must not survive into the RolledBack terminal set. }
+  if HasReadyCommitDebt then
+    ClearTransactionDebt('UserCleanupDebt', DebtKindSeedCommit);
   FailIfRequested('rollback-debts-before-terminal');
   UserRollbackOk := True;
   CurrentPayloadTrusted := ValidateCurrentPayloadForExecution;
@@ -4138,6 +4669,11 @@ begin
       end;
     end;
   end;
+  { Publish the terminal decision before retiring any cleanup debt or deleting
+    its executable anchor. A crash from this point is a RolledBack re-entry,
+    and RetryRolledBackCleanupDebt can replay the still-durable obligations. }
+  TransitionTransactionPhase(PhaseRolledBack);
+  FailIfRequested('rolledback-before-debt-finalize');
   { The seed CAS rollback is deliberately last. If an earlier exact-user
     restoration fails, its authenticated transaction remains intact for the
     retained recovery task. Once this succeeds there are no later fallible
@@ -4160,8 +4696,6 @@ begin
   end;
   if UserRollbackOk and HadUserStateIntent then
     ClearTransactionDebt('UserRollbackDebt', DebtKindUserRollback);
-  if UserRollbackOk and HasReadyCommitDebt then
-    ClearTransactionDebt('UserCleanupDebt', DebtKindSeedCommit);
   TargetCleanupComplete := not DirExists(TransactionTarget);
   if DirExists(TransactionTarget) and UserRollbackOk and
      CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
@@ -4180,7 +4714,6 @@ begin
   if not UserRollbackOk or not TargetCleanupComplete then
     RaiseException(
       'rollback compensation remains durably recoverable');
-  TransitionTransactionPhase(PhaseRolledBack);
   FailIfRequested('rolledback-before-artifact-cleanup');
   CommitRollbackActiveProjection;
   try
@@ -5236,8 +5769,24 @@ var
   ResumeId, RollbackId, RecoverId, RequestedId, ManifestArgument,
     VersionArgument: String;
 begin
+  Result := False;
+  if not AcquireEarlyTransactionMutex then Exit;
   PinRunningSetupSource;
   RequireFixedProtectedInstallRoot;
+  if not RecoverHelperCleanupDebt then
+  begin
+    Result := False;
+    Exit;
+  end;
+  if RegValueExists(HKLM64, BrandKey, 'UninstallIntentOwner') or
+     RegValueExists(HKLM64, BrandKey, 'UninstallIntent') or
+     RegValueExists(HKLM64, UninstallDeleteAnchorKey, 'Owner') or
+     RegValueExists(HKLM64, UninstallDeleteAnchorKey, 'Commit') then
+  begin
+    Log('setup blocked by committed uninstall recovery state');
+    Result := False;
+    Exit;
+  end;
   ResumeId := ExpandConstant('{param:FamoResume|}');
   RollbackId := ExpandConstant('{param:FamoRollback|}');
   RecoverId := ExpandConstant('{param:FamoRecover|}');
@@ -5400,19 +5949,38 @@ end;
 
 procedure DeinitializeSetup;
 begin
-  if TransactionPrepared and not InstallReady then RollbackTransaction;
-  if ResumeMode and InstallReady and not PendingTerminal then
-    DelayDeleteFile(ExpandConstant('{srcexe}'), 5);
+  try
+    if TransactionPrepared and not InstallReady then RollbackTransaction;
+    if ResumeMode and InstallReady and not PendingTerminal then
+      DelayDeleteFile(ExpandConstant('{srcexe}'), 5);
+  finally
+    ReleaseEarlyTransactionMutex;
+  end;
 end;
 
 function InitializeUninstall: Boolean;
 begin
+  Result := False;
+  if not AcquireEarlyTransactionMutex then Exit;
+  UninstallPrepared := False;
+  UninstallDeleteArmed := False;
+  UninstallOwner := '';
   RequireFixedProtectedInstallRoot;
+  if not RecoverHelperCleanupDebt then
+  begin
+    Result := False;
+    Exit;
+  end;
   DeleteUserData := False;
   if not UninstallSilent then
     DeleteUserData := MsgBox('是否同时删除 %LOCALAPPDATA%\Famo 中的用户词库和设置？',
       mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
   Result := True;
+end;
+
+procedure DeinitializeUninstall;
+begin
+  ReleaseEarlyTransactionMutex;
 end;
 
 function OnlyLoadedHostResidue(const VersionTarget, LoadedHost: String): Boolean;
@@ -5494,16 +6062,226 @@ begin
   Result := UninstallRestartPending;
 end;
 
+function UninstallDeleteAnchorDigest(const Owner: String): String;
+begin
+  Result := Uppercase(GetSHA256OfString(
+    JournalCanonicalField('schema', UninstallDeleteAnchorSchema) +
+    JournalCanonicalField('owner', Owner)));
+end;
+
+procedure PersistUninstallDeleteAnchor(const Owner: String);
+var
+  ExpectedDigest, StoredOwner, StoredDigest, StoredCommit: String;
+begin
+  if not ValidTransactionId(Owner) then
+    RaiseException('invalid uninstall delete anchor owner');
+  ExpectedDigest := UninstallDeleteAnchorDigest(Owner);
+  RequireJournalWrite(UninstallDeleteAnchorKey, 'Owner', Owner);
+  RequireJournalWrite(UninstallDeleteAnchorKey, 'Digest', ExpectedDigest);
+  FailIfRequested('uninstall-delete-anchor-before-commit');
+  RequireJournalWrite(UninstallDeleteAnchorKey, 'Commit', UninstallDeleteAnchorSchema);
+  FlushMachineRegistryKey(UninstallDeleteAnchorKey);
+  if not RegQueryStringValue(HKLM64, UninstallDeleteAnchorKey,
+       'Owner', StoredOwner) or
+     not RegQueryStringValue(HKLM64, UninstallDeleteAnchorKey,
+       'Digest', StoredDigest) or
+     not RegQueryStringValue(HKLM64, UninstallDeleteAnchorKey,
+       'Commit', StoredCommit) or
+     (CompareText(StoredOwner, Owner) <> 0) or
+     (CompareText(StoredDigest, ExpectedDigest) <> 0) or
+     (StoredCommit <> UninstallDeleteAnchorSchema) then
+    RaiseException('uninstall delete anchor commit readback failed');
+  UninstallOwner := Owner;
+  UninstallDeleteArmed := True;
+  FailIfRequested('uninstall-delete-anchor-after-commit');
+end;
+
+function LoadCommittedUninstallDeleteAnchor(var Owner: String): Boolean;
+var
+  StoredOwner, StoredDigest, StoredCommit, ActiveId: String;
+begin
+  Result := False;
+  Owner := '';
+  if not RegQueryStringValue(HKLM64, UninstallDeleteAnchorKey,
+       'Commit', StoredCommit) then Exit;
+  if (StoredCommit <> UninstallDeleteAnchorSchema) or
+     not RegQueryStringValue(HKLM64, UninstallDeleteAnchorKey,
+       'Owner', StoredOwner) or
+     not RegQueryStringValue(HKLM64, UninstallDeleteAnchorKey,
+       'Digest', StoredDigest) or
+     not ValidTransactionId(StoredOwner) or
+     (CompareText(StoredDigest,
+       UninstallDeleteAnchorDigest(StoredOwner)) <> 0) or
+     (RegQueryStringValue(HKLM64, BrandKey,
+        'ActiveTransactionId', ActiveId) and
+      (CompareText(ActiveId, StoredOwner) <> 0)) then
+    RaiseException('invalid committed uninstall delete anchor');
+  Owner := StoredOwner;
+  Result := True;
+end;
+
+procedure RetireUninstallDeleteAnchor;
+var
+  StoredCommit: String;
+begin
+  if RegQueryStringValue(HKLM64, UninstallDeleteAnchorKey,
+       'Commit', StoredCommit) then
+  begin
+    if StoredCommit <> UninstallDeleteAnchorSchema then
+      RaiseException('foreign uninstall delete anchor blocks retirement');
+    if not RegDeleteValue(HKLM64, UninstallDeleteAnchorKey, 'Commit') then
+      RaiseException('cannot retire uninstall delete anchor commit');
+    FlushMachineRegistryKey(UninstallDeleteAnchorKey);
+    if RegValueExists(HKLM64, UninstallDeleteAnchorKey, 'Commit') then
+      RaiseException('uninstall delete anchor commit retirement failed');
+  end;
+  if RegKeyExists(HKLM64, UninstallDeleteAnchorKey) then
+  begin
+    if not RegDeleteKeyIncludingSubkeys(
+         HKLM64, UninstallDeleteAnchorKey) then
+      RaiseException('cannot retire uninstall delete anchor');
+    FlushMachineRegistryKey(FamoRootKey);
+    if RegKeyExists(HKLM64, UninstallDeleteAnchorKey) then
+      RaiseException('uninstall delete anchor retirement readback failed');
+  end;
+  UninstallDeleteArmed := False;
+end;
+
+procedure PersistUninstallIntent(const Owner, Target, FinalTarget,
+  ObjectId: String);
+begin
+  RequireJournalWrite(BrandKey, 'UninstallIntentOwner', Owner);
+  RequireJournalWrite(BrandKey, 'UninstallIntentTarget', Target);
+  RequireJournalWrite(BrandKey, 'UninstallIntentFinalTarget', FinalTarget);
+  RequireJournalWrite(BrandKey, 'UninstallIntentObjectId', ObjectId);
+  FailIfRequested('uninstall-intent-before-commit');
+  RequireJournalWrite(BrandKey, 'UninstallIntent', UninstallIntentSchema);
+  FlushMachineRegistryKey(BrandKey);
+  FailIfRequested('uninstall-intent-after-commit');
+end;
+
+function LoadCommittedUninstallIntent(const ActiveId: String;
+  var IntentTarget: String): Boolean;
+var
+  Schema, Owner, FinalTarget, ObjectId, NormalizedTarget, ExpectedTarget,
+    CurrentFinalTarget, CurrentObjectId: String;
+begin
+  Result := False;
+  IntentTarget := '';
+  if not RegQueryStringValue(
+       HKLM64, BrandKey, 'UninstallIntent', Schema) then Exit;
+  if (Schema <> UninstallIntentSchema) or
+     not RegQueryStringValue(
+       HKLM64, BrandKey, 'UninstallIntentOwner', Owner) or
+     not RegQueryStringValue(
+       HKLM64, BrandKey, 'UninstallIntentTarget', IntentTarget) or
+     not RegQueryStringValue(
+       HKLM64, BrandKey, 'UninstallIntentFinalTarget', FinalTarget) or
+     not RegQueryStringValue(
+       HKLM64, BrandKey, 'UninstallIntentObjectId', ObjectId) or
+     (CompareText(Owner, ActiveId) <> 0) or
+     not LoadTransactionJournal(ActiveId) then
+    RaiseException('invalid committed uninstall intent');
+
+  if JournalPhase = PhaseReady then
+  begin
+    if (CompareText(TransactionTarget, IntentTarget) <> 0) or
+       (CompareText(JournalPendingFinalTarget, FinalTarget) <> 0) or
+       (CompareText(JournalPendingObjectId, ObjectId) <> 0) then
+      RaiseException('invalid committed Ready uninstall intent');
+    ExpectedTarget := NormalizeDirectoryPath(
+      AddBackslash(ExpandConstant('{app}')) + 'versions\' +
+      JournalAppVersion + '-' + Copy(JournalManifestHash, 1, 12) +
+      '-' + ActiveId);
+  end
+  else if (JournalPhase = PhaseRolledBack) and
+          (PreviousTransactionId = '') and
+          (PreviousTarget <> '') then
+  begin
+    if (CompareText(PreviousTarget, IntentTarget) <> 0) or
+       (CompareText(JournalPreviousFinalTarget, FinalTarget) <> 0) or
+       (CompareText(JournalPreviousObjectId, ObjectId) <> 0) or
+       not ValidLegacyTransactionId(
+         PreviousCompatibilityTransactionId) then
+      RaiseException('invalid committed legacy uninstall intent');
+    ExpectedTarget := NormalizeDirectoryPath(
+      AddBackslash(ExpandConstant('{app}')) + 'versions\' +
+      PreviousVersion + '-' + Copy(PreviousManifestHash, 1, 12) +
+      '-' + PreviousCompatibilityTransactionId);
+  end
+  else
+    RaiseException('invalid committed uninstall intent phase');
+
+  NormalizedTarget := NormalizeDirectoryPath(IntentTarget);
+  if not PathSame(NormalizedTarget, ExpectedTarget) or
+     not PathIsNonReparseOrMissing(NormalizedTarget) then
+    RaiseException('unsafe committed uninstall target');
+  if DirExists(IntentTarget) and
+     (not TryGetFinalObjectInfo(
+        IntentTarget, CurrentFinalTarget, CurrentObjectId) or
+      not FinalObjectsSame(
+        CurrentFinalTarget, CurrentObjectId, FinalTarget, ObjectId)) then
+    RaiseException('committed uninstall target identity changed');
+  Result := True;
+end;
+
 procedure RemoveActiveInstall;
 var
   ActiveTarget, RegisteredDll, ActiveTransactionId, BrandTarget,
-    BrandManifest: String;
+    BrandManifest, IntentTarget, IntentFinalTarget,
+    IntentObjectId: String;
   EmptyRollbackAnchor, ReadyAnchor: Boolean;
 begin
   RequireFixedProtectedInstallRoot;
+  if LoadCommittedUninstallDeleteAnchor(UninstallOwner) then
+  begin
+    UninstallDeleteArmed := True;
+    TransactionId := UninstallOwner;
+    RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
+    if RegQueryStringValue(HKLM64, RunKey, 'FamoRuntime',
+         RegisteredDll) or
+       RegQueryStringValue(HKLM64,
+         'Software\Classes\CLSID\' + StableClsid +
+         '\InprocServer32', '', RegisteredDll) or
+       not RecoveryTaskFolderAbsentByCom then
+      RaiseException(
+        'committed uninstall delete anchor has live machine state');
+    UninstallPrepared := True;
+    Exit;
+  end;
   if not RegQueryStringValue(HKLM64, BrandKey, 'ActiveTransactionId',
-       ActiveTransactionId) or
-     not LoadPendingState(ActiveTransactionId) then
+       ActiveTransactionId) then
+  begin
+    if RegKeyExists(HKLM64, BrandKey) or
+       RegQueryStringValue(HKLM64, RunKey, 'FamoRuntime',
+         RegisteredDll) or
+       RegQueryStringValue(HKLM64,
+         'Software\Classes\CLSID\' + StableClsid +
+         '\InprocServer32', '', RegisteredDll) or
+       not RecoveryTaskFolderAbsentByCom then
+      RaiseException('cannot load the active transaction for uninstall');
+    UninstallDeleteArmed := True;
+    UninstallOwner := '';
+    UninstallPrepared := True;
+    Exit;
+  end;
+  UninstallOwner := ActiveTransactionId;
+  if LoadCommittedUninstallIntent(ActiveTransactionId, IntentTarget) then
+  begin
+    if MachineComPointsToTarget(IntentTarget) and
+       not RunTrustedDirectMachineUnregister then
+      RaiseException('cannot finish committed machine unregister');
+    RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
+    if RegQueryStringValue(HKLM64,
+      'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '',
+      RegisteredDll) then
+      RaiseException(
+        'dangling machine COM registration after uninstall re-entry');
+    DeleteRecoveryTask;
+    UninstallPrepared := True;
+    Exit;
+  end;
+  if not LoadPendingState(ActiveTransactionId) then
     RaiseException('cannot load the active transaction for uninstall');
   EmptyRollbackAnchor := False;
   ReadyAnchor := JournalPhase = PhaseReady;
@@ -5572,6 +6350,20 @@ begin
   if RegQueryStringValue(HKLM64,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) then
     RaiseException('dangling machine COM registration after unregister');
+  if not TryGetFinalObjectInfo(
+       ActiveTarget, IntentFinalTarget, IntentObjectId) or
+     (ReadyAnchor and
+      not FinalObjectsSame(
+        IntentFinalTarget, IntentObjectId,
+        JournalPendingFinalTarget, JournalPendingObjectId)) or
+     ((not ReadyAnchor) and
+      not FinalObjectsSame(
+        IntentFinalTarget, IntentObjectId,
+        JournalPreviousFinalTarget, JournalPreviousObjectId)) then
+    RaiseException('active target changed before uninstall intent');
+  PersistUninstallIntent(
+    ActiveTransactionId, ActiveTarget,
+    IntentFinalTarget, IntentObjectId);
   DeleteRecoveryTask;
   UninstallPrepared := True;
 end;
@@ -5586,7 +6378,17 @@ begin
   begin
     RequireFixedProtectedInstallRoot;
     RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
-    CleanupAllValidatedRecoveryArtifacts;
+    FlushMachineRegistryKey(RunKey);
+    if RegQueryStringValue(HKLM64, RunKey, 'FamoRuntime',
+         TreeFinalPath) then
+      RaiseException('runtime startup registration survived uninstall');
+    FlushMachineRegistryKey('Software\Classes\CLSID');
+    if RegQueryStringValue(HKLM64,
+         'Software\Classes\CLSID\' + StableClsid +
+         '\InprocServer32', '', TreeFinalPath) then
+      RaiseException('machine COM registration survived uninstall');
+    if not UninstallDeleteArmed then
+      CleanupAllValidatedRecoveryArtifacts;
     VersionsRoot := ExpandConstant('{app}\versions');
     if DirExists(VersionsRoot) then
     begin
@@ -5607,6 +6409,20 @@ begin
          not DelTree(PendingRoot, True, True, True) then
         RaiseException('unsafe pending tree refused during uninstall');
     end;
-    RegDeleteKeyIncludingSubkeys(HKLM64, BrandKey);
+    { The authenticated transaction journal lives inside BrandKey. Arm a
+      sibling recovery record only after every journal-dependent cleanup has
+      succeeded, then it can safely bridge a torn recursive key deletion. }
+    if not UninstallDeleteArmed then
+      PersistUninstallDeleteAnchor(UninstallOwner);
+    if RegKeyExists(HKLM64, BrandKey) then
+    begin
+      if not RegDeleteKeyIncludingSubkeys(HKLM64, BrandKey) then
+        RaiseException('cannot delete the committed install registry');
+      FlushMachineRegistryKey(FamoRootKey);
+      if RegKeyExists(HKLM64, BrandKey) then
+        RaiseException('install registry deletion readback failed');
+    end;
+    FailIfRequested('uninstall-brand-deleted-before-anchor-retire');
+    RetireUninstallDeleteAnchor;
   end;
 end;

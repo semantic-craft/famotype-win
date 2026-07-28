@@ -30,8 +30,11 @@ bool TestFaultEnabled(const wchar_t *name) {
 bool ValidFinalReply(const Frame &reply,
                      const DeliveryReference &reference) {
   return reply.flags == kFlagResponse &&
+         static_cast<uint32_t>(reply.status) <=
+             static_cast<uint32_t>(Status::DeliveryFailed) &&
          reply.command == reference.command &&
-         reply.correlation == reference.correlation;
+         reply.correlation == reference.correlation &&
+         reply.payload.size() <= kMaxFramePayloadSize;
 }
 
 } // namespace
@@ -45,10 +48,13 @@ Frame RuntimeService::DispatchForDelivery(const Frame &request,
       request.command == Command::ExecutePrepared ||
       request.command == Command::ClaimResult ||
       request.command == Command::AckResult;
-  const bool terminal_abandon =
+  const bool terminal_connection_abandon =
       request.command == Command::AbandonConnection;
+  const bool terminal_session_abandon =
+      request.command == Command::AbandonSession;
   const bool reconnect_hello = request.command == Command::Hello;
-  if (!terminal_abandon && !reconnect_hello &&
+  if (!terminal_connection_abandon && !terminal_session_abandon &&
+      !reconnect_hello &&
       readiness_.load() != RuntimeReadiness::Ready) {
     return Reply(request, Status::Unavailable);
   }
@@ -61,8 +67,17 @@ Frame RuntimeService::DispatchForDelivery(const Frame &request,
   if (!lock)
     return Reply(request, Status::Unavailable);
 
-  if (terminal_abandon)
+  if (terminal_connection_abandon)
     return AbandonConnectionLocked(request, owner);
+  if (terminal_session_abandon) {
+    DeliveryReference reference;
+    std::string error;
+    if (request.flags != 0 || request.status != Status::Ok ||
+        !DecodeDeliveryReference(request.payload, &reference, &error)) {
+      return Reply(request, Status::InvalidFrame);
+    }
+    return AbandonSessionLocked(request, reference, owner);
+  }
   if (readiness_.load() != RuntimeReadiness::Ready) {
     const Correlation &c = request.correlation;
     if (request.flags != 0 || request.status != Status::Ok ||
@@ -167,6 +182,12 @@ Frame RuntimeService::AbandonConnectionLocked(
                          target.connection_generation ==
                              c.connection_generation;
                 });
+  std::erase_if(abandoned_sessions_, [&](const AbandonedSession &entry) {
+    const Correlation &target = entry.reference.correlation;
+    return target.client_id == c.client_id &&
+           target.activation_generation == c.activation_generation &&
+           target.connection_generation == c.connection_generation;
+  });
 
   std::lock_guard ui_lock(ui_sessions_mutex_);
   for (auto it = sessions_.begin(); it != sessions_.end();) {
@@ -182,6 +203,92 @@ Frame RuntimeService::AbandonConnectionLocked(
     }
   }
   clients_.erase(client);
+  return Reply(request, Status::Ok);
+}
+
+Frame RuntimeService::AbandonSessionLocked(
+    const Frame &request, const DeliveryReference &reference,
+    const PipeClientIdentity &owner) {
+  const Correlation &caller = request.correlation;
+  const Correlation &target = reference.correlation;
+  if (!started_ || !owner || request.flags != 0 ||
+      request.status != Status::Ok ||
+      !IsDeliveryTracked(reference.command) || caller.client_id == 0 ||
+      caller.activation_generation == 0 ||
+      caller.connection_generation == 0 || caller.session_id != 0 ||
+      caller.session_generation != 0 || caller.sequence != 0 ||
+      target.client_id != caller.client_id ||
+      target.activation_generation != caller.activation_generation ||
+      target.connection_generation != caller.connection_generation ||
+      target.session_id == 0 || target.session_generation == 0 ||
+      target.sequence == 0) {
+    return Reply(request, Status::InvalidFrame);
+  }
+
+  const AbandonedSession *tombstone =
+      FindAbandonedSessionLocked(target);
+  const auto client = clients_.find(caller.client_id);
+  if (client == clients_.end()) {
+    return Reply(request,
+                 tombstone && tombstone->owner == owner &&
+                         tombstone->reference == reference
+                     ? Status::Ok
+                     : Status::StaleRequest);
+  }
+  if (client->second.activation_generation !=
+          caller.activation_generation ||
+      client->second.connection_generation !=
+          caller.connection_generation ||
+      client->second.owner != owner) {
+    return Reply(request, Status::StaleRequest);
+  }
+  if (tombstone) {
+    return Reply(request,
+                 tombstone->owner == owner &&
+                         tombstone->reference == reference
+                     ? Status::Ok
+                     : Status::StaleRequest);
+  }
+
+  const auto delivery = std::find_if(
+      deliveries_.begin(), deliveries_.end(),
+      [&](const DeliveryEntry &entry) {
+        return entry.reference == reference;
+      });
+  if (delivery == deliveries_.end() || delivery->owner != owner ||
+      delivery->stage != DeliveryStage::TerminalFailed) {
+    return Reply(request, Status::StaleRequest);
+  }
+  const SessionKey key{
+      target.client_id, target.activation_generation,
+      target.connection_generation, target.session_id,
+      target.session_generation};
+  const auto session = sessions_.find(key);
+  if (session == sessions_.end())
+    return Reply(request, Status::StaleRequest);
+  if (!EnsureRetiredCapacityLocked(1) ||
+      !RememberAbandonedSessionLocked(reference, owner)) {
+    return Reply(request, Status::Unavailable);
+  }
+
+  // The exact owner/session/delivery tombstone is durable before destructive
+  // cleanup. Late Claim, Recover, Prepare, or OpenSession calls therefore fail
+  // closed without affecting sibling sessions in the connection epoch.
+  std::erase_if(deliveries_, [&](const DeliveryEntry &entry) {
+    return SameLogicalSession(entry.reference.correlation, target);
+  });
+  std::erase_if(acknowledged_deliveries_,
+                [&](const AcknowledgedDelivery &entry) {
+                  return SameLogicalSession(entry.reference.correlation,
+                                            target);
+                });
+  {
+    std::lock_guard ui_lock(ui_sessions_mutex_);
+    Publish(session->second, false);
+    ui_sessions_.erase(key);
+    (void)DestroyOrRetireContextLocked(session->second.context);
+    sessions_.erase(session);
+  }
   return Reply(request, Status::Ok);
 }
 
@@ -257,6 +364,9 @@ Frame RuntimeService::PrepareDeliveryLocked(
       target.connection_generation, target.session_id,
       target.session_generation};
   const auto target_session = sessions_.find(target_key);
+  if (FindAbandonedSessionLocked(target)) {
+    return Reply(request, Status::StaleRequest);
+  }
   if (target_session != sessions_.end() &&
       target.sequence <= target_session->second.last_sequence) {
     return Reply(request, Status::StaleRequest);
@@ -368,7 +478,7 @@ Frame RuntimeService::ExecutePreparedLocked(
   if (found->stage == DeliveryStage::Completed)
     return found->final_reply;
   if (found->stage == DeliveryStage::TerminalFailed)
-    return Reply(request, Status::Unavailable);
+    return Reply(found->request, Status::DeliveryFailed);
   if (found->stage == DeliveryStage::EncodingFailed)
     return RetryCachedDeliveryEncodingLocked(*found);
   if (found->stage != DeliveryStage::Prepared &&
@@ -379,6 +489,9 @@ Frame RuntimeService::ExecutePreparedLocked(
 }
 
 Frame RuntimeService::AdvanceDeliveryLocked(DeliveryEntry &delivery) {
+  // One recovery/finalization attempt is made while executing the prepared
+  // request. Claims consume the remaining shared budget.
+  constexpr uint32_t kMaxRecoveryAttempts = 3;
   const Correlation &target = delivery.reference.correlation;
   const SessionKey key{target.client_id, target.activation_generation,
                        target.connection_generation, target.session_id,
@@ -401,6 +514,13 @@ Frame RuntimeService::AdvanceDeliveryLocked(DeliveryEntry &delivery) {
             ? RecoverSessionCommand(delivery.request, key, session->second)
             : DispatchSessionCommand(delivery.request, key, session->second);
     if (final_reply.status == Status::RecoveryPending) {
+      if (!recovering)
+        delivery.recovery_attempts = 1;
+      if (recovering &&
+          ++delivery.recovery_attempts >= kMaxRecoveryAttempts) {
+        delivery.stage = DeliveryStage::TerminalFailed;
+        return Reply(delivery.request, Status::DeliveryFailed);
+      }
       delivery.stage = DeliveryStage::PendingRecovery;
       return final_reply;
     }
@@ -424,25 +544,26 @@ Frame RuntimeService::AdvanceDeliveryLocked(DeliveryEntry &delivery) {
         recoverable_session->second.pending_recovery_action != 0 &&
         recoverable_session->second.pending_recovery_sequence ==
             target.sequence;
+    if (recoverable && !recovering)
+      delivery.recovery_attempts = 1;
+    if (recoverable && recovering &&
+        ++delivery.recovery_attempts >= kMaxRecoveryAttempts) {
+      delivery.stage = DeliveryStage::TerminalFailed;
+      return Reply(delivery.request, Status::DeliveryFailed);
+    }
     delivery.stage = recoverable ? DeliveryStage::PendingRecovery
                                  : DeliveryStage::TerminalFailed;
     return Reply(delivery.request, recoverable ? Status::RecoveryPending
-                                               : Status::Unavailable);
+                                               : Status::DeliveryFailed);
   }
 }
 
 Frame RuntimeService::RetryCachedDeliveryEncodingLocked(
     DeliveryEntry &delivery) {
-  constexpr uint32_t kMaxEncodingAttempts = 3;
   if (!ValidFinalReply(delivery.final_reply, delivery.reference)) {
     delivery.stage = DeliveryStage::TerminalFailed;
-    return Reply(delivery.request, Status::Unavailable);
+    return Reply(delivery.request, Status::DeliveryFailed);
   }
-  if (delivery.encoding_attempts >= kMaxEncodingAttempts) {
-    delivery.stage = DeliveryStage::TerminalFailed;
-    return Reply(delivery.request, Status::Unavailable);
-  }
-  ++delivery.encoding_attempts;
   try {
     if (TestFaultEnabled(
             L"FAMO_TEST_RUNTIME_DELIVERY_ENCODING_ALLOCATION_FAILURE")) {
@@ -451,18 +572,13 @@ Frame RuntimeService::RetryCachedDeliveryEncodingLocked(
     std::vector<uint8_t> encoded;
     std::string error;
     if (!EncodeFrame(delivery.final_reply, &encoded, &error)) {
-      // The protocol budget is deliberately larger than the ABI result
-      // allocation, so this is an internal contract failure. Never replace an
-      // already-mutated result with an empty EngineError and never replay it.
-      delivery.stage = DeliveryStage::TerminalFailed;
-      return Reply(delivery.request, Status::Unavailable);
+      // Structural fields were validated above, so a remaining encode failure
+      // is transient allocation pressure. Preserve the exact cached result.
+      delivery.stage = DeliveryStage::EncodingFailed;
+      return Reply(delivery.request, Status::RecoveryPending);
     }
     delivery.stage = DeliveryStage::Completed;
   } catch (...) {
-    if (delivery.encoding_attempts >= kMaxEncodingAttempts) {
-      delivery.stage = DeliveryStage::TerminalFailed;
-      return Reply(delivery.request, Status::Unavailable);
-    }
     delivery.stage = DeliveryStage::EncodingFailed;
     return Reply(delivery.request, Status::RecoveryPending);
   }
@@ -503,7 +619,7 @@ Frame RuntimeService::ClaimDeliveryLocked(
   if (found->stage == DeliveryStage::Executing)
     return Reply(request, Status::Unavailable);
   if (found->stage == DeliveryStage::TerminalFailed)
-    return Reply(request, Status::Unavailable);
+    return Reply(found->request, Status::DeliveryFailed);
   if (found->stage == DeliveryStage::PendingRecovery)
     return AdvanceDeliveryLocked(*found);
   if (found->stage == DeliveryStage::EncodingFailed)

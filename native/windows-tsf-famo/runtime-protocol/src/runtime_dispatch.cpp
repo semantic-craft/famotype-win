@@ -119,13 +119,13 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
           clients_.emplace(
               c.client_id,
               ClientEpoch{c.activation_generation,
-                          c.connection_generation, bound_owner});
+                          c.connection_generation, bound_owner, 0});
         } catch (...) {
           return Reply(request, Status::Unavailable);
         }
       } else {
         found->second = ClientEpoch{
-            c.activation_generation, c.connection_generation, bound_owner};
+            c.activation_generation, c.connection_generation, bound_owner, 0};
       }
     } else if (found != clients_.end() && owner && !found->second.owner) {
       found->second.owner = *owner;
@@ -147,6 +147,8 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
   const SessionKey key{c.client_id, c.activation_generation,
                        c.connection_generation, c.session_id,
                        c.session_generation};
+  if (FindAbandonedSessionLocked(c))
+    return Reply(request, Status::StaleRequest);
   if (request.command == Command::OpenSession) {
     std::string schema, error;
     if (!DecodeOpenSession(request.payload, &schema, &error))
@@ -159,6 +161,8 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
                                 ? Status::Ok
                                 : Status::InvalidFrame);
     }
+    if (c.session_id <= client->second.max_session_id)
+      return Reply(request, Status::StaleRequest);
     const size_t client_sessions =
         std::count_if(sessions_.begin(), sessions_.end(),
                       [&](const auto &entry) {
@@ -224,6 +228,7 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
       (void)DestroyOrRetireContextLocked(context);
       return Reply(request, Status::Unavailable);
     }
+    client->second.max_session_id = c.session_id;
     return Reply(request, Status::Ok);
   }
 
@@ -330,7 +335,7 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
   FamoEngineActionResultLease action_result;
   FamoEngineRecoveryOutcome outcome;
   const int32_t action_status = engine_.ExecuteActionRecovering(
-      session.context, &action, 3, &action_result, &outcome);
+      session.context, &action, 1, &action_result, &outcome);
   if (!outcome.business_dispatched) {
     return Reply(request, Status::EngineError);
   }

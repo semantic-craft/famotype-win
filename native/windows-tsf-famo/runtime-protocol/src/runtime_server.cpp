@@ -74,6 +74,11 @@ bool IsDelayedFault(ServerFault fault) {
          fault == ServerFault::UiHang || fault == ServerFault::LateReply;
 }
 
+bool IsCopyFailureFault(ServerFault fault) {
+  return fault == ServerFault::CopyFailureAfterMutation ||
+         fault == ServerFault::CopyFailureAfterMutationSticky;
+}
+
 std::wstring CurrentProcessPath() {
   std::wstring path(32768, L'\0');
   const DWORD length =
@@ -93,7 +98,8 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
                    std::string *error,
                    uint32_t fault_after_process_keys, PipeServerStop *stop,
                    bool preserve_ui_only_session,
-                   bool ui_only_endpoint) {
+                   bool ui_only_endpoint,
+                   std::atomic<uint32_t> *terminal_abandon_count) {
   if (!service) {
     if (error)
       *error = "runtime service is required";
@@ -147,6 +153,7 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
   bool authenticated = false;
   bool only_ui_state = true;
   bool ok = true;
+  bool copy_failure_injected = false;
   uint32_t process_key_count = 0;
   uint32_t open_session_count = 0;
   try {
@@ -195,6 +202,10 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
     }
 
     const bool process_key = request.command == Command::ProcessKey;
+    if (request.command == Command::AbandonConnection ||
+        request.command == Command::AbandonSession)
+      if (terminal_abandon_count)
+        terminal_abandon_count->fetch_add(1);
     const bool execute_prepared =
         request.command == Command::ExecutePrepared;
     const bool open_session = request.command == Command::OpenSession;
@@ -206,7 +217,7 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
     const bool fault_target =
         fault == ServerFault::DisconnectBeforeExecute ||
                 fault == ServerFault::DisconnectAfterDispatch ||
-                fault == ServerFault::CopyFailureAfterMutation
+                IsCopyFailureFault(fault)
             ? execute_prepared
         : fault == ServerFault::UiHang
                                   ? ui_state
@@ -217,6 +228,7 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
                                   : process_key;
     const bool inject =
         hello_complete && fault != ServerFault::None && fault_target &&
+        !(IsCopyFailureFault(fault) && copy_failure_injected) &&
         (fault == ServerFault::OpenSessionUnavailable
              ? open_session_count <= std::max(1u, fault_after_process_keys)
              : process_key_count >= fault_after_process_keys);
@@ -255,8 +267,9 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
       reply.status = Status::Unavailable;
       reply.correlation = request.correlation;
     } else {
-      if (inject && fault == ServerFault::CopyFailureAfterMutation) {
+      if (inject && IsCopyFailureFault(fault)) {
         SetEnvironmentVariableA("FAMO_TEST_RUNTIME_COPY_FAILURE", "1");
+        copy_failure_injected = true;
       }
       if constexpr (std::is_same_v<Service, RuntimeService>) {
         reply = service->DispatchForDelivery(request, client_identity);
@@ -266,6 +279,10 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
       } else {
         reply = service->Dispatch(request);
       }
+    }
+    if (fault == ServerFault::CopyFailureAfterMutation &&
+        request.command == Command::AbandonSession) {
+      SetEnvironmentVariableA("FAMO_TEST_RUNTIME_COPY_FAILURE", nullptr);
     }
     if (inject && fault == ServerFault::DisconnectAfterDispatch)
       break;
@@ -296,13 +313,13 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
     if (inject && fault != ServerFault::OpenSessionDelay &&
         fault != ServerFault::OpenSessionHang &&
         fault != ServerFault::OpenSessionUnavailable &&
-        fault != ServerFault::CopyFailureAfterMutation)
+        !IsCopyFailureFault(fault))
       break;
   }
   } catch (...) {
     ok = false;
   }
-  if (fault == ServerFault::CopyFailureAfterMutation)
+  if (IsCopyFailureFault(fault))
     SetEnvironmentVariableA("FAMO_TEST_RUNTIME_COPY_FAILURE", nullptr);
   if (authenticated && have_correlation &&
       (!preserve_ui_only_session || !only_ui_state)) {
@@ -328,11 +345,12 @@ bool RuntimePipeServer::ServeOnce(const PipeEndpoint &endpoint,
                                   std::string *error,
                                   uint32_t fault_after_process_keys,
                                   PipeServerStop *stop,
-                                  bool ui_only_endpoint) {
+                                  bool ui_only_endpoint,
+                                  std::atomic<uint32_t> *terminal_abandon_count) {
   try {
     return ServeOnceImpl(endpoint, service, fault, accept_timeout, error,
                          fault_after_process_keys, stop, true,
-                         ui_only_endpoint);
+                         ui_only_endpoint, terminal_abandon_count);
   } catch (...) {
     try {
       if (error)
@@ -349,7 +367,7 @@ bool ControlPipeServer::ServeOnce(const PipeEndpoint &endpoint,
                                   std::string *error, PipeServerStop *stop) {
   try {
     return ServeOnceImpl(endpoint, service, ServerFault::None, accept_timeout,
-                         error, 0, stop, false, false);
+                         error, 0, stop, false, false, nullptr);
   } catch (...) {
     try {
       if (error)
@@ -425,6 +443,8 @@ bool ParseServerFault(std::string_view value, ServerFault *fault) {
     *fault = ServerFault::DisconnectAfterDispatch;
   else if (value == "copy-failure")
     *fault = ServerFault::CopyFailureAfterMutation;
+  else if (value == "copy-failure-sticky")
+    *fault = ServerFault::CopyFailureAfterMutationSticky;
   else
     return false;
   return true;

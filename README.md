@@ -63,7 +63,8 @@ native/windows-tsf-famo/installer/build-installer.ps1
 [`native/windows-tsf-famo/installer/smoke_test.md`](native/windows-tsf-famo/installer/smoke_test.md)
 完成身份检查、契约测试及 Win10 / Win11 真机 smoke。macOS 机器不得伪造 Windows 二进制发布。
 
-设置面板的测试（纯 .NET，跨平台可跑）：
+设置面板的测试需在 Windows 上运行；其中包含 Win32 / NTFS 崩溃安全事务、
+对象身份和原子重命名验证：
 
 ```powershell
 dotnet test native/windows-tsf-famo/settings-winui/FamoSettings.Tests

@@ -28,6 +28,9 @@ public sealed class FirstLaunchSeederTests : IDisposable
     {
         SeedFileTransaction.BeforeAtomicFilePublishForTests = null;
         SeedFileTransaction.BeforePinnedAtomicFilePublishForTests = null;
+        SeedFileTransaction
+            .AfterPinnedTemporaryDeleteDispositionClearedForTests = null;
+        SeedFileTransaction.AfterPinnedAtomicFileRenameForTests = null;
         UserDataTransactionLock.LocalAppDataOverrideForTests =
             TestUserDataLockEnvironment.LocalAppDataRoot;
         if (Directory.Exists(_root))
@@ -136,6 +139,131 @@ public sealed class FirstLaunchSeederTests : IDisposable
         string source = Path.Combine(_source, "default.yaml");
         string target = Path.Combine(_dest, "default.yaml");
         string marker = Path.Combine(_root, "crash-marker.txt");
+        RunCrashHarness(
+            source,
+            target,
+            marker,
+            "before-publish",
+            UserDataTransactionLock.LocalAppDataOverrideForTests);
+
+        Assert.True(File.Exists(marker));
+        string temporary = File.ReadAllText(marker);
+        Assert.False(File.Exists(temporary));
+        Assert.False(File.Exists(target));
+
+        SeedFileTransaction.CopyDurableAtomic(
+            source, target, overwrite: false);
+        Assert.Equal("schema_list:\n", File.ReadAllText(target));
+        Assert.False(File.Exists(temporary));
+    }
+
+    [Fact]
+    public void Seed_HardCrashAfterDeleteDispositionClearRecoversOnNextStartup()
+    {
+        string source = Path.Combine(_source, "default.yaml");
+        string target = Path.Combine(_dest, "default.yaml");
+        string marker = Path.Combine(_root, "after-clear-crash-marker.txt");
+        string foreign = target + ".famo-tmp-foreign";
+        Directory.CreateDirectory(_dest);
+        File.WriteAllText(foreign, "foreign");
+
+        RunCrashHarness(
+            source,
+            target,
+            marker,
+            "after-clear-before-rename",
+            UserDataTransactionLock.LocalAppDataOverrideForTests);
+
+        Assert.True(File.Exists(marker));
+        string temporary = File.ReadAllText(marker);
+        string recoveryRecord =
+            UserDataTransactionLock.AtomicPublicationRecoveryPath(_dest);
+        Assert.True(File.Exists(temporary));
+        Assert.True(File.Exists(recoveryRecord));
+        Assert.False(File.Exists(target));
+
+        FirstLaunchSeedResult recovered =
+            FirstLaunchSeeder.Seed(_source, _dest);
+
+        Assert.True(recovered.Copied >= 1);
+        Assert.Equal("schema_list:\n", File.ReadAllText(target));
+        Assert.False(File.Exists(temporary));
+        Assert.False(File.Exists(recoveryRecord));
+        Assert.Equal("foreign", File.ReadAllText(foreign));
+    }
+
+    [Fact]
+    public void Seed_RecoveryPreservesReplacementAtRecordedTemporaryPath()
+    {
+        string source = Path.Combine(_source, "default.yaml");
+        string target = Path.Combine(_dest, "default.yaml");
+        string marker = Path.Combine(_root, "identity-crash-marker.txt");
+        RunCrashHarness(
+            source,
+            target,
+            marker,
+            "after-clear-before-rename",
+            UserDataTransactionLock.LocalAppDataOverrideForTests);
+
+        string temporary = File.ReadAllText(marker);
+        string parked = temporary + ".parked";
+        string recoveryRecord =
+            UserDataTransactionLock.AtomicPublicationRecoveryPath(_dest);
+        Assert.True(File.Exists(temporary));
+        Assert.True(File.Exists(recoveryRecord));
+        File.Move(temporary, parked);
+        File.WriteAllText(temporary, "foreign replacement");
+
+        IOException error = Assert.Throws<IOException>(
+            () => FirstLaunchSeeder.Seed(_source, _dest));
+
+        Assert.Contains("identity changed", error.Message);
+        Assert.Equal("foreign replacement", File.ReadAllText(temporary));
+        Assert.Equal("schema_list:\n", File.ReadAllText(parked));
+        Assert.True(File.Exists(recoveryRecord));
+        Assert.False(File.Exists(target));
+    }
+
+    [Fact]
+    public void Seed_HardCrashAfterRenamePreservesPublishedFileOnNextStartup()
+    {
+        string source = Path.Combine(_source, "default.yaml");
+        string target = Path.Combine(_dest, "default.yaml");
+        string marker = Path.Combine(_root, "after-rename-crash-marker.txt");
+        string foreign = target + ".famo-tmp-foreign";
+        Directory.CreateDirectory(_dest);
+        File.WriteAllText(foreign, "foreign");
+
+        RunCrashHarness(
+            source,
+            target,
+            marker,
+            "after-rename-before-recovery-cleanup",
+            UserDataTransactionLock.LocalAppDataOverrideForTests);
+
+        string temporary = File.ReadAllText(marker);
+        string recoveryRecord =
+            UserDataTransactionLock.AtomicPublicationRecoveryPath(_dest);
+        Assert.False(File.Exists(temporary));
+        Assert.True(File.Exists(target));
+        Assert.True(File.Exists(recoveryRecord));
+
+        FirstLaunchSeedResult recovered =
+            FirstLaunchSeeder.Seed(_source, _dest);
+
+        Assert.True(recovered.Skipped >= 1);
+        Assert.Equal("schema_list:\n", File.ReadAllText(target));
+        Assert.False(File.Exists(recoveryRecord));
+        Assert.Equal("foreign", File.ReadAllText(foreign));
+    }
+
+    private static void RunCrashHarness(
+        string source,
+        string target,
+        string marker,
+        string? mode = null,
+        string? localAppData = null)
+    {
         var testOutput = new DirectoryInfo(AppContext.BaseDirectory);
         string configuration = testOutput.Parent?.Name
             ?? throw new InvalidOperationException(
@@ -157,9 +285,17 @@ public sealed class FirstLaunchSeederTests : IDisposable
             UseShellExecute = false,
             CreateNoWindow = true,
         };
+        if (mode is not null)
+        {
+            start.ArgumentList.Add(mode);
+        }
         start.ArgumentList.Add(source);
         start.ArgumentList.Add(target);
         start.ArgumentList.Add(marker);
+        if (localAppData is not null)
+        {
+            start.ArgumentList.Add(localAppData);
+        }
         using Process process = Process.Start(start)
             ?? throw new InvalidOperationException(
                 "Cannot start the seed crash harness.");
@@ -170,15 +306,6 @@ public sealed class FirstLaunchSeederTests : IDisposable
         }
 
         Assert.NotEqual(0, process.ExitCode);
-        Assert.True(File.Exists(marker));
-        string temporary = File.ReadAllText(marker);
-        Assert.False(File.Exists(temporary));
-        Assert.False(File.Exists(target));
-
-        SeedFileTransaction.CopyDurableAtomic(
-            source, target, overwrite: false);
-        Assert.Equal("schema_list:\n", File.ReadAllText(target));
-        Assert.False(File.Exists(temporary));
     }
 
     [Fact]

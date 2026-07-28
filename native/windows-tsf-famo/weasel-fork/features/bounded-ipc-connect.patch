@@ -1,11 +1,11 @@
 diff --git a/WeaselIPC/PipeChannel.cpp b/WeaselIPC/PipeChannel.cpp
-index 8687e87..fb5d92c 100644
+index 8687e87..eb5737f 100644
 --- a/WeaselIPC/PipeChannel.cpp
 +++ b/WeaselIPC/PipeChannel.cpp
-@@ -15,6 +15,111 @@ using namespace boost;
+@@ -15,6 +15,155 @@ using namespace boost;
        throw err;                         \
    }
-
+ 
 +namespace {
 +const DWORD kFamoPipeConnectBudgetMs = 1500;
 +const DWORD kFamoPipeIoBudgetMs = 1500;
@@ -26,9 +26,14 @@ index 8687e87..fb5d92c 100644
 +  HANDLE handle;
 +};
 +
-+[[noreturn]] void FamoCancelPipeIoAndWait(HANDLE pipe,
-+                                          OVERLAPPED& overlapped,
-+                                          DWORD error_to_report) {
++struct FamoPipeIoResult {
++  DWORD transferred = 0;
++  DWORD error = ERROR_SUCCESS;
++};
++
++FamoPipeIoResult FamoCancelPipeIoAndWait(HANDLE pipe,
++                                         OVERLAPPED& overlapped,
++                                         DWORD error_to_report) {
 +  const BOOL cancelled = ::CancelIoEx(pipe, &overlapped);
 +  const DWORD cancel_error = cancelled ? ERROR_SUCCESS : ::GetLastError();
 +
@@ -36,16 +41,24 @@ index 8687e87..fb5d92c 100644
 +  // the operation reaches a terminal state, even when cancellation races a
 +  // natural completion (ERROR_NOT_FOUND).
 +  DWORD transferred = 0;
-+  if (!::GetOverlappedResult(pipe, &overlapped, &transferred, TRUE)) {
-+    const DWORD completion_error = ::GetLastError();
-+    const bool expected_terminal =
-+        completion_error == ERROR_OPERATION_ABORTED ||
-+        completion_error == ERROR_MORE_DATA ||
-+        cancel_error == ERROR_NOT_FOUND;
-+    (void)expected_terminal;
-+    // The operation is terminal here; preserve the caller's timeout/wait
-+    // diagnosis rather than exposing a secondary cancellation error.
++  if (::GetOverlappedResult(
++          pipe, &overlapped, &transferred, TRUE)) {
++    // Cancellation lost a race with natural completion. Reporting timeout
++    // here would make a fully delivered write retry (duplicate commit), or
++    // discard a response that the read already received.
++    return {transferred, ERROR_SUCCESS};
 +  }
++  const DWORD completion_error = ::GetLastError();
++  if (completion_error == ERROR_MORE_DATA)
++    return {transferred, ERROR_MORE_DATA};
++  const bool expected_cancel =
++      completion_error == ERROR_OPERATION_ABORTED;
++  const bool completion_won_before_cancel =
++      cancel_error == ERROR_NOT_FOUND;
++  (void)expected_cancel;
++  (void)completion_won_before_cancel;
++  // The operation is terminal but did not naturally complete. Preserve the
++  // caller's timeout/wait diagnosis.
 +  _ThrowCode(error_to_report);
 +}
 +
@@ -58,14 +71,28 @@ index 8687e87..fb5d92c 100644
 +
 +    DWORD wait = ::WaitForSingleObject(overlapped.hEvent, kFamoPipeIoBudgetMs);
 +    if (wait == WAIT_TIMEOUT) {
-+      FamoCancelPipeIoAndWait(pipe, overlapped, ERROR_SEM_TIMEOUT);
++      const FamoPipeIoResult completion =
++          FamoCancelPipeIoAndWait(
++              pipe, overlapped, ERROR_SEM_TIMEOUT);
++      if (completion.error != ERROR_SUCCESS)
++        _ThrowCode(completion.error);
++      return completion.transferred;
 +    }
 +    if (wait == WAIT_FAILED) {
 +      const DWORD wait_error = ::GetLastError();
-+      FamoCancelPipeIoAndWait(pipe, overlapped, wait_error);
++      const FamoPipeIoResult completion =
++          FamoCancelPipeIoAndWait(pipe, overlapped, wait_error);
++      if (completion.error != ERROR_SUCCESS)
++        _ThrowCode(completion.error);
++      return completion.transferred;
 +    }
 +    if (wait != WAIT_OBJECT_0) {
-+      FamoCancelPipeIoAndWait(pipe, overlapped, ERROR_INVALID_DATA);
++      const FamoPipeIoResult completion =
++          FamoCancelPipeIoAndWait(
++              pipe, overlapped, ERROR_INVALID_DATA);
++      if (completion.error != ERROR_SUCCESS)
++        _ThrowCode(completion.error);
++      return completion.transferred;
 +    }
 +  }
 +
@@ -90,14 +117,31 @@ index 8687e87..fb5d92c 100644
 +
 +    DWORD wait = ::WaitForSingleObject(overlapped.hEvent, kFamoPipeIoBudgetMs);
 +    if (wait == WAIT_TIMEOUT) {
-+      FamoCancelPipeIoAndWait(pipe, overlapped, ERROR_SEM_TIMEOUT);
++      const FamoPipeIoResult completion =
++          FamoCancelPipeIoAndWait(
++              pipe, overlapped, ERROR_SEM_TIMEOUT);
++      error = completion.error;
++      return error == ERROR_MORE_DATA
++                 ? rec_len
++                 : completion.transferred;
 +    }
 +    if (wait == WAIT_FAILED) {
 +      const DWORD wait_error = ::GetLastError();
-+      FamoCancelPipeIoAndWait(pipe, overlapped, wait_error);
++      const FamoPipeIoResult completion =
++          FamoCancelPipeIoAndWait(pipe, overlapped, wait_error);
++      error = completion.error;
++      return error == ERROR_MORE_DATA
++                 ? rec_len
++                 : completion.transferred;
 +    }
 +    if (wait != WAIT_OBJECT_0) {
-+      FamoCancelPipeIoAndWait(pipe, overlapped, ERROR_INVALID_DATA);
++      const FamoPipeIoResult completion =
++          FamoCancelPipeIoAndWait(
++              pipe, overlapped, ERROR_INVALID_DATA);
++      error = completion.error;
++      return error == ERROR_MORE_DATA
++                 ? rec_len
++                 : completion.transferred;
 +    }
 +  }
 +
@@ -114,8 +158,8 @@ index 8687e87..fb5d92c 100644
  PipeChannelBase::PipeChannelBase(std::wstring&& pn_cmd,
                                   size_t bs = 4 * 1024,
                                   SECURITY_ATTRIBUTES* s = NULL)
-@@ -40,8 +145,26 @@ bool PipeChannelBase::_Ensure() {
-
+@@ -40,11 +189,31 @@ bool PipeChannelBase::_Ensure() {
+ 
  HANDLE PipeChannelBase::_Connect(const wchar_t* name) {
    HANDLE pipe = INVALID_HANDLE_VALUE;
 -  while (_Invalid(pipe = _TryConnect()))
@@ -142,8 +186,14 @@ index 8687e87..fb5d92c 100644
 +  }
    DWORD mode = PIPE_READMODE_MESSAGE;
    if (!SetNamedPipeHandleState(pipe, &mode, NULL, NULL)) {
-     _ThrowLastError;
-@@ -52,12 +175,14 @@ HANDLE PipeChannelBase::_Connect(const wchar_t* name) {
+-    _ThrowLastError;
++    const DWORD error = ::GetLastError();
++    _FinalizePipe(pipe);
++    _ThrowCode(error);
+   }
+   return pipe;
+ }
+@@ -52,12 +221,14 @@ HANDLE PipeChannelBase::_Connect(const wchar_t* name) {
  void PipeChannelBase::_Reconnect() {
    HANDLE* phandle = _GetPipeHandle();
    _FinalizePipe(*phandle);
@@ -152,7 +202,7 @@ index 8687e87..fb5d92c 100644
 +    _ThrowCode(ERROR_PIPE_NOT_CONNECTED);
 +  }
  }
-
+ 
  HANDLE PipeChannelBase::_TryConnect() {
    auto pipe = ::CreateFile(pname.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL,
 -                           OPEN_EXISTING, 0, NULL);
@@ -160,9 +210,9 @@ index 8687e87..fb5d92c 100644
    if (!_Invalid(pipe)) {
      // connected to the pipe
      return pipe;
-@@ -69,11 +194,20 @@ HANDLE PipeChannelBase::_TryConnect() {
+@@ -69,11 +240,20 @@ HANDLE PipeChannelBase::_TryConnect() {
  }
-
+ 
  size_t PipeChannelBase::_WritePipe(HANDLE pipe, size_t s, char* b) {
 -  DWORD lwritten;
 -  if (!::WriteFile(pipe, b, s, &lwritten, NULL) || lwritten <= 0) {
@@ -184,19 +234,28 @@ index 8687e87..fb5d92c 100644
 +
    return lwritten;
  }
-
-@@ -86,28 +220,65 @@ void PipeChannelBase::_FinalizePipe(HANDLE& p) {
+ 
+@@ -86,28 +266,88 @@ void PipeChannelBase::_FinalizePipe(HANDLE& p) {
  }
-
+ 
  void PipeChannelBase::_Receive(HANDLE pipe, LPVOID msg, size_t rec_len) {
 -  DWORD lread;
 -  BOOL success = ::ReadFile(pipe, msg, rec_len, &lread, NULL);
 -  if (!success) {
 -    _ThrowIfNot(ERROR_MORE_DATA);
+-
+-    auto ctx = _GetContext();
+-    memset(ctx->buffer.get(), 0, buff_size);
+-    success = ::ReadFile(pipe, ctx->buffer.get(), buff_size, &lread, NULL);
+-    if (!success) {
+-      _ThrowLastError;
 +  if (rec_len == 0 || rec_len > 0xffffffffu) {
 +    _ThrowCode(ERROR_INVALID_PARAMETER);
 +  }
-
++  auto ctx = _GetContext();
++  if (buff_size >= sizeof(wchar_t))
++    *reinterpret_cast<wchar_t*>(ctx->buffer.get()) = L'\0';
++
 +  DWORD read_error = ERROR_SUCCESS;
 +  DWORD lread =
 +      FamoReadPipeBounded(pipe, msg, static_cast<DWORD>(rec_len), read_error);
@@ -208,23 +267,27 @@ index 8687e87..fb5d92c 100644
 +  }
 +
 +  if (read_error == ERROR_MORE_DATA) {
-     auto ctx = _GetContext();
-     memset(ctx->buffer.get(), 0, buff_size);
--    success = ::ReadFile(pipe, ctx->buffer.get(), buff_size, &lread, NULL);
--    if (!success) {
--      _ThrowLastError;
-+
 +    DWORD body_error = ERROR_SUCCESS;
-+    FamoReadPipeBounded(pipe, ctx->buffer.get(), static_cast<DWORD>(buff_size),
-+                        body_error);
++    const DWORD body_read =
++        FamoReadPipeBounded(pipe, ctx->buffer.get(),
++                            static_cast<DWORD>(buff_size), body_error);
 +    if (body_error != ERROR_SUCCESS) {
 +      _ThrowCode(body_error == ERROR_MORE_DATA ? ERROR_INVALID_DATA
 +                                               : body_error);
++    }
++    if (body_read % sizeof(wchar_t) != 0 ||
++        body_read > buff_size - sizeof(wchar_t)) {
++      _ThrowCode(ERROR_INVALID_DATA);
      }
++    // Only the bytes actually read are live. Terminate them explicitly so a
++    // shorter response cannot expose the previous transaction's tail.
++    *reinterpret_cast<wchar_t*>(
++        ctx->buffer.get() + body_read) = L'\0';
    }
-   _GetContext()->has_body = false;
+-  _GetContext()->has_body = false;
++  ctx->has_body = false;
  }
-
+ 
  HANDLE PipeChannelBase::_ConnectServerPipe(std::wstring& pn) {
 -  HANDLE pipe =
 -      CreateNamedPipe(pn.c_str(), PIPE_ACCESS_DUPLEX,
@@ -239,27 +302,41 @@ index 8687e87..fb5d92c 100644
      _ThrowLastError;
    }
 +
-+  ScopedEvent event;
-+  OVERLAPPED overlapped = {};
-+  overlapped.hEvent = event.handle;
-+  if (!::ConnectNamedPipe(pipe, &overlapped)) {
-+    DWORD err = ::GetLastError();
-+    if (err == ERROR_IO_PENDING) {
-+      const DWORD wait = ::WaitForSingleObject(overlapped.hEvent, INFINITE);
-+      if (wait == WAIT_FAILED) {
-+        const DWORD wait_error = ::GetLastError();
-+        FamoCancelPipeIoAndWait(pipe, overlapped, wait_error);
++  try {
++    ScopedEvent event;
++    OVERLAPPED overlapped = {};
++    overlapped.hEvent = event.handle;
++    if (!::ConnectNamedPipe(pipe, &overlapped)) {
++      DWORD err = ::GetLastError();
++      if (err == ERROR_IO_PENDING) {
++        const DWORD wait =
++            ::WaitForSingleObject(overlapped.hEvent,
++                                  kFamoPipeConnectBudgetMs);
++        if (wait != WAIT_OBJECT_0) {
++          const DWORD wait_error =
++              wait == WAIT_TIMEOUT
++                  ? ERROR_SEM_TIMEOUT
++                  : (wait == WAIT_FAILED ? ::GetLastError()
++                                         : ERROR_INVALID_DATA);
++          const FamoPipeIoResult completion =
++              FamoCancelPipeIoAndWait(
++                  pipe, overlapped, wait_error);
++          if (completion.error != ERROR_SUCCESS)
++            _ThrowCode(completion.error);
++        } else {
++          DWORD ignored = 0;
++          if (!::GetOverlappedResult(
++                  pipe, &overlapped, &ignored, FALSE)) {
++            _ThrowLastError;
++          }
++        }
++      } else if (err != ERROR_PIPE_CONNECTED) {
++        _ThrowCode(err);
 +      }
-+      if (wait != WAIT_OBJECT_0) {
-+        FamoCancelPipeIoAndWait(pipe, overlapped, ERROR_INVALID_DATA);
-+      }
-+      DWORD ignored = 0;
-+      if (!::GetOverlappedResult(pipe, &overlapped, &ignored, FALSE)) {
-+        _ThrowLastError;
-+      }
-+    } else if (err != ERROR_PIPE_CONNECTED) {
-+      _ThrowCode(err);
 +    }
++  } catch (...) {
++    _FinalizePipe(pipe);
++    throw;
 +  }
    return pipe;
  }
@@ -269,7 +346,7 @@ index b747a49..646c09b 100644
 +++ b/include/PipeChannel.h
 @@ -166,10 +166,23 @@ class PipeChannel : public PipeChannelBase {
        data_sz = buff_size;
-
+ 
      try {
 -      _WritePipe(pipe, data_sz, pbuff);
 +      try {

@@ -152,6 +152,7 @@ private:
   HRESULT ActivateCore(ITfThreadMgr *thread_manager, TfClientId client_id,
                        bool advise_key_sink);
   HRESULT DeactivateCore();
+  void AbandonOutstandingDeliveriesNoexcept() noexcept;
   void ForceDeactivateCleanup() noexcept;
   bool OnActivationThread() const;
   bool ConnectRuntime(const runtime::Correlation &identity,
@@ -197,6 +198,8 @@ private:
                                 uint64_t composition_sequence) noexcept;
   HRESULT ApplyRuntimeComposition(ContextEntry *entry,
                                   const runtime::Composition &composition);
+  void RetireAbandonedSession(
+      const runtime::DeliveryReference &reference);
   void RecoverConnection();
   void UpdateCandidates(ContextEntry *entry,
                         const runtime::Composition &composition);
@@ -241,6 +244,10 @@ private:
       delivery_requests_;
   std::deque<std::shared_ptr<const DeliveryWorkResult>>
       delivery_results_;
+  // A terminal result is allocated before its destructive runtime abandon and
+  // published through this allocation-free slot afterward.
+  std::atomic<std::shared_ptr<const DeliveryWorkResult>>
+      terminal_delivery_result_;
   std::mutex session_retry_mutex_;
   std::condition_variable session_retry_wake_;
   HWND recovery_window_ = nullptr;
@@ -248,5 +255,6 @@ private:
 };
 
 HRESULT CreateTextServiceInstance(REFIID iid, void **object);
+uint32_t TerminalCleanupConnectAttemptsForTest() noexcept;
 
 } // namespace famo::tsf

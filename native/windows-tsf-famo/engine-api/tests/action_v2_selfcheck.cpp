@@ -7,6 +7,7 @@
 #include <cstring>
 #include <string>
 
+#include "../engines/action_v2_result.h"
 #include "../famo_engine_api.h"
 #include "../host/famo_engine_host.h"
 
@@ -22,11 +23,16 @@
 namespace {
 
 static_assert(FAMO_KEY_MOD_SHIFT == 0x00000001u);
-static_assert(FAMO_KEY_MOD_CAPS_LOCK == 0x00000002u);
-static_assert(FAMO_KEY_MOD_CONTROL == 0x00000004u);
-static_assert(FAMO_KEY_MOD_ALT == 0x00000008u);
-static_assert(FAMO_KEY_MOD_SUPER == 0x04000000u);
-static_assert(FAMO_KEY_MOD_RELEASE == 0x40000000u);
+static_assert(FAMO_KEY_MOD_CONTROL == 0x00000002u);
+static_assert(FAMO_KEY_MOD_ALT == 0x00000004u);
+static_assert(FAMO_KEY_MOD_SUPER == 0x00000008u);
+static_assert(FAMO_KEY_MOD_CAPS_LOCK == 0x00000010u);
+static_assert(FAMO_KEY_V2_MOD_SHIFT == 0x00000001u);
+static_assert(FAMO_KEY_V2_MOD_CAPS_LOCK == 0x00000002u);
+static_assert(FAMO_KEY_V2_MOD_CONTROL == 0x00000004u);
+static_assert(FAMO_KEY_V2_MOD_ALT == 0x00000008u);
+static_assert(FAMO_KEY_V2_MOD_SUPER == 0x04000000u);
+static_assert(FAMO_KEY_V2_MOD_RELEASE == 0x40000000u);
 static_assert(FAMO_ENGINE_ACTION_REQUEST_V2_REQUIRED_SIZE <=
               sizeof(FamoEngineActionRequestV2));
 
@@ -86,6 +92,24 @@ void FAMO_ENGINE_CALL CaptureNotification(
 }  // namespace
 
 int main() {
+  famo_action_v2::Snapshot shed_candidates;
+  shed_candidates.candidates.resize(1);
+  shed_candidates.candidates[0].text.assign(
+      FAMO_ENGINE_V2_MAX_STRING_BYTES + 1u, 'x');
+  shed_candidates.highlighted_index = 1;
+  shed_candidates.page_index = 3;
+  shed_candidates.page_size = 9;
+  shed_candidates.is_last_page = 0;
+  shed_candidates.state_flags |= FAMO_COMPOSITION_HAS_CANDIDATES;
+  CHECK(famo_action_v2::TrimOptionalToResultBudget(&shed_candidates));
+  CHECK(shed_candidates.candidates.empty());
+  CHECK(shed_candidates.highlighted_index == 0);
+  CHECK(shed_candidates.page_index == 0);
+  CHECK(shed_candidates.page_size == 0);
+  CHECK(shed_candidates.is_last_page == 1);
+  CHECK((shed_candidates.state_flags &
+         FAMO_COMPOSITION_HAS_CANDIDATES) == 0);
+
   using CreateV2 = int32_t(FAMO_ENGINE_CALL*)(uint32_t, FamoEngineApiV2*);
   HMODULE module = ::LoadLibraryW(L"FamoTestEngine.dll");
   CHECK(module != nullptr);
@@ -352,7 +376,7 @@ int main() {
   CHECK(result == nullptr);
 
   request.key.is_key_down = 1;
-  request.key.modifiers = FAMO_KEY_MOD_RELEASE;
+  request.key.modifiers = FAMO_KEY_V2_MOD_RELEASE;
   CHECK(host.v2_api().execute_action(context, &request, &result) ==
         FAMO_ENGINE_E_INVALID_ARGUMENT);
   CHECK(result == nullptr);
@@ -363,7 +387,7 @@ int main() {
         FAMO_ENGINE_E_INVALID_ARGUMENT);
   CHECK(result == nullptr);
 
-  request.key.modifiers = FAMO_KEY_MOD_RELEASE;
+  request.key.modifiers = FAMO_KEY_V2_MOD_RELEASE;
   request.index = 1;
   CHECK(host.v2_api().execute_action(context, &request, &result) ==
         FAMO_ENGINE_E_INVALID_ARGUMENT);

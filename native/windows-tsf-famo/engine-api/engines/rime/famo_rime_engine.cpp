@@ -51,6 +51,8 @@ namespace {
 FamoEngineHostApi g_host;
 RimeApi* g_rime = nullptr;
 bool g_rime_initialized = false;
+std::string g_data_root;
+uint32_t g_initialized_abi_version = 0;
 famo_action_v2::ResultStore g_v2_results;
 std::mutex g_context_mutex;
 struct PendingNotification {
@@ -92,6 +94,7 @@ std::mutex g_callback_lifetime_mutex;
 std::condition_variable g_callback_lifetime_cv;
 bool g_callback_gate_closed = true;
 size_t g_active_callbacks = 0;
+thread_local size_t g_callback_depth = 0;
 
 size_t SeenSessionLimit() noexcept {
   char configured[32]{};
@@ -164,6 +167,7 @@ class CallbackLifetime {
       std::lock_guard<std::mutex> lock(g_callback_lifetime_mutex);
       if (!g_callback_gate_closed) {
         ++g_active_callbacks;
+        ++g_callback_depth;
         entered_ = true;
       }
     } catch (...) {
@@ -173,6 +177,8 @@ class CallbackLifetime {
   ~CallbackLifetime() {
     if (!entered_)
       return;
+    if (g_callback_depth > 0)
+      --g_callback_depth;
     try {
       std::lock_guard<std::mutex> lock(g_callback_lifetime_mutex);
       if (g_active_callbacks > 0)
@@ -322,6 +328,8 @@ void ResetRimeState() noexcept {
   }
   g_rime_initialized = false;
   g_rime = nullptr;
+  g_data_root.clear();
+  g_initialized_abi_version = 0;
   try {
     std::lock_guard<std::mutex> notification_lock(g_notification_mutex);
     g_notification_ever_enabled = false;
@@ -1231,16 +1239,22 @@ int32_t ReInitializeForAbi(const FamoEngineHostApi* host,
   // adapter finalizes even if an exceptional failure interrupts the call.
   g_rime_initialized = true;
   g_rime->initialize(&traits);  // pointers valid for the call duration
+  g_data_root = root;
+  g_initialized_abi_version = expected_abi_version;
   return FAMO_ENGINE_OK;
 }
 
 int32_t FAMO_ENGINE_CALL ReInitialize(const FamoEngineHostApi* host,
                                       const FamoUtf8String* data_root) {
+  if (g_callback_depth != 0)
+    return FAMO_ENGINE_E_RUNTIME;
   return ReInitializeForAbi(host, data_root, FAMO_ENGINE_ABI_VERSION);
 }
 
 int32_t FAMO_ENGINE_CALL ReInitializeV2(const FamoEngineHostApi* host,
                                         const FamoUtf8String* data_root) {
+  if (g_callback_depth != 0)
+    return FAMO_ENGINE_E_RUNTIME;
   const int32_t result =
       ReInitializeForAbi(host, data_root, FAMO_ENGINE_ABI_V2);
   if (result != FAMO_ENGINE_OK)
@@ -1253,8 +1267,77 @@ int32_t FAMO_ENGINE_CALL ReInitializeV2(const FamoEngineHostApi* host,
 }
 
 int32_t FAMO_ENGINE_CALL ReShutdown(void) {
+  if (g_callback_depth != 0)
+    return FAMO_ENGINE_E_RUNTIME;
   ResetRimeState();
   return FAMO_ENGINE_OK;
+}
+
+bool RotateEmptyRimeEpoch() noexcept {
+  // ResetRimeState waits for every active callback. A host notification that
+  // re-enters create_context must never try to rotate the epoch from inside
+  // the callback it would then wait for.
+  if (g_callback_depth != 0)
+    return false;
+  bool reset_started = false;
+  try {
+    if (!g_v2_results.Empty())
+      return false;
+    {
+      std::lock_guard<std::mutex> lock(g_context_mutex);
+      if (!g_contexts.empty())
+        return false;
+    }
+    if (TestSwitch("FAMO_TEST_RIME_NOTIFICATION_DURING_ROTATION")) {
+      // Model a librime worker that is already inside the host callback while
+      // the creator owns g_context_creation_mutex and is about to drain
+      // callbacks. Its re-entrant create must fail before touching that mutex.
+      std::thread notifier(
+          [] { RouteNotification(0, "deploy", "start"); });
+      notifier.join();
+    }
+
+    const FamoEngineHostApi host = g_host;
+    const std::string root = g_data_root;
+    const uint32_t abi_version = g_initialized_abi_version;
+    FamoEngineNotificationHandlerV2 handler = nullptr;
+    void* user_data = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_notification_mutex);
+      handler = g_notification_handler;
+      user_data = g_notification_user_data;
+    }
+    if (TestSwitch("FAMO_TEST_RIME_ROTATION_PREFLIGHT_FAILURE"))
+      throw std::bad_alloc();
+
+    reset_started = true;
+    ResetRimeState();
+    if (handler) {
+      std::lock_guard<std::mutex> lock(g_notification_mutex);
+      g_notification_handler = handler;
+      g_notification_user_data = user_data;
+      g_notification_ever_enabled = true;
+    }
+    const FamoUtf8String root_view = Borrowed(root);
+    const int32_t result =
+        abi_version == FAMO_ENGINE_ABI_V2
+            ? ReInitializeV2(&host, &root_view)
+            : ReInitialize(&host, &root_view);
+    if (result != FAMO_ENGINE_OK) {
+      ResetRimeState();
+      return false;
+    }
+    return true;
+  } catch (...) {
+    if (reset_started) {
+      // A partial reinitialization must not leave librime, the host allocator,
+      // or notification registration in an indeterminate mixed epoch.
+      ResetRimeState();
+    }
+    // A preflight copy/allocation failure occurs before the old epoch is
+    // touched, so it remains runnable for a later bounded retry.
+    return false;
+  }
 }
 
 bool RetireContextBindingAndWait(FamoEngineContext* context) noexcept {
@@ -1292,6 +1375,11 @@ bool RetireContextBindingAndWait(FamoEngineContext* context) noexcept {
 int32_t DestroyRimeContext(FamoEngineContext* context) {
   if (!context)
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  // RetireContextBindingAndWait includes the current callback in
+  // active_notifications. A callback must not wait for itself, or acquire the
+  // creation mutex while another thread owns it and drains that callback.
+  if (g_callback_depth != 0)
+    return FAMO_ENGINE_E_RUNTIME;
   std::lock_guard<std::mutex> creation_lock(g_context_creation_mutex);
   if (!RetireContextBindingAndWait(context))
     return FAMO_ENGINE_E_RUNTIME;
@@ -1319,6 +1407,12 @@ int32_t FAMO_ENGINE_CALL ReCreateContext(const FamoUtf8String* schema_id,
                                          FamoEngineContext** out_context) {
   if (!out_context) return FAMO_ENGINE_E_INVALID_ARGUMENT;
   *out_context = nullptr;
+  // A callback-reentrant create must never wait on the creation mutex: another
+  // thread may own it while rotating and be waiting for this callback to exit.
+  // The same guard also prevents a synchronous initialize notification from
+  // recursively locking the non-recursive creation mutex.
+  if (g_callback_depth != 0)
+    return FAMO_ENGINE_E_RUNTIME;
   if (!g_rime) return FAMO_ENGINE_E_INVALID_ARGUMENT;
   const std::string schema = AsStd(schema_id);
   if (!schema.empty()) {
@@ -1342,12 +1436,19 @@ int32_t FAMO_ENGINE_CALL ReCreateContext(const FamoUtf8String* schema_id,
     // deadlock a re-entrant host notification handler.
     std::lock_guard<std::mutex> creation_lock(g_context_creation_mutex);
     const size_t limit = SeenSessionLimit();
+    bool rotate_epoch = false;
     {
       std::lock_guard<std::mutex> lock(g_context_mutex);
       if (g_session_registry_poisoned ||
           g_seen_session_ids.size() >= limit) {
-        return FAMO_ENGINE_E_RUNTIME;
+        if (!g_contexts.empty())
+          return FAMO_ENGINE_E_RUNTIME;
+        rotate_epoch = true;
       }
+    }
+    if (rotate_epoch) {
+      if (!RotateEmptyRimeEpoch())
+        return FAMO_ENGINE_E_RUNTIME;
     }
     session = g_rime->create_session();
     if (!session)
@@ -1525,7 +1626,7 @@ int32_t FAMO_ENGINE_CALL ReProcessKey(FamoEngineContext* context, const FamoKeyE
   }
   int keycode = 0, mask = 0;
   bool handled = false;
-  if (famo_rime_keys::FamoKeyToRime(*key, &keycode, &mask))
+  if (famo_rime_keys::FamoKeyToRimeV1(*key, &keycode, &mask))
     handled = g_rime->process_key(context->session, keycode, mask);
   const int32_t rc =
       FillFromSession(context->session, out_view, view_size,
@@ -1641,6 +1742,11 @@ int32_t FAMO_ENGINE_CALL ReSetNotificationHandlerV2(
     void* user_data) {
   if (!handler && user_data)
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
+  // DisableNotifications waits for g_active_callbacks and handler replacement
+  // shares the creation/registration locks with destroy/rotation. Neither
+  // operation may run synchronously from the callback being drained.
+  if (g_callback_depth != 0)
+    return FAMO_ENGINE_E_RUNTIME;
   if (!handler) {
     DisableNotifications();
     return FAMO_ENGINE_OK;
@@ -1911,7 +2017,7 @@ int32_t FAMO_ENGINE_CALL ReExecuteActionV2(
         return FAMO_ENGINE_E_INVALID_ARGUMENT;
       int keycode = 0;
       int mask = 0;
-      if (famo_rime_keys::FamoKeyToRime(request->key, &keycode, &mask)) {
+      if (famo_rime_keys::FamoKeyToRimeV2(request->key, &keycode, &mask)) {
         handled =
             g_rime->process_key(context->session, keycode, mask) != False;
       }
@@ -2008,14 +2114,19 @@ int32_t FAMO_ENGINE_CALL ReInitializeSafe(
     return FAMO_ENGINE_E_INVALID_ARGUMENT;
   const int32_t result = ReLegacyNoUnwind(
       [&] { return ReInitialize(host, data_root); });
-  if (result != FAMO_ENGINE_OK)
+  // ReInitialize rejects callback re-entry before touching engine state.
+  // ResetRimeState would wait for the callback currently executing this
+  // wrapper and therefore deadlock the callback thread against itself.
+  if (result != FAMO_ENGINE_OK && g_callback_depth == 0)
     ResetRimeState();
   return result;
 }
 
 int32_t FAMO_ENGINE_CALL ReShutdownSafe() noexcept {
   const int32_t result = ReLegacyNoUnwind([] { return ReShutdown(); });
-  if (result != FAMO_ENGINE_OK)
+  // Preserve the same fail-fast callback boundary as ReShutdown. Cleanup from
+  // inside that callback would synchronously wait for itself to leave.
+  if (result != FAMO_ENGINE_OK && g_callback_depth == 0)
     ResetRimeState();
   return result;
 }
