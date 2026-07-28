@@ -453,17 +453,12 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     int32_t content_w = max_content_w + 2 * panel_margin_x;
     int32_t content_h = list_bottom + m.margin_y;
     out->content_size = ClampSize(m, content_w, content_h);
-    if (hl >= 0 && static_cast<uint32_t>(hl) < n) {
+    // The selection pill is exactly its row. It used to bleed 4px up and 9px
+    // down into the panel's outer padding (macOS parity), which clamped it flush
+    // to the bottom edge and left only 2px between it and the preedit's dotted
+    // rule — the panel read as two stacked blocks, not a card with a selection.
+    if (hl >= 0 && static_cast<uint32_t>(hl) < n)
       out->highlight = out->candidates[hl].bounds;
-      // macOS lets the compact selection tint bleed into the row's outer
-      // padding without changing candidate hit-testing or panel size.
-      out->highlight.top =
-          (std::max)(0, out->highlight.top - Scale(4, in.dpi));
-      const int32_t bottom_bleed = Scale(preview_available ? 2 : 9, in.dpi);
-      out->highlight.bottom =
-          (std::min)(out->content_size.cy,
-                     out->highlight.bottom + bottom_bleed);
-    }
   } else {
     // Vertical + VerticalText: candidates stack top→bottom. (VerticalText differs
     // in glyph orientation at PAINT time, B5; its box geometry stacks like
@@ -516,6 +511,17 @@ extern "C" int32_t FamoCandidateUiLayout(const FamoCompositionView* view,
     int32_t content_w = max_content_w + 2 * panel_margin_x;
     int32_t content_h = y + m.margin_y;
     out->content_size = ClampSize(m, content_w, content_h);
+  }
+
+  // Hairline between the preedit/aux band and the candidate list, centred in
+  // `spacing` so it gets equal air above and below, and full-bleed edge-to-edge
+  // like a Fluent MenuFlyout separator. It does not compete with the preedit's
+  // dotted rule: that one is per-segment (it marks WHICH run is converting and
+  // is drawn under that run only), this one is the band boundary.
+  if (band_h > 0 && n > 0) {
+    const int32_t y = y0 + band_h + m.spacing / 2;
+    const int32_t thickness = (std::max)(1, Scale(1, in.dpi));
+    out->separator = FamoRect{0, y, out->content_size.cx, y + thickness};
   }
 
   // Status-icon slot (top-right of the panel) when the skin reserves one.

@@ -189,17 +189,16 @@ int RunFamily(FamoLayoutType type) {
     if (CheckCommon(out, 3)) return 1;
     CHECK(NonEmpty(out.preedit));                 // multibyte preedit band shown
     CHECK(NonEmpty(out.highlight));
-    if (type == FAMO_LAYOUT_HORIZONTAL) {
-      CHECK(out.highlight.left == out.candidates[1].bounds.left);
-      CHECK(out.highlight.right == out.candidates[1].bounds.right);
-      CHECK(out.highlight.top == out.candidates[1].bounds.top - 4);
-      CHECK(out.highlight.bottom ==
-            (std::min)(out.content_size.cy,
-                       out.candidates[1].bounds.bottom + 9));
-    } else {
-      CHECK(std::memcmp(&out.highlight, &out.candidates[1].bounds,
-                        sizeof(FamoRect)) == 0);
-    }
+    // Every family: the pill is exactly its row — no bleed into the panel's
+    // outer padding, so it never clamps flush to an edge.
+    CHECK(std::memcmp(&out.highlight, &out.candidates[1].bounds,
+                      sizeof(FamoRect)) == 0);
+    // Hairline separates the band from the list, full-bleed, air on both sides.
+    CHECK(NonEmpty(out.separator));
+    CHECK(out.separator.left == 0);
+    CHECK(out.separator.right == out.content_size.cx);
+    CHECK(out.separator.top >= out.preedit.bottom);
+    CHECK(out.separator.bottom <= out.candidates[0].bounds.top);
     CHECK(NonEmpty(out.prev_page));               // page_index>0 → "<"
     CHECK(NonEmpty(out.next_page));               // !is_last_page → ">"
 
@@ -225,15 +224,8 @@ int RunFamily(FamoLayoutType type) {
     if (CheckCommon(out, 3)) return 1;
     CHECK(IsEmpty(out.prev_page));                // page_index==0 → no "<"
     CHECK(IsEmpty(out.next_page));                // is_last_page → no ">"
-    if (type == FAMO_LAYOUT_HORIZONTAL) {
-      CHECK(out.highlight.top == out.candidates[0].bounds.top - 4);
-      CHECK(out.highlight.bottom ==
-            (std::min)(out.content_size.cy,
-                       out.candidates[0].bounds.bottom + 9));
-    } else {
-      CHECK(std::memcmp(&out.highlight, &out.candidates[0].bounds,
-                        sizeof(FamoRect)) == 0);
-    }
+    CHECK(std::memcmp(&out.highlight, &out.candidates[0].bounds,
+                      sizeof(FamoRect)) == 0);
   }
 
   return 0;
@@ -373,14 +365,16 @@ int RunPreeditAndPreview() {
   CHECK(shown.preview_candidate_count == 4);
   CHECK(shown.preview_candidates[2].bounds.top >
         shown.preview_candidates[0].bounds.top);
-  CHECK(shown.highlight.top == shown.candidates[0].bounds.top - 4);
-  CHECK(shown.highlight.bottom == shown.candidates[0].bounds.bottom + 2);
+  CHECK(std::memcmp(&shown.highlight, &shown.candidates[0].bounds,
+                    sizeof(FamoRect)) == 0);
+  CHECK(NonEmpty(shown.separator));
 
   skin.show_preedit = 0;
   FamoLayoutResult hidden{};
   CHECK(FamoCandidateUiLayout(&view, &skin, &input, &hidden) == FAMO_UI_OK);
   CHECK(IsEmpty(hidden.preedit));
   CHECK(hidden.content_size.cy < shown.content_size.cy);
+  CHECK(IsEmpty(hidden.separator));  // no band → nothing to separate
 
   skin.layout_type = FAMO_LAYOUT_VERTICAL;
   FamoLayoutResult vertical{};
