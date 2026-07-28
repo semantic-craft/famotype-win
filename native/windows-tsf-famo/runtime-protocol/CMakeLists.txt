@@ -21,8 +21,10 @@ target_link_libraries(famo_runtime_protocol PUBLIC advapi32)
 
 add_library(famo_runtime_core STATIC
   src/runtime_state.cpp
+  src/user_data_lock.cpp
   src/runtime_service.cpp
   src/runtime_dispatch.cpp
+  src/runtime_delivery.cpp
   src/runtime_control_engine.cpp
   src/runtime_style_config.cpp
   src/runtime_control.cpp
@@ -34,7 +36,7 @@ add_library(famo_runtime_core STATIC
 target_include_directories(famo_runtime_core PUBLIC include)
 target_compile_definitions(famo_runtime_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(famo_runtime_core PUBLIC
-  famo_runtime_protocol famo_engine_host advapi32)
+  famo_runtime_protocol famo_engine_host advapi32 ntdll ole32 shell32)
 
 add_executable(protocol_selfcheck tests/protocol_selfcheck.cpp)
 target_link_libraries(protocol_selfcheck PRIVATE famo_runtime_protocol)
@@ -49,6 +51,22 @@ add_custom_command(TARGET runtime_service_selfcheck POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:FamoTestEngine> $<TARGET_FILE_DIR:runtime_service_selfcheck>)
 
+add_executable(userdb_transaction_selfcheck
+  tests/userdb_transaction_selfcheck.cpp)
+target_link_libraries(userdb_transaction_selfcheck PRIVATE famo_runtime_core)
+add_dependencies(userdb_transaction_selfcheck FamoTestEngine)
+add_custom_command(TARGET userdb_transaction_selfcheck POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:FamoTestEngine>
+    $<TARGET_FILE_DIR:userdb_transaction_selfcheck>)
+
+add_executable(delivery_selfcheck tests/delivery_selfcheck.cpp)
+target_link_libraries(delivery_selfcheck PRIVATE famo_runtime_core)
+add_dependencies(delivery_selfcheck FamoTestEngine)
+add_custom_command(TARGET delivery_selfcheck POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:FamoTestEngine> $<TARGET_FILE_DIR:delivery_selfcheck>)
+
 add_executable(FamoTestRuntime src/test_runtime_main.cpp)
 target_link_libraries(FamoTestRuntime PRIVATE famo_runtime_core)
 add_dependencies(FamoTestRuntime FamoTestEngine)
@@ -62,7 +80,8 @@ add_dependencies(pipe_roundtrip_selfcheck FamoTestRuntime)
 
 add_executable(control_roundtrip_selfcheck tests/control_roundtrip_selfcheck.cpp)
 target_link_libraries(control_roundtrip_selfcheck PRIVATE famo_runtime_core)
-add_dependencies(control_roundtrip_selfcheck FamoTestEngine)
+add_dependencies(control_roundtrip_selfcheck FamoTestEngine
+                 pipe_roundtrip_selfcheck)
 add_custom_command(TARGET control_roundtrip_selfcheck POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:FamoTestEngine> $<TARGET_FILE_DIR:control_roundtrip_selfcheck>)
@@ -71,6 +90,10 @@ enable_testing()
 add_test(NAME protocol_selfcheck COMMAND protocol_selfcheck)
 add_test(NAME runtime_state_selfcheck COMMAND runtime_state_selfcheck)
 add_test(NAME runtime_service_selfcheck COMMAND runtime_service_selfcheck)
+add_test(NAME userdb_transaction_selfcheck
+  COMMAND userdb_transaction_selfcheck)
+set_tests_properties(userdb_transaction_selfcheck PROPERTIES TIMEOUT 60)
+add_test(NAME delivery_selfcheck COMMAND delivery_selfcheck)
 add_test(NAME pipe_roundtrip_selfcheck COMMAND pipe_roundtrip_selfcheck)
 add_test(NAME control_roundtrip_selfcheck COMMAND control_roundtrip_selfcheck)
 set_tests_properties(pipe_roundtrip_selfcheck PROPERTIES TIMEOUT 30)

@@ -196,7 +196,7 @@ public:
   StatusUi &operator=(const StatusUi &) = delete;
 
   bool Start();
-  void Stop();
+  void Stop() noexcept;
   void
   Publish(std::shared_ptr<const RuntimeSnapshot> snapshot) noexcept override;
   // The bar paints from the same FamoSkin as the candidate window, so it tracks

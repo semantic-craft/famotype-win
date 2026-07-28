@@ -160,6 +160,14 @@ bool HealthyRoundtrip(TextServiceModule *module, const wchar_t *runtime_path) {
                  ITfThreadMgr *, ITfDocumentMgr *) {
         CHECK(TestKey(key_sink, context, 'N', true));
         CHECK(TestKey(key_sink, context, 'N', true));
+        {
+          ScopedEnvironment fail_key(
+              "FAMO_TEST_KEY_CALLBACK_ALLOCATION_FAILURE", "1");
+          BOOL eaten = TRUE;
+          CHECK(key_sink->OnKeyDown(context, 'N', 0, &eaten) == S_OK);
+          CHECK(eaten == FALSE);
+          CHECK(store->text().empty());
+        }
         const auto first_started = std::chrono::steady_clock::now();
         CHECK(SendKey(key_sink, context, 'N', true));
         const auto first_elapsed = std::chrono::steady_clock::now() - first_started;
@@ -210,6 +218,39 @@ bool HealthyRoundtrip(TextServiceModule *module, const wchar_t *runtime_path) {
   return passed && runtime_finished;
 }
 
+bool AllocationBoundariesReleaseReferences(TextServiceModule *module) {
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  {
+    ScopedEnvironment fail_activation(
+        "FAMO_TEST_ACTIVATION_ALLOCATION_FAILURE", "1");
+    ComPtr<ITfTextInputProcessorEx> rejected;
+    CHECK(module->CreateForTest(thread_manager.get(), client_id,
+                                rejected.put()) == E_OUTOFMEMORY);
+    CHECK(!rejected);
+  }
+  CHECK(module->CanUnload());
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  {
+    ScopedEnvironment fail_deactivate(
+        "FAMO_TEST_DEACTIVATE_ALLOCATION_FAILURE", "1");
+    CHECK(service->Deactivate() == E_OUTOFMEMORY);
+  }
+  service.reset();
+  CHECK(module->CanUnload());
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  return true;
+}
+
 bool DisabledInlinePreeditStaysOutOfHost(TextServiceModule *module,
                                          const wchar_t *runtime_path) {
   RuntimeProcess runtime;
@@ -257,6 +298,149 @@ bool InlinePreeditPreservesUtf16Selection(TextServiceModule *module,
         CHECK(store->text() == L"\xd83d\xde00" L"A");
         CHECK(store->selection().acpStart == 2 &&
               store->selection().acpEnd == 2);
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool PhysicalSelectionKeysAreInterpretedByEngine(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  ScopedEnvironment select_keys("FAMO_TEST_SELECT_KEYS", "j0123456789");
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(store->text() == L"n");
+        // 'J' is candidate zero in this schema. TSF forwards the physical key;
+        // the engine, not a host-side numeric-index table, commits it.
+        CHECK(SendKey(key_sink, context, 'J', true));
+        CHECK(store->text() == L"n");
+
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(store->text() == L"nn");
+        // '0' maps beyond the only visible candidate and is therefore
+        // unhandled by the schema. It must pass through instead of becoming a
+        // fabricated SelectCandidate request.
+        CHECK(SendKey(key_sink, context, '0', false));
+        CHECK(store->text() == L"nn");
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool DigitCanStartCompositionWhenSchemaHandlesIt(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  ScopedEnvironment digit_input("FAMO_TEST_DIGIT_INPUT", "1");
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(TestKey(key_sink, context, '7', true));
+        CHECK(SendKey(key_sink, context, '7', true));
+        CHECK(store->text() == L"7");
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool PreviewSelectionRequiresCapabilityAndAuthenticatedRuntimeWindow(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 1, true, 1));
+  const bool passed = RunTextStoreSession(
+      module,
+      [&](ITfKeyEventSink *key_sink, ITfContext *context,
+          FakeTextStore *store, ITfTextInputProcessorEx *service,
+          ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"ni");
+
+        HWND target = nullptr;
+        famo::runtime::PreviewSelectionRequest request;
+        CHECK(module->PreviewSelectionStateForTest(service, &target,
+                                                    &request));
+        CHECK(target && request.selection_capability &&
+              request.composition_sequence != 0);
+        // This channel carries clicks from the extra preview page, not the
+        // already visible candidate page. With one row/page the first
+        // selectable preview candidate has absolute index 1.
+        request.absolute_index = 1;
+
+        HWND runtime_source = nullptr;
+        const auto source_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!(runtime_source = runtime.PreviewSourceWindow()) &&
+               std::chrono::steady_clock::now() < source_deadline) {
+          Sleep(1);
+        }
+        CHECK(runtime_source);
+        HWND fake_source = CreateWindowExW(
+            0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        CHECK(fake_source);
+
+        const auto send = [&](HWND source,
+                              famo::runtime::PreviewSelectionRequest *value) {
+          COPYDATASTRUCT copy{
+              static_cast<ULONG_PTR>(
+                  famo::runtime::kPreviewSelectionCopyDataId),
+              static_cast<DWORD>(sizeof(*value)),
+              value,
+          };
+          return SendMessageW(target, WM_COPYDATA,
+                              reinterpret_cast<WPARAM>(source),
+                              reinterpret_cast<LPARAM>(&copy));
+        };
+
+        auto wrong = request;
+        wrong.selection_capability.low ^= 1;
+        CHECK(send(runtime_source, &wrong) == FALSE);
+        auto missing = request;
+        missing.selection_capability = {};
+        CHECK(send(runtime_source, &missing) == FALSE);
+        CHECK(send(nullptr, &request) == FALSE);
+        CHECK(send(fake_source, &request) == FALSE);
+        CHECK(store->text() == L"ni");
+
+        // An authenticated but out-of-contract current-page index receives an
+        // exact rejection. It must not poison/restart the connection.
+        auto current_page = request;
+        current_page.absolute_index = 0;
+        CHECK(send(runtime_source, &current_page) == FALSE);
+        CHECK(store->text() == L"ni");
+        CHECK(TestKey(key_sink, context, 'A', true));
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(store->text() == L"nia");
+        CHECK(SendKey(key_sink, context, ' ', true));
+        CHECK(store->text() == L"nia");
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"niani");
+        CHECK(module->PreviewSelectionStateForTest(service, &target,
+                                                    &request));
+        request.absolute_index = 1;
+
+        CHECK(send(runtime_source, &request) == TRUE);
+        // The matching capability is consumed before the delivery boundary.
+        CHECK(send(runtime_source, &request) == FALSE);
+        const auto apply_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (store->text() == L"niani" &&
+               std::chrono::steady_clock::now() < apply_deadline) {
+          PumpMessages();
+          Sleep(1);
+        }
+        CHECK(store->text() == L"nia\u5c3c");
+        DestroyWindow(fake_source);
         return true;
       });
   const bool runtime_finished = runtime.Finish();
@@ -367,6 +551,71 @@ bool RecoveryEditFailureIsCleanedBeforeReconnect(
   return passed && runtime_finished;
 }
 
+bool TerminalDeactivateAbandonsAmbiguousDelivery(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"copy-failure", 0, 2));
+  const auto started = std::chrono::steady_clock::now();
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        // Execute has mutated the engine, but the runtime cannot copy the
+        // authoritative result into its wire cache. The key stays eaten and
+        // the host must not invent an empty commit or replay the action.
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(store->text().empty());
+        CHECK(TestKey(key_sink, context, 'A', false));
+        return true;
+      });
+  CHECK(passed);
+  CHECK(std::chrono::steady_clock::now() - started <
+        std::chrono::seconds(4));
+  // The test host is still running here. Deactivate must nevertheless have
+  // released every TSF/COM reference, while AbandonConnection reclaimed the
+  // runtime delivery and session in the still-live runtime process.
+  CHECK(module->CanUnload());
+  CHECK(runtime.Finish());
+  return true;
+}
+
+bool TerminalAbandonDebtRetriesOnNextActivation(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess unavailable_after_disconnect;
+  CHECK(unavailable_after_disconnect.Start(runtime_path, L"copy-failure", 0,
+                                            1));
+  CHECK(RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(store->text().empty());
+        CHECK(TestKey(key_sink, context, 'A', false));
+        return true;
+      }));
+  CHECK(module->CanUnload());
+  CHECK(unavailable_after_disconnect.Finish());
+
+  // The first runtime had no second server instance, so Deactivate could not
+  // reconnect to issue AbandonConnection and recorded exact in-process debt.
+  // The next activation must retire that old epoch before opening its own
+  // connection. Two sequential server instances make a missing retry visible:
+  // the runtime would otherwise wait forever for the unused second instance.
+  RuntimeProcess restarted;
+  CHECK(restarted.Start(runtime_path, L"none", 0, 2));
+  CHECK(RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(TestKey(key_sink, context, 'N', true));
+        CHECK(store->text().empty());
+        return true;
+      }));
+  CHECK(module->CanUnload());
+  CHECK(restarted.Finish());
+  return true;
+}
+
 bool CloseDuringWarmupInvalidatesConnection(
     TextServiceModule *module, const wchar_t *runtime_path) {
   RuntimeProcess runtime;
@@ -440,7 +689,7 @@ bool CloseDuringWarmupInvalidatesConnection(
 bool MultiContextFaultRecoversEveryComposition(
     TextServiceModule *module, const wchar_t *runtime_path) {
   RuntimeProcess runtime;
-  CHECK(runtime.Start(runtime_path, L"engine-hang", 2));
+  CHECK(runtime.Start(runtime_path, L"engine-hang", 2, 2));
 
   ComPtr<ITfThreadMgr> thread_manager;
   CHECK(SUCCEEDED(CoCreateInstance(
@@ -500,6 +749,22 @@ bool MultiContextFaultRecoversEveryComposition(
   CHECK(first.store->text() == L"n" && second.store->text() == L"n");
   CHECK(SendKey(key_sink.get(), first.context.get(), 'H', false));
   CHECK(SendKey(key_sink.get(), second.context.get(), 'H', false));
+
+  // Both contexts now own distinct cancellation/recovery work items. The
+  // worker must drain both; a single atomic publication slot would overwrite
+  // one and leave that context permanently pending.
+  ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while ((!TestKey(key_sink.get(), first.context.get(), 'A', true) ||
+          !TestKey(key_sink.get(), second.context.get(), 'A', true)) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SendKey(key_sink.get(), first.context.get(), 'A', true));
+  CHECK(SendKey(key_sink.get(), second.context.get(), 'A', true));
+  CHECK(first.store->text() == L"na" && second.store->text() == L"na");
 
   key_sink.reset();
   CHECK(SUCCEEDED(service->Deactivate()));
@@ -889,15 +1154,22 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(SUCCEEDED(com.result()));
   TextServiceModule module;
   CHECK(module.Load(module_path));
+  CHECK(AllocationBoundariesReleaseReferences(&module));
   CHECK(MissingRuntimeFailsOpen(&module));
   CHECK(HealthyRoundtrip(&module, runtime_path));
   CHECK(DisabledInlinePreeditStaysOutOfHost(&module, runtime_path));
   CHECK(InlinePreeditPreservesUtf16Selection(&module, runtime_path));
+  CHECK(PhysicalSelectionKeysAreInterpretedByEngine(&module, runtime_path));
+  CHECK(DigitCanStartCompositionWhenSchemaHandlesIt(&module, runtime_path));
+  CHECK(PreviewSelectionRequiresCapabilityAndAuthenticatedRuntimeWindow(
+      &module, runtime_path));
   CHECK(FaultFailsOpen(&module, runtime_path, L"engine-hang"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"disconnect"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"malformed"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"late"));
   CHECK(RecoveryEditFailureIsCleanedBeforeReconnect(&module, runtime_path));
+  CHECK(TerminalDeactivateAbandonsAmbiguousDelivery(&module, runtime_path));
+  CHECK(TerminalAbandonDebtRetriesOnNextActivation(&module, runtime_path));
   CHECK(CloseDuringWarmupInvalidatesConnection(&module, runtime_path));
   CHECK(MultiContextFaultRecoversEveryComposition(&module, runtime_path));
   CHECK(FocusChurnRejectsObsoleteWarmup(&module, runtime_path));

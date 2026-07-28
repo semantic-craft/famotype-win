@@ -428,6 +428,42 @@ static int check_soft_cursor() {
   return 0;
 }
 
+static int check_resource_abi_boundaries() {
+  FamoSkin skin = FamoSkinDefault();
+
+  CHECK(SetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", "create"));
+  CHECK(FamoTextResourcesCreate(&skin, 96) == nullptr);
+  CHECK(SetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", nullptr));
+
+  FamoTextResources* resources = FamoTextResourcesCreate(&skin, 96);
+  CHECK(resources != nullptr);
+  const int32_t original_width =
+      FamoTextMeasure(resources, 1, "boundary", 8);
+  CHECK(original_width > 0);
+
+  FamoSkin replacement = skin;
+  replacement.text_font.point_size += 10.0f;
+  CHECK(SetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", "reconfigure"));
+  CHECK(FamoTextResourcesReconfigure(resources, &replacement, 144) ==
+        FAMO_UI_E_PAINT_FAILED);
+  CHECK(SetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", nullptr));
+  CHECK(FamoTextMeasure(resources, 1, "boundary", 8) == original_width);
+
+  CHECK(SetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", "measure"));
+  CHECK(FamoTextMeasure(resources, 1, "boundary", 8) == 0);
+  CHECK(SetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", nullptr));
+  CHECK(FamoTextMeasure(resources, 1, "boundary", 8) == original_width);
+
+  FamoTextResourcesDestroy(resources);
+  return 0;
+}
+
 int main() {
   // ── Skin: square (round_corner 0) + no border/shadow so pixels are exact.
   FamoSkin sk = FamoSkinDefault();
@@ -567,6 +603,7 @@ int main() {
   if (int r = check_shadow()) return r;
   if (int r = check_soft_cursor()) return r;
   if (int r = check_legacy_candidate_abi()) return r;
+  if (int r = check_resource_abi_boundaries()) return r;
 
   std::printf(
       "bitmap_smoke: OK (%dx%d) +shadow +soft-cursor +legacy-candidate\n",

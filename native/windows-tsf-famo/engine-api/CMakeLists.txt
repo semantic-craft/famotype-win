@@ -29,6 +29,11 @@ add_executable(roundtrip_selfcheck tests/roundtrip_selfcheck.cpp)
 target_link_libraries(roundtrip_selfcheck PRIVATE famo_engine_host)
 add_dependencies(roundtrip_selfcheck FamoTestEngine)
 
+# ABI v2 public action-interface canary.
+add_executable(action_v2_selfcheck tests/action_v2_selfcheck.cpp)
+target_link_libraries(action_v2_selfcheck PRIVATE famo_engine_host)
+add_dependencies(action_v2_selfcheck FamoTestEngine)
+
 # Public-DLL ABI canary: a current engine must honor a smaller legacy view and
 # legacy candidate-array stride on both query and free paths.
 add_executable(view_abi_canary tests/view_abi_canary.cpp)
@@ -38,9 +43,13 @@ add_dependencies(view_abi_canary FamoTestEngine)
 add_custom_command(TARGET roundtrip_selfcheck POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:FamoTestEngine> $<TARGET_FILE_DIR:roundtrip_selfcheck>)
+add_custom_command(TARGET action_v2_selfcheck POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:FamoTestEngine> $<TARGET_FILE_DIR:action_v2_selfcheck>)
 
 enable_testing()
 add_test(NAME roundtrip COMMAND roundtrip_selfcheck)
+add_test(NAME action_v2 COMMAND action_v2_selfcheck)
 add_test(NAME view_abi_test_engine COMMAND
   view_abi_canary $<TARGET_FILE:FamoTestEngine> --test-engine)
 
@@ -76,6 +85,18 @@ if(FAMO_BUILD_RIME_ENGINE AND EXISTS "${FAMO_RIME_ROOT}/lib64/rime.lib")
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${FAMO_RIME_ROOT}/output/rime.dll" $<TARGET_FILE_DIR:rime_smoke>)
   add_test(NAME rime_smoke COMMAND rime_smoke)
+  add_executable(rime_action_v2_selfcheck
+    tests/rime_action_v2_selfcheck.cpp)
+  target_link_libraries(rime_action_v2_selfcheck PRIVATE famo_engine_host)
+  add_dependencies(rime_action_v2_selfcheck FamoRimeEngine)
+  add_custom_command(TARGET rime_action_v2_selfcheck POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      $<TARGET_FILE:FamoRimeEngine>
+      $<TARGET_FILE_DIR:rime_action_v2_selfcheck>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${FAMO_RIME_ROOT}/output/rime.dll"
+      $<TARGET_FILE_DIR:rime_action_v2_selfcheck>)
+  add_test(NAME rime_action_v2 COMMAND rime_action_v2_selfcheck)
   add_test(NAME view_abi_rime_engine COMMAND
     view_abi_canary $<TARGET_FILE:FamoRimeEngine>)
 

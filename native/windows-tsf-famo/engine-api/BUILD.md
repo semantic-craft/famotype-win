@@ -15,10 +15,18 @@ never locks `weaselx64.dll`.
 cd native/windows-tsf-famo/engine-api
 cmake -S . -B build -A x64
 cmake --build build --config Release
-build/Release/roundtrip_selfcheck.exe   # expect: "roundtrip_selfcheck: OK", exit 0
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-`ctest --test-dir build -C Release` runs the same check via CTest.
+The suite currently runs six checks: legacy roundtrip, ABI-v2 action/recovery,
+the deterministic test-engine view contract, Rime smoke, Rime ABI-v2
+action/recovery, and the Rime view contract. In particular, the action tests
+cover receipt-first `RESYNC_REQUIRED`, bounded `RECOVER`, allocation failure,
+candidate/string/result limits, and exact commit recovery without replaying a
+business mutation.
+
+These commands only build and load test copies. They do not register a TSF,
+replace an installed DLL, restart Weasel, or touch a live input-method process.
 
 If CMake does not auto-pick a generator, pass one explicitly, e.g.
 `-G "Visual Studio 17 2022"` or `-G "Visual Studio 18"`.

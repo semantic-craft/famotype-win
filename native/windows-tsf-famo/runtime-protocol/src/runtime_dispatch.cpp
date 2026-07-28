@@ -35,7 +35,8 @@ FamoKeyEvent EngineKey(const KeyEvent &value) {
 
 } // namespace
 
-Frame RuntimeService::DispatchLocked(const Frame &request) {
+Frame RuntimeService::DispatchLocked(const Frame &request,
+                                     const PipeClientIdentity *owner) {
   if (!started_ || request.flags != 0 || request.status != Status::Ok)
     return Reply(request, Status::InvalidFrame);
   const auto &c = request.correlation;
@@ -46,7 +47,14 @@ Frame RuntimeService::DispatchLocked(const Frame &request) {
     if (!request.payload.empty() || c.session_id != 0 ||
         c.session_generation != 0 || c.sequence != 0)
       return Reply(request, Status::InvalidFrame);
+    CleanupDeadOwnersLocked();
+    if (IsAbandonedEpochLocked(c))
+      return Reply(request, Status::StaleRequest);
     const auto found = clients_.find(c.client_id);
+    if (found != clients_.end() && owner && found->second.owner &&
+        found->second.owner != *owner) {
+      return Reply(request, Status::StaleRequest);
+    }
     if (found != clients_.end() &&
         (c.activation_generation < found->second.activation_generation ||
          (c.activation_generation == found->second.activation_generation &&
@@ -57,27 +65,80 @@ Frame RuntimeService::DispatchLocked(const Frame &request) {
         found == clients_.end() ||
         c.activation_generation > found->second.activation_generation ||
         c.connection_generation > found->second.connection_generation;
+    PipeClientIdentity bound_owner =
+        found == clients_.end() ? PipeClientIdentity{} : found->second.owner;
+    if (owner && !bound_owner)
+      bound_owner = *owner;
     if (advances) {
+      if (found != clients_.end() &&
+          HasOutstandingConnectionLocked(
+              c.client_id, found->second.activation_generation,
+              found->second.connection_generation)) {
+        return Reply(request, Status::Unavailable);
+      }
+      if (found == clients_.end()) {
+        const PipeClientIdentity capacity_owner =
+            owner ? *owner : bound_owner;
+        const size_t owner_clients =
+            capacity_owner
+                ? std::count_if(
+                      clients_.begin(), clients_.end(),
+                      [&](const auto &entry) {
+                        return entry.second.owner == capacity_owner;
+                      })
+                : 0;
+        if (clients_.size() >= kMaxClients ||
+            owner_clients >= kMaxClientsPerOwner) {
+          return Reply(request, Status::Unavailable);
+        }
+      }
+      const size_t context_count =
+          std::count_if(sessions_.begin(), sessions_.end(),
+                        [&](const auto &entry) {
+                          return entry.first.client_id == c.client_id;
+                        });
+      if (!EnsureRetiredCapacityLocked(context_count))
+        return Reply(request, Status::Unavailable);
       std::lock_guard ui_lock(ui_sessions_mutex_);
       for (auto it = sessions_.begin(); it != sessions_.end();) {
         if (it->first.client_id == c.client_id) {
+          if (HasOutstandingDeliveryLocked(it->first)) {
+            ++it;
+            continue;
+          }
           Publish(it->second, false);
           ui_sessions_.erase(it->first);
-          engine_.api().destroy_context(it->second.context);
+          (void)DestroyOrRetireContextLocked(it->second.context);
           it = sessions_.erase(it);
         } else {
           ++it;
         }
       }
-      clients_[c.client_id] =
-          ClientEpoch{c.activation_generation, c.connection_generation};
+      if (found == clients_.end()) {
+        try {
+          clients_.emplace(
+              c.client_id,
+              ClientEpoch{c.activation_generation,
+                          c.connection_generation, bound_owner});
+        } catch (...) {
+          return Reply(request, Status::Unavailable);
+        }
+      } else {
+        found->second = ClientEpoch{
+            c.activation_generation, c.connection_generation, bound_owner};
+      }
+    } else if (found != clients_.end() && owner && !found->second.owner) {
+      found->second.owner = *owner;
     }
     return Reply(request, Status::Ok);
   }
+  if (request.command == Command::OpenSession)
+    CleanupDeadOwnersLocked();
   const auto client = clients_.find(c.client_id);
   if (client == clients_.end() ||
       client->second.activation_generation != c.activation_generation ||
-      client->second.connection_generation != c.connection_generation) {
+      client->second.connection_generation != c.connection_generation ||
+      (owner && client->second.owner != *owner)) {
     return Reply(request, Status::StaleRequest);
   }
   if (c.session_id == 0 || c.session_generation == 0 || c.sequence == 0)
@@ -87,41 +148,81 @@ Frame RuntimeService::DispatchLocked(const Frame &request) {
                        c.connection_generation, c.session_id,
                        c.session_generation};
   if (request.command == Command::OpenSession) {
-    if (sessions_.contains(key))
-      return Reply(request, Status::Ok);
     std::string schema, error;
     if (!DecodeOpenSession(request.payload, &schema, &error))
       return Reply(request, Status::InvalidFrame);
+    const auto existing = sessions_.find(key);
+    if (existing != sessions_.end()) {
+      if (c != existing->second.open_correlation)
+        return Reply(request, Status::StaleRequest);
+      return Reply(request, schema == existing->second.open_schema
+                                ? Status::Ok
+                                : Status::InvalidFrame);
+    }
+    const size_t client_sessions =
+        std::count_if(sessions_.begin(), sessions_.end(),
+                      [&](const auto &entry) {
+                        return entry.first.client_id == c.client_id;
+                      });
+    const size_t owner_sessions =
+        client->second.owner
+            ? std::count_if(
+                  sessions_.begin(), sessions_.end(),
+                  [&](const auto &entry) {
+                    const auto session_client =
+                        clients_.find(entry.first.client_id);
+                    return session_client != clients_.end() &&
+                           session_client->second.owner ==
+                               client->second.owner;
+                  })
+            : 0;
+    if (sessions_.size() >= kMaxSessions ||
+        client_sessions >= kMaxSessionsPerClient ||
+        owner_sessions >= kMaxSessionsPerOwner ||
+        !EnsureRetiredCapacityLocked(1)) {
+      return Reply(request, Status::Unavailable);
+    }
     FamoEngineContext *context = nullptr;
     const std::string &effective_schema =
         selected_schema_.empty() ? schema : selected_schema_;
     const FamoUtf8String engine_schema = EngineString(effective_schema);
-    if (engine_.api().create_context(&engine_schema, &context) !=
+    if (engine_.CreateContext(&engine_schema, &context) !=
             FAMO_ENGINE_OK ||
         !context || !ApplyOptionsLocked(context, options_)) {
       if (context)
-        engine_.api().destroy_context(context);
+        (void)DestroyOrRetireContextLocked(context);
       return Reply(request, Status::EngineError);
     }
     Composition composition;
     if (!ReadStatusLocked(context, &composition)) {
-      engine_.api().destroy_context(context);
+      (void)DestroyOrRetireContextLocked(context);
       return Reply(request, Status::EngineError);
     }
-    auto ui = std::make_shared<UiSessionState>();
-    auto snapshot = std::make_shared<RuntimeSnapshot>();
-    snapshot->correlation = c;
-    snapshot->composition = composition;
-    snapshot->composition_sequence = c.sequence;
-    snapshot->style = style_state_;
-    snapshot->revision = snapshot_revision_.fetch_add(1) + 1;
-    ui->latest.store(std::move(snapshot));
-    sessions_.emplace(
-        key, Session{context, c.sequence, c, std::move(composition), c.sequence,
-                     0, ui});
-    {
+    std::shared_ptr<UiSessionState> ui;
+    try {
+      ui = std::make_shared<UiSessionState>();
+      ui->owner = client->second.owner;
+      auto snapshot = std::make_shared<RuntimeSnapshot>();
+      snapshot->correlation = c;
+      snapshot->selection_owner = client->second.owner;
+      snapshot->composition = composition;
+      snapshot->composition_sequence = c.sequence;
+      snapshot->style = style_state_;
+      snapshot->revision = snapshot_revision_.fetch_add(1) + 1;
+      ui->latest.store(std::move(snapshot));
       std::lock_guard ui_lock(ui_sessions_mutex_);
-      ui_sessions_[key] = std::move(ui);
+      ui_sessions_.emplace(key, ui);
+      try {
+        sessions_.emplace(
+            key, Session{context, c.sequence, c, std::move(composition),
+                         c.sequence, 0, ui, c, schema});
+      } catch (...) {
+        ui_sessions_.erase(key);
+        throw;
+      }
+    } catch (...) {
+      (void)DestroyOrRetireContextLocked(context);
+      return Reply(request, Status::Unavailable);
     }
     return Reply(request, Status::Ok);
   }
@@ -139,39 +240,41 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
                                              const SessionKey &key,
                                              Session &session) {
   const Correlation &c = request.correlation;
-  if (request.command != Command::UpdateUiState)
-    session.last_sequence = c.sequence;
   if (request.command == Command::CloseSession) {
     if (!request.payload.empty())
       return Reply(request, Status::InvalidFrame);
+    if (HasOutstandingDeliveryLocked(key))
+      return Reply(request, Status::Unavailable);
+    if (!EnsureRetiredCapacityLocked(1))
+      return Reply(request, Status::Unavailable);
     {
       std::lock_guard ui_lock(ui_sessions_mutex_);
       ui_sessions_.erase(key);
       Publish(session, false);
     }
-    const int32_t rc = engine_.api().destroy_context(session.context);
+    if (!DestroyOrRetireContextLocked(session.context))
+      return Reply(request, Status::Unavailable);
     sessions_.erase(key);
-    return Reply(request,
-                 rc == FAMO_ENGINE_OK ? Status::Ok : Status::EngineError);
+    return Reply(request, Status::Ok);
+  }
+  if (session.pending_recovery_action != 0 ||
+      session.pending_recovery_result) {
+    return Reply(request, Status::Unavailable);
   }
 
-  FamoCompositionView view{};
-  view.size = static_cast<uint32_t>(sizeof(view));
-  int32_t rc = FAMO_ENGINE_E_INVALID_ARGUMENT;
   std::string error;
-  std::string explicit_commit;
-  Composition composition;
-  bool composition_ready = false;
-  bool candidate_selection_handled = false;
   KeyEvent processed_key;
+  bool processed_key_available = false;
+  FamoEngineActionRequestV2 action{};
   const uint32_t status_before_key = session.composition.status_flags;
   if (request.command == Command::ProcessKey) {
     KeyEvent value;
     if (!DecodeKeyEvent(request.payload, &value, &error))
       return Reply(request, Status::InvalidFrame);
     processed_key = value;
-    const FamoKeyEvent engine_key = EngineKey(value);
-    rc = engine_.api().process_key(session.context, &engine_key, &view);
+    processed_key_available = true;
+    action = FamoEngineHost::Action(FAMO_ENGINE_ACTION_PROCESS_KEY);
+    action.key = EngineKey(value);
   } else if (request.command == Command::SelectCandidate ||
              request.command == Command::SelectCandidateAbsolute) {
     uint32_t index = 0;
@@ -190,76 +293,120 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
       if (preview_start > UINT32_MAX || index < preview_start ||
           index >= preview_end)
         return Reply(request, Status::InvalidFrame);
-      if (!engine_.CanSelectCandidateAbsolute())
-        return Reply(request, Status::EngineError);
-      rc = engine_.api().select_candidate_absolute(session.context, index,
-                                                    &view);
+      action = FamoEngineHost::Action(
+          FAMO_ENGINE_ACTION_SELECT_CANDIDATE_ABSOLUTE);
     } else {
       if (!DecodeCandidateIndex(request.payload, &index, &error))
         return Reply(request, Status::InvalidFrame);
-      rc = engine_.api().select_candidate(session.context, index, &view);
+      action =
+          FamoEngineHost::Action(FAMO_ENGINE_ACTION_SELECT_CANDIDATE);
     }
-    if (rc == FAMO_ENGINE_OK) {
-      composition_ready = CopyView(view, &composition, &error);
-      const int32_t free_rc = engine_.FreeView(&view);
-      if (!composition_ready || free_rc != FAMO_ENGINE_OK)
-        return Reply(request, Status::EngineError);
-      candidate_selection_handled = composition.handled;
-    }
-    if (rc == FAMO_ENGINE_OK && candidate_selection_handled &&
-        composition.commit.empty()) {
-      // The Rime ABI intentionally leaves the selection commit pending so the
-      // legacy Weasel host can retrieve it through its simulated VK_SELECT.
-      // Reproduce that established response step inside the new runtime.
-      constexpr uint32_t kRimeSelectKeysym = 0xff60;
-      const FamoKeyEvent select_key{sizeof(FamoKeyEvent), kRimeSelectKeysym,
-                                    0, 0, 1, 0};
-      composition = {};
-      composition_ready = false;
-      rc = engine_.api().process_key(session.context, &select_key, &view);
-    }
+    action.index = index;
   } else if (request.command == Command::CommitComposition ||
              request.command == Command::ClearComposition) {
     if (!request.payload.empty())
       return Reply(request, Status::InvalidFrame);
-    if (request.command == Command::CommitComposition)
-      explicit_commit = session.composition.commit_preview;
-    rc = request.command == Command::CommitComposition
-             ? engine_.api().commit_composition(session.context)
-             : engine_.api().clear_composition(session.context);
-    if (rc == FAMO_ENGINE_OK)
-      rc = engine_.api().get_status(session.context, &view);
+    action = FamoEngineHost::Action(
+        request.command == Command::CommitComposition
+            ? FAMO_ENGINE_ACTION_COMMIT_COMPOSITION
+            : FAMO_ENGINE_ACTION_CLEAR_COMPOSITION);
   } else if (request.command == Command::HighlightCandidate) {
     uint32_t index = 0;
     if (!DecodeCandidateIndex(request.payload, &index, &error))
       return Reply(request, Status::InvalidFrame);
-    rc = engine_.api().highlight_candidate(session.context, index);
-    if (rc == FAMO_ENGINE_OK)
-      rc = engine_.api().get_status(session.context, &view);
+    action =
+        FamoEngineHost::Action(FAMO_ENGINE_ACTION_HIGHLIGHT_CANDIDATE);
+    action.index = index;
   } else if (request.command == Command::ChangePage) {
     bool backward = false;
     if (!DecodePageDirection(request.payload, &backward, &error))
       return Reply(request, Status::InvalidFrame);
-    rc = engine_.api().change_page(session.context, backward ? 1 : 0);
-    if (rc == FAMO_ENGINE_OK)
-      rc = engine_.api().get_status(session.context, &view);
+    action = FamoEngineHost::Action(FAMO_ENGINE_ACTION_CHANGE_PAGE);
+    action.value = backward ? 1 : 0;
   } else {
     return Reply(request, Status::InvalidFrame);
   }
-  if (rc != FAMO_ENGINE_OK)
-    return Reply(request, Status::EngineError);
 
-  if (!composition_ready) {
-    const bool copied = CopyView(view, &composition, &error);
-    const int32_t free_rc = engine_.FreeView(&view);
-    if (!copied || free_rc != FAMO_ENGINE_OK)
-      return Reply(request, Status::EngineError);
+  FamoEngineActionResultLease action_result;
+  FamoEngineRecoveryOutcome outcome;
+  const int32_t action_status = engine_.ExecuteActionRecovering(
+      session.context, &action, 3, &action_result, &outcome);
+  if (!outcome.business_dispatched) {
+    return Reply(request, Status::EngineError);
+  }
+  session.last_sequence = c.sequence;
+  session.pending_recovery_action = action.action;
+  session.pending_recovery_handled = outcome.handled;
+  session.pending_recovery_sequence = c.sequence;
+  session.pending_recovery_key_available = processed_key_available;
+  session.pending_recovery_key = processed_key;
+  session.pending_recovery_status_before_key = status_before_key;
+  if (outcome.recovery_pending)
+    return Reply(request, Status::RecoveryPending);
+  if (action_status != FAMO_ENGINE_OK || !action_result ||
+      action_result->action != action.action ||
+      action_result->result_flags != 0 ||
+      (action_result->handled != 0) != outcome.handled) {
+    return Reply(request, Status::RecoveryPending);
+  }
+  return CompleteSessionCommand(request, session, action.action,
+                                std::move(action_result));
+}
+
+Frame RuntimeService::RecoverSessionCommand(const Frame &request,
+                                            const SessionKey &key,
+                                            Session &session) {
+  (void)key;
+  const Correlation &c = request.correlation;
+  if (session.pending_recovery_action == 0 ||
+      session.pending_recovery_sequence != c.sequence ||
+      session.last_sequence != c.sequence || !session.context) {
+    return Reply(request, Status::StaleRequest);
+  }
+
+  FamoEngineActionResultLease action_result;
+  if (session.pending_recovery_result) {
+    action_result = std::move(session.pending_recovery_result);
+  } else {
+    FamoEngineActionRequestV2 recovery =
+        FamoEngineHost::Action(FAMO_ENGINE_ACTION_RECOVER);
+    recovery.value =
+        static_cast<int32_t>(session.pending_recovery_action);
+    if (engine_.ExecuteAction(session.context, &recovery, &action_result) !=
+            FAMO_ENGINE_OK ||
+        !action_result) {
+      return Reply(request, Status::RecoveryPending);
+    }
+  }
+  if (action_result->action != session.pending_recovery_action ||
+      action_result->result_flags != 0 ||
+      (action_result->handled != 0) != session.pending_recovery_handled) {
+    session.pending_recovery_result = std::move(action_result);
+    return Reply(request, Status::RecoveryPending);
+  }
+  return CompleteSessionCommand(request, session,
+                                session.pending_recovery_action,
+                                std::move(action_result));
+}
+
+Frame RuntimeService::CompleteSessionCommand(
+    const Frame &request, Session &session, uint32_t expected_action,
+    FamoEngineActionResultLease action_result) {
+  try {
+  const Correlation &c = request.correlation;
+  std::string error;
+  Composition composition;
+  if (!action_result ||
+      !CopyResult(*action_result, expected_action,
+                  FAMO_ENGINE_V2_MAX_VIEW_CANDIDATES, &composition, &error)) {
+    session.pending_recovery_result = std::move(action_result);
+    return Reply(request, Status::RecoveryPending);
   }
 
   const FamoUtf8String vertical_option{sizeof(FamoUtf8String), "_vertical", 9};
   int32_t rime_vertical = 0;
-  if (engine_.api().get_option(session.context, &vertical_option,
-                               &rime_vertical) == FAMO_ENGINE_OK &&
+  if (engine_.GetOption(session.context, &vertical_option, &rime_vertical) ==
+          FAMO_ENGINE_OK &&
       rime_vertical != 0)
     composition.state_flags |= kHostRimeVertical;
 
@@ -267,59 +414,94 @@ Frame RuntimeService::DispatchSessionCommand(const Frame &request,
   // candidate pages. The engine iterator does not move the live page/highlight;
   // any unsupported/error path simply leaves the preview empty.
   if ((composition.state_flags & kHostPreviewPages) != 0 &&
-      composition.is_last_page == 0 && composition.page_size > 0 &&
-      engine_.CanPeekCandidates()) {
+      composition.is_last_page == 0 && composition.page_size > 0) {
     const uint32_t rows =
         (composition.state_flags & kHostPreviewRowsTwo) != 0 ? 2u : 1u;
     const uint64_t start =
         (static_cast<uint64_t>(composition.page_index) + 1) *
         composition.page_size;
     const uint32_t count = static_cast<uint32_t>((std::min)(
-        static_cast<uint64_t>(kMaxCandidateCount),
+        static_cast<uint64_t>((std::min)(
+            kMaxCandidateCount, FAMO_ENGINE_V2_MAX_PEEK_CANDIDATES)),
         static_cast<uint64_t>(composition.page_size) * rows));
     if (start <= UINT32_MAX && count > 0) {
-      FamoCompositionView preview_view{};
-      preview_view.size = static_cast<uint32_t>(sizeof(preview_view));
-      if (engine_.api().peek_candidates(
-              session.context, static_cast<uint32_t>(start), count,
-              &preview_view) == FAMO_ENGINE_OK) {
+      FamoEngineActionRequestV2 preview_action =
+          FamoEngineHost::Action(FAMO_ENGINE_ACTION_PEEK_CANDIDATES);
+      preview_action.index = static_cast<uint32_t>(start);
+      preview_action.count = count;
+      FamoEngineActionResultLease preview_result;
+      if (engine_.ExecuteAction(session.context, &preview_action,
+                                &preview_result) == FAMO_ENGINE_OK &&
+          preview_result) {
         Composition preview;
         std::string preview_error;
-        if (CopyView(preview_view, &preview, &preview_error))
+        if (CopyResult(*preview_result, preview_action.action,
+                       preview_action.count, &preview, &preview_error))
           composition.preview_candidates = std::move(preview.candidates);
-        (void)engine_.FreeView(&preview_view);
       }
     }
   }
-  // The v1.1 commit_composition ABI returns only success; the following
-  // get_status deliberately does not consume or repeat a commit. Preserve the
-  // already-validated preview from the last engine view so the host can apply
-  // the exact text that librime committed.
-  if (request.command == Command::CommitComposition &&
-      !explicit_commit.empty()) {
-    composition.commit = std::move(explicit_commit);
-    composition.handled = true;
-    composition.state_flags |=
-        FAMO_COMPOSITION_HAS_COMMIT | FAMO_COMPOSITION_HANDLED;
-  }
-  if ((request.command == Command::SelectCandidate ||
-       request.command == Command::SelectCandidateAbsolute) &&
-      candidate_selection_handled) {
-    composition.handled = true;
-    composition.state_flags |= FAMO_COMPOSITION_HANDLED;
-  }
   Frame reply = Reply(request, Status::Ok);
-  if (!EncodeComposition(composition, &reply.payload, &error))
-    return Reply(request, Status::EngineError);
+  bool encoded = false;
+  try {
+    encoded = EncodeComposition(composition, &reply.payload, &error);
+  } catch (...) {
+    encoded = false;
+  }
+  if (!encoded) {
+    // Preview/candidate UI is optional; the handled decision and exact commit
+    // are not.  A primary ABI result fits the protocol budget by construction,
+    // but an additional preview result may not.  Shed only optional rendering
+    // data and retry without copying the commit.
+    Composition essential;
+    essential.handled = composition.handled;
+    essential.commit = std::move(composition.commit);
+    essential.status_flags = composition.status_flags;
+    essential.state_flags =
+        composition.state_flags &
+        ~(FAMO_COMPOSITION_HAS_PREEDIT |
+          FAMO_COMPOSITION_HAS_CANDIDATES);
+    if (essential.commit.empty())
+      essential.state_flags &= ~FAMO_COMPOSITION_HAS_COMMIT;
+    else
+      essential.state_flags |= FAMO_COMPOSITION_HAS_COMMIT;
+    try {
+      encoded = EncodeComposition(essential, &reply.payload, &error);
+    } catch (...) {
+      encoded = false;
+    }
+    if (encoded)
+      composition = std::move(essential);
+  }
+  if (!encoded) {
+    session.pending_recovery_result = std::move(action_result);
+    return Reply(request, Status::RecoveryPending);
+  }
   session.correlation = c;
-  if (request.command == Command::ProcessKey &&
-      IsShiftModeSwitch(processed_key, status_before_key,
+  if (session.pending_recovery_key_available &&
+      IsShiftModeSwitch(session.pending_recovery_key,
+                        session.pending_recovery_status_before_key,
                         composition.status_flags))
     session.mode_switch_sequence = c.sequence;
   session.composition = std::move(composition);
   session.composition_sequence = c.sequence;
+  session.pending_recovery_action = 0;
+  session.pending_recovery_handled = false;
+  session.pending_recovery_sequence = 0;
+  session.pending_recovery_key_available = false;
+  session.pending_recovery_key = {};
+  session.pending_recovery_status_before_key = 0;
+  session.pending_recovery_result.Reset();
   Publish(session, true);
   return reply;
+  } catch (...) {
+    // Once the engine has returned a final result it no longer owns a
+    // recoverable snapshot. Keep that exact engine allocation alive across
+    // every host-side allocation/formatting failure so Claim can retry without
+    // replaying the business action or issuing a now-invalid RECOVER.
+    session.pending_recovery_result = std::move(action_result);
+    return Reply(request, Status::RecoveryPending);
+  }
 }
 
 } // namespace famo::runtime

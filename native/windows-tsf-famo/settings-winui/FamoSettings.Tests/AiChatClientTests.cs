@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using Famo.Settings.Core;
 using Famo.Settings.Core.Ai;
 using Xunit;
@@ -153,6 +154,86 @@ public sealed class AiChatClientTests : IDisposable
     }
 
     [Fact]
+    public async Task SendAsync_TruncatesStructuredHttpErrorPreview()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile("sk-secret");
+        string remoteMessage = new string('x', 160) + "😀" + new string('y', 1024);
+        string body = JsonSerializer.Serialize(new
+        {
+            error = new { message = remoteMessage },
+        });
+        var http = new HttpClient(new CaptureHandler(_ =>
+            new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json"),
+            }));
+        var client = new AiChatClient(
+            settings, new AiProviderProfileStore(_file), _secrets, http);
+
+        InvalidOperationException ex =
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => client.SendAsync("hello", CancellationToken.None));
+
+        Assert.DoesNotContain("y", ex.Message);
+        Assert.DoesNotContain('\uD83D', ex.Message);
+        Assert.DoesNotContain('\uDE00', ex.Message);
+    }
+
+    [Fact]
+    public async Task SendAsync_RejectsDeclaredOversizedModelResponseWithoutReadingBody()
+    {
+        const int responseLimit = BoundedHttpContent.MaxResponseBytes;
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile("sk-secret");
+        var body = new CountingReadStream(responseLimit + 1);
+        var content = new StreamContent(body);
+        content.Headers.ContentLength = responseLimit + 1;
+        var http = new HttpClient(new CaptureHandler(_ =>
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = content,
+            }));
+        var client = new AiChatClient(
+            settings, new AiProviderProfileStore(_file), _secrets, http);
+
+        InvalidOperationException ex =
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => client.SendAsync("hello", CancellationToken.None));
+
+        Assert.Contains("过大", ex.Message);
+        Assert.Equal(0, body.BytesRead);
+    }
+
+    [Fact]
+    public async Task SendAsync_StopsReadingChunkedModelResponseAtTheLimit()
+    {
+        const int responseLimit = BoundedHttpContent.MaxResponseBytes;
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        AddDefaultProfile("sk-secret");
+        var body = new CountingReadStream(responseLimit * 2);
+        var content = new StreamContent(body);
+        content.Headers.ContentLength = null;
+        var http = new HttpClient(new CaptureHandler(_ =>
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = content,
+            }));
+        var client = new AiChatClient(
+            settings, new AiProviderProfileStore(_file), _secrets, http);
+
+        InvalidOperationException ex =
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => client.SendAsync("hello", CancellationToken.None));
+
+        Assert.Contains("过大", ex.Message);
+        Assert.InRange(body.BytesRead, responseLimit + 1, responseLimit + 128 * 1024);
+    }
+
+    [Fact]
     public async Task SendAsync_WhenMalformedErrorPreviewEndsInsideEmoji_DoesNotReturnUnpairedSurrogate()
     {
         FamoSettings settings = SettingsStore.CreateDefault();
@@ -261,6 +342,44 @@ public sealed class AiChatClientTests : IDisposable
     }
 
     [Fact]
+    public async Task SendAsync_WhenSearchResponseIsOversized_FallsBackWithoutReadingBody()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+        settings.Ai.CloudEnabled = true;
+        settings.Ai.AskWebSearchEnabled = true;
+        AddDefaultProfile("sk-model");
+        _secrets.SetSecret(
+            WebSearchBackends.SecretName(WebSearchBackends.Doubao),
+            "sk-search");
+        var body = new CountingReadStream(
+            BoundedHttpContent.MaxResponseBytes + 1L);
+        var content = new StreamContent(body);
+        content.Headers.ContentLength =
+            BoundedHttpContent.MaxResponseBytes + 1L;
+        var handler = new CaptureHandler(request =>
+            request.RequestUri!.Host == "open.feedcoopapi.com"
+                ? new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = content,
+                }
+                : JsonResponse(
+                    """{ "choices": [ { "message": { "content": "普通答案" } } ] }"""));
+        var client = new AiChatClient(
+            settings,
+            new AiProviderProfileStore(_file),
+            _secrets,
+            new HttpClient(handler));
+
+        AiChatResult result =
+            await client.SendAsync("继续回答", CancellationToken.None);
+
+        Assert.Equal(2, handler.Calls);
+        Assert.Null(result.SearchProvider);
+        Assert.Equal("普通答案", result.Text);
+        Assert.Equal(0, body.BytesRead);
+    }
+
+    [Fact]
     public async Task SendAsync_WithPerplexitySearch_UsesDedicatedEndpoint()
     {
         FamoSettings settings = SettingsStore.CreateDefault();
@@ -333,6 +452,54 @@ public sealed class AiChatClientTests : IDisposable
             Calls++;
             return Task.FromResult(_send(request));
         }
+    }
+
+    private sealed class CountingReadStream(long length) : Stream
+    {
+        private long _remaining = length;
+
+        public long BytesRead { get; private set; }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => BytesRead;
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int read = (int)Math.Min(count, _remaining);
+            if (read == 0) return 0;
+            Array.Clear(buffer, offset, read);
+            _remaining -= read;
+            BytesRead += read;
+            return read;
+        }
+
+        public override ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int read = (int)Math.Min(buffer.Length, _remaining);
+            if (read == 0) return ValueTask.FromResult(0);
+            buffer.Span[..read].Clear();
+            _remaining -= read;
+            BytesRead += read;
+            return ValueTask.FromResult(read);
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) =>
+            throw new NotSupportedException();
+        public override void SetLength(long value) =>
+            throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeSecretStore : ISecretStore

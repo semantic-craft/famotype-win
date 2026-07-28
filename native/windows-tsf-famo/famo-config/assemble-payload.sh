@@ -178,6 +178,13 @@ copy_base() {
   log "rime-ice 基座已落地($(find "${PAYLOAD_DIR}" -type f | wc -l | tr -d ' ') 文件)。"
 }
 
+reject_payload_links() {
+  local link
+  link="$(find "${PAYLOAD_DIR}" -type l -print -quit)"
+  [ -z "${link}" ] \
+    || die "拒绝 payload 符号链接（Windows 发布包只允许普通文件/目录）：${link#${PAYLOAD_DIR}/}"
+}
+
 # rime-ice 只携带 emoji OpenCC 数据；s2t/s2hk 是前端通常预装的标准数据。
 # 法墨使用自足 data_root，必须显式带入，否则开关会变成“状态已繁、候选仍简”。
 overlay_opencc_standard() {
@@ -325,6 +332,7 @@ neutralize_payload_identity_text() {
 # ── 5. 体检：关键文件 + 出厂锚定就位 + 旧底座/限制残留断言 ──────────────────────
 verify() {
   local ok=1
+  reject_payload_links
   for f in rime_ice.schema.yaml rime_ice.dict.yaml \
            t9.schema.yaml melt_eng.schema.yaml \
            double_pinyin_flypy.schema.yaml \
@@ -364,6 +372,7 @@ main() {
   fetch_rime_ice
   fetch_wubi
   copy_base
+  reject_payload_links
   overlay_opencc_standard
   overlay_wubi
   ensure_wubi_pinyin_traditionalization

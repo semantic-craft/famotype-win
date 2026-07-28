@@ -120,6 +120,27 @@ bool WaitFor(const StatusUi &ui, uint64_t registrations) {
   return false;
 }
 
+bool StatusThreadCreationFailureDoesNotTakeRuntimeDown() {
+  RuntimeService service;
+  std::string error;
+  CHECK(service.Start(L"FamoTestEngine.dll", "", &error));
+  CHECK(service.InitializeControlState() == ControlError::None);
+  std::atomic<bool> running{true};
+  StatusUi ui(&service, &running);
+  CHECK(_putenv_s("FAMO_TEST_STATUS_THREAD_CREATION_FAILURE", "1") == 0);
+  CHECK(!ui.Start());
+  CHECK(_putenv_s("FAMO_TEST_STATUS_THREAD_CREATION_FAILURE", "") == 0);
+
+  Frame hello;
+  hello.command = Command::Hello;
+  hello.correlation = {901, 902, 903, 0, 0, 0};
+  CHECK(service.Dispatch(hello).status == Status::Ok);
+  CHECK(ui.Start());
+  ui.Stop();
+  service.Stop();
+  return true;
+}
+
 std::shared_ptr<RuntimeSnapshot> Snapshot(bool focused, uint32_t status_flags) {
   auto snapshot = std::make_shared<RuntimeSnapshot>();
   snapshot->ui_state.focused = focused;
@@ -206,12 +227,151 @@ bool OpenSessionOn(RuntimeService *service) {
   return true;
 }
 
-// The menu's write path. The test engine accepts options without modelling
-// them, so this pins the reporting contract rather than the resulting mode:
-// no live session or a rejecting engine must not read as success.
+// The menu's write path. A started runtime with no live session updates the
+// overlay for the next session; a stopped runtime or a rejecting engine must
+// not read as success.
 bool SetOptionReportsHonestly() {
   RuntimeService idle;
   CHECK(!idle.SetOption("ascii_mode", true));
+
+  RuntimeService no_session;
+  std::string error;
+  CHECK(no_session.Start(L"FamoTestEngine.dll", "", &error));
+  CHECK(no_session.InitializeControlState() == ControlError::None);
+  CHECK(no_session.SetOption("ascii_mode", true));
+  _putenv_s("FAMO_TEST_FAIL_OPTION", "ascii_mode");
+  Frame no_session_hello;
+  no_session_hello.command = Command::Hello;
+  no_session_hello.correlation = {31, 32, 33, 0, 0, 0};
+  CHECK(no_session.Dispatch(no_session_hello).status == Status::Ok);
+  Frame no_session_open;
+  no_session_open.command = Command::OpenSession;
+  no_session_open.correlation = {31, 32, 33, 34, 35, 1};
+  CHECK(EncodeOpenSession("test", &no_session_open.payload, &error));
+  CHECK(no_session.Dispatch(no_session_open).status == Status::EngineError);
+  _putenv_s("FAMO_TEST_FAIL_OPTION", "");
+  CHECK(no_session.ExecuteControl(Command::ControlShutdown) ==
+        ControlError::None);
+  CHECK(!no_session.SetOption("ascii_mode", false));
+  no_session.Stop();
+
+  RuntimeService transactional;
+  CHECK(transactional.Start(L"FamoTestEngine.dll", "", &error));
+  CHECK(transactional.InitializeControlState() == ControlError::None);
+  Frame first_hello;
+  first_hello.command = Command::Hello;
+  first_hello.correlation = {41, 42, 43, 0, 0, 0};
+  CHECK(transactional.Dispatch(first_hello).status == Status::Ok);
+  Frame first_open;
+  first_open.command = Command::OpenSession;
+  first_open.correlation = {41, 42, 43, 44, 45, 1};
+  CHECK(EncodeOpenSession("test", &first_open.payload, &error));
+  CHECK(transactional.Dispatch(first_open).status == Status::Ok);
+  Frame first_key;
+  first_key.command = Command::ProcessKey;
+  first_key.correlation = {41, 42, 43, 44, 45, 2};
+  CHECK(EncodeKeyEvent({'A', 0, 0, 1, 1}, &first_key.payload));
+  CHECK(transactional.Dispatch(first_key).status == Status::Ok);
+
+  Frame second_hello;
+  second_hello.command = Command::Hello;
+  second_hello.correlation = {51, 52, 53, 0, 0, 0};
+  CHECK(transactional.Dispatch(second_hello).status == Status::Ok);
+  Frame second_open;
+  second_open.command = Command::OpenSession;
+  second_open.correlation = {51, 52, 53, 54, 55, 1};
+  CHECK(EncodeOpenSession("test", &second_open.payload, &error));
+  CHECK(transactional.Dispatch(second_open).status == Status::Ok);
+  Frame second_key;
+  second_key.command = Command::ProcessKey;
+  second_key.correlation = {51, 52, 53, 54, 55, 2};
+  CHECK(EncodeKeyEvent({'B', 0, 0, 1, 1}, &second_key.payload));
+  CHECK(transactional.Dispatch(second_key).status == Status::Ok);
+
+  _putenv_s("FAMO_TEST_FAIL_OPTION_BUFFER", "b");
+  CHECK(!transactional.SetOption("ascii_mode", true));
+  _putenv_s("FAMO_TEST_FAIL_OPTION_BUFFER", "");
+  first_key.correlation.sequence = 3;
+  CHECK(EncodeKeyEvent({'C', 0, 0, 1, 2}, &first_key.payload));
+  const Frame first_after_rollback = transactional.Dispatch(first_key);
+  CHECK(first_after_rollback.status == Status::Ok);
+  Composition rolled_back;
+  CHECK(DecodeComposition(first_after_rollback.payload, &rolled_back, &error));
+  CHECK((rolled_back.status_flags & FAMO_STATUS_ASCII_MODE) == 0);
+
+  _putenv_s("FAMO_TEST_FAIL_OPTION", "ascii_mode");
+  Frame third_hello;
+  third_hello.command = Command::Hello;
+  third_hello.correlation = {61, 62, 63, 0, 0, 0};
+  CHECK(transactional.Dispatch(third_hello).status == Status::Ok);
+  Frame third_open;
+  third_open.command = Command::OpenSession;
+  third_open.correlation = {61, 62, 63, 64, 65, 1};
+  CHECK(EncodeOpenSession("test", &third_open.payload, &error));
+  CHECK(transactional.Dispatch(third_open).status == Status::Ok);
+  _putenv_s("FAMO_TEST_FAIL_OPTION", "");
+  transactional.Stop();
+
+  RuntimeService apply_rollback_failure;
+  CHECK(apply_rollback_failure.Start(
+      L"FamoTestEngine.dll", "", &error));
+  CHECK(apply_rollback_failure.InitializeControlState() ==
+        ControlError::None);
+  Frame rollback_first_hello;
+  rollback_first_hello.command = Command::Hello;
+  rollback_first_hello.correlation = {71, 72, 73, 0, 0, 0};
+  CHECK(apply_rollback_failure.Dispatch(rollback_first_hello).status ==
+        Status::Ok);
+  Frame rollback_first_open;
+  rollback_first_open.command = Command::OpenSession;
+  rollback_first_open.correlation = {71, 72, 73, 74, 75, 1};
+  CHECK(EncodeOpenSession("test", &rollback_first_open.payload, &error));
+  CHECK(apply_rollback_failure.Dispatch(rollback_first_open).status ==
+        Status::Ok);
+  Frame rollback_first_key;
+  rollback_first_key.command = Command::ProcessKey;
+  rollback_first_key.correlation = {71, 72, 73, 74, 75, 2};
+  CHECK(EncodeKeyEvent({'A', 0, 0, 1, 1},
+                       &rollback_first_key.payload));
+  CHECK(apply_rollback_failure.Dispatch(rollback_first_key).status ==
+        Status::Ok);
+  Frame rollback_second_hello;
+  rollback_second_hello.command = Command::Hello;
+  rollback_second_hello.correlation = {81, 82, 83, 0, 0, 0};
+  CHECK(apply_rollback_failure.Dispatch(rollback_second_hello).status ==
+        Status::Ok);
+  Frame rollback_second_open;
+  rollback_second_open.command = Command::OpenSession;
+  rollback_second_open.correlation = {81, 82, 83, 84, 85, 1};
+  CHECK(EncodeOpenSession("test", &rollback_second_open.payload, &error));
+  CHECK(apply_rollback_failure.Dispatch(rollback_second_open).status ==
+        Status::Ok);
+  Frame rollback_second_key;
+  rollback_second_key.command = Command::ProcessKey;
+  rollback_second_key.correlation = {81, 82, 83, 84, 85, 2};
+  CHECK(EncodeKeyEvent({'B', 0, 0, 1, 1},
+                       &rollback_second_key.payload));
+  CHECK(apply_rollback_failure.Dispatch(rollback_second_key).status ==
+        Status::Ok);
+  _putenv_s("FAMO_TEST_FAIL_OPTION_BUFFER", "b");
+  _putenv_s("FAMO_TEST_FAIL_OPTION_ROLLBACK", "ascii_mode");
+  CHECK(!apply_rollback_failure.SetOption("ascii_mode", true));
+  CHECK(apply_rollback_failure.readiness() ==
+        RuntimeReadiness::Unavailable);
+  _putenv_s("FAMO_TEST_FAIL_OPTION_BUFFER", "");
+  _putenv_s("FAMO_TEST_FAIL_OPTION_ROLLBACK", "");
+  apply_rollback_failure.Stop();
+
+  RuntimeService status_rollback_failure;
+  CHECK(OpenSessionOn(&status_rollback_failure));
+  _putenv_s("FAMO_TEST_RUNTIME_COPY_FAILURE", "1");
+  _putenv_s("FAMO_TEST_FAIL_OPTION_ROLLBACK", "ascii_mode");
+  CHECK(!status_rollback_failure.SetOption("ascii_mode", true));
+  CHECK(status_rollback_failure.readiness() ==
+        RuntimeReadiness::Unavailable);
+  _putenv_s("FAMO_TEST_RUNTIME_COPY_FAILURE", "");
+  _putenv_s("FAMO_TEST_FAIL_OPTION_ROLLBACK", "");
+  status_rollback_failure.Stop();
 
   RuntimeService service;
   CHECK(OpenSessionOn(&service));
@@ -227,7 +387,7 @@ bool SetOptionReportsHonestly() {
   Frame open;
   open.command = Command::OpenSession;
   open.correlation = {21, 22, 23, 24, 25, 1};
-  std::string error;
+  error.clear();
   CHECK(EncodeOpenSession("test", &open.payload, &error));
   CHECK(service.Dispatch(open).status == Status::EngineError);
   _putenv_s("FAMO_TEST_FAIL_OPTION", "");
@@ -264,6 +424,7 @@ bool OpenSessionPublishesStatusBeforeFirstKey() {
   update.correlation = {11, 12, 13, 14, 15, 2};
   UiState focused;
   focused.focused = true;
+  focused.selection_capability = {1, 2};
   std::string error;
   CHECK(EncodeUiState(focused, &update.payload, &error));
   CHECK(service.Dispatch(update).status == Status::Ok);
@@ -807,12 +968,21 @@ bool SchemaSegmentRoutesItsOwnRightClick() {
 bool DumpBarFrame() {
   // Manual visualization harness, not a check: paints one frame and dumps it to
   // a BMP so a human can eyeball the schema segment. Both env vars are required
-  // input; under ctest neither is set and getenv returns nullptr -- feeding
-  // that to string_view/ofstream was a guaranteed segfault. Absent vars mean
-  // "not asked to dump", and the selfcheck stays green.
-  const char *bar_name = std::getenv("FAMO_BAR_NAME");
-  const char *dump_path = std::getenv("FAMO_BAR_DUMP");
-  if (!bar_name || !dump_path)
+  // input. Absent vars mean "not asked to dump", and the selfcheck stays green.
+  const auto environment = [](const char *name) {
+    const DWORD required = GetEnvironmentVariableA(name, nullptr, 0);
+    if (required == 0)
+      return std::string();
+    std::string value(static_cast<size_t>(required - 1), '\0');
+    const DWORD copied =
+        GetEnvironmentVariableA(name, value.data(), required);
+    if (copied == 0 || copied >= required)
+      value.clear();
+    return value;
+  };
+  const std::string bar_name = environment("FAMO_BAR_NAME");
+  const std::string dump_path = environment("FAMO_BAR_DUMP");
+  if (bar_name.empty() || dump_path.empty())
     return true;
   const uint32_t dpi = 144;
   const StatusBarLayout layout = StatusBarLayoutFor(dpi);
@@ -881,6 +1051,7 @@ int main() {
       !SchemaSegmentRoutesItsOwnRightClick())
     return 1;
   if (!TrayPathMatchesTheShellsStoredForm() ||
+      !StatusThreadCreationFailureDoesNotTakeRuntimeDown() ||
       !TrayReregistersAfterTaskbarCreated() ||
       !KeyboardHookFailureIsVisibleAndRecovers() ||
       !DefocusedSnapshotsDoNotMoveTheIcon() || !SetOptionReportsHonestly() ||

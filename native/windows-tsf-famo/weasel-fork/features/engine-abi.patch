@@ -1,8 +1,42 @@
 diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
-index 67e9b6d..61e4fa7 100644
+index 5d2766c..02d097c 100644
 --- a/RimeWithWeasel/RimeWithWeasel.cpp
 +++ b/RimeWithWeasel/RimeWithWeasel.cpp
-@@ -116,21 +116,19 @@ void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize);
+@@ -9,7 +9,10 @@
+ #include <fstream>
+ #include <sstream>
+ #include <map>
++#include <new>
+ #include <array>
++#include <type_traits>
++#include <utility>
+ #include <vector>
+ #include <regex>
+ #include <rime_api.h>
+@@ -26,7 +29,8 @@ typedef enum { COLOR_ABGR = 0, COLOR_ARGB, COLOR_RGBA } ColorFormat;
+ using namespace weasel;
+-
++
+ static RimeApi* rime_api;
+-WeaselSessionId _GenerateNewWeaselSessionId(SessionStatusMap sm, DWORD pid) {
++WeaselSessionId _GenerateNewWeaselSessionId(const SessionStatusMap& sm,
++                                            DWORD pid) {
+   if (sm.empty())
+     return (WeaselSessionId)(pid + 1);
+   return (WeaselSessionId)(sm.rbegin()->first + 1);
+@@ -60,7 +64,9 @@ RimeWithWeaselHandler::RimeWithWeaselHandler(UI* ui)
+ }
+-
++
+ RimeWithWeaselHandler::~RimeWithWeaselHandler() {
++  _DestroyAbiContexts();
++  m_engine_host.Unload();
++  _ClearNotifications();
+   m_show_notifications.clear();
+-  m_session_status_map.clear();
+   m_app_options.clear();
+ }
+@@ -116,20 +122,28 @@ void _UpdateUIStyle(RimeConfig* config, UI* ui, bool initialize);
  bool _UpdateUIStyleColor(RimeConfig* config,
                           UIStyle& style,
                           const std::string& color = std::string());
@@ -15,8 +49,19 @@ index 67e9b6d..61e4fa7 100644
 +  u.length_bytes = (uint32_t)s.size();
 +  return u;
 +}
++
++static inline std::string FamoString(const FamoUtf8String& value) {
++  return value.length_bytes && value.data
++             ? std::string(value.data, value.length_bytes)
++             : std::string();
++}
++
++static inline std::wstring FamoWide(const FamoUtf8String& value) {
++  return u8tow(FamoString(value));
++}
  void _LoadAppOptions(RimeConfig* config, AppOptionsByAppName& app_options);
-
+-
++
 -void _RefreshTrayIcon(const RimeSessionId session_id,
 -                      const std::function<void()> _UpdateUICallback) {
 -  // Dangerous, don't touch
@@ -34,30 +79,41 @@ index 67e9b6d..61e4fa7 100644
 +  if (_UpdateUICallback)
      _UpdateUICallback();
  }
-
-@@ -158,12 +156,31 @@ void RimeWithWeaselHandler::Initialize() {
+@@ -149,7 +163,6 @@ void RimeWithWeaselHandler::_Setup() {
+   std::string log_dir = WeaselLogPath().u8string();
+   weasel_traits.log_dir = log_dir.c_str();
+   rime_api->setup(&weasel_traits);
+-  rime_api->set_notification_handler(&RimeWithWeaselHandler::OnNotify, this);
+ }
+-
++
+ void RimeWithWeaselHandler::Initialize() {
+@@ -158,12 +171,33 @@ void RimeWithWeaselHandler::Initialize() {
      return;
    }
-
+-
++
 -  LOG(INFO) << "Initializing la rime.";
 -  rime_api->initialize(NULL);
 -  if (rime_api->start_maintenance(/*full_check = */ False)) {
 +  std::string data_root = wtou8(WeaselUserDataPath().wstring());
-+  int32_t rc = m_engine_host.Load(L"FamoRimeEngine.dll", data_root.c_str());
-+  if (rc != FAMO_ENGINE_OK || !m_engine_host.AbiRunnable()) {
-+    LOG(ERROR) << "Famo engine ABI load failed rc=" << rc;
++  int32_t rc = m_engine_host.LoadV2(
++      L"FamoRimeEngine.dll", data_root.c_str(),
++      &RimeWithWeaselHandler::OnNotify, this);
++  if (rc != FAMO_ENGINE_OK || !m_engine_host.V2Runnable()) {
++    LOG(ERROR) << "Famo engine ABI v2 load failed rc=" << rc;
      m_disabled = true;
 -    rime_api->join_maintenance_thread();
 +    return;
    }
-+  LOG(INFO) << "Famo engine ABI backend active (FamoRimeEngine.dll).";
++  LOG(INFO) << "Famo engine ABI v2 backend active (FamoRimeEngine.dll).";
 +
 +  {
 +    HKEY hkey;
 +    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Famo\\InputMethod", 0,
 +                        nullptr, 0, KEY_SET_VALUE, nullptr, &hkey,
 +                        nullptr) == ERROR_SUCCESS) {
-+      const wchar_t* active = L"abi";
++      const wchar_t* active = L"abi-v2";
 +      RegSetValueExW(hkey, L"ActiveBackend", 0, REG_SZ,
 +                     reinterpret_cast<const BYTE*>(active),
 +                     (DWORD)((wcslen(active) + 1) * sizeof(wchar_t)));
@@ -68,21 +124,23 @@ index 67e9b6d..61e4fa7 100644
 +  LOG(INFO) << "Initializing la rime through FamoRimeEngine.dll.";
 +  // 引擎 initialize() 已在 host_.Load 内完成 setup+initialize（+首启部署）。
 +  // 以下全局 config 读直连同一 librime 单例（只读、引擎已初始化）。
-
+-
++
    RimeConfig config = {NULL};
    if (rime_api->config_open("weasel", &config)) {
-@@ -201,16 +218,35 @@ void RimeWithWeaselHandler::Finalize() {
+@@ -199,18 +233,157 @@ void RimeWithWeaselHandler::Initialize() {
+ void RimeWithWeaselHandler::Finalize() {
+   m_active_session = 0;
    m_disabled = true;
-   m_session_status_map.clear();
+-  m_session_status_map.clear();
    LOG(INFO) << "Finalizing la rime.";
 -  rime_api->finalize();
-+  if (m_abi_view_valid) {
-+    m_engine_host.FreeView(&m_abi_view);
-+    m_abi_view_valid = false;
-+  }
++  _DestroyAbiContexts();
 +  m_engine_host.Unload();  // 引擎 shutdown() 内跑 librime finalize
++  _ClearNotifications();   // Unload waited for the last async callback.
  }
-
+-
++
  DWORD RimeWithWeaselHandler::FindSession(WeaselSessionId ipc_id) {
    if (m_disabled)
      return 0;
@@ -90,29 +148,153 @@ index 67e9b6d..61e4fa7 100644
 -  DLOG(INFO) << "Find session: session_id = " << to_session_id(ipc_id)
 -             << ", found = " << found;
 -  return found ? (ipc_id) : 0;
-+  bool found = get_session_status(ipc_id).engine_ctx != nullptr;
++  const auto found_session = m_session_status_map.find(ipc_id);
++  const bool found = found_session != m_session_status_map.end() &&
++                     found_session->second.engine_ctx != nullptr;
 +  DLOG(INFO) << "Find session: ipc_id = " << ipc_id << ", found = " << found;
 +  return found ? ipc_id : 0;
 +}
 +
-+// 法墨引擎 ABI：用引擎 get_status 刷新 m_abi_view（thin op commit/clear/highlight/change_page
-+// 之后没有 out_view，靠此取当前 context+status；get_status 填全视图，不消费 commit）。
-+bool RimeWithWeaselHandler::_RefillAbiView(FamoEngineContext* ctx) {
-+  if (m_abi_view_valid) {
-+    m_engine_host.FreeView(&m_abi_view);
-+    m_abi_view_valid = false;
++RimeWithWeaselHandler::AbiActionOutcome
++RimeWithWeaselHandler::_ExecuteAbiAction(
++    WeaselSessionId ipc_id,
++    SessionStatus* session_status,
++    FamoEngineActionRequestV2 request,
++    EatLine eat) {
++  AbiActionOutcome result;
++  if (!session_status || !session_status->engine_ctx)
++    return result;
++
++  constexpr uint32_t kMaxViewCandidates = 4096u;
++  constexpr uint32_t kMaxPendingResponseStringBytes = 1024u * 1024u;
++  static_assert(
++      std::is_nothrow_move_assignable<
++          FamoEngineActionResultLease>::value,
++      "pending response adoption must not allocate or throw");
++
++  // A previously finalized result owns the only undelivered commit. Retry it
++  // before this physical/control action can enter the engine. Failure leaves
++  // the lease untouched and makes the current action fail open/fail.
++  if (session_status->pending_response_result &&
++      !_DeliverPendingResponse(ipc_id, session_status, eat)) {
++    return result;
 +  }
++
++  if (session_status->pending_recovery_action != 0) {
++    const uint32_t original_action =
++        session_status->pending_recovery_action;
++    FamoEngineActionRequestV2 recovery =
++        FamoEngineHost::Action(FAMO_ENGINE_ACTION_RECOVER);
++    recovery.value = static_cast<int32_t>(original_action);
++    bool recovered = false;
++    for (uint32_t attempt = 0; attempt < 3u; ++attempt) {
++      if (m_engine_host.ExecuteAction(session_status->engine_ctx, &recovery,
++                                      &m_abi_result) == FAMO_ENGINE_OK &&
++          m_abi_result &&
++          FamoEngineHost::ValidateResultV2(
++              m_abi_result.get(), original_action, kMaxViewCandidates,
++              kMaxPendingResponseStringBytes) &&
++          m_abi_result->result_flags == 0 &&
++          (m_abi_result->handled != 0) ==
++              session_status->pending_recovery_handled) {
++        recovered = true;
++        break;
++      }
++      (void)m_abi_result.Reset();
++    }
++    if (!recovered) {
++      result.recovered_prior = true;
++      // The current physical input never entered the engine. Do not retain it
++      // waiting for another user event: fail open in this callback.
++      result.handled = false;
++      return result;
++    }
++    // Adopt the engine-owned final result before clearing the receipt state or
++    // performing any formatting allocation. A bad_alloc/sink failure can now
++    // retry serialization without ever issuing RECOVER twice.
++    session_status->pending_response_result = std::move(m_abi_result);
++    session_status->pending_recovery_action = 0;
++    session_status->pending_recovery_handled = false;
++    result.recovered_prior = true;
++    if (!_DeliverPendingResponse(ipc_id, session_status, eat)) {
++      return result;
++    }
++  }
++
++  FamoEngineRecoveryOutcome recovery_outcome;
++  const int32_t execute_result = m_engine_host.ExecuteActionRecovering(
++      session_status->engine_ctx, &request, 3u, &m_abi_result,
++      &recovery_outcome);
++  result.business_dispatched = recovery_outcome.business_dispatched;
++  result.handled = recovery_outcome.handled;
++  if (execute_result != FAMO_ENGINE_OK || !m_abi_result) {
++    if (recovery_outcome.recovery_pending) {
++      session_status->pending_recovery_action = request.action;
++      session_status->pending_recovery_handled =
++          recovery_outcome.handled;
++    }
++    (void)m_abi_result.Reset();
++    return result;
++  }
++  if (!FamoEngineHost::ValidateResultV2(
++          m_abi_result.get(), request.action, kMaxViewCandidates,
++          kMaxPendingResponseStringBytes) ||
++      m_abi_result->result_flags != 0) {
++    (void)m_abi_result.Reset();
++    return result;
++  }
++  session_status->pending_response_result = std::move(m_abi_result);
++  result.ready = true;
++  result.handled =
++      session_status->pending_response_result->handled != 0;
++  return result;
++}
++
++// STATUS 是显式只读 action，不消费 commit；结果仍经同一 v2 validator。
++bool RimeWithWeaselHandler::_RefillAbiView(FamoEngineContext* ctx) {
 +  if (!ctx)
 +    return false;
-+  m_abi_view = FamoCompositionView{};
-+  m_abi_view.size = (uint32_t)sizeof(FamoCompositionView);
-+  int32_t rc = m_engine_host.api().get_status(ctx, &m_abi_view);
-+  m_abi_view_valid = (rc == FAMO_ENGINE_OK);
-+  return m_abi_view_valid;
++  for (const auto& entry : m_session_status_map) {
++    if (entry.second.engine_ctx == ctx &&
++        (entry.second.pending_recovery_action != 0 ||
++         entry.second.pending_response_result)) {
++      return false;
++    }
++  }
++  FamoEngineActionRequestV2 status =
++      FamoEngineHost::Action(FAMO_ENGINE_ACTION_STATUS);
++  if (m_engine_host.ExecuteAction(ctx, &status, &m_abi_result) !=
++          FAMO_ENGINE_OK ||
++      !m_abi_result ||
++      !FamoEngineHost::ValidateResultV2(
++          m_abi_result.get(), status.action, 4096u, 1024u * 1024u) ||
++      m_abi_result->result_flags != 0) {
++    (void)m_abi_result.Reset();
++    return false;
++  }
++  return true;
++}
++
++void RimeWithWeaselHandler::_DestroyAbiContexts() {
++  // ABI lifecycle order is strict: result -> contexts -> shutdown/unload.
++  (void)m_abi_result.Reset();
++  if (m_engine_host.V2Runnable()) {
++    for (auto& pair : m_session_status_map) {
++      (void)pair.second.pending_response_result.Reset();
++      if (pair.second.engine_ctx) {
++        (void)_DestroyEngineContext(pair.second.engine_ctx);
++        pair.second.engine_ctx = nullptr;
++        pair.second.engine_generation = 0;
++      }
++    }
++  }
++  m_session_status_map.clear();
++  _ClearNotifications();
  }
-
+-
++
  DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
-@@ -220,45 +256,40 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+@@ -220,49 +393,104 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
      if (m_disabled)
        return 0;
    }
@@ -122,124 +304,226 @@ index 67e9b6d..61e4fa7 100644
 -    std::string sel = _ReadFamoSelectSchema();
 -    if (!sel.empty())
 -      rime_api->select_schema(session_id, sel.c_str());
--  }
--  if (m_global_ascii_mode) {
--    for (const auto& pair : m_session_status_map) {
--      if (pair.first) {
--        rime_api->set_option(session_id, "ascii_mode",
--                             !!pair.second.status.is_ascii_mode);
--        break;
--      }
--    }
--  }
--  // 法墨即时开关①：新会话即回放 famo-options.yaml → 开关跨 App/重启持久（不部署）。
--  _ApplyFamoOptions(session_id);
 +  FamoEngineContext* engine_ctx = nullptr;
 +  // 法墨即时输入方式②：新会话即采用 famo-select-schema.txt 所选方案（不部署）。
 +  std::string sel = _ReadFamoSelectSchema();
 +  FamoUtf8String schema = FamoU8(sel);
 +  const int32_t create_context_result =
-+      m_engine_host.api().create_context(sel.empty() ? nullptr : &schema,
++      m_engine_host.CreateContext(sel.empty() ? nullptr : &schema,
 +                                           &engine_ctx);
 +  if (create_context_result != FAMO_ENGINE_OK || !engine_ctx) {
 +    LOG(ERROR) << "Add session: context creation failed rc="
 +               << create_context_result << ", schema=" << sel;
 +    if (engine_ctx)
-+      m_engine_host.api().destroy_context(engine_ctx);
++      _DestroyEngineContext(engine_ctx);
++    return 0;
+   }
+   if (m_global_ascii_mode) {
++    const std::string ascii_option = "ascii_mode";
++    const FamoUtf8String ascii_name = FamoU8(ascii_option);
+     for (const auto& pair : m_session_status_map) {
+-      if (pair.first) {
+-        rime_api->set_option(session_id, "ascii_mode",
+-                             !!pair.second.status.is_ascii_mode);
++      if (pair.second.engine_ctx) {
++        if (m_engine_host.SetOption(
++                engine_ctx, &ascii_name,
++                !!pair.second.status.is_ascii_mode ? 1 : 0) !=
++            FAMO_ENGINE_OK) {
++          _DestroyEngineContext(engine_ctx);
++          return 0;
++        }
+         break;
+       }
+     }
+   }
+-  // 法墨即时开关①：新会话即回放 famo-options.yaml → 开关跨 App/重启持久（不部署）。
+-  _ApplyFamoOptions(session_id);
++  if (!_ApplyFamoOptions(engine_ctx)) {
++    _DestroyEngineContext(engine_ctx);
 +    return 0;
 +  }
-+  _ApplyFamoOptions(engine_ctx);
-+  if (!_RefillAbiView(engine_ctx)) {
-+    m_engine_host.api().destroy_context(engine_ctx);
-+    LOG(ERROR) << "Add session: context status unavailable, schema=" << sel;
-+    return 0;
-+  }
-+  std::string schema_id =
-+      m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
-
+-
++
    WeaselSessionId ipc_id =
        _GenerateNewWeaselSessionId(m_session_status_map, m_pid);
 -  DLOG(INFO) << "Add session: created session_id = " << session_id
 -             << ", ipc_id = " << ipc_id;
+-  SessionStatus& session_status = new_session_status(ipc_id);
 +  DLOG(INFO) << "Add session: ipc_id = " << ipc_id;
-   SessionStatus& session_status = new_session_status(ipc_id);
++  SessionStatus* inserted_status = nullptr;
++  try {
++    const auto inserted = m_session_status_map.try_emplace(ipc_id);
++    if (!inserted.second) {
++      _DestroyEngineContext(engine_ctx);
++      return 0;
++    }
++    inserted_status = &inserted.first->second;
++  } catch (...) {
++    _DestroyEngineContext(engine_ctx);
++    return 0;
++  }
++  SessionStatus& session_status = *inserted_status;
    session_status.style = m_base_style;
 -  session_status.session_id = session_id;
-+  session_status.engine_ctx = engine_ctx;
-   _ReadClientInfo(ipc_id, buffer);
-
+-  _ReadClientInfo(ipc_id, buffer);
+-
 -  RIME_STRUCT(RimeStatus, status);
 -  if (rime_api->get_status(session_id, &status)) {
 -    std::string schema_id = status.schema_id;
 -    m_last_schema_id = schema_id;
 -    _LoadSchemaSpecificSettings(ipc_id, schema_id);
-+  m_last_schema_id = schema_id;
-+  _LoadSchemaSpecificSettings(ipc_id, schema_id);
 -    _LoadAppInlinePreeditSet(ipc_id, true);
 -    _UpdateInlinePreeditStatus(ipc_id);
-+  _UpdateInlinePreeditStatus(ipc_id);
 -    _RefreshTrayIcon(session_id, _UpdateUICallback);
 -    session_status.status = status;
 -    session_status.__synced = false;
-+  session_status.__synced = false;
 -    rime_api->free_status(&status);
--  }
++  session_status.engine_ctx = engine_ctx;
++  if (!_BindNotificationContext(
++          engine_ctx, ipc_id, &session_status.engine_generation)) {
++    m_session_status_map.erase(ipc_id);
++    _DestroyEngineContext(engine_ctx);
++    return 0;
++  }
++  if (!_ReadClientInfo(ipc_id, buffer)) {
++    m_session_status_map.erase(ipc_id);
++    _DestroyEngineContext(engine_ctx);
++    return 0;
++  }
++
++  // The first STATUS only identifies the selected schema.  App/schema policy
++  // may set engine options, so it must never be the snapshot sent to the
++  // client.
++  if (!_RefillAbiView(engine_ctx)) {
++    m_session_status_map.erase(ipc_id);
++    _DestroyEngineContext(engine_ctx);
++    LOG(ERROR) << "Add session: context status unavailable, schema=" << sel;
++    return 0;
+   }
++  std::string schema_id = FamoString(m_abi_result->view.schema_id);
++  m_last_schema_id = schema_id;
++  _LoadSchemaSpecificSettings(ipc_id, schema_id);
++  _ApplyAppInlinePreeditSetting(ipc_id);
++  if (!_UpdateInlinePreeditStatus(ipc_id)) {
++    (void)m_abi_result.Reset();
++    m_session_status_map.erase(ipc_id);
++    _DestroyEngineContext(engine_ctx);
++    return 0;
++  }
++  // This is the authoritative initial response: it observes global-ascii,
++  // famo, app, schema and inline-preedit options in their final order.
++  if (!_RefillAbiView(engine_ctx)) {
++    m_session_status_map.erase(ipc_id);
++    _DestroyEngineContext(engine_ctx);
++    LOG(ERROR) << "Add session: final context status unavailable, schema="
++               << sel;
++    return 0;
++  }
++  session_status.__synced = false;
    m_ui->style() = session_status.style;
    // show session's welcome message :-) if any
-@@ -277,9 +308,11 @@ DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
-     m_ui->Hide();
+   if (eat) {
++    // Only the final post-option STATUS may become the initial IPC body.
+     _Respond(ipc_id, eat);
+   }
+   add_session = true;
+@@ -273,14 +501,25 @@ DWORD RimeWithWeaselHandler::AddSession(LPWSTR buffer, EatLine eat) {
+ }
+-
++
+ DWORD RimeWithWeaselHandler::RemoveSession(WeaselSessionId ipc_id) {
+-  if (m_ui)
+-    m_ui->Hide();
    if (m_disabled)
      return 0;
 -  DLOG(INFO) << "Remove session: session_id = " << to_session_id(ipc_id);
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status)
++    return 0;
++  if (m_ui)
++    m_ui->Hide();
 +  DLOG(INFO) << "Remove session: ipc_id = " << ipc_id;
    // TODO: force committing? otherwise current composition would be lost
 -  rime_api->destroy_session(to_session_id(ipc_id));
-+  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
-+  if (ctx)
-+    m_engine_host.api().destroy_context(ctx);
++  FamoEngineContext* ctx = session_status->engine_ctx;
++  (void)m_abi_result.Reset();
++  (void)session_status->pending_response_result.Reset();
++  session_status->engine_ctx = nullptr;
++  session_status->engine_generation = 0;
++  if (ctx) {
++    _DestroyEngineContext(ctx);
++  }
    m_session_status_map.erase(ipc_id);
-   m_active_session = 0;
+-  m_active_session = 0;
++  if (m_active_session == ipc_id)
++    m_active_session = 0;
    return 0;
-@@ -306,14 +339,13 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
+ }
+@@ -306,17 +545,21 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode) {
    }
-
+-
++
    for (auto& pair : m_session_status_map) {
 -    RIME_STRUCT(RimeStatus, status);
 -    if (rime_api->get_status(to_session_id(pair.first), &status)) {
 -      _LoadSchemaSpecificSettings(pair.first, std::string(status.schema_id));
 -      _LoadAppInlinePreeditSet(pair.first, true);
 +    if (_RefillAbiView(pair.second.engine_ctx)) {
-+      std::string schema_id =
-+          m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
++      std::string schema_id = FamoString(m_abi_result->view.schema_id);
 +      pair.second.style = m_base_style;
 +      _LoadSchemaSpecificSettings(pair.first, schema_id);
++      _ApplyAppInlinePreeditSetting(pair.first);
        _UpdateInlinePreeditStatus(pair.first);
 -      pair.second.status = status;
        pair.second.__synced = false;
 -      rime_api->free_status(&status);
      }
    }
-   m_ui->style() = get_session_status(m_active_session).style;
-@@ -370,27 +401,29 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
+-  m_ui->style() = get_session_status(m_active_session).style;
++  if (m_ui) {
++    if (const SessionStatus* active =
++            find_session_status(m_active_session)) {
++      m_ui->style() = active->style;
++    }
++  }
+ }
+-
++
+ void RimeWithWeaselHandler::_ApplyFamoStyleOverlay(RimeConfig* base) {
+@@ -351,6 +594,12 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
+   // 法墨即时外观②：重读 base(weasel.yaml) + famo-style.yaml 覆盖层，刷新所有会话样式。
+   // 复用 UpdateColorTheme 的传播逻辑；不部署、不重建 prism、不碰 TSF 热路径。
+   LOG(INFO) << "Famo: ReloadStyleOverlay (instant style, no deploy).";
++  for (const auto& pair : m_session_status_map) {
++    if (pair.second.pending_recovery_action != 0 ||
++        pair.second.pending_response_result) {
++      return;
++    }
++  }
+   RimeConfig config = {NULL};
+   if (rime_api->config_open("weasel", &config)) {
+     if (m_ui) {
+@@ -371,45 +620,55 @@ void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,
    }
-
+-
++
    for (auto& pair : m_session_status_map) {
 -    RIME_STRUCT(RimeStatus, status);
 -    if (rime_api->get_status(to_session_id(pair.first), &status)) {
--      pair.second.style = m_base_style;
++    if (_RefillAbiView(pair.second.engine_ctx)) {
++      std::string schema_id = FamoString(m_abi_result->view.schema_id);
+       pair.second.style = m_base_style;
 -      _LoadSchemaSpecificSettings(pair.first, std::string(status.schema_id));
 -      _LoadAppInlinePreeditSet(pair.first, true);
-+    if (_RefillAbiView(pair.second.engine_ctx)) {
-+      std::string schema_id =
-+          m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
-+      pair.second.style = m_base_style;
 +      _LoadSchemaSpecificSettings(pair.first, schema_id);
++      _ApplyAppInlinePreeditSetting(pair.first);
        _UpdateInlinePreeditStatus(pair.first);
 -      pair.second.status = status;
        pair.second.__synced = false;
 -      rime_api->free_status(&status);
 +      if (m_ui) {
-+        m_ui->style() = get_session_status(pair.first).style;
++        m_ui->style() = pair.second.style;
 +        _UpdateUI(pair.first);
 +      }
      }
@@ -247,25 +531,35 @@ index 67e9b6d..61e4fa7 100644
 -  if (m_active_session) {
 -    m_ui->style() = get_session_status(m_active_session).style;
 -    _UpdateUI(m_active_session);
--  }
++  if (ipc_id && eat) {
++    if (SessionStatus* requested = find_session_status(ipc_id)) {
++      _RefillAbiView(requested->engine_ctx);
++      _Respond(ipc_id, eat);
++    }
+   }
 -  if (ipc_id && eat && m_session_status_map.find(ipc_id) != m_session_status_map.end())
 -    _Respond(ipc_id, eat);
-+  if (ipc_id && eat && m_session_status_map.find(ipc_id) != m_session_status_map.end()) {
-+    _RefillAbiView(get_session_status(ipc_id).engine_ctx);
-+    _Respond(ipc_id, eat);
-+  }
  }
-
+-
++
 -void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
 -  // 法墨即时开关①：把 famo-options.yaml 的 options: 映射逐项 set_option 到一个会话。
-+void RimeWithWeaselHandler::_ApplyFamoOptions(FamoEngineContext* ctx) {
++bool RimeWithWeaselHandler::_ApplyFamoOptions(FamoEngineContext* ctx) {
 +  // 法墨即时开关①：把 famo-options.yaml 的 options: 映射逐项 set_option 到 ABI context。
 +  if (!ctx)
-+    return;
++    return false;
    std::string yaml = _ReadFamoFile(L"famo-options.yaml");
    if (yaml.empty())
-     return;
-@@ -397,8 +428,11 @@ void RimeWithWeaselHandler::_ApplyFamoOptions(RimeSessionId session_id) {
+-    return;
++    return true;
+   RimeConfig cfg = {NULL};
+   if (!rime_api->config_init(&cfg))
+-    return;
+-  if (rime_api->config_load_string(&cfg, yaml.c_str())) {
++    return false;
++  bool success = rime_api->config_load_string(&cfg, yaml.c_str());
++  if (success) {
+     RimeConfigIterator it = {0};
      if (rime_api->config_begin_map(&it, &cfg, "options")) {
        while (rime_api->config_next(&it)) {
          Bool v = False;
@@ -274,17 +568,31 @@ index 67e9b6d..61e4fa7 100644
 +        if (rime_api->config_get_bool(&cfg, it.path, &v)) {
 +          std::string key = it.key ? it.key : "";
 +          FamoUtf8String name = FamoU8(key);
-+          m_engine_host.api().set_option(ctx, &name, !!v);
++          if (m_engine_host.SetOption(ctx, &name, !!v) != FAMO_ENGINE_OK)
++            success = false;
 +        }
        }
        rime_api->config_end(&it);
      }
-@@ -411,8 +445,10 @@ void RimeWithWeaselHandler::ReloadOptions() {
+   }
+   rime_api->config_close(&cfg);
++  return success;
+ }
+-
++
+ void RimeWithWeaselHandler::ReloadOptions() {
+@@ -417,8 +676,16 @@ void RimeWithWeaselHandler::ReloadOptions() {
    LOG(INFO) << "Famo: ReloadOptions (instant switches, no deploy).";
    if (m_disabled)
      return;
 -  for (auto& pair : m_session_status_map)
 -    _ApplyFamoOptions(to_session_id(pair.first));
++  for (const auto& pair : m_session_status_map) {
++    if (pair.second.pending_recovery_action != 0 ||
++        pair.second.pending_response_result) {
++      return;
++    }
++  }
 +  for (auto& pair : m_session_status_map) {
 +    _ApplyFamoOptions(pair.second.engine_ctx);
 +    _RefillAbiView(pair.second.engine_ctx);
@@ -292,75 +600,293 @@ index 67e9b6d..61e4fa7 100644
    if (m_active_session)
      _UpdateUI(m_active_session);  // 中英/简繁等状态变化即时反映到候选窗/状态栏
  }
-@@ -428,15 +464,63 @@ std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
+@@ -434,17 +701,277 @@ std::string RimeWithWeaselHandler::_ReadFamoSelectSchema() {
  }
-
+-
++
  void RimeWithWeaselHandler::SelectSchema() {
 -  // 法墨即时输入方式②：读 famo-select-schema.txt，select_schema 到所有活动会话（不部署、不重建 prism）。
 +  // 法墨即时输入方式②：读 famo-select-schema.txt，重建活动 ABI contexts（不部署、不重建 prism）。
    LOG(INFO) << "Famo: SelectSchema (instant schema switch, no deploy).";
    if (m_disabled)
      return;
-   std::string id = _ReadFamoSelectSchema();
-   if (id.empty())
+-  std::string id = _ReadFamoSelectSchema();
+-  if (id.empty())
++  for (const auto& pair : m_session_status_map) {
++    if (pair.second.pending_recovery_action != 0 ||
++        pair.second.pending_response_result) {
++      return;
++    }
++  }
++  bool committed = false;
++  try {
++    std::string id = _ReadFamoSelectSchema();
++    if (id.empty())
++      return;
++    FamoUtf8String schema = FamoU8(id);
++    struct PendingContext {
++      SessionStatus* session_status;
++      WeaselSessionId ipc_id;
++      FamoEngineContext* context;
++      uint64_t generation;
++      UIStyle style;
++    };
++    struct SessionStyleSnapshot {
++      SessionStatus* session_status;
++      UIStyle style;
++    };
++    const auto stage_and_commit = [&]() -> bool {
++      // Take every potentially-throwing snapshot/allocation before creating a
++      // replacement context. No live session state has changed at this point.
++      std::vector<SessionStyleSnapshot> session_styles;
++      session_styles.reserve(m_session_status_map.size());
++      for (auto& pair : m_session_status_map)
++        session_styles.push_back({&pair.second, pair.second.style});
++      auto prior_show_notifications = m_show_notifications;
++      UIStyle prior_ui_style = m_ui ? m_ui->style() : UIStyle();
++      std::vector<PendingContext> replacements;
++      replacements.reserve(m_session_status_map.size());
++      FamoEngineContext* in_progress = nullptr;
++
++      class SchemaStagingGuard {
++       public:
++        SchemaStagingGuard(
++            RimeWithWeaselHandler& owner,
++            FamoEngineActionResultLease& abi_result,
++            weasel::UI* ui,
++            std::vector<PendingContext>& replacements,
++            FamoEngineContext*& in_progress,
++            std::vector<SessionStyleSnapshot>& session_styles,
++            std::map<std::string, bool>& show_notifications,
++            std::map<std::string, bool>& prior_show_notifications,
++            UIStyle& prior_ui_style) noexcept
++            : owner_(owner),
++              abi_result_(abi_result),
++              ui_(ui),
++              replacements_(replacements),
++              in_progress_(in_progress),
++              session_styles_(session_styles),
++              show_notifications_(show_notifications),
++              prior_show_notifications_(prior_show_notifications),
++              prior_ui_style_(prior_ui_style) {}
++
++        ~SchemaStagingGuard() noexcept {
++          if (!active_)
++            return;
++          // Result memory may refer to the in-progress context. Release it
++          // before destroying any staged context.
++          try {
++            (void)abi_result_.Reset();
++          } catch (...) {
++          }
++          if (in_progress_) {
++            (void)owner_._DestroyEngineContext(in_progress_);
++            in_progress_ = nullptr;
++          }
++          for (auto& replacement : replacements_) {
++            if (!replacement.context)
++              continue;
++            (void)owner_._DestroyEngineContext(replacement.context);
++            replacement.context = nullptr;
++          }
++          // Swaps make rollback allocation-free. The assertions below keep
++          // this destructor a real no-unwind transaction boundary.
++          for (auto& snapshot : session_styles_)
++            std::swap(snapshot.session_status->style, snapshot.style);
++          show_notifications_.swap(prior_show_notifications_);
++          if (ui_)
++            std::swap(ui_->style(), prior_ui_style_);
++          // _DestroyEngineContext removes only queues bound to staged
++          // contexts. Concurrent notifications from live contexts and global
++          // deploy notifications remain untouched.
++        }
++
++        void Disarm() noexcept { active_ = false; }
++
++       private:
++        RimeWithWeaselHandler& owner_;
++        FamoEngineActionResultLease& abi_result_;
++        weasel::UI* ui_;
++        std::vector<PendingContext>& replacements_;
++        FamoEngineContext*& in_progress_;
++        std::vector<SessionStyleSnapshot>& session_styles_;
++        std::map<std::string, bool>& show_notifications_;
++        std::map<std::string, bool>& prior_show_notifications_;
++        UIStyle& prior_ui_style_;
++        bool active_ = true;
++      } rollback(*this, m_abi_result, m_ui, replacements,
++                 in_progress, session_styles, m_show_notifications,
++                 prior_show_notifications, prior_ui_style);
++
++      size_t session_index = 0;
++      for (auto& pair : m_session_status_map) {
++        FamoEngineContext* new_ctx = nullptr;
++        const int32_t create_context_result =
++            m_engine_host.CreateContext(&schema, &new_ctx);
++        in_progress = new_ctx;
++        if (create_context_result != FAMO_ENGINE_OK || !new_ctx) {
++          LOG(ERROR) << "Famo: schema context creation failed rc="
++                     << create_context_result << ", schema=" << id;
++          return false;
++        }
++        uint64_t new_generation = 0;
++        if (!_BindNotificationContext(
++                new_ctx, pair.first, &new_generation)) {
++          LOG(ERROR) << "Famo: schema notification binding failed, schema="
++                     << id;
++          return false;
++        }
++        const std::string client_app_property = "client_app";
++        const FamoUtf8String client_app_name = FamoU8(client_app_property);
++        const FamoUtf8String client_app_value =
++            FamoU8(pair.second.client_app);
++        bool options_ok =
++            m_engine_host.SetProperty(
++                new_ctx, &client_app_name, &client_app_value) ==
++                FAMO_ENGINE_OK &&
++            _ApplyFamoOptions(new_ctx) &&
++            _ApplyAppOptions(new_ctx, pair.second.client_app);
++        if (options_ok && m_global_ascii_mode && pair.second.engine_ctx) {
++          const std::string ascii_option = "ascii_mode";
++          const FamoUtf8String ascii_name = FamoU8(ascii_option);
++          int32_t ascii_mode = 0;
++          options_ok =
++              m_engine_host.GetOption(pair.second.engine_ctx, &ascii_name,
++                                      &ascii_mode) == FAMO_ENGINE_OK &&
++              m_engine_host.SetOption(new_ctx, &ascii_name,
++                                      ascii_mode ? 1 : 0) == FAMO_ENGINE_OK;
++        }
++        if (!options_ok) {
++          LOG(ERROR) << "Famo: schema context option replay failed, schema="
++                     << id;
++          return false;
++        }
++        if (!_RefillAbiView(new_ctx)) {
++          LOG(ERROR) << "Famo: schema context status unavailable, schema="
++                     << id;
++          return false;
++        }
++        std::string schema_id = FamoString(m_abi_result->view.schema_id);
++        _LoadSchemaSpecificSettings(pair.first, schema_id);
++        _ApplyAppInlinePreeditSetting(pair.first);
++        UIStyle staged_style = pair.second.style;
++        pair.second.style = session_styles[session_index++].style;
++        if (m_ui)
++          m_ui->style() = prior_ui_style;
++        if (!_SetInlinePreeditOptions(new_ctx, staged_style.inline_preedit) ||
++            !_RefillAbiView(new_ctx)) {
++          LOG(ERROR) << "Famo: schema context final status unavailable, "
++                        "schema="
++                     << id;
++          return false;
++        }
++        static_assert(std::is_nothrow_move_constructible<UIStyle>::value,
++                      "schema staging requires a no-throw UIStyle move");
++        replacements.push_back(
++            {&pair.second, pair.first, in_progress,
++             new_generation,
++             std::move(staged_style)});
++        in_progress = nullptr;
++      }
++      if (m_abi_result.Reset() != FAMO_ENGINE_OK) {
++        LOG(ERROR) << "Famo: unable to release staged schema result, schema="
++                   << id;
++        return false;
++      }
++      static_assert(
++          noexcept(std::swap(std::declval<UIStyle&>(),
++                             std::declval<UIStyle&>())),
++          "schema commit requires a no-throw UIStyle swap");
++      static_assert(
++          noexcept(std::declval<std::map<std::string, bool>&>().swap(
++              std::declval<std::map<std::string, bool>&>())),
++          "schema rollback requires a no-throw notification-map swap");
++      // Commit contains only no-throw pointer/style/scalar operations. Keep the
++      // rollback guard armed until every live session has been swapped. The
++      // notification mutex makes the context/generation visibility change
++      // atomic with removing the old binding; no engine API is called while
++      // this mutex is held.
++      bool bindings_valid = true;
++      {
++        std::lock_guard<std::mutex> lock(m_notifier_mutex);
++        for (const auto& replacement : replacements) {
++          const auto staged =
++              m_notification_targets.find(replacement.context);
++          const auto live = m_notification_targets.find(
++              replacement.session_status->engine_ctx);
++          if (staged == m_notification_targets.end() ||
++              staged->second.ipc_id != replacement.ipc_id ||
++              staged->second.generation != replacement.generation ||
++              live == m_notification_targets.end() ||
++              live->second.ipc_id != replacement.ipc_id ||
++              live->second.generation !=
++                  replacement.session_status->engine_generation) {
++            bindings_valid = false;
++            break;
++          }
++        }
++        if (bindings_valid) {
++          for (auto& replacement : replacements) {
++            FamoEngineContext* old_context =
++                replacement.session_status->engine_ctx;
++            const uint64_t old_generation =
++                replacement.session_status->engine_generation;
++            m_session_notifications.erase(
++                EngineNotificationKey(replacement.ipc_id,
++                                      old_generation));
++            m_notification_targets.erase(old_context);
++            m_unbound_notifications.erase(old_context);
++            std::swap(replacement.session_status->engine_ctx,
++                      replacement.context);
++            std::swap(replacement.session_status->engine_generation,
++                      replacement.generation);
++            std::swap(replacement.session_status->style,
++                      replacement.style);
++            replacement.session_status->__synced = false;
++          }
++        }
++      }
++      if (!bindings_valid) {
++        LOG(ERROR) << "Famo: schema notification binding changed during "
++                      "staging, schema="
++                   << id;
++        return false;
++      }
++      rollback.Disarm();
++      // replacement.context is now the old live context. Destroy only after
++      // the all-session commit is complete and rollback is disarmed.
++      for (auto& replacement : replacements) {
++        if (replacement.context)
++          (void)_DestroyEngineContext(replacement.context);
++      }
++      return true;
++    };
++
++    committed = stage_and_commit();
++  } catch (const std::exception& error) {
++    LOG(ERROR) << "Famo: schema switch rolled back after exception: "
++               << error.what();
++  } catch (...) {
++    LOG(ERROR) << "Famo: schema switch rolled back after unknown exception.";
++  }
++  if (!committed) {
++    (void)m_abi_result.Reset();
++    if (SessionStatus* active = find_session_status(m_active_session))
++      (void)_RefillAbiView(active->engine_ctx);
      return;
 -  for (auto& pair : m_session_status_map)
 -    rime_api->select_schema(to_session_id(pair.first), id.c_str());
-+  FamoUtf8String schema = FamoU8(id);
-+  struct PendingContext {
-+    WeaselSessionId ipc_id;
-+    FamoEngineContext* context;
-+    std::string schema_id;
-+  };
-+  std::vector<PendingContext> replacements;
-+  replacements.reserve(m_session_status_map.size());
-+  for (auto& pair : m_session_status_map) {
-+    FamoEngineContext* new_ctx = nullptr;
-+    const int32_t create_context_result =
-+        m_engine_host.api().create_context(&schema, &new_ctx);
-+    if (create_context_result != FAMO_ENGINE_OK || !new_ctx) {
-+      if (m_active_session)
-+        _RefillAbiView(get_session_status(m_active_session).engine_ctx);
-+      if (new_ctx)
-+        m_engine_host.api().destroy_context(new_ctx);
-+      for (auto& replacement : replacements)
-+        m_engine_host.api().destroy_context(replacement.context);
-+      LOG(ERROR) << "Famo: schema context creation failed rc="
-+                 << create_context_result << ", schema=" << id;
-+      return;
-+    }
-+    _ApplyFamoOptions(new_ctx);
-+    if (!_RefillAbiView(new_ctx)) {
-+      if (m_active_session)
-+        _RefillAbiView(get_session_status(m_active_session).engine_ctx);
-+      m_engine_host.api().destroy_context(new_ctx);
-+      for (auto& replacement : replacements)
-+        m_engine_host.api().destroy_context(replacement.context);
-+      LOG(ERROR) << "Famo: schema context status unavailable, schema=" << id;
-+      return;
-+    }
-+    std::string schema_id =
-+        m_abi_view.schema_id.data ? m_abi_view.schema_id.data : "";
-+    replacements.push_back({pair.first, new_ctx, schema_id});
-+  }
-+  for (auto& replacement : replacements) {
-+    SessionStatus& session_status =
-+        get_session_status(replacement.ipc_id);
-+    FamoEngineContext* old_ctx = session_status.engine_ctx;
-+    session_status.engine_ctx = replacement.context;
-+    _LoadSchemaSpecificSettings(replacement.ipc_id, replacement.schema_id);
-+    _UpdateInlinePreeditStatus(replacement.ipc_id);
-+    session_status.__synced = false;
-+    if (old_ctx)
-+      m_engine_host.api().destroy_context(old_ctx);
-+  }
 -  if (m_active_session)
-+  if (m_active_session) {
-+    _RefillAbiView(get_session_status(m_active_session).engine_ctx);
++  }
++  if (SessionStatus* active = find_session_status(m_active_session)) {
++    (void)_RefillAbiView(active->engine_ctx);
      _UpdateUI(m_active_session);  // 切到新方案后即时刷新候选窗/状态栏
 +  }
  }
-@@ -448,21 +532,50 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
+-
++
+ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
+@@ -454,55 +981,115 @@ BOOL RimeWithWeaselHandler::ProcessKeyEvent(KeyEvent keyEvent,
               << ", mask = " << keyEvent.mask << ", ipc_id = " << ipc_id;
    if (m_disabled)
      return FALSE;
@@ -369,30 +895,26 @@ index 67e9b6d..61e4fa7 100644
 -                                       expand_ibus_modifier(keyEvent.mask));
 -  // vim_mode when keydown only
 -  if (!handled && !(keyEvent.mask & ibus::Modifier::RELEASE_MASK)) {
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || !session_status->engine_ctx)
++    return FALSE;
 +  Bool handled = False;
-+  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
-+  if (m_abi_view_valid) {
-+    m_engine_host.FreeView(&m_abi_view);
-+    m_abi_view_valid = false;
-+  }
-+  m_abi_view = FamoCompositionView{};
-+  m_abi_view.size = (uint32_t)sizeof(FamoCompositionView);
-+  FamoKeyEvent ke{};
-+  ke.size = (uint32_t)sizeof(FamoKeyEvent);
-+  ke.virtual_key = keyEvent.keycode;
-+  ke.modifiers = expand_ibus_modifier(keyEvent.mask);
-+  ke.is_key_down = !(keyEvent.mask & ibus::Modifier::RELEASE_MASK);
-+  int32_t rc = ctx ? m_engine_host.api().process_key(ctx, &ke, &m_abi_view)
-+                   : FAMO_ENGINE_E_INVALID_ARGUMENT;
-+  m_abi_view_valid = (rc == FAMO_ENGINE_OK);
-+  // ABI-only pass-through rule: FAMO_COMPOSITION_HANDLED is independent of
-+  // preedit, commit, and candidate content.
-+  handled =
-+      (m_abi_view_valid &&
-+       (m_abi_view.state_flags & FAMO_COMPOSITION_HANDLED))
-+          ? True
-+          : False;
-+  if (!handled && !(keyEvent.mask & ibus::Modifier::RELEASE_MASK) && ctx) {
++  FamoEngineContext* ctx = session_status->engine_ctx;
++  FamoEngineActionRequestV2 action =
++      FamoEngineHost::Action(FAMO_ENGINE_ACTION_PROCESS_KEY);
++  action.key.size = (uint32_t)sizeof(FamoKeyEvent);
++  action.key.virtual_key = keyEvent.keycode;
++  action.key.modifiers = expand_ibus_modifier(keyEvent.mask);
++  action.key.is_key_down =
++      !(keyEvent.mask & ibus::Modifier::RELEASE_MASK);
++  const AbiActionOutcome action_outcome =
++      _ExecuteAbiAction(ipc_id, session_status, action, eat);
++  bool response_ok =
++      action_outcome.ready && _Respond(ipc_id, eat);
++  // v2 handled is authoritative and independent of every view content bit.
++  handled = action_outcome.handled ? True : False;
++  if (response_ok && !handled &&
++      !(keyEvent.mask & ibus::Modifier::RELEASE_MASK) && ctx) {
      bool isVimBackInCommandMode =
          (keyEvent.keycode == ibus::Keycode::Escape) ||
          ((keyEvent.mask & (1 << 2)) &&
@@ -410,133 +932,452 @@ index 67e9b6d..61e4fa7 100644
 +      std::string ascii = "ascii_mode";
 +      FamoUtf8String vim_name = FamoU8(vim);
 +      FamoUtf8String ascii_name = FamoU8(ascii);
-+      if (m_engine_host.api().get_option(ctx, &vim_name, &vim_mode) ==
++      if (m_engine_host.GetOption(ctx, &vim_name, &vim_mode) ==
 +              FAMO_ENGINE_OK &&
-+          m_engine_host.api().get_option(ctx, &ascii_name, &ascii_mode) ==
++          m_engine_host.GetOption(ctx, &ascii_name, &ascii_mode) ==
 +              FAMO_ENGINE_OK &&
 +          vim_mode && !ascii_mode) {
-+        m_engine_host.api().set_option(ctx, &ascii_name, 1);
++        if (m_engine_host.SetOption(ctx, &ascii_name, 1) ==
++                FAMO_ENGINE_OK &&
++            _RefillAbiView(ctx)) {
++          response_ok = _Respond(ipc_id, eat);
++        }
 +      }
      }
    }
-   _Respond(ipc_id, eat);
-@@ -475,7 +588,10 @@ void RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id) {
+-  _Respond(ipc_id, eat);
+   _UpdateUI(ipc_id);
+   m_active_session = ipc_id;
+   return (BOOL)handled;
+ }
+-
++
+-void RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id) {
++bool RimeWithWeaselHandler::CommitComposition(WeaselSessionId ipc_id,
++                                              EatLine eat) {
    DLOG(INFO) << "Commit composition: ipc_id = " << ipc_id;
    if (m_disabled)
-     return;
+-    return;
 -  rime_api->commit_composition(to_session_id(ipc_id));
-+  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
-+  if (ctx)
-+    m_engine_host.api().commit_composition(ctx);
-+  _RefillAbiView(ctx);
++    return false;
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || !session_status->engine_ctx)
++    return false;
++  const AbiActionOutcome action_outcome = _ExecuteAbiAction(
++      ipc_id, session_status,
++      FamoEngineHost::Action(FAMO_ENGINE_ACTION_COMMIT_COMPOSITION), eat);
++  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
    _UpdateUI(ipc_id);
    m_active_session = ipc_id;
++  return responded;
  }
-@@ -484,7 +600,10 @@ void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
+-
++
+-void RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id) {
++bool RimeWithWeaselHandler::ClearComposition(WeaselSessionId ipc_id,
++                                             EatLine eat) {
    DLOG(INFO) << "Clear composition: ipc_id = " << ipc_id;
    if (m_disabled)
-     return;
+-    return;
 -  rime_api->clear_composition(to_session_id(ipc_id));
-+  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
-+  if (ctx)
-+    m_engine_host.api().clear_composition(ctx);
-+  _RefillAbiView(ctx);
++    return false;
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || !session_status->engine_ctx)
++    return false;
++  // librime clear_composition is void. A valid context therefore reports the
++  // command accepted; handled=true is the deliberate v2 semantic.
++  const AbiActionOutcome action_outcome = _ExecuteAbiAction(
++      ipc_id, session_status,
++      FamoEngineHost::Action(FAMO_ENGINE_ACTION_CLEAR_COMPOSITION), eat);
++  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
    _UpdateUI(ipc_id);
    m_active_session = ipc_id;
++  return responded;
  }
-@@ -496,7 +615,18 @@ void RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
+-
++
+-void RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
++bool RimeWithWeaselHandler::SelectCandidateOnCurrentPage(
+     size_t index,
+-    WeaselSessionId ipc_id) {
++    WeaselSessionId ipc_id,
++    EatLine eat) {
+   DLOG(INFO) << "select candidate on current page, ipc_id = " << ipc_id
               << ", index = " << index;
    if (m_disabled)
-     return;
+-    return;
 -  rime_api->select_candidate_on_current_page(to_session_id(ipc_id), index);
-+  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
-+  if (m_abi_view_valid) {
-+    m_engine_host.FreeView(&m_abi_view);
-+    m_abi_view_valid = false;
-+  }
-+  m_abi_view = FamoCompositionView{};
-+  m_abi_view.size = (uint32_t)sizeof(FamoCompositionView);
-+  if (ctx) {
-+    int32_t rc = m_engine_host.api().select_candidate(ctx, (uint32_t)index,
-+                                                      &m_abi_view);
-+    m_abi_view_valid = (rc == FAMO_ENGINE_OK);
-+  }
++    return false;
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || !session_status->engine_ctx)
++    return false;
++  if (index > UINT32_MAX)
++    return false;
++  FamoEngineActionRequestV2 action =
++      FamoEngineHost::Action(FAMO_ENGINE_ACTION_SELECT_CANDIDATE);
++  action.index = static_cast<uint32_t>(index);
++  const AbiActionOutcome action_outcome =
++      _ExecuteAbiAction(ipc_id, session_status, action, eat);
++  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
++  _UpdateUI(ipc_id);
++  m_active_session = ipc_id;
++  return responded;
  }
-
+-
++
  bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
-@@ -505,8 +635,10 @@ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
+@@ -511,11 +1098,21 @@ bool RimeWithWeaselHandler::HighlightCandidateOnCurrentPage(
      EatLine eat) {
    DLOG(INFO) << "highlight candidate on current page, ipc_id = " << ipc_id
               << ", index = " << index;
 -  bool res = rime_api->highlight_candidate_on_current_page(
 -      to_session_id(ipc_id), index);
-+  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
-+  bool res = ctx && (m_engine_host.api().highlight_candidate(
-+                         ctx, (uint32_t)index) == FAMO_ENGINE_OK);
-+  _RefillAbiView(ctx);
-   _Respond(ipc_id, eat);
+-  _Respond(ipc_id, eat);
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || !session_status->engine_ctx)
++    return false;
++  if (index > UINT32_MAX)
++    return false;
++  FamoEngineActionRequestV2 action =
++      FamoEngineHost::Action(FAMO_ENGINE_ACTION_HIGHLIGHT_CANDIDATE);
++  action.index = static_cast<uint32_t>(index);
++  const AbiActionOutcome action_outcome =
++      _ExecuteAbiAction(ipc_id, session_status, action, eat);
++  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
    _UpdateUI(ipc_id);
-   return res;
-@@ -517,7 +649,10 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
+-  return res;
++  // IPC callers need to know whether a fresh response body was written.
++  // `handled` is an engine semantic and must not be conflated with readiness.
++  return responded;
+ }
+-
++
+ bool RimeWithWeaselHandler::ChangePage(bool backward,
+@@ -523,16 +1120,23 @@ bool RimeWithWeaselHandler::ChangePage(bool backward,
                                         EatLine eat) {
    DLOG(INFO) << "change page, ipc_id = " << ipc_id
               << (backward ? "backward" : "foreward");
 -  bool res = rime_api->change_page(to_session_id(ipc_id), backward);
-+  FamoEngineContext* ctx = get_session_status(ipc_id).engine_ctx;
-+  bool res = ctx && (m_engine_host.api().change_page(ctx, backward ? 1 : 0) ==
-+                     FAMO_ENGINE_OK);
-+  _RefillAbiView(ctx);
-   _Respond(ipc_id, eat);
+-  _Respond(ipc_id, eat);
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || !session_status->engine_ctx)
++    return false;
++  FamoEngineActionRequestV2 action =
++      FamoEngineHost::Action(FAMO_ENGINE_ACTION_CHANGE_PAGE);
++  action.value = backward ? 1 : 0;
++  const AbiActionOutcome action_outcome =
++      _ExecuteAbiAction(ipc_id, session_status, action, eat);
++  const bool responded = action_outcome.ready && _Respond(ipc_id, eat);
    _UpdateUI(ipc_id);
-   return res;
-@@ -568,6 +703,7 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
-                                      uintptr_t session_id,
-                                      const char* message_type,
-                                      const char* message_value) {
-+  (void)session_id;
-   // may be running in a thread when deploying rime
-   RimeWithWeaselHandler* self =
-       reinterpret_cast<RimeWithWeaselHandler*>(context_object);
-@@ -576,16 +712,11 @@ void RimeWithWeaselHandler::OnNotify(void* context_object,
-   std::lock_guard<std::mutex> lock(m_notifier_mutex);
-   m_message_type = message_type;
-   m_message_value = message_value;
+-  return res;
++  return responded;
+ }
+-
++
+ void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
+   DLOG(INFO) << "Focus in: ipc_id = " << ipc_id
+              << ", client_caps = " << client_caps;
+-  if (m_disabled)
++  if (m_disabled || !find_session_status(ipc_id))
+     return;
+   _UpdateUI(ipc_id);
+   m_active_session = ipc_id;
+@@ -543,5 +1147,7 @@ void RimeWithWeaselHandler::FocusIn(DWORD client_caps, WeaselSessionId ipc_id) {
+ void RimeWithWeaselHandler::FocusOut(DWORD param, WeaselSessionId ipc_id) {
+   DLOG(INFO) << "Focus out: ipc_id = " << ipc_id;
++  if (!find_session_status(ipc_id))
++    return;
+   if (m_ui)
+     m_ui->Hide();
+   m_active_session = 0;
+@@ -554,6 +1160,8 @@ void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
+   DLOG(INFO) << "Update input position: (" << rc.left << ", " << rc.top
+              << "), ipc_id = " << ipc_id
+              << ", m_active_session = " << m_active_session;
++  if (!find_session_status(ipc_id))
++    return;
+   if (m_ui)
+     m_ui->UpdateInputPosition(rc);
+   if (m_disabled)
+@@ -564,38 +1172,200 @@ void RimeWithWeaselHandler::UpdateInputPosition(RECT const& rc,
+   }
+ }
+-
++
+-std::string RimeWithWeaselHandler::m_message_type;
+-std::string RimeWithWeaselHandler::m_message_value;
+-std::string RimeWithWeaselHandler::m_message_label;
+-std::string RimeWithWeaselHandler::m_option_name;
+-std::mutex RimeWithWeaselHandler::m_notifier_mutex;
++bool RimeWithWeaselHandler::_BindNotificationContext(
++    FamoEngineContext* engine_ctx,
++    WeaselSessionId ipc_id,
++    uint64_t* out_generation) noexcept {
++  if (out_generation)
++    *out_generation = 0;
++  if (!engine_ctx || !ipc_id || !out_generation)
++    return false;
++  try {
++    std::lock_guard<std::mutex> lock(m_notifier_mutex);
++    if (m_notification_targets.find(engine_ctx) !=
++        m_notification_targets.end())
++      return false;
++    const uint64_t generation = m_next_notification_generation;
++    if (!generation || generation == UINT64_MAX)
++      return false;
++    const EngineNotificationKey key(ipc_id, generation);
++    const auto target =
++        m_notification_targets.emplace(
++            engine_ctx, EngineNotificationTarget{ipc_id, generation});
++    if (!target.second)
++      return false;
++    try {
++      const auto queue = m_session_notifications.try_emplace(key);
++      if (!queue.second) {
++        m_notification_targets.erase(target.first);
++        return false;
++      }
++      const auto unbound = m_unbound_notifications.find(engine_ctx);
++      if (unbound != m_unbound_notifications.end()) {
++        queue.first->second.swap(unbound->second);
++        m_unbound_notifications.erase(unbound);
++      }
++    } catch (...) {
++      m_notification_targets.erase(target.first);
++      throw;
++    }
++    ++m_next_notification_generation;
++    *out_generation = generation;
++    return true;
++  } catch (...) {
++    return false;
++  }
++}
++
++void RimeWithWeaselHandler::_ForgetNotificationContext(
++    FamoEngineContext* engine_ctx) noexcept {
++  if (!engine_ctx)
++    return;
++  try {
++    std::lock_guard<std::mutex> lock(m_notifier_mutex);
++    const auto target = m_notification_targets.find(engine_ctx);
++    if (target != m_notification_targets.end()) {
++      m_session_notifications.erase(
++          EngineNotificationKey(target->second.ipc_id,
++                                target->second.generation));
++      m_notification_targets.erase(target);
++    }
++    m_unbound_notifications.erase(engine_ctx);
++  } catch (...) {
++  }
++}
++
++void RimeWithWeaselHandler::_ClearNotifications() noexcept {
++  try {
++    std::lock_guard<std::mutex> lock(m_notifier_mutex);
++    m_notification_targets.clear();
++    m_unbound_notifications.clear();
++    m_session_notifications.clear();
++    m_global_notifications.clear();
++    m_next_notification_generation = 1;
++  } catch (...) {
++  }
++}
++
++bool RimeWithWeaselHandler::_TakeNotification(
++    FamoEngineContext* engine_ctx,
++    uint64_t engine_generation,
++    PendingEngineNotification* out) noexcept {
++  if (!out)
++    return false;
++  try {
++    std::lock_guard<std::mutex> lock(m_notifier_mutex);
++    if (engine_ctx && engine_generation) {
++      const auto target = m_notification_targets.find(engine_ctx);
++      if (target != m_notification_targets.end() &&
++          target->second.generation == engine_generation) {
++        const EngineNotificationKey key(target->second.ipc_id,
++                                        target->second.generation);
++        const auto queue = m_session_notifications.find(key);
++        if (queue != m_session_notifications.end() &&
++            !queue->second.empty()) {
++          *out = std::move(queue->second.front());
++          queue->second.pop_front();
++          return true;
++        }
++      }
++    }
++    if (!m_global_notifications.empty()) {
++      *out = std::move(m_global_notifications.front());
++      m_global_notifications.pop_front();
++      return true;
++    }
++  } catch (...) {
++  }
++  return false;
++}
+-
++
+-void RimeWithWeaselHandler::OnNotify(void* context_object,
+-                                     uintptr_t session_id,
+-                                     const char* message_type,
+-                                     const char* message_value) {
+-  // may be running in a thread when deploying rime
+-  RimeWithWeaselHandler* self =
+-      reinterpret_cast<RimeWithWeaselHandler*>(context_object);
+-  if (!self || !message_type || !message_value)
++int32_t RimeWithWeaselHandler::_DestroyEngineContext(
++    FamoEngineContext* engine_ctx) noexcept {
++  if (!engine_ctx)
++    return FAMO_ENGINE_E_INVALID_ARGUMENT;
++  int32_t result = FAMO_ENGINE_E_RUNTIME;
++  try {
++    // Never hold m_notifier_mutex while entering the engine: DestroyContext
++    // may wait for an OnNotify callback that is currently taking that mutex.
++    result = m_engine_host.DestroyContext(engine_ctx);
++  } catch (...) {
++  }
++  _ForgetNotificationContext(engine_ctx);
++  return result;
++}
++
++void FAMO_ENGINE_CALL RimeWithWeaselHandler::OnNotify(
++    void* context_object,
++    FamoEngineContext* context,
++    const FamoUtf8String* message_type,
++    const FamoUtf8String* message_value,
++    const FamoUtf8String* state_label) noexcept {
++  // May run on a librime worker. The v2 host has already validated the borrowed
++  // spans; copy them while the callback owns their lifetime. This path never
++  // reads the live session container and never calls an engine API.
++  if (!context_object || !message_type || !message_value || !state_label)
+     return;
+-  std::lock_guard<std::mutex> lock(m_notifier_mutex);
+-  m_message_type = message_type;
+-  m_message_value = message_value;
 -  if (RIME_API_AVAILABLE(rime_api, get_state_label) &&
 -      !strcmp(message_type, "option")) {
-+  if (!strcmp(message_type, "option")) {
-     Bool state = message_value[0] != '!';
-     const char* option_name = message_value + !state;
-     m_option_name = option_name;
+-    Bool state = message_value[0] != '!';
+-    const char* option_name = message_value + !state;
+-    m_option_name = option_name;
 -    const char* state_label =
 -        rime_api->get_state_label(session_id, option_name, state);
 -    if (state_label) {
 -      m_message_label = std::string(state_label);
--    }
-+    m_message_label = option_name;
++  try {
++    auto* handler =
++        static_cast<RimeWithWeaselHandler*>(context_object);
++    const std::string type = FamoString(*message_type);
++    const std::string value = FamoString(*message_value);
++    const std::string label = FamoString(*state_label);
++    PendingEngineNotification notification;
++    notification.message_type = type;
++    notification.message_value = value;
++    if (type == "option") {
++      const Bool state = value.empty() || value[0] != '!';
++      notification.option_name = value.substr(state ? 0 : 1);
++      notification.message_label =
++          label.empty() ? notification.option_name : label;
+     }
++    std::lock_guard<std::mutex> lock(handler->m_notifier_mutex);
++    constexpr size_t kMaxPendingNotifications = 32;
++    const auto enqueue =
++        [kMaxPendingNotifications](
++            std::deque<PendingEngineNotification>& queue,
++            PendingEngineNotification&& value) {
++      if (queue.size() >= kMaxPendingNotifications)
++        queue.pop_front();
++      queue.push_back(std::move(value));
++    };
++    if (!context) {
++      if (type == "deploy")
++        enqueue(handler->m_global_notifications,
++                std::move(notification));
++      return;
++    }
++    const auto target =
++        handler->m_notification_targets.find(context);
++    if (target != handler->m_notification_targets.end()) {
++      const EngineNotificationKey key(target->second.ipc_id,
++                                      target->second.generation);
++      const auto queue = handler->m_session_notifications.find(key);
++      if (queue != handler->m_session_notifications.end())
++        enqueue(queue->second, std::move(notification));
++      return;
++    }
++    // CreateContext may notify synchronously before returning its opaque
++    // pointer to the host. Keep a small context-keyed queue and atomically move
++    // it when AddSession/SelectSchema binds the returned context.
++    constexpr size_t kMaxUnboundContexts = 64;
++    auto unbound = handler->m_unbound_notifications.find(context);
++    if (unbound == handler->m_unbound_notifications.end()) {
++      if (handler->m_unbound_notifications.size() >=
++          kMaxUnboundContexts)
++        return;
++      unbound =
++          handler->m_unbound_notifications.try_emplace(context).first;
++    }
++    enqueue(unbound->second, std::move(notification));
++  } catch (...) {
++    // The notification ABI and librime worker callback are both no-unwind.
    }
  }
-
-@@ -610,50 +741,48 @@ void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
+-
++
+-void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
++bool RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
+                                             LPWSTR buffer) {
+   std::string app_name;
+   // parse request text
+@@ -615,55 +1385,84 @@ void RimeWithWeaselHandler::_ReadClientInfo(WeaselSessionId ipc_id,
+       app_name = wtou8(lwr.substr(kClientAppKey.length()));
      }
    }
-   SessionStatus& session_status = get_session_status(ipc_id);
+-  SessionStatus& session_status = get_session_status(ipc_id);
 -  RimeSessionId session_id = session_status.session_id;
-+  FamoEngineContext* ctx = session_status.engine_ctx;
-+  if (!ctx)
-+    return;
-   // set app specific options
-   if (!app_name.empty()) {
+-  // set app specific options
+-  if (!app_name.empty()) {
 -    rime_api->set_property(session_id, "client_app", app_name.c_str());
 -
-     auto it = m_app_options.find(app_name);
-     if (it != m_app_options.end()) {
-       AppOptions& options(m_app_options[it->first]);
-       for (const auto& pair : options) {
-         DLOG(INFO) << "set app option: " << pair.first << " = " << pair.second;
+-    auto it = m_app_options.find(app_name);
+-    if (it != m_app_options.end()) {
+-      AppOptions& options(m_app_options[it->first]);
+-      for (const auto& pair : options) {
+-        DLOG(INFO) << "set app option: " << pair.first << " = " << pair.second;
 -        rime_api->set_option(session_id, pair.first.c_str(), Bool(pair.second));
-+        FamoUtf8String name = FamoU8(pair.first);
-+        m_engine_host.api().set_option(ctx, &name, Bool(pair.second));
-       }
+-      }
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status)
++    return false;
++  session_status->client_app = app_name;
++  FamoEngineContext* ctx = session_status->engine_ctx;
++  if (!ctx)
++    return false;
++  const std::string property_name = "client_app";
++  const FamoUtf8String name = FamoU8(property_name);
++  const FamoUtf8String value = FamoU8(app_name);
++  if (m_engine_host.SetProperty(ctx, &name, &value) != FAMO_ENGINE_OK)
++    return false;
++  return _ApplyAppOptions(ctx, app_name);
++}
++
++bool RimeWithWeaselHandler::_ApplyAppOptions(
++    FamoEngineContext* ctx,
++    const std::string& app_name) {
++  if (!ctx)
++    return false;
++  if (app_name.empty())
++    return true;
++  auto app = m_app_options.find(app_name);
++  if (app == m_app_options.end())
++    return true;
++  for (const auto& option : app->second) {
++    DLOG(INFO) << "set app option: " << option.first << " = "
++               << option.second;
++    FamoUtf8String name = FamoU8(option.first);
++    if (m_engine_host.SetOption(ctx, &name, Bool(option.second)) !=
++        FAMO_ENGINE_OK) {
++      return false;
      }
    }
 -  // inline preedit
@@ -544,9 +1385,8 @@ index 67e9b6d..61e4fa7 100644
 -  rime_api->set_option(session_id, "inline_preedit", Bool(inline_preedit));
 -  // show soft cursor on weasel panel but not inline
 -  rime_api->set_option(session_id, "soft_cursor", Bool(!inline_preedit));
-+  _UpdateInlinePreeditStatus(ipc_id);
- }
-
+-}
+-
 -void RimeWithWeaselHandler::_GetCandidateInfo(CandidateInfo& cinfo,
 -                                              RimeContext& ctx) {
 -  cinfo.candies.resize(ctx.menu.num_candidates);
@@ -564,24 +1404,41 @@ index 67e9b6d..61e4fa7 100644
 -      cinfo.labels[i].str =
 -          escape_string(std::wstring(1, ctx.menu.select_keys[i]));
 -    } else {
++  return true;
++}
 +
-+// 法墨引擎 ABI（joint seam）：从 FamoCompositionView 建 CandidateInfo。
-+// labels 取 v1.2 view.candidates[i].label（引擎侧已 select_labels→select_keys→(i+1)%10）；
-+// is_last_page 取 v1.2 view.is_last_page（消歧满页末页）。_Respond 据此序列化 → IPC 字节 parity。
++void RimeWithWeaselHandler::_ApplyAppInlinePreeditSetting(
++    WeaselSessionId ipc_id) {
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status || session_status->client_app.empty())
++    return;
++  auto app = m_app_options.find(session_status->client_app);
++  if (app == m_app_options.end())
++    return;
++  auto inline_preedit = app->second.find("inline_preedit");
++  if (inline_preedit != app->second.end())
++    session_status->style.inline_preedit = inline_preedit->second;
++}
++
++
++// 法墨引擎 ABI v2：候选按协商的 byte stride 取项，绝不使用 MSVC sizeof。
 +void RimeWithWeaselHandler::_GetCandidateInfoFromView(
 +    CandidateInfo& cinfo,
-+    const FamoCompositionView& view) {
++    const FamoCompositionViewV2& view) {
 +  const uint32_t n = view.candidate_count;
 +  cinfo.candies.resize(n);
 +  cinfo.comments.resize(n);
 +  cinfo.labels.resize(n);
++  const auto* candidate_bytes =
++      reinterpret_cast<const unsigned char*>(view.candidates);
 +  for (uint32_t i = 0; i < n; ++i) {
-+    const FamoCandidate& c = view.candidates[i];
-+    cinfo.candies[i].str = escape_string(u8tow(c.text.data ? c.text.data : ""));
-+    if (c.comment.data && c.comment.length_bytes)
-+      cinfo.comments[i].str = escape_string(u8tow(c.comment.data));
-+    if (c.label.data && c.label.length_bytes)
-+      cinfo.labels[i].str = escape_string(u8tow(c.label.data));
++    const auto& c = *reinterpret_cast<const FamoCandidateV2*>(
++        candidate_bytes + static_cast<size_t>(i) * view.candidate_stride);
++    cinfo.candies[i].str = escape_string(FamoWide(c.text));
++    if (c.comment.length_bytes)
++      cinfo.comments[i].str = escape_string(FamoWide(c.comment));
++    if (c.label.length_bytes)
++      cinfo.labels[i].str = escape_string(FamoWide(c.label));
 +    else
        cinfo.labels[i].str = std::to_wstring((i + 1) % 10);
 -    }
@@ -593,17 +1450,35 @@ index 67e9b6d..61e4fa7 100644
 +  cinfo.currentPage = view.page_index;
 +  cinfo.is_last_page = view.is_last_page;
  }
-
+-
++
  void RimeWithWeaselHandler::StartMaintenance() {
-@@ -674,15 +803,21 @@ void RimeWithWeaselHandler::SetOption(WeaselSessionId ipc_id,
+-  m_session_status_map.clear();
+   Finalize();
+   _UpdateUI(0);
+ }
+@@ -673,21 +1472,31 @@ void RimeWithWeaselHandler::EndMaintenance() {
+     Initialize();
+     _UpdateUI(0);
+   }
+-  m_session_status_map.clear();
+ }
+-
++
+ void RimeWithWeaselHandler::SetOption(WeaselSessionId ipc_id,
                                        const std::string& opt,
                                        bool val) {
    // from no-session client, not actual typing session
 +  FamoUtf8String name = FamoU8(opt);
 +  auto set_opt = [&](WeaselSessionId id) {
-+    FamoEngineContext* ctx = get_session_status(id).engine_ctx;
-+    if (ctx)
-+      m_engine_host.api().set_option(ctx, &name, val ? 1 : 0);
++    if (SessionStatus* session_status = find_session_status(id)) {
++      if (session_status->engine_ctx &&
++          session_status->pending_recovery_action == 0 &&
++          !session_status->pending_response_result) {
++        m_engine_host.SetOption(session_status->engine_ctx, &name,
++                                val ? 1 : 0);
++      }
++    }
 +  };
    if (!ipc_id) {
      if (m_global_ascii_mode && opt == "ascii_mode") {
@@ -619,16 +1494,36 @@ index 67e9b6d..61e4fa7 100644
 +    set_opt(ipc_id);
    }
  }
-
-@@ -707,25 +842,23 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
+@@ -709,53 +1518,95 @@ void RimeWithWeaselHandler::_UpdateUI(WeaselSessionId ipc_id) {
+   // if m_ui nullptr, _UpdateUI meaningless
+   if (!m_ui)
+     return;
++  SessionStatus* requested_session = nullptr;
++  if (ipc_id != 0) {
++    requested_session = find_session_status(ipc_id);
++    if (!requested_session)
++      return;
++    if (requested_session->pending_recovery_action != 0 ||
++        requested_session->pending_response_result) {
++      // A receipt/final response is still pending. Preserve the last rendered
++      // UI and leave exact context/generation notifications queued until the
++      // engine-owned snapshot has been delivered.
++      _RefreshTrayIcon(_UpdateUICallback);
++      return;
++    }
++  }
+-
++
    Status& weasel_status = m_ui->status();
    Context weasel_context;
-
+-
++
 -  RimeSessionId session_id = to_session_id(ipc_id);
 -
    if (ipc_id == 0)
      weasel_status.disabled = m_disabled;
-
+-
++
 -  _GetStatus(weasel_status, ipc_id, weasel_context);
 -
 -  SessionStatus& session_status = get_session_status(ipc_id);
@@ -637,27 +1532,100 @@ index 67e9b6d..61e4fa7 100644
 -  else
 -    session_status.style.client_caps &= ~INLINE_PREEDIT_CAPABLE;
 +  if (ipc_id != 0) {
-+    SessionStatus& session_status = get_session_status(ipc_id);
++    SessionStatus& session_status = *requested_session;
 +    if (_RefillAbiView(session_status.engine_ctx)) {
-+      _GetStatusFromView(weasel_status, ipc_id, weasel_context, m_abi_view);
-+      _GetContextFromView(weasel_context, m_abi_view);
++      std::string schema_id = FamoString(m_abi_result->view.schema_id);
++      const bool schema_changed = schema_id != m_last_schema_id;
++      bool show_schema_notification = false;
++      if (schema_changed) {
++        session_status.__synced = false;
++        m_last_schema_id = schema_id;
++        if (schema_id != ".default") {
++          _LoadSchemaSpecificSettings(ipc_id, schema_id);
++          _ApplyAppInlinePreeditSetting(ipc_id);
++          _UpdateInlinePreeditStatus(ipc_id);
++          m_ui->style() = session_status.style;
++          show_schema_notification =
++              m_show_notifications.find("schema") !=
++                  m_show_notifications.end() &&
++              m_show_notifications_time > 0;
++          // Inline/schema options can affect STATUS.  Replace the preliminary
++          // schema-detection snapshot before any UI or IPC consumer sees it.
++          (void)_RefillAbiView(session_status.engine_ctx);
++        }
++      }
++      if (m_abi_result) {
++        const FamoCompositionViewV2& view = m_abi_result->view;
++        _GetStatusFromView(weasel_status, ipc_id, weasel_context, view);
++        _GetContextFromView(weasel_context, view);
++        if (show_schema_notification) {
++          weasel_context.aux.str = weasel_status.schema_name;
++          m_ui->Update(weasel_context, weasel_status);
++          m_ui->ShowWithTimeout(m_show_notifications_time);
++        }
++      }
 +    }
 +  }
-
-   if (!_ShowMessage(weasel_context, weasel_status)) {
+-
++
+-  if (!_ShowMessage(weasel_context, weasel_status)) {
++  if (!_ShowMessage(
++          weasel_context, weasel_status,
++          requested_session ? requested_session->engine_ctx : nullptr,
++          requested_session ? requested_session->engine_generation : 0)) {
      m_ui->Hide();
      m_ui->Update(weasel_context, weasel_status);
    }
-
+-
++
 -  _RefreshTrayIcon(session_id, _UpdateUICallback);
+-
+-  {
+-    std::lock_guard<std::mutex> lock(m_notifier_mutex);
+-    m_message_type.clear();
+-    m_message_value.clear();
+-    m_message_label.clear();
+-    m_option_name.clear();
+-  }
 +  _RefreshTrayIcon(_UpdateUICallback);
-
-   {
-     std::lock_guard<std::mutex> lock(m_notifier_mutex);
-@@ -801,55 +934,6 @@ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
-   rime_api->config_close(&config);
  }
-
+-
++
+ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
+     WeaselSessionId ipc_id,
+     const std::string& schema_id) {
+-  if (!m_ui)
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!m_ui || !session_status)
+     return;
+   RimeConfig config;
+   if (!rime_api->schema_open(schema_id.c_str(), &config))
+     return;
++  struct ConfigCloseGuard {
++    RimeConfig* config;
++    ~ConfigCloseGuard() noexcept {
++      if (config)
++        rime_api->config_close(config);
++    }
++  } close_config{&config};
+   _UpdateShowNotifications(&config);
+   m_ui->style() = m_base_style;
+   _UpdateUIStyle(&config, m_ui, false);
+-  SessionStatus& session_status = get_session_status(ipc_id);
+-  session_status.style = m_ui->style();
+-  UIStyle& style = session_status.style;
++  session_status->style = m_ui->style();
++  UIStyle& style = session_status->style;
+   // load schema color style config
+   const int BUF_SIZE = 255;
+   char buffer[BUF_SIZE + 1] = {0};
+@@ -804,78 +1655,34 @@ void RimeWithWeaselHandler::_LoadSchemaSpecificSettings(
+     style.current_half_icon = load_icon(config, "schema/half_icon", NULL);
+   }
+   // load schema icon end
+-  rime_api->config_close(&config);
+-}
+-
 -void RimeWithWeaselHandler::_LoadAppInlinePreeditSet(WeaselSessionId ipc_id,
 -                                                     bool ignore_app_name) {
 -  SessionStatus& session_status = get_session_status(ipc_id);
@@ -706,87 +1674,215 @@ index 67e9b6d..61e4fa7 100644
 -  }
 -  if (session_status.style.inline_preedit != inline_preedit)
 -    _UpdateInlinePreeditStatus(ipc_id);
--}
-
- bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
-   std::lock_guard<std::mutex> lock(m_notifier_mutex);
-@@ -926,155 +1010,98 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+ }
+-
++
+-bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
+-  std::lock_guard<std::mutex> lock(m_notifier_mutex);
+-  if (m_message_type.empty() || m_message_value.empty())
++
++bool RimeWithWeaselHandler::_ShowMessage(
++    Context& ctx,
++    Status& status,
++    FamoEngineContext* engine_ctx,
++    uint64_t engine_generation) {
++  PendingEngineNotification notification;
++  if (!_TakeNotification(engine_ctx, engine_generation, &notification) ||
++      notification.message_type.empty() ||
++      notification.message_value.empty())
+     return m_ui->IsCountingDown();
+   // show as auxiliary string
+   std::wstring& tips(ctx.aux.str);
+   bool show_icon = false;
+-  if (m_message_type == "deploy") {
+-    if (m_message_value == "start")
++  if (notification.message_type == "deploy") {
++    if (notification.message_value == "start")
+       if (GetThreadUILanguage() == MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US))
+         tips = L"Deploying RIME";
+       else
+         tips = L"正在部署 RIME";
+-    else if (m_message_value == "success")
++    else if (notification.message_value == "success")
+       if (GetThreadUILanguage() == MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US))
+         tips = L"Deployed";
+       else
+         tips = L"部署完成";
+-    else if (m_message_value == "failure") {
++    else if (notification.message_value == "failure") {
+       if (GetThreadUILanguage() ==
+           MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_TRADITIONAL))
+         tips = L"有錯誤，請查看日誌 %TEMP%\\rime.weasel\\rime.weasel.*.INFO";
+@@ -887,28 +1694,29 @@ bool RimeWithWeaselHandler::_ShowMessage(Context& ctx, Status& status) {
+             L"There is an error, please check the logs "
+             L"%TEMP%\\rime.weasel\\rime.weasel.*.INFO";
+     }
+-  } else if (m_message_type == "schema") {
++  } else if (notification.message_type == "schema") {
+     tips = /*L"【" + */ status.schema_name /* + L"】"*/;
+-  } else if (m_message_type == "option") {
++  } else if (notification.message_type == "option") {
+     status.type = SCHEMA;
+-    if (m_message_value == "!ascii_mode") {
++    if (notification.message_value == "!ascii_mode") {
+       show_icon = true;
+-    } else if (m_message_value == "ascii_mode") {
++    } else if (notification.message_value == "ascii_mode") {
+       show_icon = true;
+     } else
+-      tips = u8tow(m_message_label);
++      tips = u8tow(notification.message_label);
+-
++
+-    if (m_message_value == "full_shape" || m_message_value == "!full_shape")
++    if (notification.message_value == "full_shape" ||
++        notification.message_value == "!full_shape")
+       status.type = FULL_SHAPE;
+   }
+   auto counter = m_ui->IsCountingDown();
+   if (!show_icon && counter)
+     return counter;
+-  auto foption = m_show_notifications.find(m_option_name);
++  auto foption = m_show_notifications.find(notification.option_name);
+   auto falways = m_show_notifications.find("always");
+   if ((!add_session && (foption != m_show_notifications.end() ||
+                         falways != m_show_notifications.end())) ||
+-      m_message_type == "deploy") {
++      notification.message_type == "deploy") {
+     m_ui->Update(ctx, status);
+     if (m_show_notifications_time)
+       m_ui->ShowWithTimeout(m_show_notifications_time);
+@@ -925,162 +1733,198 @@ inline std::string _GetLabelText(const std::vector<Text>& labels,
+   return wtou8(std::wstring(buffer));
+ }
+-
++
+-bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
++static bool _FailResponseFormattingOnceForTesting() noexcept {
++  wchar_t value[2] = {};
++  if (GetEnvironmentVariableW(
++          L"FAMO_TEST_WEASEL_FORMAT_FAILURE", value, 2) != 1 ||
++      value[0] != L'1') {
++    return false;
++  }
++  // The server serializes engine access, so consuming this process-local test
++  // seam needs no allocating synchronization primitive.
++  (void)SetEnvironmentVariableW(
++      L"FAMO_TEST_WEASEL_FORMAT_FAILURE", L"0");
++  return true;
++}
++
++bool RimeWithWeaselHandler::_DeliverPendingResponse(
++    WeaselSessionId ipc_id,
++    SessionStatus* requested_session,
++    EatLine eat) noexcept {
++  if (!eat || !requested_session ||
++      !requested_session->pending_response_result) {
++    return false;
++  }
++  try {
++  const FamoCompositionViewV2& view =
++      requested_session->pending_response_result->view;
++  constexpr uint32_t kMaxPendingCommitBytes = 1024u * 1024u;
++  if (view.commit.length_bytes > kMaxPendingCommitBytes) {
++    return false;
++  }
++  if (_FailResponseFormattingOnceForTesting()) {
++    throw std::bad_alloc();
++  }
+   std::wstring body;
+   body.reserve(4096);
+   std::vector<const char*> actions;
    actions.reserve(8);
-
-   SessionStatus& session_status = get_session_status(ipc_id);
+-
++
+-  SessionStatus& session_status = get_session_status(ipc_id);
 -  RimeSessionId session_id = session_status.session_id;
 -  RIME_STRUCT(RimeCommit, commit);
 -  if (rime_api->get_commit(session_id, &commit)) {
++  SessionStatus& session_status = *requested_session;
++  const std::string commit_utf8 =
++      (view.state_flags & FAMO_COMPOSITION_HAS_COMMIT)
++          ? FamoString(view.commit)
++          : std::string();
 +  static const std::wstring Bool_wstring[] = {L"0", L"1"};
 +  bool is_composing = false;
 +
-+  if (m_abi_view_valid &&
-+      (m_abi_view.state_flags & FAMO_COMPOSITION_HAS_COMMIT) &&
-+      m_abi_view.commit.data && m_abi_view.commit.length_bytes) {
++  if (!commit_utf8.empty()) {
      actions.push_back("commit");
 -    std::wstring commit_text_w = escape_string(u8tow(commit.text));
 -    body.append(L"commit=").append(commit_text_w).append(L"\n");
 -    rime_api->free_commit(&commit);
 +    body.append(L"commit=")
-+        .append(escape_string(u8tow(m_abi_view.commit.data)))
++        .append(escape_string(u8tow(commit_utf8)))
 +        .append(L"\n");
    }
-
+-
++
 -  bool is_composing = false;
 -  RIME_STRUCT(RimeStatus, status);
 -  static const std::wstring Bool_wstring[] = {L"0", L"1"};
 -  if (rime_api->get_status(session_id, &status)) {
 -    is_composing = !!status.is_composing;
-+  if (m_abi_view_valid) {
-+    is_composing = !!(m_abi_view.status_flags & FAMO_STATUS_COMPOSING);
-     actions.push_back("status");
-     body.append(L"status.ascii_mode=")
+-    actions.push_back("status");
+-    body.append(L"status.ascii_mode=")
 -        .append(Bool_wstring[!!status.is_ascii_mode])
-+        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_ASCII_MODE)])
-         .append(L"\n")
-         .append(L"status.composing=")
+-        .append(L"\n")
+-        .append(L"status.composing=")
 -        .append(Bool_wstring[!!status.is_composing])
-+        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_COMPOSING)])
-         .append(L"\n")
-         .append(L"status.disabled=")
+-        .append(L"\n")
+-        .append(L"status.disabled=")
 -        .append(Bool_wstring[!!status.is_disabled])
-+        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_DISABLED)])
-         .append(L"\n")
-         .append(L"status.full_shape=")
+-        .append(L"\n")
+-        .append(L"status.full_shape=")
 -        .append(Bool_wstring[!!status.is_full_shape])
-+        .append(Bool_wstring[!!(m_abi_view.status_flags & FAMO_STATUS_FULL_SHAPE)])
-         .append(L"\n")
-         .append(L"status.schema_id=")
+-        .append(L"\n")
+-        .append(L"status.schema_id=")
 -        .append(status.schema_id ? u8tow(status.schema_id) : std::wstring())
-+        .append(m_abi_view.schema_id.data ? u8tow(m_abi_view.schema_id.data)
-+                                          : std::wstring())
-         .append(L"\n");
+-        .append(L"\n");
 -    if (m_global_ascii_mode &&
 -        (session_status.status.is_ascii_mode != status.is_ascii_mode)) {
 -      for (auto& pair : m_session_status_map) {
 -        if (pair.first != ipc_id)
 -          rime_api->set_option(to_session_id(pair.first), "ascii_mode",
 -                               !!status.is_ascii_mode);
--      }
--    }
++  is_composing = !!(view.status_flags & FAMO_STATUS_COMPOSING);
++  actions.push_back("status");
++  body.append(L"status.ascii_mode=")
++      .append(Bool_wstring[!!(view.status_flags & FAMO_STATUS_ASCII_MODE)])
++      .append(L"\n")
++      .append(L"status.composing=")
++      .append(Bool_wstring[!!(view.status_flags & FAMO_STATUS_COMPOSING)])
++      .append(L"\n")
++      .append(L"status.disabled=")
++      .append(Bool_wstring[!!(view.status_flags & FAMO_STATUS_DISABLED)])
++      .append(L"\n")
++      .append(L"status.full_shape=")
++      .append(Bool_wstring[!!(view.status_flags & FAMO_STATUS_FULL_SHAPE)])
++      .append(L"\n")
++      .append(L"status.schema_id=")
++      .append(FamoWide(view.schema_id))
++      .append(L"\n");
++  const bool ascii_mode =
++      !!(view.status_flags & FAMO_STATUS_ASCII_MODE);
++  if (m_global_ascii_mode &&
++      !!session_status.status.is_ascii_mode != ascii_mode) {
++    const std::string ascii_option = "ascii_mode";
++    const FamoUtf8String ascii_name = FamoU8(ascii_option);
++    for (auto& pair : m_session_status_map) {
++      if (pair.first != ipc_id && pair.second.engine_ctx) {
++        (void)m_engine_host.SetOption(pair.second.engine_ctx, &ascii_name,
++                                     ascii_mode ? 1 : 0);
+       }
+     }
 -    session_status.status = status;
 -    rime_api->free_status(&status);
-+    session_status.status.is_ascii_mode =
-+        !!(m_abi_view.status_flags & FAMO_STATUS_ASCII_MODE);
-+    session_status.status.is_composing =
-+        !!(m_abi_view.status_flags & FAMO_STATUS_COMPOSING);
-+    session_status.status.is_disabled =
-+        !!(m_abi_view.status_flags & FAMO_STATUS_DISABLED);
-+    session_status.status.is_full_shape =
-+        !!(m_abi_view.status_flags & FAMO_STATUS_FULL_SHAPE);
    }
-
+-
 -  RIME_STRUCT(RimeContext, ctx);
 -  if (rime_api->get_context(session_id, &ctx)) {
 -    bool has_candidates = ctx.menu.num_candidates > 0;
-+  if (m_abi_view_valid) {
-+    bool has_candidates = m_abi_view.candidate_count > 0;
-     CandidateInfo cinfo;
+-    CandidateInfo cinfo;
 -    if (has_candidates) {
 -      _GetCandidateInfo(cinfo, ctx);
 -    }
@@ -795,17 +1891,10 @@ index 67e9b6d..61e4fa7 100644
 -      const auto& start = ctx.composition.sel_start;
 -      const auto& end = ctx.composition.sel_end;
 -      const auto& cursor = ctx.composition.cursor_pos;
-+    if (has_candidates)
-+      _GetCandidateInfoFromView(cinfo, m_abi_view);
-+    if (is_composing && m_abi_view.preedit.data) {
-+      const char* preedit = m_abi_view.preedit.data;
-+      uint32_t start = m_abi_view.preedit_sel_start;
-+      uint32_t end = m_abi_view.preedit_sel_end;
-+      uint32_t cursor = m_abi_view.preedit_cursor_pos;
-       static const auto u8towstring = [](const char* u8str, int len = 0) {
-         return std::to_wstring(utf8towcslen(u8str, len));
-       };
-       actions.push_back("ctx");
+-      static const auto u8towstring = [](const char* u8str, int len = 0) {
+-        return std::to_wstring(utf8towcslen(u8str, len));
+-      };
+-      actions.push_back("ctx");
 -      switch (session_status.style.preedit_type) {
 -        case UIStyle::PREVIEW: {
 -          if (ctx.commit_text_preview) {
@@ -830,33 +1919,7 @@ index 67e9b6d..61e4fa7 100644
 -        case UIStyle::COMPOSITION: {
 -          body.append(L"ctx.preedit=")
 -              .append(escape_string(u8tow(preedit)))
-+      if (session_status.style.preedit_type == UIStyle::PREVIEW &&
-+          m_abi_view.commit_preview.data) {
-+        const char* fp = m_abi_view.commit_preview.data;
-+        const std::wstring first_w = escape_string(u8tow(fp));
-+        const std::wstring tmp = u8towstring(fp, (int)std::strlen(fp));
-+        body.append(L"ctx.preedit=")
-+            .append(first_w)
-+            .append(L"\n")
-+            .append(L"ctx.preedit.cursor=")
-+            .append(u8towstring(fp, 0))
-+            .append(L",")
-+            .append(tmp)
-+            .append(L",")
-+            .append(tmp)
-+            .append(L"\n");
-+      } else {
-+        body.append(L"ctx.preedit=")
-+            .append(escape_string(u8tow(preedit)))
-+            .append(L"\n");
-+        if (start <= end) {
-+          body.append(L"ctx.preedit.cursor=")
-+              .append(u8towstring(preedit, start))
-+              .append(L",")
-+              .append(u8towstring(preedit, end))
-+              .append(L",")
-+              .append(u8towstring(preedit, cursor))
-               .append(L"\n");
+-              .append(L"\n");
 -          if (start <= end) {
 -            body.append(L"ctx.preedit.cursor=")
 -                .append(u8towstring(preedit, start))
@@ -910,28 +1973,246 @@ index 67e9b6d..61e4fa7 100644
 -                .append(L"\n");
 -          }
 -          break;
++  session_status.status.is_ascii_mode =
++      ascii_mode;
++  session_status.status.is_composing =
++      !!(view.status_flags & FAMO_STATUS_COMPOSING);
++  session_status.status.is_disabled =
++      !!(view.status_flags & FAMO_STATUS_DISABLED);
++  session_status.status.is_full_shape =
++      !!(view.status_flags & FAMO_STATUS_FULL_SHAPE);
++
++  const bool has_candidates = view.candidate_count > 0;
++  CandidateInfo cinfo;
++  if (has_candidates)
++    _GetCandidateInfoFromView(cinfo, view);
++  if (is_composing && view.preedit.length_bytes) {
++    const std::string preedit_utf8 = FamoString(view.preedit);
++    const char* preedit = preedit_utf8.c_str();
++    const uint32_t start = view.preedit_sel_start;
++    const uint32_t end = view.preedit_sel_end;
++    const uint32_t cursor = view.preedit_cursor_pos;
++    static const auto u8towstring = [](const char* u8str, int len = 0) {
++      return std::to_wstring(utf8towcslen(u8str, len));
++    };
++    actions.push_back("ctx");
++    if (session_status.style.preedit_type == UIStyle::PREVIEW &&
++        view.commit_preview.length_bytes) {
++      const std::string preview_utf8 = FamoString(view.commit_preview);
++      const char* fp = preview_utf8.c_str();
++      const std::wstring first_w =
++          escape_string(FamoWide(view.commit_preview));
++      const std::wstring tmp =
++          u8towstring(fp, static_cast<int>(preview_utf8.size()));
++      body.append(L"ctx.preedit=")
++          .append(first_w)
++          .append(L"\n")
++          .append(L"ctx.preedit.cursor=")
++          .append(u8towstring(fp, 0))
++          .append(L",")
++          .append(tmp)
++          .append(L",")
++          .append(tmp)
++          .append(L"\n");
++    } else if (session_status.style.preedit_type == UIStyle::PREVIEW_ALL &&
++               has_candidates) {
++      body.append(L"ctx.preedit=")
++          .append(escape_string(u8tow(preedit)))
++          .append(L"  [");
++      const bool label_valid =
++          session_status.style.label_font_point > 0;
++      const bool comment_valid =
++          session_status.style.comment_font_point > 0;
++      const std::wstring mark_text =
++          session_status.style.mark_text.empty()
++              ? std::wstring(L"*")
++              : session_status.style.mark_text;
++      const auto* candidate_bytes =
++          reinterpret_cast<const unsigned char*>(view.candidates);
++      for (uint32_t i = 0; i < view.candidate_count; ++i) {
++        const auto& candidate =
++            *reinterpret_cast<const FamoCandidateV2*>(
++                candidate_bytes +
++                static_cast<size_t>(i) * view.candidate_stride);
++        std::wstring label;
++        if (label_valid) {
++          const std::wstring raw_label = FamoWide(candidate.label);
++          wchar_t formatted[128];
++          swprintf_s<128>(
++              formatted,
++              session_status.style.label_text_format.c_str(),
++              raw_label.c_str());
++          label = formatted;
          }
-+        // ABI-only preview mode currently serializes through the composition path; release smoke covers inline candidate behavior.
++        const std::wstring comment =
++            comment_valid ? FamoWide(candidate.comment) : std::wstring();
++        body.append(L" ")
++            .append(i == view.highlighted_index ? mark_text : L"")
++            .append(escape_string(label))
++            .append(escape_string(FamoWide(candidate.text)))
++            .append(L" ")
++            .append(escape_string(comment));
++      }
++      body.append(L" ]\n");
++      if (start <= end) {
++        body.append(L"ctx.preedit.cursor=")
++            .append(u8towstring(preedit, start))
++            .append(L",")
++            .append(u8towstring(preedit, end))
++            .append(L",")
++            .append(u8towstring(preedit, cursor))
++            .append(L"\n");
++      }
++    } else {
++      body.append(L"ctx.preedit=")
++          .append(escape_string(u8tow(preedit)))
++          .append(L"\n");
++      if (start <= end) {
++        body.append(L"ctx.preedit.cursor=")
++            .append(u8towstring(preedit, start))
++            .append(L",")
++            .append(u8towstring(preedit, end))
++            .append(L",")
++            .append(u8towstring(preedit, cursor))
++            .append(L"\n");
        }
      }
-     if (has_candidates) {
-       std::wstringstream ss;
-       boost::archive::text_woarchive oa(ss);
+-    if (has_candidates) {
+-      std::wstringstream ss;
+-      boost::archive::text_woarchive oa(ss);
 -
-       oa << cinfo;
+-      oa << cinfo;
 -
 -      auto s = ss.str();
 -      body.append(L"ctx.cand=").append(std::move(s)).append(L"\n");
-+      body.append(L"ctx.cand=").append(ss.str()).append(L"\n");
-     }
+-    }
 -    rime_api->free_context(&ctx);
++  }
++  if (has_candidates) {
++    std::wstringstream ss;
++    boost::archive::text_woarchive oa(ss);
++    oa << cinfo;
++    body.append(L"ctx.cand=").append(ss.str()).append(L"\n");
    }
-
+-
++
    // configuration information
-@@ -1637,80 +1664,57 @@ static void _LoadAppOptions(RimeConfig* config,
+@@ -1102,14 +1946,56 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+       .append(L"\n");
+-
++
+   // style
+-  if (!session_status.__synced) {
++  bool includes_style = !session_status.__synced;
++  if (includes_style) {
+     std::wstringstream ss;
+     boost::archive::text_woarchive oa(ss);
+     oa << session_status.style;
+-
++
+     actions.push_back("style");
+     body.append(L"style=").append(ss.str()).append(L"\n");
+-    session_status.__synced = true;
++  }
++
++  // PipeChannel has an 8 MiB transaction buffer. A valid ABI result can still
++  // expand while converting UTF-8 to escaped UTF-16 or serializing candidate
++  // archives, so preflight the complete encoded body. On overflow, candidates,
++  // preedit, config and style are disposable; the complete commit and handled
++  // outcome are not. A later STATUS refreshes the omitted UI.
++  constexpr size_t kResponseBufferBytes = 8u * 1024u * 1024u;
++  constexpr size_t kResponseReserveBytes = 64u * 1024u;
++  const size_t max_body_wchars =
++      (kResponseBufferBytes - kResponseReserveBytes) / sizeof(wchar_t);
++  if (body.size() > max_body_wchars) {
++    actions.clear();
++    body.clear();
++    if (!commit_utf8.empty()) {
++      actions.push_back("commit");
++      body.append(L"commit=")
++          .append(escape_string(u8tow(commit_utf8)))
++          .append(L"\n");
++    }
++    actions.push_back("status");
++    body.append(L"status.ascii_mode=")
++        .append(Bool_wstring[
++            !!(view.status_flags & FAMO_STATUS_ASCII_MODE)])
++        .append(L"\n")
++        .append(L"status.composing=")
++        .append(Bool_wstring[
++            !!(view.status_flags & FAMO_STATUS_COMPOSING)])
++        .append(L"\n")
++        .append(L"status.disabled=")
++        .append(Bool_wstring[
++            !!(view.status_flags & FAMO_STATUS_DISABLED)])
++        .append(L"\n")
++        .append(L"status.full_shape=")
++        .append(Bool_wstring[
++            !!(view.status_flags & FAMO_STATUS_FULL_SHAPE)])
++        .append(L"\n")
++        .append(L"status.schema_id=\n");
++    includes_style = false;
++    if (body.size() > max_body_wchars) {
++      return false;  // Commit itself violates the bounded ABI/pipe contract.
++    }
+   }
+-
++
+   // summarize: send header first to avoid vector head-insert cost
+@@ -1126,14 +2012,42 @@ bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
+     }
+     header = std::wstring(L"action=") + u8tow(actionList) + L"\n";
+   }
+-  if (!eat(header))
+-    return false;
+-
+   body.append(L".\n");
+-  if (!eat(body))
++  if (body.size() > max_body_wchars ||
++      header.size() > max_body_wchars - body.size()) {
+     return false;
++  }
++  std::wstring response;
++  response.reserve(header.size() + body.size());
++  response.append(header).append(body);
++  // EatLine writes to the server's per-request transaction buffer. One call
++  // for one complete document prevents a successful header from surviving a
++  // failed body append in injected/backpressured sinks.
++  if (!eat(response)) {
++    return false;
++  }
+-
++
++  if (includes_style)
++    session_status.__synced = true;
++  (void)session_status.pending_response_result.Reset();
+   return true;
++  } catch (...) {
++    // Formatting, archive conversion and a violating sink are all no-unwind.
++    // The engine-owned lease remains the exact retry anchor.
++    return false;
++  }
++}
++
++bool RimeWithWeaselHandler::_Respond(WeaselSessionId ipc_id, EatLine eat) {
++  SessionStatus* requested_session = find_session_status(ipc_id);
++  if (!requested_session)
++    return false;
++  if (m_abi_result) {
++    if (requested_session->pending_response_result)
++      return false;
++    requested_session->pending_response_result = std::move(m_abi_result);
++  }
++  return _DeliverPendingResponse(ipc_id, requested_session, eat);
+ }
+-
++
+ // Blend foreground and background ARGB colors taking alpha into account.
+@@ -1643,80 +2557,74 @@ static void _LoadAppOptions(RimeConfig* config,
        });
  }
-
+-
++
 -void RimeWithWeaselHandler::_GetStatus(Status& stat,
 -                                       WeaselSessionId ipc_id,
 -                                       Context& ctx) {
@@ -971,16 +2252,19 @@ index 67e9b6d..61e4fa7 100644
 +
 +// 法墨引擎 ABI（joint seam）：从 view 建 Context（preedit + 选区高亮 + cinfo），镜像 _GetContext。
 +void RimeWithWeaselHandler::_GetContextFromView(Context& weasel_context,
-+                                                const FamoCompositionView& view) {
-+  if (view.preedit.data && view.preedit.length_bytes > 0) {
-+    weasel_context.preedit.str = u8tow(view.preedit.data);
++                                                const FamoCompositionViewV2& view) {
++  if (view.preedit.length_bytes > 0) {
++    const std::string preedit = FamoString(view.preedit);
++    weasel_context.preedit.str = u8tow(preedit);
 +    // 选区高亮：view 带 UTF-8 字节偏移，UI 用 wchar → utf8towcslen 转。。
 +    // NonNeg（引擎把 librime -1 → 0）：无选区表现为 start==end==0，故 `<` 判据不误发。
 +    if (view.preedit_sel_start < view.preedit_sel_end) {
 +      TextAttribute attr;
 +      attr.type = HIGHLIGHTED;
-+      attr.range.start = utf8towcslen(view.preedit.data, view.preedit_sel_start);
-+      attr.range.end = utf8towcslen(view.preedit.data, view.preedit_sel_end);
++      attr.range.start =
++          utf8towcslen(preedit.c_str(), view.preedit_sel_start);
++      attr.range.end =
++          utf8towcslen(preedit.c_str(), view.preedit_sel_end);
 +      weasel_context.preedit.attributes.push_back(attr);
      }
 -    rime_api->free_status(&status);
@@ -988,7 +2272,8 @@ index 67e9b6d..61e4fa7 100644
 +  if (view.candidate_count)
 +    _GetCandidateInfoFromView(weasel_context.cinfo, view);
  }
-
+-
++
 -void RimeWithWeaselHandler::_GetContext(Context& weasel_context,
 -                                        RimeSessionId session_id) {
 -  RIME_STRUCT(RimeContext, ctx);
@@ -1002,7 +2287,29 @@ index 67e9b6d..61e4fa7 100644
 -            utf8towcslen(ctx.composition.preedit, ctx.composition.sel_start);
 -        attr.range.end =
 -            utf8towcslen(ctx.composition.preedit, ctx.composition.sel_end);
++// 法墨引擎 ABI（joint seam）：从最终 view 填 Status 核心字段。
++// _UpdateUI 在调用本函数前处理 schema-change 副作用并重新取得 STATUS。
++void RimeWithWeaselHandler::_GetStatusFromView(Status& stat,
++                                               WeaselSessionId ipc_id,
++                                               Context& ctx,
++                                               const FamoCompositionViewV2& view) {
++  (void)ctx;
++  stat.schema_name = FamoWide(view.schema_name);
++  stat.schema_id = FamoWide(view.schema_id);
++  stat.ascii_mode = !!(view.status_flags & FAMO_STATUS_ASCII_MODE);
++  stat.composing = !!(view.status_flags & FAMO_STATUS_COMPOSING);
++  stat.disabled = !!(view.status_flags & FAMO_STATUS_DISABLED);
++  stat.full_shape = !!(view.status_flags & FAMO_STATUS_FULL_SHAPE);
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status)
++    return;
++  session_status->status.is_ascii_mode = stat.ascii_mode;
++  session_status->status.is_composing = stat.composing;
++  session_status->status.is_disabled = stat.disabled;
++  session_status->status.is_full_shape = stat.full_shape;
++}
 -
++
 -        weasel_context.preedit.attributes.push_back(attr);
 -      }
 -    }
@@ -1012,44 +2319,41 @@ index 67e9b6d..61e4fa7 100644
 -    }
 -    rime_api->free_context(&ctx);
 -  }
-+// 法墨引擎 ABI（joint seam）：从 view 填 Status 核心字段，填 Status 核心字段。
-+// schema-change 副作用（_LoadSchemaSpecificSettings/toast/icon）由 AddSession/
-+// UpdateColorTheme 承担，此处只填状态。ipc_id/ctx 保留以与 _GetStatus 签名对称。
-+void RimeWithWeaselHandler::_GetStatusFromView(Status& stat,
-+                                               WeaselSessionId ipc_id,
-+                                               Context& ctx,
-+                                               const FamoCompositionView& view) {
-+  (void)ipc_id;
-+  (void)ctx;
-+  stat.schema_name =
-+      view.schema_name.data ? u8tow(view.schema_name.data) : std::wstring();
-+  stat.schema_id =
-+      view.schema_id.data ? u8tow(view.schema_id.data) : std::wstring();
-+  stat.ascii_mode = !!(view.status_flags & FAMO_STATUS_ASCII_MODE);
-+  stat.composing = !!(view.status_flags & FAMO_STATUS_COMPOSING);
-+  stat.disabled = !!(view.status_flags & FAMO_STATUS_DISABLED);
-+  stat.full_shape = !!(view.status_flags & FAMO_STATUS_FULL_SHAPE);
++bool RimeWithWeaselHandler::_SetInlinePreeditOptions(
++    FamoEngineContext* ctx,
++    bool inline_preedit) {
++  if (!ctx)
++    return false;
++  const std::string inline_name = "inline_preedit";
++  const std::string cursor_name = "soft_cursor";
++  const FamoUtf8String inline_opt = FamoU8(inline_name);
++  const FamoUtf8String cursor_opt = FamoU8(cursor_name);
++  return m_engine_host.SetOption(ctx, &inline_opt, Bool(inline_preedit)) ==
++             FAMO_ENGINE_OK &&
++         m_engine_host.SetOption(ctx, &cursor_opt, Bool(!inline_preedit)) ==
++             FAMO_ENGINE_OK;
  }
-
- void RimeWithWeaselHandler::_UpdateInlinePreeditStatus(WeaselSessionId ipc_id) {
+-
++
+-void RimeWithWeaselHandler::_UpdateInlinePreeditStatus(WeaselSessionId ipc_id) {
++bool RimeWithWeaselHandler::_UpdateInlinePreeditStatus(
++    WeaselSessionId ipc_id) {
    if (!m_ui)
-     return;
-   SessionStatus& session_status = get_session_status(ipc_id);
+-    return;
+-  SessionStatus& session_status = get_session_status(ipc_id);
 -  RimeSessionId session_id = session_status.session_id;
 -  // set inline_preedit option
-+  FamoEngineContext* ctx = session_status.engine_ctx;
-+  if (!ctx)
-+    return;
-   bool inline_preedit = session_status.style.inline_preedit;
+-  bool inline_preedit = session_status.style.inline_preedit;
 -  rime_api->set_option(session_id, "inline_preedit", Bool(inline_preedit));
 -  // show soft cursor on weasel panel but not inline
 -  rime_api->set_option(session_id, "soft_cursor", Bool(!inline_preedit));
-+  std::string inline_name = "inline_preedit";
-+  std::string cursor_name = "soft_cursor";
-+  FamoUtf8String inline_opt = FamoU8(inline_name);
-+  FamoUtf8String cursor_opt = FamoU8(cursor_name);
-+  m_engine_host.api().set_option(ctx, &inline_opt, Bool(inline_preedit));
-+  m_engine_host.api().set_option(ctx, &cursor_opt, Bool(!inline_preedit));
++    return false;
++  SessionStatus* session_status = find_session_status(ipc_id);
++  if (!session_status)
++    return false;
++  FamoEngineContext* ctx = session_status->engine_ctx;
++  return _SetInlinePreeditOptions(ctx,
++                                  session_status->style.inline_preedit);
  }
 diff --git a/RimeWithWeasel/RimeWithWeasel.vcxproj b/RimeWithWeasel/RimeWithWeasel.vcxproj
 index ac5b0bf..8c1a23a 100644
@@ -1145,14 +2449,358 @@ index ac5b0bf..8c1a23a 100644
    </ItemGroup>
    <ItemGroup>
      <ClInclude Include="..\include\RimeWithWeasel.h" />
+diff --git a/WeaselIPC/Committer.cpp b/WeaselIPC/Committer.cpp
+index 42a2827..16156fd 100644
+--- a/WeaselIPC/Committer.cpp
++++ b/WeaselIPC/Committer.cpp
+@@ -18,6 +18,8 @@ void Committer::Store(Deserializer::KeyType const& key,
+   if (!m_pTarget->p_commit)
+     return;
+   if (key.size() == 1) {
+-    *m_pTarget->p_commit = unescape_string(value);
++    // Preserve commit order when one atomic pipe transaction contains a
++    // recovered response followed by the current action response.
++    m_pTarget->p_commit->append(unescape_string(value));
+   }
+ }
+diff --git a/WeaselIPC/ResponseParser.cpp b/WeaselIPC/ResponseParser.cpp
+index 7aaf7d2..49fa43a 100644
+--- a/WeaselIPC/ResponseParser.cpp
++++ b/WeaselIPC/ResponseParser.cpp
+@@ -21,18 +21,27 @@ ResponseParser::ResponseParser(std::wstring* commit,
+ bool ResponseParser::operator()(LPWSTR buffer, UINT length) {
+   wbufferstream bs(buffer, length);
+   std::wstring line;
++  bool complete = false;
+   while (bs.good()) {
+     std::getline(bs, line);
+     if (!bs.good())
+-      return false;
++      return complete;
+-
++
+-    // file ends
+-    if (line == L".")
+-      break;
++    // A single pipe transaction may contain a recovered response followed by
++    // the current action response. Both documents are complete and ordered;
++    // stop only at the zero-filled end of the transaction buffer.
++    if (line == L".") {
++      complete = true;
++      if (bs.peek() == L'\0' ||
++          bs.peek() == std::char_traits<wchar_t>::eof()) {
++        return true;
++      }
++      continue;
++    }
+-
++
+     Feed(line);
+   }
+-  return bs.good();
++  return complete;
+ }
+-
++
+ void ResponseParser::Feed(const std::wstring& line) {
+diff --git a/WeaselIPCServer/WeaselServerImpl.cpp b/WeaselIPCServer/WeaselServerImpl.cpp
+index 487d5af..4ca10e0 100644
+--- a/WeaselIPCServer/WeaselServerImpl.cpp
++++ b/WeaselIPCServer/WeaselServerImpl.cpp
+@@ -199,7 +199,6 @@ DWORD ServerImpl::OnStartSession(WEASEL_IPC_COMMAND uMsg,
+   return m_pRequestHandler->AddSession(
+       reinterpret_cast<LPWSTR>(channel->ReceiveBuffer()),
+       [this](std::wstring& msg) -> bool {
+-        *channel << msg;
+-        return true;
++        return channel->TryWrite(msg);
+       });
+ }
+@@ -219,8 +218,7 @@ DWORD ServerImpl::OnKeyEvent(WEASEL_IPC_COMMAND uMsg,
+     return 0;
+-
++
+   auto eat = [this](std::wstring& msg) -> bool {
+-    *channel << msg;
+-    return true;
++    return channel->TryWrite(msg);
+   };
+   return m_pRequestHandler->ProcessKeyEvent(KeyEvent(wParam), lParam, eat);
+ }
+@@ -311,23 +309,38 @@ DWORD ServerImpl::OnEndMaintenance(WEASEL_IPC_COMMAND uMsg,
+ DWORD ServerImpl::OnCommitComposition(WEASEL_IPC_COMMAND uMsg,
+                                       DWORD wParam,
+                                       DWORD lParam) {
+-  if (m_pRequestHandler)
+-    m_pRequestHandler->CommitComposition(lParam);
++  if (m_pRequestHandler) {
++    auto eat = [this](std::wstring& msg) -> bool {
++      return channel->TryWrite(msg);
++    };
++    return m_pRequestHandler->CommitComposition(lParam, eat) ? 1 : 0;
++  }
+   return 0;
+ }
+-
++
+ DWORD ServerImpl::OnClearComposition(WEASEL_IPC_COMMAND uMsg,
+                                      DWORD wParam,
+                                      DWORD lParam) {
+-  if (m_pRequestHandler)
+-    m_pRequestHandler->ClearComposition(lParam);
++  if (m_pRequestHandler) {
++    auto eat = [this](std::wstring& msg) -> bool {
++      return channel->TryWrite(msg);
++    };
++    return m_pRequestHandler->ClearComposition(lParam, eat) ? 1 : 0;
++  }
+   return 0;
+ }
+-
++
+ DWORD ServerImpl::OnSelectCandidateOnCurrentPage(WEASEL_IPC_COMMAND uMsg,
+                                                  DWORD wParam,
+                                                  DWORD lParam) {
+-  if (m_pRequestHandler)
+-    m_pRequestHandler->SelectCandidateOnCurrentPage(wParam, lParam);
++  if (m_pRequestHandler) {
++    auto eat = [this](std::wstring& msg) -> bool {
++      return channel->TryWrite(msg);
++    };
++    return m_pRequestHandler->SelectCandidateOnCurrentPage(wParam, lParam,
++                                                           eat)
++               ? 1
++               : 0;
++  }
+   return 0;
+ }
+@@ -337,10 +350,12 @@ DWORD ServerImpl::OnHighlightCandidateOnCurrentPage(WEASEL_IPC_COMMAND uMsg,
+                                                     DWORD lParam) {
+   if (m_pRequestHandler) {
+     auto eat = [this](std::wstring& msg) -> bool {
+-      *channel << msg;
+-      return true;
++      return channel->TryWrite(msg);
+     };
+-    m_pRequestHandler->HighlightCandidateOnCurrentPage(wParam, lParam, eat);
++    return m_pRequestHandler->HighlightCandidateOnCurrentPage(wParam, lParam,
++                                                               eat)
++               ? 1
++               : 0;
+   }
+   return 0;
+ }
+@@ -350,10 +365,9 @@ DWORD ServerImpl::OnChangePage(WEASEL_IPC_COMMAND uMsg,
+                                DWORD lParam) {
+   if (m_pRequestHandler) {
+     auto eat = [this](std::wstring& msg) -> bool {
+-      *channel << msg;
+-      return true;
++      return channel->TryWrite(msg);
+     };
+-    m_pRequestHandler->ChangePage(wParam, lParam, eat);
++    return m_pRequestHandler->ChangePage(wParam, lParam, eat) ? 1 : 0;
+   }
+   return 0;
+ }
+@@ -364,8 +378,7 @@ DWORD ServerImpl::OnReloadStyle(WEASEL_IPC_COMMAND uMsg,
+   // 法墨即时外观②：重读 famo-style.yaml 覆盖层并重绘（不部署）。
+   if (m_pRequestHandler) {
+     auto eat = [this](std::wstring& msg) -> bool {
+-      *channel << msg;
+-      return true;
++      return channel->TryWrite(msg);
+     };
+     m_pRequestHandler->ReloadStyleOverlay(lParam, eat);
+   }
+diff --git a/WeaselTSF/CandidateList.cpp b/WeaselTSF/CandidateList.cpp
+index 11c1e88..d923cb4 100644
+--- a/WeaselTSF/CandidateList.cpp
++++ b/WeaselTSF/CandidateList.cpp
+@@ -442,24 +442,17 @@ void WeaselTSF::_DeleteCandidateList() {
+ }
+-
++
+ void WeaselTSF::_SelectCandidateOnCurrentPage(size_t index) {
+-  m_client.SelectCandidateOnCurrentPage(index);
+-  // simulate a VK_SELECT presskey to get data back and DoEditSession
+-  // the simulated keycode must be the one make TranslateKeycode Non-Zero return
+-  // fix me: are there any better ways?
+-  INPUT inputs[2];
+-  inputs[0].type = INPUT_KEYBOARD;
+-  inputs[0].ki = {VK_SELECT, 0, 0, 0, 0};
+-  inputs[1].type = INPUT_KEYBOARD;
+-  inputs[1].ki = {VK_SELECT, 0, KEYEVENTF_KEYUP, 0, 0};
+-  ::SendInput(sizeof(inputs) / sizeof(INPUT), inputs, sizeof(INPUT));
++  if (m_client.SelectCandidateOnCurrentPage(index))
++    _UpdateComposition(_pEditSessionContext);
+ }
+-
++
+ void WeaselTSF::_HandleMousePageEvent(bool* const nextPage,
+                                       bool* const scrollNextPage) {
++  bool response_ready = false;
+   // from scrolling event
+   if (scrollNextPage) {
+     if (_cand->style().paging_on_scroll)
+-      m_client.ChangePage(!(*scrollNextPage));
++      response_ready = m_client.ChangePage(!(*scrollNextPage));
+     else {
+       UINT current_select = 0, cand_count = 0;
+       _cand->GetSelection(&current_select);
+@@ -469,17 +462,23 @@ void WeaselTSF::_HandleMousePageEvent(bool* const nextPage,
+       offset = offset * (is_reposition ? -1 : 1);
+       int index = (int)current_select + offset;
+       if (index >= 0 && index < (int)cand_count)
+-        m_client.HighlightCandidateOnCurrentPage((size_t)index);
++        response_ready =
++            m_client.HighlightCandidateOnCurrentPage((size_t)index);
+       else {
+         KeyEvent ke{0, 0};
+         ke.keycode = (index < 0) ? ibus::Up : ibus::Down;
+         m_client.ProcessKeyEvent(ke);
++        // ProcessKeyEvent's return is engine `handled`, not response-ready.
++        // The receive buffer is cleared per transaction, so consuming an
++        // empty failure response is safe and cannot replay an earlier body.
++        response_ready = true;
+       }
+     }
+   } else {  // from click event
+-    m_client.ChangePage(!(*nextPage));
++    response_ready = m_client.ChangePage(!(*nextPage));
+   }
+-  _UpdateComposition(_pEditSessionContext);
++  if (response_ready)
++    _UpdateComposition(_pEditSessionContext);
+ }
+-
++
+ void WeaselTSF::_HandleMouseHoverEvent(const size_t index) {
+@@ -487,7 +486,7 @@ void WeaselTSF::_HandleMouseHoverEvent(const size_t index) {
+   _cand->GetSelection(&current_select);
+-
++
+   if (index != current_select) {
+-    m_client.HighlightCandidateOnCurrentPage(index);
+-    _UpdateComposition(_pEditSessionContext);
++    if (m_client.HighlightCandidateOnCurrentPage(index))
++      _UpdateComposition(_pEditSessionContext);
+   }
+ }
+diff --git a/include/PipeChannel.h b/include/PipeChannel.h
+index 646c09b..6dc5d21 100644
+--- a/include/PipeChannel.h
++++ b/include/PipeChannel.h
+@@ -86,7 +86,7 @@ class PipeChannel : public PipeChannelBase {
+  public:
+   PipeChannel(std::wstring&& pn_cmd,
+               SECURITY_ATTRIBUTES* s = NULL,
+-              size_t bs = 64 * 1024)
++              size_t bs = 8 * 1024 * 1024)
+       : PipeChannelBase(std::move(pn_cmd), bs, s) {}
+-
++
+  public:
+@@ -117,6 +117,31 @@ class PipeChannel : public PipeChannelBase {
+     return *this;
+   }
+-
++
++  // Append one complete response document only when it fits in the remaining
++  // transaction buffer.  The preflight keeps a failed append from exposing a
++  // truncated document while allowing an already-buffered recovered response
++  // to be sent in the same transaction.
++  bool TryWrite(const std::wstring& cnt) {
++    auto ctx = _GetContext();
++    size_t used = 0;
++    if (ctx->write_stream) {
++      const std::streampos pos = ctx->write_stream->tellp();
++      if (pos == std::streampos(-1))
++        return false;
++      used = static_cast<size_t>(pos);
++    }
++    const size_t capacity = _SendBufferSizeW();
++    if (used > capacity || cnt.size() > capacity - used)
++      return false;
++
++    Stream& stream = _BufferWriteStream();
++    stream.write(cnt.data(), static_cast<std::streamsize>(cnt.size()));
++    if (!stream)
++      return false;
++    ctx->has_body = true;
++    return true;
++  }
++
+   _TyRes Transact(Msg& msg) {
+     _Ensure();
+     HANDLE* phandle = _GetPipeHandle();
+@@ -132,6 +157,15 @@ class PipeChannel : public PipeChannelBase {
+     }
+   }
+-
++
++  void ClearTransactionBuffer() noexcept {
++    auto* ctx = context.get();
++    if (!ctx)
++      return;
++    ctx->has_body = false;
++    ctx->write_stream.reset(nullptr);
++    memset(ctx->buffer.get(), 0, buff_size);
++  }
++
+   char* SendBuffer() const { return _GetContext()->buffer.get() + _MsgSize; }
+-
++
+   char* ReceiveBuffer() const { return _GetContext()->buffer.get() + _ResSize; }
+@@ -180,16 +214,23 @@ class PipeChannel : public PipeChannelBase {
+         _WritePipe(*retry_pipe, data_sz, pbuff);
+       }
+     } catch (...) {
+-      // Covers the initial write, reconnect, and retry write.
+-      ClearBufferStream();
++      // This also covers a reconnect/retry failure.  Never let the next
++      // transaction inherit either an old request body or an old response.
++      ClearTransactionBuffer();
+       throw;
+     }
+-    ClearBufferStream();
++    ClearTransactionBuffer();
+   }
+-
++
+   _TyRes _ReceiveResponse() {
+     HANDLE* phandle = _GetPipeHandle();
+-    _TyRes result;
++    auto ctx = _GetContext();
++    // A response may contain only the DWORD result.  Clear the shared body
++    // buffer before every transaction so a failed/body-less action can never
++    // replay the previous composition or commit.
++    memset(ctx->buffer.get(), 0, buff_size);
++    ctx->has_body = false;
++    _TyRes result{};
+     _Receive(*phandle, &result, sizeof(result));
+     return result;
+   }
 diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
-index 08e2dca..e48f615 100644
+index 49d17d0..9b76c53 100644
 --- a/include/RimeWithWeasel.h
 +++ b/include/RimeWithWeasel.h
-@@ -7,6 +7,13 @@
-
+@@ -1,12 +1,22 @@
+ #pragma once
+ #include <WeaselIPC.h>
+ #include <WeaselUI.h>
++#include <cstdint>
++#include <deque>
+ #include <map>
+-#include <string>
+ #include <mutex>
++#include <string>
++#include <utility>
+-
++
  #include <rime_api.h>
-
+-
++
 +// 法墨引擎 ABI：会话 I/O 经中立 FamoEngineApi 重路由到 FamoRimeEngine.dll。
 +// famo_engine_host.h 是纯 Win32 host loader（无 librime/Weasel/TSF 依赖）。用相对本头的路径
 +// include：engine-api 经 build-prep 置于 $(SolutionDir)..\engine-api，即本 include/ 目录的
@@ -1163,47 +2811,108 @@ index 08e2dca..e48f615 100644
  struct CaseInsensitiveCompare {
    bool operator()(const std::string& str1, const std::string& str2) const {
      std::string str1Lower, str2Lower;
-@@ -23,13 +30,14 @@ typedef std::map<std::string, AppOptions, CaseInsensitiveCompare>
+@@ -23,13 +33,27 @@ typedef std::map<std::string, AppOptions, CaseInsensitiveCompare>
      AppOptionsByAppName;
-
+-
++
  struct SessionStatus {
 -  SessionStatus() : style(weasel::UIStyle()), __synced(false), session_id(0) {
-+  SessionStatus() : style(weasel::UIStyle()), __synced(false) {
-     RIME_STRUCT(RimeStatus, status);
-   }
+-    RIME_STRUCT(RimeStatus, status);
+-  }
++  SessionStatus() : style(weasel::UIStyle()), status{}, __synced(false) {}
    weasel::UIStyle style;
    RimeStatus status;
    bool __synced;
 -  RimeSessionId session_id;
-+  // ABI-only 会话支点。RemoveSession 经 host_.api()->destroy_context 释放。
++  // Parsed from the IPC session request. It is also written through the v2
++  // property seam so schemas/Lua observe the legacy client_app property.
++  std::string client_app;
++  // ABI-only 会话支点。RemoveSession 经 host v2 seam 释放。
 +  FamoEngineContext* engine_ctx = nullptr;
++  // Notification routing uses a generation in addition to the opaque pointer,
++  // so a recycled engine allocation can never inherit a stale event.
++  uint64_t engine_generation = 0;
++  // A receipt means this business action already ran. A later physical input
++  // is dispatched only if bounded RECOVER completes in that same callback;
++  // otherwise it fails open and is never silently retained or discarded.
++  uint32_t pending_recovery_action = 0;
++  bool pending_recovery_handled = false;
++  // The engine-owned final result is the zero-allocation recovery anchor for
++  // response formatting and sink backpressure. While it is live no later
++  // business action may enter this context.
++  FamoEngineActionResultLease pending_response_result;
  };
  typedef std::map<DWORD, SessionStatus> SessionStatusMap;
  typedef DWORD WeaselSessionId;
-@@ -77,30 +85,30 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+@@ -45,10 +69,11 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   virtual BOOL ProcessKeyEvent(weasel::KeyEvent keyEvent,
+                                WeaselSessionId ipc_id,
+                                EatLine eat);
+-  virtual void CommitComposition(WeaselSessionId ipc_id);
+-  virtual void ClearComposition(WeaselSessionId ipc_id);
+-  virtual void SelectCandidateOnCurrentPage(size_t index,
+-                                            WeaselSessionId ipc_id);
++  virtual bool CommitComposition(WeaselSessionId ipc_id, EatLine eat);
++  virtual bool ClearComposition(WeaselSessionId ipc_id, EatLine eat);
++  virtual bool SelectCandidateOnCurrentPage(size_t index,
++                                            WeaselSessionId ipc_id,
++                                            EatLine eat);
+   virtual bool HighlightCandidateOnCurrentPage(size_t index,
+                                                WeaselSessionId ipc_id,
+                                                EatLine eat);
+@@ -77,35 +102,82 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
    void _UpdateUI(WeaselSessionId ipc_id);
    void _LoadSchemaSpecificSettings(WeaselSessionId ipc_id,
                                     const std::string& schema_id);
 -  void _LoadAppInlinePreeditSet(WeaselSessionId ipc_id,
 -                                bool ignore_app_name = false);
-   bool _ShowMessage(weasel::Context& ctx, weasel::Status& status);
+-  bool _ShowMessage(weasel::Context& ctx, weasel::Status& status);
++  struct PendingEngineNotification {
++    std::string message_type;
++    std::string message_value;
++    std::string message_label;
++    std::string option_name;
++  };
++  struct EngineNotificationTarget {
++    WeaselSessionId ipc_id;
++    uint64_t generation;
++  };
++  using EngineNotificationKey = std::pair<WeaselSessionId, uint64_t>;
++
++  bool _ShowMessage(weasel::Context& ctx,
++                    weasel::Status& status,
++                    FamoEngineContext* engine_ctx,
++                    uint64_t engine_generation);
++  bool _BindNotificationContext(FamoEngineContext* engine_ctx,
++                                WeaselSessionId ipc_id,
++                                uint64_t* out_generation) noexcept;
++  void _ForgetNotificationContext(FamoEngineContext* engine_ctx) noexcept;
++  void _ClearNotifications() noexcept;
++  bool _TakeNotification(FamoEngineContext* engine_ctx,
++                         uint64_t engine_generation,
++                         PendingEngineNotification* out) noexcept;
++  int32_t _DestroyEngineContext(FamoEngineContext* engine_ctx) noexcept;
++  bool _DeliverPendingResponse(WeaselSessionId ipc_id,
++                               SessionStatus* session_status,
++                               EatLine eat) noexcept;
    bool _Respond(WeaselSessionId ipc_id, EatLine eat);
-   void _ReadClientInfo(WeaselSessionId ipc_id, LPWSTR buffer);
+-  void _ReadClientInfo(WeaselSessionId ipc_id, LPWSTR buffer);
 -  void _GetCandidateInfo(weasel::CandidateInfo& cinfo, RimeContext& ctx);
 -  void _GetStatus(weasel::Status& stat,
 -                  WeaselSessionId ipc_id,
 -                  weasel::Context& ctx);
 -  void _GetContext(weasel::Context& ctx, RimeSessionId session_id);
-+  // 法墨引擎 ABI：view 版翻译孪生。从 FamoCompositionView 构建
++  bool _ReadClientInfo(WeaselSessionId ipc_id, LPWSTR buffer);
++  // 法墨引擎 ABI：view 版翻译孪生。从 FamoCompositionViewV2 构建
 +  // weasel::CandidateInfo/Status/Context，使 _Respond 的 IPC 序列化字节对齐。
 +  void _GetCandidateInfoFromView(weasel::CandidateInfo& cinfo,
-+                                 const FamoCompositionView& view);
++                                 const FamoCompositionViewV2& view);
 +  void _GetStatusFromView(weasel::Status& stat,
 +                          WeaselSessionId ipc_id,
 +                          weasel::Context& ctx,
-+                          const FamoCompositionView& view);
++                          const FamoCompositionViewV2& view);
 +  void _GetContextFromView(weasel::Context& ctx,
-+                           const FamoCompositionView& view);
++                           const FamoCompositionViewV2& view);
    void _UpdateShowNotifications(RimeConfig* config, bool initialize = false);
    // 法墨即时外观②：读 %LOCALAPPDATA%\Famo\famo-style.yaml 覆盖层并应用到 m_ui->style()。
    // base = 已编译的 "weasel" 配置（含 preset_color_schemes，用于按名套皮肤）。
@@ -1211,28 +2920,178 @@ index 08e2dca..e48f615 100644
 -  // 法墨即时开关①：读 famo-options.yaml 的 options: 映射，set_option 到给定会话（不部署）。
 -  void _ApplyFamoOptions(RimeSessionId session_id);
 +  // 法墨即时开关①：读 famo-options.yaml 的 options: 映射，set_option 到给定 ABI context（不部署）。
-+  void _ApplyFamoOptions(FamoEngineContext* ctx);
++  bool _ApplyFamoOptions(FamoEngineContext* ctx);
++  bool _ApplyAppOptions(FamoEngineContext* ctx,
++                        const std::string& app_name);
++  void _ApplyAppInlinePreeditSetting(WeaselSessionId ipc_id);
    // 法墨即时输入方式②：读 %LOCALAPPDATA%\Famo\famo-select-schema.txt（单行 schema id，trim）；缺失返回空串。
    std::string _ReadFamoSelectSchema();
-
-   void _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
-
+-
++
+-  void _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
++  bool _SetInlinePreeditOptions(FamoEngineContext* ctx,
++                                bool inline_preedit);
++  bool _UpdateInlinePreeditStatus(WeaselSessionId ipc_id);
++  struct AbiActionOutcome {
++    bool ready = false;
++    bool business_dispatched = false;
++    bool handled = false;
++    bool recovered_prior = false;
++  };
++  AbiActionOutcome _ExecuteAbiAction(WeaselSessionId ipc_id,
++                                     SessionStatus* session_status,
++                                     FamoEngineActionRequestV2 request,
++                                     EatLine eat);
++  bool _RefillAbiView(FamoEngineContext* ctx);
++  void _DestroyAbiContexts();
+-
++
 -  RimeSessionId to_session_id(WeaselSessionId ipc_id) {
 -    return m_session_status_map[ipc_id].session_id;
 -  }
-   SessionStatus& get_session_status(WeaselSessionId ipc_id) {
-     return m_session_status_map[ipc_id];
+-  SessionStatus& get_session_status(WeaselSessionId ipc_id) {
+-    return m_session_status_map[ipc_id];
++  SessionStatus* find_session_status(WeaselSessionId ipc_id) noexcept {
++    const auto found = m_session_status_map.find(ipc_id);
++    return found == m_session_status_map.end() ? nullptr : &found->second;
    }
-@@ -135,4 +143,12 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+-  SessionStatus& new_session_status(WeaselSessionId ipc_id) {
+-    return m_session_status_map[ipc_id] = SessionStatus();
++  const SessionStatus* find_session_status(
++      WeaselSessionId ipc_id) const noexcept {
++    const auto found = m_session_status_map.find(ipc_id);
++    return found == m_session_status_map.end() ? nullptr : &found->second;
+   }
+-
++
+   AppOptionsByAppName m_app_options;
+@@ -121,18 +193,30 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+   std::function<void()> _FocusInCallback;   // 法墨状态栏 focus-in
+   std::function<void()> _FocusOutCallback;  // 法墨状态栏 focus-out
+-
++
+-  static void OnNotify(void* context_object,
+-                       uintptr_t session_id,
+-                       const char* message_type,
+-                       const char* message_value);
+-  static std::string m_message_type;
+-  static std::string m_message_value;
+-  static std::string m_message_label;
+-  static std::string m_option_name;
+-  static std::mutex m_notifier_mutex;
++  static void FAMO_ENGINE_CALL OnNotify(
++      void* context_object,
++      FamoEngineContext* context,
++      const FamoUtf8String* message_type,
++      const FamoUtf8String* message_value,
++      const FamoUtf8String* state_label) noexcept;
++  std::mutex m_notifier_mutex;
++  std::map<FamoEngineContext*, EngineNotificationTarget>
++      m_notification_targets;
++  std::map<FamoEngineContext*, std::deque<PendingEngineNotification>>
++      m_unbound_notifications;
++  std::map<EngineNotificationKey, std::deque<PendingEngineNotification>>
++      m_session_notifications;
++  std::deque<PendingEngineNotification> m_global_notifications;
++  uint64_t m_next_notification_generation = 1;
++  // Declare the host before every result-owning session container. Destruction
++  // is reversed, so all leases disappear before the engine DLL can unload.
++  FamoEngineHost m_engine_host;
+   SessionStatusMap m_session_status_map;
+   bool m_current_dark_mode;
    bool m_global_ascii_mode;
    int m_show_notifications_time;
    DWORD m_pid;
-+  // 法墨引擎 ABI：进程唯一的引擎 host。
-+  FamoEngineHost m_engine_host;
-+  // ABI-only：当前会话视图，由被重路由的会话 op 填充（先 FreeView 再填），供同一 handler
-+  // 调用内后续的 _Respond/_UpdateUI abi 分支消费。惰性释放（下一个 op 开头 free），一次只持一份。
-+  FamoCompositionView m_abi_view{};
-+  bool m_abi_view_valid = false;
-+  // 用引擎 get_status 刷新 m_abi_view（thin op：highlight/change_page/commit 之后取新视图）。
-+  bool _RefillAbiView(FamoEngineContext* ctx);
++  // Declared after host and session map: the shared scratch lease is released
++  // first; session leases follow; the host unloads last.
++  FamoEngineActionResultLease m_abi_result;
  };
+diff --git a/include/WeaselIPC.h b/include/WeaselIPC.h
+index 2633fe2..5321030 100644
+--- a/include/WeaselIPC.h
++++ b/include/WeaselIPC.h
+@@ -72,9 +72,17 @@ struct RequestHandler {
+                                EatLine eat) {
+     return FALSE;
+   }
+-  virtual void CommitComposition(DWORD session_id) {}
+-  virtual void ClearComposition(DWORD session_id) {}
+-  virtual void SelectCandidateOnCurrentPage(size_t index, DWORD session_id) {}
++  virtual bool CommitComposition(DWORD session_id, EatLine eat) {
++    return false;
++  }
++  virtual bool ClearComposition(DWORD session_id, EatLine eat) {
++    return false;
++  }
++  virtual bool SelectCandidateOnCurrentPage(size_t index,
++                                            DWORD session_id,
++                                            EatLine eat) {
++    return false;
++  }
+   virtual bool HighlightCandidateOnCurrentPage(size_t index,
+                                                DWORD session_id,
+                                                EatLine eat) {
+diff --git a/test/TestResponseParser/TestResponseParser.cpp b/test/TestResponseParser/TestResponseParser.cpp
+index 643fd67..e679df3 100644
+--- a/test/TestResponseParser/TestResponseParser.cpp
++++ b/test/TestResponseParser/TestResponseParser.cpp
+@@ -4,4 +4,5 @@
+ #include "stdafx.h"
+ #include <boost/detail/lightweight_test.hpp>
++#include <PipeChannel.h>
+ #include <ResponseParser.h>
+ #include <string>
+@@ -85,12 +86,50 @@ void test_4() {
+   BOOST_TEST_EQ(1, c.totalPages);
+ }
+-
++
++void test_5() {
++  WCHAR resp[] =
++      L"action=commit\n"
++      L"commit=旧\n"
++      L".\n"
++      L"action=commit\n"
++      L"commit=新\n"
++      L".\n";
++  DWORD len = static_cast<DWORD>(wcslen(resp));
++  std::wstring commit;
++  weasel::Context ctx;
++  weasel::Status status;
++  weasel::ResponseParser parser(&commit, &ctx, &status);
++  BOOST_TEST(parser(resp, len));
++  BOOST_TEST(commit == L"旧新");
++}
++
++void test_6() {
++  // A failed second response must not partially overwrite the first complete
++  // document already buffered for this transaction.
++  weasel::PipeChannel<DWORD> channel(std::wstring(L"unused"), nullptr, 128);
++  const std::wstring first =
++      L"action=commit\n"
++      L"commit=旧\n"
++      L".\n";
++  BOOST_TEST(channel.TryWrite(first));
++  BOOST_TEST(!channel.TryWrite(std::wstring(64, L'x')));
++  const auto* stored =
++      reinterpret_cast<const wchar_t*>(channel.SendBuffer());
++  BOOST_TEST(std::wstring(stored, first.size()) == first);
++}
++
+ int _tmain(int argc, _TCHAR* argv[]) {
++  if (argc == 2 && wcscmp(argv[1], L"--recovered-order") == 0) {
++    test_5();
++    test_6();
++    return boost::report_errors();
++  }
+   test_1();
+   test_2();
+   test_3();
+   test_4();
++  test_5();
++  test_6();
+-
++
+-  system("pause");
+   return boost::report_errors();
+ }

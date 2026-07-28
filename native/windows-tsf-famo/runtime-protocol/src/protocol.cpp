@@ -4,19 +4,89 @@
 #include <algorithm>
 #include <limits>
 
+#include "../../engine-api/famo_engine_api.h"
+#include "protocol_boundary.h"
+
 namespace famo::runtime {
 namespace {
 
 bool KnownCommand(uint16_t value) {
   return value >= static_cast<uint16_t>(Command::Hello) &&
-         value <= static_cast<uint16_t>(Command::SelectCandidateAbsolute);
+         value <= static_cast<uint16_t>(Command::AbandonConnection);
 }
 
 bool KnownStatus(uint32_t value) {
-  return value <= static_cast<uint32_t>(Status::WrongPeer);
+  return value <= static_cast<uint32_t>(Status::RecoveryPending);
+}
+
+bool Utf8Boundary(std::string_view text, uint32_t offset) {
+  if (offset > text.size())
+    return false;
+  return offset == text.size() ||
+         (static_cast<unsigned char>(text[offset]) & 0xc0u) != 0x80u;
+}
+
+bool ValidCompositionSemantics(const Composition &value,
+                               std::string *error) {
+  constexpr uint32_t kContentFlags =
+      FAMO_COMPOSITION_HAS_PREEDIT | FAMO_COMPOSITION_HAS_COMMIT |
+      FAMO_COMPOSITION_HAS_CANDIDATES | FAMO_COMPOSITION_HANDLED;
+  constexpr uint32_t kHostFlags =
+      kHostInlinePreedit | kHostCandidatePreview | kHostAutoPair |
+      kHostCjkEnglishSpacing | kHostCjkNumberSpacing | kHostPreviewPages |
+      kHostPreviewRowsTwo | kHostRimeVertical;
+  constexpr uint32_t kStatusFlags =
+      FAMO_STATUS_ASCII_MODE | FAMO_STATUS_COMPOSING | FAMO_STATUS_DISABLED |
+      FAMO_STATUS_FULL_SHAPE | FAMO_STATUS_ASCII_PUNCT |
+      FAMO_STATUS_SIMPLIFIED;
+  uint32_t expected_content = 0;
+  if (!value.preedit.empty())
+    expected_content |= FAMO_COMPOSITION_HAS_PREEDIT;
+  if (!value.commit.empty())
+    expected_content |= FAMO_COMPOSITION_HAS_COMMIT;
+  if (!value.candidates.empty())
+    expected_content |= FAMO_COMPOSITION_HAS_CANDIDATES;
+  if (value.handled)
+    expected_content |= FAMO_COMPOSITION_HANDLED;
+  bool valid =
+      (value.state_flags & ~(kContentFlags | kHostFlags)) == 0 &&
+      (value.state_flags & kContentFlags) == expected_content &&
+      (value.status_flags & ~kStatusFlags) == 0 &&
+      value.candidates.size() <= kMaxCandidateCount &&
+      ((value.candidates.empty() && value.highlighted_index == 0) ||
+       (!value.candidates.empty() &&
+        value.highlighted_index < value.candidates.size())) &&
+      ((value.candidates.empty() && value.page_index == 0 &&
+        value.page_size == 0) ||
+       (!value.candidates.empty() && value.page_size > 0)) &&
+      (value.commit.empty() || value.handled) && value.is_last_page <= 1 &&
+      value.preedit_sel_start <= value.preedit_sel_end &&
+      Utf8Boundary(value.preedit, value.preedit_sel_start) &&
+      Utf8Boundary(value.preedit, value.preedit_sel_end) &&
+      Utf8Boundary(value.preedit, value.preedit_cursor_pos);
+  if (valid) {
+    for (const Candidate &candidate : value.candidates) {
+      if ((candidate.flags & ~FAMO_CANDIDATE_FLAG_DEFAULT) != 0) {
+        valid = false;
+        break;
+      }
+    }
+  }
+  if (!valid && error)
+    *error = "inconsistent composition semantics";
+  return valid;
 }
 
 } // namespace
+
+bool SelectionCapabilityMatches(
+    const SelectionCapability &left,
+    const SelectionCapability &right) noexcept {
+  const uint64_t difference =
+      (left.low ^ right.low) | (left.high ^ right.high);
+  return difference == 0 && static_cast<bool>(left) &&
+         static_cast<bool>(right);
+}
 
 uint32_t Crc32(std::span<const uint8_t> bytes) {
   uint32_t crc = 0xffffffffu;
@@ -29,7 +99,8 @@ uint32_t Crc32(std::span<const uint8_t> bytes) {
 }
 
 bool PeekFrameSize(std::span<const uint8_t> header, uint32_t *size,
-                   std::string *error) {
+                   std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!size || header.size() < kHeaderSize) {
     if (error)
       *error = "truncated header";
@@ -37,25 +108,29 @@ bool PeekFrameSize(std::span<const uint8_t> header, uint32_t *size,
   }
   Reader reader(header);
   uint32_t magic = 0;
+  uint32_t decoded_size = 0;
   uint16_t version = 0, header_size = 0;
   if (!reader.U32(&magic) || !reader.U16(&version) ||
-      !reader.U16(&header_size) || !reader.U32(size) ||
+      !reader.U16(&header_size) || !reader.U32(&decoded_size) ||
       magic != kProtocolMagic || version != kProtocolVersion ||
-      header_size != kHeaderSize || *size < kHeaderSize ||
-      *size > kMaxFrameSize) {
+      header_size != kHeaderSize || decoded_size < kHeaderSize ||
+      decoded_size > kMaxFrameSize) {
     if (error)
       *error = "invalid frame prefix";
     return false;
   }
+  *size = decoded_size;
   return true;
+  });
 }
 
 bool EncodeFrame(const Frame &frame, std::vector<uint8_t> *bytes,
-                 std::string *error) {
+                 std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!bytes || !KnownCommand(static_cast<uint16_t>(frame.command)) ||
       !KnownStatus(static_cast<uint32_t>(frame.status)) ||
-      (frame.flags & ~kFlagResponse) != 0 ||
-      frame.payload.size() > kMaxFrameSize - kHeaderSize) {
+      (frame.flags & ~(kFlagResponse | kFlagAcknowledgePrevious)) != 0 ||
+      frame.payload.size() > kMaxFramePayloadSize) {
     if (error)
       *error = "invalid frame fields";
     return false;
@@ -79,10 +154,12 @@ bool EncodeFrame(const Frame &frame, std::vector<uint8_t> *bytes,
   writer.Bytes(frame.payload);
   *bytes = writer.Take();
   return true;
+  });
 }
 
 bool DecodeFrame(std::span<const uint8_t> bytes, Frame *frame,
-                 std::string *error) {
+                 std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!frame || bytes.size() < kHeaderSize) {
     if (error)
       *error = "truncated frame";
@@ -114,7 +191,8 @@ bool DecodeFrame(std::span<const uint8_t> bytes, Frame *frame,
     return false;
   }
   if (!KnownCommand(command) || !KnownStatus(status) ||
-      (flags & ~kFlagResponse) != 0 || reserved != 0) {
+      (flags & ~(kFlagResponse | kFlagAcknowledgePrevious)) != 0 ||
+      reserved != 0) {
     if (error)
       *error = "unknown command, status, flags, or reserved field";
     return false;
@@ -125,16 +203,20 @@ bool DecodeFrame(std::span<const uint8_t> bytes, Frame *frame,
       *error = "payload CRC mismatch";
     return false;
   }
-  frame->command = static_cast<Command>(command);
-  frame->flags = flags;
-  frame->status = static_cast<Status>(status);
-  frame->correlation = correlation;
-  frame->payload.assign(payload.begin(), payload.end());
+  Frame decoded;
+  decoded.command = static_cast<Command>(command);
+  decoded.flags = flags;
+  decoded.status = static_cast<Status>(status);
+  decoded.correlation = correlation;
+  decoded.payload.assign(payload.begin(), payload.end());
+  *frame = std::move(decoded);
   return true;
+  });
 }
 
 bool EncodeOpenSession(std::string_view schema, std::vector<uint8_t> *payload,
-                       std::string *error) {
+                       std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!payload)
     return false;
   Writer writer;
@@ -142,17 +224,26 @@ bool EncodeOpenSession(std::string_view schema, std::vector<uint8_t> *payload,
     return false;
   *payload = writer.Take();
   return true;
+  });
 }
 
 bool DecodeOpenSession(std::span<const uint8_t> payload, std::string *schema,
-                       std::string *error) {
+                       std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!schema)
     return false;
+  std::string decoded;
   Reader reader(payload);
-  return reader.String(*schema, error) && Finish(reader, error);
+  if (!reader.String(decoded, error) || !Finish(reader, error))
+    return false;
+  *schema = std::move(decoded);
+  return true;
+  });
 }
 
-bool EncodeKeyEvent(const KeyEvent &key, std::vector<uint8_t> *payload) {
+bool EncodeKeyEvent(const KeyEvent &key,
+                    std::vector<uint8_t> *payload) noexcept {
+  return ProtocolBoundary(nullptr, [&] {
   if (!payload)
     return false;
   Writer writer;
@@ -163,48 +254,65 @@ bool EncodeKeyEvent(const KeyEvent &key, std::vector<uint8_t> *payload) {
   writer.U64(key.timestamp_ms);
   *payload = writer.Take();
   return true;
+  });
 }
 
 bool DecodeKeyEvent(std::span<const uint8_t> payload, KeyEvent *key,
-                    std::string *error) {
+                    std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!key)
     return false;
+  KeyEvent decoded;
   Reader reader(payload);
-  if (!reader.U32(&key->virtual_key) || !reader.U32(&key->scan_code) ||
-      !reader.U32(&key->modifiers) || !reader.U32(&key->is_key_down) ||
-      !reader.U64(&key->timestamp_ms) || key->is_key_down > 1) {
+  if (!reader.U32(&decoded.virtual_key) || !reader.U32(&decoded.scan_code) ||
+      !reader.U32(&decoded.modifiers) || !reader.U32(&decoded.is_key_down) ||
+      !reader.U64(&decoded.timestamp_ms) || decoded.is_key_down > 1) {
     if (error)
       *error = "invalid key payload";
     return false;
   }
-  return Finish(reader, error);
+  if (!Finish(reader, error))
+    return false;
+  *key = decoded;
+  return true;
+  });
 }
 
-bool EncodeCandidateIndex(uint32_t index, std::vector<uint8_t> *payload) {
+bool EncodeCandidateIndex(uint32_t index,
+                          std::vector<uint8_t> *payload) noexcept {
+  return ProtocolBoundary(nullptr, [&] {
   if (!payload)
     return false;
   Writer writer;
   writer.U32(index);
   *payload = writer.Take();
   return true;
+  });
 }
 
 bool DecodeCandidateIndex(std::span<const uint8_t> payload, uint32_t *index,
-                          std::string *error) {
+                          std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!index)
     return false;
   Reader reader(payload);
-  if (!reader.U32(index)) {
+  uint32_t decoded = 0;
+  if (!reader.U32(&decoded)) {
     if (error)
       *error = "invalid candidate index payload";
     return false;
   }
-  return Finish(reader, error);
+  if (!Finish(reader, error))
+    return false;
+  *index = decoded;
+  return true;
+  });
 }
 
 bool EncodeAbsoluteCandidateSelection(uint32_t index,
                                       uint64_t composition_sequence,
-                                      std::vector<uint8_t> *payload) {
+                                      std::vector<uint8_t> *payload) noexcept {
+  return ProtocolBoundary(nullptr, [&] {
   if (!payload || composition_sequence == 0)
     return false;
   Writer writer;
@@ -212,35 +320,123 @@ bool EncodeAbsoluteCandidateSelection(uint32_t index,
   writer.U64(composition_sequence);
   *payload = writer.Take();
   return true;
+  });
 }
 
 bool DecodeAbsoluteCandidateSelection(std::span<const uint8_t> payload,
                                       uint32_t *index,
                                       uint64_t *composition_sequence,
-                                      std::string *error) {
+                                      std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!index || !composition_sequence)
     return false;
   Reader reader(payload);
-  if (!reader.U32(index) || !reader.U64(composition_sequence) ||
-      *composition_sequence == 0) {
+  uint32_t decoded_index = 0;
+  uint64_t decoded_sequence = 0;
+  if (!reader.U32(&decoded_index) || !reader.U64(&decoded_sequence) ||
+      decoded_sequence == 0) {
     if (error)
       *error = "invalid absolute candidate selection payload";
     return false;
   }
-  return Finish(reader, error);
+  if (!Finish(reader, error))
+    return false;
+  *index = decoded_index;
+  *composition_sequence = decoded_sequence;
+  return true;
+  });
 }
 
-bool EncodePageDirection(bool backward, std::vector<uint8_t> *payload) {
+bool IsDeliveryTracked(Command command) {
+  switch (command) {
+  case Command::ProcessKey:
+  case Command::SelectCandidate:
+  case Command::CommitComposition:
+  case Command::ClearComposition:
+  case Command::HighlightCandidate:
+  case Command::ChangePage:
+  case Command::SelectCandidateAbsolute:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool EncodeDeliveryReference(const DeliveryReference &reference,
+                             std::vector<uint8_t> *payload) noexcept {
+  return ProtocolBoundary(nullptr, [&] {
+  const Correlation &c = reference.correlation;
+  if (!payload || !IsDeliveryTracked(reference.command) || c.client_id == 0 ||
+      c.activation_generation == 0 || c.connection_generation == 0 ||
+      c.session_id == 0 || c.session_generation == 0 || c.sequence == 0) {
+    return false;
+  }
+  Writer writer;
+  writer.U16(static_cast<uint16_t>(reference.command));
+  writer.U16(0);
+  writer.U64(c.client_id);
+  writer.U64(c.activation_generation);
+  writer.U64(c.connection_generation);
+  writer.U64(c.session_id);
+  writer.U64(c.session_generation);
+  writer.U64(c.sequence);
+  *payload = writer.Take();
+  return true;
+  });
+}
+
+bool DecodeDeliveryReference(std::span<const uint8_t> payload,
+                             DeliveryReference *reference,
+                             std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+  if (!reference) {
+    if (error)
+      *error = "delivery reference target is required";
+    return false;
+  }
+  Reader reader(payload);
+  uint16_t command = 0;
+  uint16_t reserved = 0;
+  DeliveryReference decoded;
+  Correlation &c = decoded.correlation;
+  if (!reader.U16(&command) || !reader.U16(&reserved) ||
+      !reader.U64(&c.client_id) ||
+      !reader.U64(&c.activation_generation) ||
+      !reader.U64(&c.connection_generation) || !reader.U64(&c.session_id) ||
+      !reader.U64(&c.session_generation) || !reader.U64(&c.sequence) ||
+      !reader.done() || reserved != 0) {
+    if (error)
+      *error = "invalid delivery reference payload";
+    return false;
+  }
+  decoded.command = static_cast<Command>(command);
+  if (!IsDeliveryTracked(decoded.command) || c.client_id == 0 ||
+      c.activation_generation == 0 || c.connection_generation == 0 ||
+      c.session_id == 0 || c.session_generation == 0 || c.sequence == 0) {
+    if (error)
+      *error = "invalid delivery reference fields";
+    return false;
+  }
+  *reference = decoded;
+  return true;
+  });
+}
+
+bool EncodePageDirection(bool backward,
+                         std::vector<uint8_t> *payload) noexcept {
+  return ProtocolBoundary(nullptr, [&] {
   if (!payload)
     return false;
   Writer writer;
   writer.U32(backward ? 1u : 0u);
   *payload = writer.Take();
   return true;
+  });
 }
 
 bool DecodePageDirection(std::span<const uint8_t> payload, bool *backward,
-                         std::string *error) {
+                         std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!backward)
     return false;
   Reader reader(payload);
@@ -250,17 +446,22 @@ bool DecodePageDirection(std::span<const uint8_t> payload, bool *backward,
       *error = "invalid page direction payload";
     return false;
   }
+  if (!Finish(reader, error))
+    return false;
   *backward = encoded != 0;
-  return Finish(reader, error);
+  return true;
+  });
 }
 
 bool EncodeUiState(const UiState &state, std::vector<uint8_t> *payload,
-                   std::string *error) {
+                   std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   const auto valid_rect = [](const UiRect &rect) {
     return rect.right >= rect.left && rect.bottom >= rect.top;
   };
   if (!payload || !valid_rect(state.caret) || !valid_rect(state.work_area) ||
-      state.dpi < 48 || state.dpi > 768) {
+      state.dpi < 48 || state.dpi > 768 ||
+      !state.selection_capability) {
     if (error)
       *error = "invalid UI state";
     return false;
@@ -277,12 +478,16 @@ bool EncodeUiState(const UiState &state, std::vector<uint8_t> *payload,
   writer.U32(state.dpi);
   writer.U32((state.layout_available ? 1u : 0u) |
              (state.focused ? 2u : 0u) | (state.show_allowed ? 4u : 0u));
+  writer.U64(state.selection_capability.low);
+  writer.U64(state.selection_capability.high);
   *payload = writer.Take();
   return true;
+  });
 }
 
 bool DecodeUiState(std::span<const uint8_t> payload, UiState *state,
-                   std::string *error) {
+                   std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!state)
     return false;
   Reader reader(payload);
@@ -295,6 +500,13 @@ bool DecodeUiState(std::span<const uint8_t> payload, UiState *state,
     }
   }
   const uint32_t flags = values[9];
+  uint64_t capability_low = 0;
+  uint64_t capability_high = 0;
+  if (!reader.U64(&capability_low) || !reader.U64(&capability_high)) {
+    if (error)
+      *error = "truncated UI selection capability";
+    return false;
+  }
   UiState decoded{{static_cast<int32_t>(values[0]),
                    static_cast<int32_t>(values[1]),
                    static_cast<int32_t>(values[2]),
@@ -306,35 +518,39 @@ bool DecodeUiState(std::span<const uint8_t> payload, UiState *state,
                   values[8],
                   (flags & 1u) != 0,
                   (flags & 2u) != 0,
-                  (flags & 4u) != 0};
+                  (flags & 4u) != 0,
+                  {capability_low, capability_high}};
   const auto valid_rect = [](const UiRect &rect) {
     return rect.right >= rect.left && rect.bottom >= rect.top;
   };
   if (!reader.done() || (flags & ~7u) != 0 || decoded.dpi < 48 ||
       decoded.dpi > 768 || !valid_rect(decoded.caret) ||
-      !valid_rect(decoded.work_area)) {
+      !valid_rect(decoded.work_area) ||
+      !decoded.selection_capability) {
     if (error)
       *error = "invalid UI state";
     return false;
   }
   *state = decoded;
   return true;
+  });
 }
 
 bool EncodeComposition(const Composition &value, std::vector<uint8_t> *payload,
-                       std::string *error) {
-  if (!payload || value.candidates.size() > kMaxCandidateCount) {
+                       std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+  if (!payload || !ValidCompositionSemantics(value, error)) {
     if (error)
-      *error = "too many candidates";
+      if (error->empty())
+        *error = "invalid composition";
     return false;
   }
   constexpr size_t kFixedBytes = 4 + 4 + (9 * 4);
-  constexpr size_t kMaxPayload = kMaxFrameSize - kHeaderSize;
   size_t encoded_size = kFixedBytes + (value.candidates.size() * 8);
   const auto account_string = [&](std::string_view text) {
     if (text.size() > kMaxStringBytes || !IsValidUtf8(text) ||
-        encoded_size > kMaxPayload ||
-        text.size() + 4 > kMaxPayload - encoded_size) {
+        encoded_size > kMaxFramePayloadSize ||
+        text.size() + 4 > kMaxFramePayloadSize - encoded_size) {
       return false;
     }
     encoded_size += 4 + text.size();
@@ -385,31 +601,33 @@ bool EncodeComposition(const Composition &value, std::vector<uint8_t> *payload,
   writer.U32(value.is_last_page);
   *payload = writer.Take();
   return true;
+  });
 }
 
 bool DecodeComposition(std::span<const uint8_t> payload, Composition *value,
-                       std::string *error) {
+                       std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
   if (!value)
     return false;
+  Composition decoded;
   Reader reader(payload);
   uint8_t handled = 0, reserved8 = 0;
   uint16_t reserved16 = 0;
   uint32_t count = 0;
   if (!reader.U8(&handled) || !reader.U8(&reserved8) ||
       !reader.U16(&reserved16) || handled > 1 || reserved8 != 0 ||
-      reserved16 != 0 || !reader.String(value->preedit, error) ||
-      !reader.String(value->commit, error) ||
-      !reader.String(value->commit_preview, error) ||
-      !reader.String(value->schema_id, error) ||
-      !reader.String(value->schema_name, error) || !reader.U32(&count) ||
+      reserved16 != 0 || !reader.String(decoded.preedit, error) ||
+      !reader.String(decoded.commit, error) ||
+      !reader.String(decoded.commit_preview, error) ||
+      !reader.String(decoded.schema_id, error) ||
+      !reader.String(decoded.schema_name, error) || !reader.U32(&count) ||
       count > kMaxCandidateCount) {
     if (error && error->empty())
       *error = "invalid composition prefix";
     return false;
   }
-  value->handled = handled != 0;
-  value->candidates.clear();
-  value->candidates.reserve(count);
+  decoded.handled = handled != 0;
+  decoded.candidates.reserve(count);
   for (uint32_t i = 0; i < count; ++i) {
     Candidate candidate;
     if (!reader.String(candidate.text, error) ||
@@ -417,20 +635,25 @@ bool DecodeComposition(std::span<const uint8_t> payload, Composition *value,
         !reader.String(candidate.label, error) ||
         !reader.U32(&candidate.quality) || !reader.U32(&candidate.flags))
       return false;
-    value->candidates.push_back(std::move(candidate));
+    decoded.candidates.push_back(std::move(candidate));
   }
-  if (!reader.U32(&value->highlighted_index) ||
-      !reader.U32(&value->page_index) || !reader.U32(&value->page_size) ||
-      !reader.U32(&value->state_flags) ||
-      !reader.U32(&value->preedit_sel_start) ||
-      !reader.U32(&value->preedit_sel_end) ||
-      !reader.U32(&value->preedit_cursor_pos) ||
-      !reader.U32(&value->status_flags) || !reader.U32(&value->is_last_page)) {
+  if (!reader.U32(&decoded.highlighted_index) ||
+      !reader.U32(&decoded.page_index) || !reader.U32(&decoded.page_size) ||
+      !reader.U32(&decoded.state_flags) ||
+      !reader.U32(&decoded.preedit_sel_start) ||
+      !reader.U32(&decoded.preedit_sel_end) ||
+      !reader.U32(&decoded.preedit_cursor_pos) ||
+      !reader.U32(&decoded.status_flags) ||
+      !reader.U32(&decoded.is_last_page)) {
     if (error)
       *error = "truncated composition suffix";
     return false;
   }
-  return Finish(reader, error);
+  if (!Finish(reader, error) || !ValidCompositionSemantics(decoded, error))
+    return false;
+  *value = std::move(decoded);
+  return true;
+  });
 }
 
 } // namespace famo::runtime

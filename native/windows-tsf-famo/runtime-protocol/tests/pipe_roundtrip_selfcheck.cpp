@@ -11,7 +11,9 @@
 
 #include <windows.h>
 
+#include "famo_runtime_control.h"
 #include "famo_runtime_pipe.h"
+#include "../src/pipe_io.h"
 
 #define CHECK(x)                                                               \
   do {                                                                         \
@@ -79,6 +81,33 @@ bool FinishRuntime(PROCESS_INFORMATION *process) {
   return wait == WAIT_OBJECT_0 && exit_code == 0;
 }
 
+bool RunWrongOwnerChild(std::wstring_view suffix,
+                        const Correlation &identity) {
+  std::wstring command =
+      L"\"" + ModulePath() + L"\" --wrong-owner " + std::wstring(suffix) +
+      L" " + std::to_wstring(identity.client_id) + L" " +
+      std::to_wstring(identity.activation_generation) + L" " +
+      std::to_wstring(identity.connection_generation);
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW, nullptr, ModuleDirectory().c_str(),
+                      &startup, &process)) {
+    return false;
+  }
+  CloseHandle(process.hThread);
+  const DWORD wait = WaitForSingleObject(process.hProcess, 3000);
+  DWORD exit_code = STILL_ACTIVE;
+  GetExitCodeProcess(process.hProcess, &exit_code);
+  if (wait == WAIT_TIMEOUT) {
+    TerminateProcess(process.hProcess, 9);
+    WaitForSingleObject(process.hProcess, 1000);
+  }
+  CloseHandle(process.hProcess);
+  return wait == WAIT_OBJECT_0 && exit_code == 0;
+}
+
 Frame Request(Command command, uint64_t generation, uint64_t sequence) {
   Frame frame;
   frame.command = command;
@@ -91,6 +120,31 @@ Frame Hello(uint64_t generation) {
   frame.correlation.session_id = 0;
   frame.correlation.session_generation = 0;
   return frame;
+}
+
+CallResult DeliveredCall(PipeRuntimePort &port, Frame &&request) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = started + kHardCallDeadline;
+  const DeliveryReference reference{request.command, request.correlation};
+  CallResult prepared = port.Prepare(std::move(request), deadline);
+  if (prepared.status != Status::Prepared)
+    return prepared;
+  DeliveryResult delivered = port.ExecutePrepared(reference, deadline);
+  CallResult result;
+  result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  if (delivered.status != Status::Ok) {
+    result.status = delivered.status;
+    return result;
+  }
+  result.reply = std::move(delivered.final_reply);
+  result.status = result.reply.status;
+  const CallResult acknowledged =
+      port.Ack(reference, std::chrono::steady_clock::now() +
+                              kHardCallDeadline);
+  if (acknowledged.status != Status::Ok)
+    result.status = acknowledged.status;
+  return result;
 }
 
 class BlockingSink final : public RuntimeSnapshotSink {
@@ -173,13 +227,13 @@ bool NormalRoundtrip() {
     Frame unhandled = Request(Command::ProcessKey, generation, sequence);
     CHECK(EncodeKeyEvent({0x7b, 0, 0, 1, sequence}, &unhandled.payload));
     const CallResult immediate =
-        port.Call(std::move(unhandled), kHardCallDeadline);
+        DeliveredCall(port, std::move(unhandled));
     CHECK(immediate.status == Status::Ok);
   }
 
   Frame key = Request(Command::ProcessKey, generation, 102);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 1}, &key.payload));
-  CallResult result = port.Call(std::move(key), kHardCallDeadline);
+  CallResult result = DeliveredCall(port, std::move(key));
   CHECK(result.status == Status::Ok);
   Composition composition;
   CHECK(DecodeComposition(result.reply.payload, &composition, &error));
@@ -187,21 +241,21 @@ bool NormalRoundtrip() {
 
   key = Request(Command::ProcessKey, generation, 103);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('I'), 0, 0, 1, 2}, &key.payload));
-  result = port.Call(std::move(key), kHardCallDeadline);
+  result = DeliveredCall(port, std::move(key));
   CHECK(result.status == Status::Ok);
   CHECK(DecodeComposition(result.reply.payload, &composition, &error));
   CHECK(composition.preedit == "ni" && !composition.candidates.empty());
 
   Frame select = Request(Command::SelectCandidate, generation, 104);
   CHECK(EncodeCandidateIndex(0, &select.payload));
-  result = port.Call(std::move(select), kHardCallDeadline);
+  result = DeliveredCall(port, std::move(select));
   CHECK(result.status == Status::Ok);
   CHECK(DecodeComposition(result.reply.payload, &composition, &error));
   CHECK(composition.commit == "\xe4\xbd\xa0");
 
   Frame unhandled = Request(Command::ProcessKey, generation, 105);
   CHECK(EncodeKeyEvent({0x7b, 0, 0, 1, 3}, &unhandled.payload));
-  result = port.Call(std::move(unhandled), kHardCallDeadline);
+  result = DeliveredCall(port, std::move(unhandled));
   CHECK(result.status == Status::Ok);
   CHECK(DecodeComposition(result.reply.payload, &composition, &error));
   CHECK(!composition.handled);
@@ -236,7 +290,7 @@ bool AbsolutePreviewSelectionRoundtrip() {
     Frame key = Request(Command::ProcessKey, generation, sequence);
     const uint32_t letter = sequence == 2 ? 'N' : 'I';
     CHECK(EncodeKeyEvent({letter, 0, 0, 1, sequence}, &key.payload));
-    CallResult result = port.Call(std::move(key), kHardCallDeadline);
+    CallResult result = DeliveredCall(port, std::move(key));
     CHECK(result.status == Status::Ok);
     CHECK(DecodeComposition(result.reply.payload, &composition, &error));
   }
@@ -245,19 +299,18 @@ bool AbsolutePreviewSelectionRoundtrip() {
 
   Frame stale = Request(Command::SelectCandidateAbsolute, generation, 4);
   CHECK(EncodeAbsoluteCandidateSelection(1, 2, &stale.payload));
-  const CallResult stale_result =
-      port.Call(std::move(stale), kHardCallDeadline);
+  const CallResult stale_result = DeliveredCall(port, std::move(stale));
   CHECK(stale_result.status == Status::StaleRequest);
   Frame out_of_range =
       Request(Command::SelectCandidateAbsolute, generation, 5);
   CHECK(EncodeAbsoluteCandidateSelection(3, 3, &out_of_range.payload));
-  CHECK(port.Call(std::move(out_of_range), kHardCallDeadline).status ==
+  CHECK(DeliveredCall(port, std::move(out_of_range)).status ==
         Status::InvalidFrame);
 
   Frame page_two =
       Request(Command::SelectCandidateAbsolute, generation, 6);
   CHECK(EncodeAbsoluteCandidateSelection(1, 3, &page_two.payload));
-  CallResult selected = port.Call(std::move(page_two), kHardCallDeadline);
+  CallResult selected = DeliveredCall(port, std::move(page_two));
   CHECK(selected.status == Status::Ok);
   CHECK(DecodeComposition(selected.reply.payload, &composition, &error));
   CHECK(composition.commit == "\xe5\xb0\xbc");
@@ -266,14 +319,14 @@ bool AbsolutePreviewSelectionRoundtrip() {
     Frame key = Request(Command::ProcessKey, generation, sequence);
     const uint32_t letter = sequence == 7 ? 'N' : 'I';
     CHECK(EncodeKeyEvent({letter, 0, 0, 1, sequence}, &key.payload));
-    selected = port.Call(std::move(key), kHardCallDeadline);
+    selected = DeliveredCall(port, std::move(key));
     CHECK(selected.status == Status::Ok);
     CHECK(DecodeComposition(selected.reply.payload, &composition, &error));
   }
   Frame page_three =
       Request(Command::SelectCandidateAbsolute, generation, 9);
   CHECK(EncodeAbsoluteCandidateSelection(2, 8, &page_three.payload));
-  selected = port.Call(std::move(page_three), kHardCallDeadline);
+  selected = DeliveredCall(port, std::move(page_three));
   CHECK(selected.status == Status::Ok);
   CHECK(DecodeComposition(selected.reply.payload, &composition, &error));
   CHECK(composition.commit == "\xe6\xb3\xa5");
@@ -354,6 +407,70 @@ bool OptionalUiPipeDoesNotDelayPrimaryReadiness() {
   return true;
 }
 
+bool UiEndpointRejectsBusinessCommands() {
+  const std::wstring suffix =
+      L"ui-command-isolation-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+  const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
+  RuntimeService service;
+  CHECK(service.Start(EnginePath().c_str(), "", &error));
+  CHECK(service.InitializeControlState() == ControlError::None);
+
+  bool served = false;
+  std::string server_error;
+  std::thread server([&] {
+    RuntimePipeServer pipe_server;
+    served = pipe_server.ServeOnce(
+        ui_endpoint, &service, ServerFault::None, std::chrono::seconds(2),
+        &server_error, 0, nullptr, true);
+  });
+
+  HANDLE pipe = INVALID_HANDLE_VALUE;
+  const auto connect_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (pipe == INVALID_HANDLE_VALUE &&
+         std::chrono::steady_clock::now() < connect_deadline) {
+    pipe = CreateFileW(ui_endpoint.name.c_str(), GENERIC_READ | GENERIC_WRITE,
+                       0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
+                       nullptr);
+    if (pipe == INVALID_HANDLE_VALUE)
+      Sleep(1);
+  }
+  bool isolated = false;
+  if (pipe != INVALID_HANDLE_VALUE) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    Frame hello = Hello(445);
+    Frame reply;
+    const bool greeted =
+        pipe_io::WriteFrame(pipe, hello, deadline, &error) ==
+            pipe_io::Result::Ok &&
+        pipe_io::ReadFrame(pipe, &reply, deadline, &error) ==
+            pipe_io::Result::Ok &&
+        reply.command == Command::Hello && reply.status == Status::Ok;
+    Frame open = Request(Command::OpenSession, 445, 1);
+    const bool encoded = EncodeOpenSession("test", &open.payload, &error);
+    Frame rejected;
+    isolated =
+        greeted && encoded &&
+        pipe_io::WriteFrame(pipe, open, deadline, &error) ==
+            pipe_io::Result::Ok &&
+        pipe_io::ReadFrame(pipe, &rejected, deadline, &error) ==
+            pipe_io::Result::Ok &&
+        rejected.command == Command::OpenSession &&
+        rejected.status == Status::InvalidFrame &&
+        rejected.correlation == open.correlation;
+    CloseHandle(pipe);
+  }
+  server.join();
+  service.Stop();
+  CHECK(served);
+  CHECK(isolated);
+  return true;
+}
+
 bool ConcurrentClients() {
   const std::wstring suffix =
       L"concurrent-" + std::to_wstring(GetCurrentProcessId());
@@ -375,7 +492,8 @@ bool ConcurrentClients() {
           index < 2 ? endpoint : ui_endpoint;
       served[index] = server.ServeOnce(
           active_endpoint, &service, ServerFault::None,
-          std::chrono::seconds(2), &server_errors[index]);
+          std::chrono::seconds(2), &server_errors[index], 0, nullptr,
+          index >= 2);
     });
   }
   Sleep(50);
@@ -405,6 +523,95 @@ bool ConcurrentClients() {
   CHECK(second_elapsed < std::chrono::milliseconds(100));
   for (const bool connection_served : served)
     CHECK(connection_served);
+  return true;
+}
+
+bool PrimaryCapacityRejectsAtProtocolBoundary() {
+  const std::wstring suffix =
+      L"primary-capacity-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+  RuntimeService service;
+  CHECK(service.Start(EnginePath().c_str(), "", &error));
+  CHECK(service.InitializeControlState() == ControlError::None);
+
+  constexpr size_t kConnections = kRuntimeClientCapacity + 1;
+  std::vector<std::thread> servers;
+  std::vector<uint8_t> served(kConnections, 0);
+  std::vector<std::string> server_errors(kConnections);
+  servers.reserve(kConnections);
+  for (size_t index = 0; index < kConnections; ++index) {
+    servers.emplace_back([&, index] {
+      RuntimePipeServer server;
+      served[index] =
+          server.ServeOnce(endpoint, &service, ServerFault::None,
+                           std::chrono::seconds(3), &server_errors[index])
+              ? 1
+              : 0;
+    });
+  }
+  Sleep(100);
+
+  std::vector<HANDLE> connections;
+  connections.reserve(kConnections);
+  bool transport_ok = true;
+  bool first_seventeen_ok = true;
+  bool capacity_reply_ok = false;
+  for (size_t index = 0; index < kConnections; ++index) {
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    const auto connect_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < connect_deadline) {
+      pipe = CreateFileW(endpoint.name.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+      if (pipe != INVALID_HANDLE_VALUE)
+        break;
+      WaitNamedPipeW(endpoint.name.c_str(), 20);
+    }
+    if (pipe == INVALID_HANDLE_VALUE) {
+      transport_ok = false;
+      break;
+    }
+    connections.push_back(pipe);
+    Frame hello = Hello(5000 + index);
+    hello.correlation.client_id = 10000 + index;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    Frame reply;
+    const bool exchanged =
+        pipe_io::WriteFrame(pipe, hello, deadline, &error) ==
+            pipe_io::Result::Ok &&
+        pipe_io::ReadFrame(pipe, &reply, deadline, &error) ==
+            pipe_io::Result::Ok &&
+        reply.command == Command::Hello &&
+        reply.correlation == hello.correlation;
+    if (!exchanged) {
+      transport_ok = false;
+      break;
+    }
+    if (index < 17)
+      first_seventeen_ok = first_seventeen_ok && reply.status == Status::Ok;
+    if (index < kRuntimeClientCapacity)
+      transport_ok = transport_ok && reply.status == Status::Ok;
+    else
+      capacity_reply_ok = reply.status == Status::Unavailable;
+  }
+
+  for (HANDLE pipe : connections)
+    CloseHandle(pipe);
+  for (std::thread &server : servers)
+    server.join();
+  service.Stop();
+  for (size_t index = 0; index < served.size(); ++index) {
+    if (!served[index])
+      std::fprintf(stderr, "capacity server %zu failed: %s\n", index,
+                   server_errors[index].c_str());
+    transport_ok = transport_ok && served[index];
+  }
+  CHECK(transport_ok);
+  CHECK(first_seventeen_ok);
+  CHECK(capacity_reply_ok);
   return true;
 }
 
@@ -438,6 +645,86 @@ bool ConcurrentRuntimeClients() {
   return true;
 }
 
+bool WrongProcessHelloCannotInvalidateOwnerDelivery() {
+  const std::wstring suffix =
+      L"owner-binding-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+
+  RuntimeService service;
+  CHECK(service.Start(EnginePath().c_str(), "", &error));
+  CHECK(service.InitializeControlState() == ControlError::None);
+  std::array<bool, 2> served{};
+  std::array<std::string, 2> server_errors;
+  std::array<std::thread, 2> servers;
+  for (size_t index = 0; index < servers.size(); ++index) {
+    servers[index] = std::thread([&, index] {
+      RuntimePipeServer server;
+      served[index] =
+          server.ServeOnce(endpoint, &service, ServerFault::None,
+                           std::chrono::seconds(3), &server_errors[index]);
+    });
+  }
+  Sleep(25);
+
+  PipeRuntimePort owner;
+  constexpr uint64_t generation = 485;
+  const Correlation identity = Hello(generation).correlation;
+  CHECK(owner.Connect(endpoint, ModulePath(), identity,
+                      std::chrono::seconds(2), &error));
+  Frame open = Request(Command::OpenSession, generation, 1);
+  CHECK(EncodeOpenSession("test", &open.payload, &error));
+  CHECK(owner.Call(std::move(open), kHardCallDeadline).status == Status::Ok);
+
+  Frame key = Request(Command::ProcessKey, generation, 2);
+  CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 1},
+                       &key.payload));
+  const DeliveryReference reference{key.command, key.correlation};
+  CHECK(owner
+            .Prepare(std::move(key),
+                     std::chrono::steady_clock::now() + kHardCallDeadline)
+            .status == Status::Prepared);
+
+  // A distinct process presents the exact same logical correlation. Its Hello
+  // must be rejected, and that rejected physical connection must not run
+  // InvalidateConnection against the legitimate owner's session.
+  CHECK(RunWrongOwnerChild(suffix, identity));
+  DeliveryResult delivered =
+      owner.Claim(reference,
+                  std::chrono::steady_clock::now() + kHardCallDeadline);
+  CHECK(delivered.status == Status::Prepared);
+  delivered = owner.ExecutePrepared(
+      reference, std::chrono::steady_clock::now() + kHardCallDeadline);
+  CHECK(delivered.status == Status::Ok);
+  Composition composition;
+  CHECK(DecodeComposition(delivered.final_reply.payload, &composition, &error));
+  CHECK(composition.handled && composition.preedit == "n");
+  CHECK(owner.Ack(reference, std::chrono::steady_clock::now() +
+                                 kHardCallDeadline)
+            .status == Status::Ok);
+
+  Frame next = Request(Command::ProcessKey, generation, 3);
+  CHECK(EncodeKeyEvent({static_cast<uint32_t>('I'), 0, 0, 1, 2},
+                       &next.payload));
+  const CallResult next_result = DeliveredCall(owner, std::move(next));
+  CHECK(next_result.status == Status::Ok);
+  CHECK(DecodeComposition(next_result.reply.payload, &composition, &error));
+  CHECK(composition.handled && composition.preedit == "ni");
+
+  owner.Stop();
+  for (std::thread &server : servers)
+    server.join();
+  service.Stop();
+  for (size_t index = 0; index < served.size(); ++index) {
+    if (!served[index])
+      std::fprintf(stderr, "owner server %zu failed: %s\n", index,
+                   server_errors[index].c_str());
+    CHECK(served[index]);
+  }
+  return true;
+}
+
 bool UiStateFailureDoesNotOccupyOrPoisonProcessKey() {
   const std::wstring suffix =
       L"ui-state-isolation-" + std::to_wstring(GetCurrentProcessId());
@@ -458,7 +745,7 @@ bool UiStateFailureDoesNotOccupyOrPoisonProcessKey() {
 
   Frame ui = Request(Command::UpdateUiState, generation, 2);
   CHECK(EncodeUiState({{640, 480, 642, 504}, {0, 0, 1920, 1080}, 144, true,
-                       true, true},
+                       true, true, {1, 2}},
                       &ui.payload, &error));
   port.Post(std::move(ui));
   Sleep(10);
@@ -467,7 +754,7 @@ bool UiStateFailureDoesNotOccupyOrPoisonProcessKey() {
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 1},
                        &first_key.payload));
   const CallResult first =
-      port.Call(std::move(first_key), kHardCallDeadline);
+      DeliveredCall(port, std::move(first_key));
   const bool first_succeeded = first.status == Status::Ok;
   const bool first_stayed_ready = port.state() == ChannelState::Ready;
 
@@ -478,7 +765,7 @@ bool UiStateFailureDoesNotOccupyOrPoisonProcessKey() {
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('I'), 0, 0, 1, 2},
                        &second_key.payload));
   const CallResult second =
-      port.Call(std::move(second_key), kHardCallDeadline);
+      DeliveredCall(port, std::move(second_key));
   const bool second_succeeded = second.status == Status::Ok;
   const bool second_stayed_ready = port.state() == ChannelState::Ready;
 
@@ -515,7 +802,8 @@ bool TransientBusyKeepsKeyChannelReady() {
           index == 0 ? endpoint : ui_endpoint;
       served[index] = server.ServeOnce(
           active_endpoint, &service, ServerFault::None,
-          std::chrono::seconds(2), &server_errors[index]);
+          std::chrono::seconds(2), &server_errors[index], 0, nullptr,
+          index != 0);
     });
   }
   Sleep(25);
@@ -551,7 +839,7 @@ bool TransientBusyKeepsKeyChannelReady() {
     if (entered) {
       Frame busy_key = Request(Command::ProcessKey, generation, 3);
       if (EncodeKeyEvent({0x7b, 0, 0, 1, 2}, &busy_key.payload)) {
-        busy_result = port.Call(std::move(busy_key), kHardCallDeadline);
+        busy_result = DeliveredCall(port, std::move(busy_key));
         busy_ready = port.state() == ChannelState::Ready;
       }
     }
@@ -563,7 +851,7 @@ bool TransientBusyKeepsKeyChannelReady() {
   if (entered && blocker_status.load() == Status::Ok) {
     Frame retry_key = Request(Command::ProcessKey, generation, 3);
     if (EncodeKeyEvent({0x7b, 0, 0, 1, 3}, &retry_key.payload)) {
-      retry_result = port.Call(std::move(retry_key), kHardCallDeadline);
+      retry_result = DeliveredCall(port, std::move(retry_key));
       retry_ready = port.state() == ChannelState::Ready;
     }
   }
@@ -615,7 +903,8 @@ bool UiStateFloodKeepsOneThousandKeysWithinBudget() {
       Frame ui = Request(Command::UpdateUiState, generation, sequence);
       const int32_t offset = static_cast<int32_t>(sequence % 1000);
       if (!EncodeUiState({{offset, 480, offset + 2, 504},
-                          {0, 0, 1920, 1080}, 144, true, true, true},
+                          {0, 0, 1920, 1080}, 144, true, true, true,
+                          {sequence, sequence ^ 0xa5a5a5a5u}},
                          &ui.payload, &producer_error)) {
         encode_failed.store(true);
         break;
@@ -634,7 +923,7 @@ bool UiStateFloodKeepsOneThousandKeysWithinBudget() {
     Frame key = Request(Command::ProcessKey, generation,
                         next_sequence.fetch_add(1));
     if (!EncodeKeyEvent({0x7b, 0, 0, 1, index}, &key.payload) ||
-        port.Call(std::move(key), kHardCallDeadline).status != Status::Ok) {
+        DeliveredCall(port, std::move(key)).status != Status::Ok) {
       warmup_ok = false;
       break;
     }
@@ -651,7 +940,7 @@ bool UiStateFloodKeepsOneThousandKeysWithinBudget() {
       continue;
     }
     const auto started = std::chrono::steady_clock::now();
-    const CallResult result = port.Call(std::move(key), kHardCallDeadline);
+    const CallResult result = DeliveredCall(port, std::move(key));
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - started);
     latencies_us.push_back(elapsed.count());
@@ -706,9 +995,12 @@ bool FaultCheck(std::wstring_view name, std::wstring_view fault,
   CHECK(first.status == Status::Timeout || first.status == Status::Unavailable);
   CHECK(first.elapsed <= kHardCallDeadline);
   CHECK(port.state() == ChannelState::OpenCircuit);
-  CHECK(port.connection_generation() == generation + 1);
+  // A business request can have been prepared before the transport fault.
+  // Retiring the physical pipe must preserve the logical generation so Claim
+  // or cancellation can address that exact delivery after reconnect.
+  CHECK(port.connection_generation() == generation);
 
-  Frame later = Hello(generation + 1);
+  Frame later = Hello(generation);
   const auto started = std::chrono::steady_clock::now();
   CHECK(port.Call(std::move(later), kHardCallDeadline).status ==
         Status::Unavailable);
@@ -719,14 +1011,81 @@ bool FaultCheck(std::wstring_view name, std::wstring_view fault,
   return true;
 }
 
-bool LateGenerationCannotReturn() {
+bool ExecuteDisconnectRecoversExactDelivery(
+    std::wstring_view name, std::wstring_view fault, uint64_t generation,
+    Status expected_claim_status) {
+  const std::wstring suffix =
+      std::wstring(name) + L"-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+  PROCESS_INFORMATION process{};
+  CHECK(SpawnRuntime(suffix, fault, &process, 2, false));
+
+  PipeRuntimePort port;
+  CHECK(port.Connect(endpoint, RuntimePath(), Hello(generation).correlation,
+                     std::chrono::seconds(2), &error));
+  Frame open = Request(Command::OpenSession, generation, 1);
+  CHECK(EncodeOpenSession("test", &open.payload, &error));
+  CHECK(port.Call(std::move(open), kSessionOpenDeadline).status == Status::Ok);
+
+  Frame key_n = Request(Command::ProcessKey, generation, 2);
+  CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 1},
+                       &key_n.payload));
+  const DeliveryReference reference{key_n.command, key_n.correlation};
+  CHECK(port.Prepare(std::move(key_n),
+                     std::chrono::steady_clock::now() + kHardCallDeadline)
+            .status == Status::Prepared);
+  const DeliveryResult ambiguous =
+      port.ExecutePrepared(reference,
+                           std::chrono::steady_clock::now() +
+                               kHardCallDeadline);
+  CHECK(ambiguous.status == Status::Unavailable ||
+        ambiguous.status == Status::Timeout);
+  CHECK(port.connection_generation() == generation);
+  port.Stop();
+
+  CHECK(port.Connect(endpoint, RuntimePath(), Hello(generation).correlation,
+                     std::chrono::seconds(2), &error));
+  DeliveryResult recovered =
+      port.Claim(reference,
+                 std::chrono::steady_clock::now() + kHardCallDeadline);
+  CHECK(recovered.status == expected_claim_status);
+  if (recovered.status == Status::Prepared) {
+    recovered =
+        port.ExecutePrepared(reference,
+                             std::chrono::steady_clock::now() +
+                                 kHardCallDeadline);
+  }
+  CHECK(recovered.status == Status::Ok);
+  Composition composition;
+  CHECK(DecodeComposition(recovered.final_reply.payload, &composition, &error));
+  CHECK(composition.handled && composition.preedit == "n");
+  CHECK(port.Ack(reference, std::chrono::steady_clock::now() +
+                                kHardCallDeadline)
+            .status == Status::Ok);
+
+  Frame key_i = Request(Command::ProcessKey, generation, 3);
+  CHECK(EncodeKeyEvent({static_cast<uint32_t>('I'), 0, 0, 1, 2},
+                       &key_i.payload));
+  const CallResult current = DeliveredCall(port, std::move(key_i));
+  CHECK(current.status == Status::Ok);
+  CHECK(DecodeComposition(current.reply.payload, &composition, &error));
+  CHECK(composition.handled && composition.preedit == "ni");
+
+  port.Stop();
+  CHECK(FinishRuntime(&process));
+  return true;
+}
+
+bool LatePreparedDeliveryReturnsOnSameGeneration() {
   const std::wstring suffix =
       L"late-reconnect-" + std::to_wstring(GetCurrentProcessId());
   PipeEndpoint endpoint;
   std::string error;
   CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
   PROCESS_INFORMATION process{};
-  CHECK(SpawnRuntime(suffix, L"late", &process, 4, true));
+  CHECK(SpawnRuntime(suffix, L"late", &process, 2, false));
   PipeRuntimePort port;
   CHECK(port.Connect(endpoint, RuntimePath(), Hello(700).correlation,
                      std::chrono::seconds(2), &error));
@@ -736,18 +1095,43 @@ bool LateGenerationCannotReturn() {
   Frame old_key = Request(Command::ProcessKey, 700, 2);
   CHECK(EncodeKeyEvent({static_cast<uint32_t>('N'), 0, 0, 1, 1},
                        &old_key.payload));
-  CHECK(port.Call(std::move(old_key), kHardCallDeadline).status ==
-        Status::Timeout);
-  CHECK(port.connection_generation() == 701);
+  const DeliveryReference reference{old_key.command, old_key.correlation};
+  const CallResult prepared =
+      port.Prepare(std::move(old_key),
+                   std::chrono::steady_clock::now() + kHardCallDeadline);
+  CHECK(prepared.status == Status::Timeout);
+  CHECK(port.connection_generation() == 700);
   port.Stop();
 
-  CHECK(port.Connect(endpoint, RuntimePath(), Hello(701).correlation,
+  // The first server deliberately publishes Prepare after the caller's
+  // deadline. Wait until that physical connection has retired, then reconnect
+  // with the same logical generation and finish the exact delivery.
+  Sleep(300);
+  CHECK(port.Connect(endpoint, RuntimePath(), Hello(700).correlation,
                      std::chrono::seconds(2), &error));
-  Frame open = Request(Command::OpenSession, 701, 1);
-  CHECK(EncodeOpenSession("test", &open.payload, &error));
-  const CallResult current = port.Call(std::move(open), kHardCallDeadline);
+  DeliveryResult recovered =
+      port.Claim(reference,
+                 std::chrono::steady_clock::now() + kHardCallDeadline);
+  CHECK(recovered.status == Status::Prepared);
+  recovered =
+      port.ExecutePrepared(reference,
+                           std::chrono::steady_clock::now() +
+                               kHardCallDeadline);
+  CHECK(recovered.status == Status::Ok);
+  Composition composition;
+  CHECK(DecodeComposition(recovered.final_reply.payload, &composition, &error));
+  CHECK(composition.handled && composition.preedit == "n");
+  CHECK(port.Ack(reference, std::chrono::steady_clock::now() +
+                                kHardCallDeadline)
+            .status == Status::Ok);
+
+  Frame current_key = Request(Command::ProcessKey, 700, 3);
+  CHECK(EncodeKeyEvent({static_cast<uint32_t>('I'), 0, 0, 1, 2},
+                       &current_key.payload));
+  const CallResult current = DeliveredCall(port, std::move(current_key));
   CHECK(current.status == Status::Ok);
-  CHECK(current.reply.correlation.connection_generation == 701);
+  CHECK(DecodeComposition(current.reply.payload, &composition, &error));
+  CHECK(composition.handled && composition.preedit == "ni");
   port.Stop();
   CHECK(FinishRuntime(&process));
   return true;
@@ -771,6 +1155,21 @@ bool DuplicateOpenSessionIsIdempotent() {
   CHECK(EncodeOpenSession("test", &duplicate.payload, &error));
   CHECK(port.Call(std::move(duplicate), kSessionOpenDeadline).status ==
         Status::Ok);
+  Frame malformed = Request(Command::OpenSession, 800, 1);
+  malformed.payload = {1};
+  CHECK(port.Call(std::move(malformed), kSessionOpenDeadline).status ==
+        Status::InvalidFrame);
+  Frame changed = Request(Command::OpenSession, 800, 1);
+  CHECK(EncodeOpenSession("different", &changed.payload, &error));
+  CHECK(port.Call(std::move(changed), kSessionOpenDeadline).status ==
+        Status::InvalidFrame);
+  Frame jumped = Request(Command::OpenSession, 800, 2);
+  CHECK(EncodeOpenSession("test", &jumped.payload, &error));
+  CHECK(port.Call(std::move(jumped), kSessionOpenDeadline).status ==
+        Status::StaleRequest);
+  Frame key = Request(Command::ProcessKey, 800, 2);
+  CHECK(EncodeKeyEvent({'N', 0, 0, 1, 1}, &key.payload));
+  CHECK(DeliveredCall(port, std::move(key)).status == Status::Ok);
   CHECK(port.state() == ChannelState::Ready);
   port.Stop();
   CHECK(FinishRuntime(&process));
@@ -809,12 +1208,45 @@ bool StopRetiresInFlightOffControlPath() {
 
 } // namespace
 
-int main() {
+int wmain(int argc, wchar_t **argv) {
+  if (argc == 4 &&
+      std::wstring_view(argv[1]) == L"--control-intruder") {
+    PipeEndpoint endpoint;
+    std::string error;
+    if (!BuildCurrentPipeEndpoint(argv[2], &endpoint, &error))
+      return 2;
+    ControlResult result;
+    const bool accepted =
+        RunControlClient(endpoint, argv[3], Command::ControlDeploy,
+                         std::chrono::seconds(2), &result, &error);
+    return accepted ? 1 : 0;
+  }
+  if (argc == 6 && std::wstring_view(argv[1]) == L"--wrong-owner") {
+    PipeEndpoint endpoint;
+    std::string error;
+    if (!BuildCurrentPipeEndpoint(argv[2], &endpoint, &error))
+      return 2;
+    Correlation identity{};
+    identity.client_id = _wcstoui64(argv[3], nullptr, 10);
+    identity.activation_generation = _wcstoui64(argv[4], nullptr, 10);
+    identity.connection_generation = _wcstoui64(argv[5], nullptr, 10);
+    PipeRuntimePort intruder;
+    const bool connected =
+        intruder.Connect(endpoint, ModulePath(), identity,
+                         std::chrono::seconds(2), &error);
+    intruder.Stop();
+    return connected ? 1 : 0;
+  }
+  if (argc != 1)
+    return 2;
   if (!NormalRoundtrip() || !AbsolutePreviewSelectionRoundtrip() ||
       !WrongPeerRejected() ||
       !ConnectFailureIsOffHotPath() ||
-      !OptionalUiPipeDoesNotDelayPrimaryReadiness() || !ConcurrentClients() ||
+      !OptionalUiPipeDoesNotDelayPrimaryReadiness() ||
+      !UiEndpointRejectsBusinessCommands() || !ConcurrentClients() ||
+      !PrimaryCapacityRejectsAtProtocolBoundary() ||
       !ConcurrentRuntimeClients() ||
+      !WrongProcessHelloCannotInvalidateOwnerDelivery() ||
       !UiStateFailureDoesNotOccupyOrPoisonProcessKey() ||
       !TransientBusyKeepsKeyChannelReady() ||
       !UiStateFloodKeepsOneThousandKeysWithinBudget() ||
@@ -823,7 +1255,14 @@ int main() {
       !FaultCheck(L"engine-hang", L"engine-hang", 520, false) ||
       !FaultCheck(L"malformed", L"malformed", 540, false) ||
       !FaultCheck(L"disconnect", L"disconnect", 550, false) ||
-      !LateGenerationCannotReturn() || !DuplicateOpenSessionIsIdempotent() ||
+      !ExecuteDisconnectRecoversExactDelivery(
+          L"disconnect-before-execute", L"disconnect-before-execute", 560,
+          Status::Prepared) ||
+      !ExecuteDisconnectRecoversExactDelivery(
+          L"disconnect-after-dispatch", L"disconnect-after-dispatch", 570,
+          Status::Ok) ||
+      !LatePreparedDeliveryReturnsOnSameGeneration() ||
+      !DuplicateOpenSessionIsIdempotent() ||
       !StopRetiresInFlightOffControlPath()) {
     return 1;
   }

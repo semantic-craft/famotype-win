@@ -33,8 +33,12 @@ public sealed class FamoEngineApiContractTests
         Assert.NotEmpty(structs);
         foreach (Match match in structs)
         {
+            string name = match.Groups[1].Value;
             string body = match.Groups[2].Value.TrimStart();
-            Assert.StartsWith("uint32_t size;", body);
+            string expectedPrefix = name.EndsWith("V2", StringComparison.Ordinal)
+                ? "uint32_t struct_size;"
+                : "uint32_t size;";
+            Assert.StartsWith(expectedPrefix, body);
         }
 
         Assert.Contains("typedef struct FamoUtf8String", header);
@@ -43,6 +47,27 @@ public sealed class FamoEngineApiContractTests
         Assert.Contains("void* (FAMO_ENGINE_CALL *alloc)(size_t bytes);", header);
         Assert.Contains("void (FAMO_ENGINE_CALL *free)(void* p);", header);
         Assert.Contains("free_view", header);
+    }
+
+    [Fact]
+    public void Header_V2UsesAnIndependentOwnedActionResultAndExplicitLayout()
+    {
+        string header = Header();
+
+        Assert.Contains("#define FAMO_ENGINE_ABI_V2 2u", header);
+        Assert.Contains("FamoCreateEngineApiV2", header);
+        Assert.Contains("typedef struct FamoEngineApiV2", header);
+        Assert.Contains("FamoEngineActionRequestV2", header);
+        Assert.Contains("FamoEngineActionResultV2** out_result", header);
+        Assert.Contains("FAMO_COMPOSITION_LAYOUT_V2", header);
+        Assert.Contains("FAMO_CANDIDATE_LAYOUT_V2", header);
+        Assert.Contains("FAMO_CANDIDATE_V2_STRIDE", header);
+        Assert.Contains("uint32_t candidate_stride;", header);
+        Assert.Contains("uint32_t handled;", header);
+        Assert.Contains("free_result", header);
+        Assert.Contains(
+            "int32_t (FAMO_ENGINE_CALL *deploy_schema)(\n      const FamoUtf8String* schema_id);",
+            header);
     }
 
     [Fact]

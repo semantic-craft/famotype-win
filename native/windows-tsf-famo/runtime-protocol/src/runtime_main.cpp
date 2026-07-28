@@ -94,7 +94,7 @@ int wmain(int argc, wchar_t **argv) {
   std::wstring control_endpoint_suffix;
   Command control_command = Command::Hello;
   bool control_mode = false;
-  int workers = 16;
+  int workers = static_cast<int>(kRuntimeAcceptWorkerCapacity);
   for (int i = 1; i < argc; ++i) {
     const std::wstring_view argument(argv[i]);
     if (argument == L"--data-root" && i + 1 < argc) {
@@ -162,8 +162,11 @@ int wmain(int argc, wchar_t **argv) {
   }
   const bool root_ready = CreateDirectoryW(data_root.c_str(), nullptr) != FALSE ||
                           GetLastError() == ERROR_ALREADY_EXISTS;
-  if (data_root.empty() || endpoint_suffix.empty() || workers < 2 ||
-      workers > 64 || !root_ready ||
+  // The primary accept pool must be able to service every logical client slot;
+  // one extra acceptor returns protocol-level Unavailable at capacity. The UI
+  // lane has its own equally-sized pool below.
+  if (data_root.empty() || endpoint_suffix.empty() ||
+      workers != static_cast<int>(kRuntimeAcceptWorkerCapacity) || !root_ready ||
       !Utf8(data_root, &data_root_utf8) ||
       !BuildCurrentPipeEndpoint(endpoint_suffix, &endpoint, &error)) {
     std::fprintf(stderr, "runtime setup failed: %s\n", error.c_str());
@@ -230,47 +233,85 @@ int wmain(int argc, wchar_t **argv) {
   PipeServerStop key_server_stop;
   PipeServerStop ui_server_stop;
   PipeServerStop control_server_stop;
-  servers.reserve(static_cast<size_t>((workers * 2) + 2));
-  for (int worker = 0; worker < workers; ++worker) {
-    servers.emplace_back([&] {
-      while (running.load()) {
-        RuntimePipeServer server;
-        std::string serve_error;
-        if (!server.ServeOnce(endpoint, &service, ServerFault::None,
-                              std::chrono::milliseconds(250), &serve_error, 0,
-                              &key_server_stop)) {
-          Sleep(10);
+  bool worker_pool_ready = true;
+  try {
+    servers.reserve(static_cast<size_t>((workers * 2) + 2));
+  } catch (...) {
+    worker_pool_ready = false;
+    running.store(false);
+  }
+  for (int worker = 0; worker < workers && worker_pool_ready; ++worker) {
+    try {
+      servers.emplace_back([&] {
+        try {
+          while (running.load()) {
+            RuntimePipeServer server;
+            std::string serve_error;
+            if (!server.ServeOnce(endpoint, &service, ServerFault::None,
+                                  std::chrono::milliseconds(250), &serve_error,
+                                  0, &key_server_stop)) {
+              Sleep(10);
+            }
+          }
+        } catch (...) {
+          running.store(false);
         }
-      }
-    });
+      });
+    } catch (...) {
+      worker_pool_ready = false;
+      running.store(false);
+      break;
+    }
   }
   // UI updates have their own accept pool so best-effort candidate-window
   // traffic can never consume a primary key connection slot.
-  for (int worker = 0; worker < workers; ++worker) {
-    servers.emplace_back([&] {
-      while (running.load()) {
-        RuntimePipeServer server;
-        std::string serve_error;
-        if (!server.ServeOnce(ui_endpoint, &service, ServerFault::None,
-                              std::chrono::milliseconds(250), &serve_error, 0,
-                              &ui_server_stop)) {
-          Sleep(10);
+  for (int worker = 0; worker < workers && worker_pool_ready; ++worker) {
+    try {
+      servers.emplace_back([&] {
+        try {
+          while (running.load()) {
+            RuntimePipeServer server;
+            std::string serve_error;
+            if (!server.ServeOnce(ui_endpoint, &service, ServerFault::None,
+                                  std::chrono::milliseconds(250), &serve_error,
+                                  0, &ui_server_stop, true)) {
+              Sleep(10);
+            }
+          }
+        } catch (...) {
+          running.store(false);
         }
-      }
-    });
+      });
+    } catch (...) {
+      worker_pool_ready = false;
+      running.store(false);
+      break;
+    }
   }
-  for (int worker = 0; worker < 2; ++worker) {
-    servers.emplace_back([&] {
-      while (running.load()) {
-        ControlPipeServer server;
-        std::string serve_error;
-        if (!server.ServeOnce(control_endpoint, &control_service,
-                              std::chrono::milliseconds(250), &serve_error,
-                              &control_server_stop))
-          Sleep(10);
-      }
-    });
+  for (int worker = 0; worker < 2 && worker_pool_ready; ++worker) {
+    try {
+      servers.emplace_back([&] {
+        try {
+          while (running.load()) {
+            ControlPipeServer server;
+            std::string serve_error;
+            if (!server.ServeOnce(control_endpoint, &control_service,
+                                  std::chrono::milliseconds(250), &serve_error,
+                                  &control_server_stop))
+              Sleep(10);
+          }
+        } catch (...) {
+          running.store(false);
+        }
+      });
+    } catch (...) {
+      worker_pool_ready = false;
+      running.store(false);
+      break;
+    }
   }
+  if (!worker_pool_ready)
+    std::fprintf(stderr, "runtime worker pool setup failed\n");
   while (running.load())
     Sleep(10);
   key_server_stop.Stop();

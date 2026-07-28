@@ -3,6 +3,8 @@
 #include <new>
 #include <utility>
 
+#include "abi_boundary.h"
+
 namespace famo::tsf {
 
 class TextService::LayoutEditSession final : public ITfEditSession {
@@ -32,7 +34,8 @@ public:
     return remaining;
   }
   HRESULT STDMETHODCALLTYPE DoEditSession(TfEditCookie cookie) override {
-    return service_->CaptureLayout(context_.get(), view_.get(), cookie);
+    return ComBoundary(
+        [&] { return service_->CaptureLayout(context_.get(), view_.get(), cookie); });
   }
 
 private:
@@ -45,6 +48,7 @@ private:
 
 HRESULT TextService::OnLayoutChange(ITfContext *context, TfLayoutCode code,
                                     ITfContextView *view) {
+  return ComBoundary([&] {
   if (!OnActivationThread())
     return RPC_E_WRONG_THREAD;
   ContextEntry *entry = FindContext(context);
@@ -57,6 +61,7 @@ HRESULT TextService::OnLayoutChange(ITfContext *context, TfLayoutCode code,
   }
   RefreshLayout(entry, view);
   return S_OK;
+  });
 }
 
 void TextService::RefreshLayout(ContextEntry *entry, ITfContextView *view) {

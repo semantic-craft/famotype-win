@@ -78,7 +78,7 @@ struct ReaperContext {
   RetirementGatePtr gate;
 };
 
-DWORD WINAPI ReapPendingTransfer(void *value) {
+DWORD WINAPI ReapPendingTransfer(void *value) noexcept {
   std::unique_ptr<ReaperContext> context(static_cast<ReaperContext *>(value));
   WaitForSingleObject(context->pending->event.get(), INFINITE);
   context->gate->End();

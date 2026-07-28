@@ -7,6 +7,7 @@
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <string>
 
@@ -208,18 +209,6 @@ std::string FirstUtf8Char(std::string_view value) {
 
 bool Contains(std::string_view haystack, std::string_view needle) {
   return haystack.find(needle) != std::string_view::npos;
-}
-
-bool WriteSelectedSchema(const std::wstring &data_root, const std::string &id) {
-  if (data_root.empty() || !SafeSchemaName(id))
-    return false;
-  // Binary and unterminated: SafeName rejects newlines, and the reader trims.
-  std::ofstream file(data_root + L"\\famo-select-schema.txt",
-                     std::ios::trunc | std::ios::binary);
-  if (!file)
-    return false;
-  file << id;
-  return file.good();
 }
 
 } // namespace
@@ -614,7 +603,7 @@ namespace {
 
 StatusUi::State *g_hook_state = nullptr;
 
-LRESULT CALLBACK KeyboardHook(int code, WPARAM wparam, LPARAM lparam) {
+LRESULT KeyboardHookImpl(int code, WPARAM wparam, LPARAM lparam) {
   if (code >= 0 && g_hook_state) {
     const auto *key = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lparam);
     if ((key->flags & LLKHF_INJECTED) == 0) {
@@ -662,10 +651,26 @@ LRESULT CALLBACK KeyboardHook(int code, WPARAM wparam, LPARAM lparam) {
   return CallNextHookEx(nullptr, code, wparam, lparam);
 }
 
-LRESULT CALLBACK MouseHook(int code, WPARAM wparam, LPARAM lparam) {
+LRESULT CALLBACK KeyboardHook(int code, WPARAM wparam, LPARAM lparam) noexcept {
+  try {
+    return KeyboardHookImpl(code, wparam, lparam);
+  } catch (...) {
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+  }
+}
+
+LRESULT MouseHookImpl(int code, WPARAM wparam, LPARAM lparam) {
   if (code >= 0 && g_hook_state && wparam != WM_MOUSEMOVE)
     g_hook_state->alt_double_tap.Reset();
   return CallNextHookEx(nullptr, code, wparam, lparam);
+}
+
+LRESULT CALLBACK MouseHook(int code, WPARAM wparam, LPARAM lparam) noexcept {
+  try {
+    return MouseHookImpl(code, wparam, lparam);
+  } catch (...) {
+    return CallNextHookEx(nullptr, code, wparam, lparam);
+  }
 }
 
 bool ToolboxEnabled(const std::wstring &data_root, bool require_menu_enabled) {
@@ -865,9 +870,12 @@ void RunCommand(StatusUi::State *state, UINT command) {
       continue;
     const bool next =
         StatusBarNextOptionValue(state->status_flags.load(), index);
-    state->service->SetOption(toggle.option, next);
-    if (const char *secondary = StatusBarSecondaryOption(index))
-      state->service->SetOption(secondary, next);
+    if (const char *secondary = StatusBarSecondaryOption(index)) {
+      state->service->SetOptions(
+          {{toggle.option, next}, {secondary, next}});
+    } else {
+      state->service->SetOption(toggle.option, next);
+    }
     return;
   }
   if (command == kCmdSettings) {
@@ -945,15 +953,11 @@ void SwitchSchema(StatusUi::State *state, HWND window, const std::string &id) {
       (current && current->id == id))
     return;
   state->pending_previous = current ? current->id : std::string();
-  const std::wstring data_root = state->data_root;
-  state->deploy = std::async(std::launch::async, [state, window, id,
-                                                  data_root] {
-    if (!WriteSelectedSchema(data_root, id))
-      return;
+  state->deploy = std::async(std::launch::async, [state, window, id] {
     // A failed switch is left visible: the segment keeps painting whatever the
     // engine last published, so the bar never claims a schema that is not live.
     // Three ids in a stock schema_list have no compiled prism and land here.
-    if (state->service->ExecuteControl(Command::ControlSelectSchema) !=
+    if (state->service->SelectSchemaAndPersist(id) !=
         ControlError::None)
       return;
     try {
@@ -1164,8 +1168,7 @@ int HitTestBar(StatusUi::State *state, LPARAM lparam) {
   return StatusBarHitTest(layout, x, y);
 }
 
-LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
-                         LPARAM lparam) {
+LRESULT BarProcImpl(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
   auto *state = reinterpret_cast<StatusUi::State *>(
       GetWindowLongPtrW(window, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
@@ -1295,6 +1298,17 @@ LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK BarProc(HWND window, UINT message, WPARAM wparam,
+                         LPARAM lparam) noexcept {
+  try {
+    return BarProcImpl(window, message, wparam, lparam);
+  } catch (...) {
+    return message == WM_NCCREATE
+               ? FALSE
+               : DefWindowProcW(window, message, wparam, lparam);
+  }
+}
+
 void CreateBar(std::shared_ptr<StatusUi::State> &state) {
   WNDCLASSW bar_class{};
   bar_class.lpfnWndProc = BarProc;
@@ -1328,8 +1342,8 @@ void CreateBar(std::shared_ptr<StatusUi::State> &state) {
   PaintBar(state.get());
 }
 
-LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
-                            LPARAM lparam) {
+LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
+                       LPARAM lparam) {
   auto *state = reinterpret_cast<StatusUi::State *>(
       GetWindowLongPtrW(window, GWLP_USERDATA));
   if (message == WM_NCCREATE) {
@@ -1408,6 +1422,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
   return DefWindowProcW(window, message, wparam, lparam);
 }
 
+LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
+                            LPARAM lparam) noexcept {
+  try {
+    return WindowProcImpl(window, message, wparam, lparam);
+  } catch (...) {
+    return message == WM_NCCREATE
+               ? FALSE
+               : DefWindowProcW(window, message, wparam, lparam);
+  }
+}
+
 } // namespace
 
 StatusUi::StatusUi(RuntimeService *service, std::atomic<bool> *running,
@@ -1432,10 +1457,12 @@ StatusUi::StatusUi(RuntimeService *service, std::atomic<bool> *running,
 StatusUi::~StatusUi() { Stop(); }
 
 void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
+  HRESULT com = E_FAIL;
+  try {
   // The bar is a per-monitor DPI aware layered window, and its D2D renderer
   // plus ShellExecuteW both want an initialised apartment on this thread.
   SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   const std::wstring icons = ModuleDirectory() + L"\\data\\";
   state->icon_zh = LoadTrayIcon(icons + L"famo_zh.ico");
   state->icon_ascii = LoadTrayIcon(icons + L"famo_ascii.ico");
@@ -1507,25 +1534,64 @@ void StatusUi::ThreadMain(std::shared_ptr<State> state) noexcept {
   state->bar_style.reset();
   if (SUCCEEDED(com))
     CoUninitialize();
+  } catch (...) {
+    if (state->keyboard_hook)
+      UnhookWindowsHookEx(state->keyboard_hook);
+    if (state->mouse_hook)
+      UnhookWindowsHookEx(state->mouse_hook);
+    state->keyboard_hook = nullptr;
+    state->mouse_hook = nullptr;
+    g_hook_state = nullptr;
+    if (state->bar) {
+      DestroyWindow(state->bar);
+      state->bar = nullptr;
+    }
+    if (HWND window = state->window.exchange(nullptr))
+      DestroyWindow(window);
+    FamoTextResourcesDestroy(state->resources);
+    state->resources = nullptr;
+    state->bar_style.reset();
+    state->ready.store(true);
+    if (SUCCEEDED(com))
+      CoUninitialize();
+  }
 }
 
 bool StatusUi::Start() {
   if (thread_.joinable())
     return true;
-  thread_ = std::thread(&StatusUi::ThreadMain, state_);
+  state_->ready.store(false);
+  try {
+    if (GetEnvironmentVariableA("FAMO_TEST_STATUS_THREAD_CREATION_FAILURE",
+                                nullptr, 0) != 0) {
+      throw std::bad_alloc();
+    }
+    thread_ = std::thread(&StatusUi::ThreadMain, state_);
+  } catch (...) {
+    state_->ready.store(true);
+    return false;
+  }
   while (!state_->ready.load())
     Sleep(1);
   return state_->window.load() != nullptr;
 }
 
-void StatusUi::Stop() {
-  if (!thread_.joinable())
-    return;
-  if (HWND window = state_->window.load())
-    PostMessageW(window, WM_QUIT, 0, 0);
-  thread_.join();
-  if (state_->deploy.valid())
-    state_->deploy.wait();
+void StatusUi::Stop() noexcept {
+  try {
+    if (!thread_.joinable())
+      return;
+    if (HWND window = state_->window.load())
+      PostMessageW(window, WM_QUIT, 0, 0);
+    thread_.join();
+    if (state_->deploy.valid())
+      state_->deploy.wait();
+  } catch (...) {
+    try {
+      if (thread_.joinable())
+        thread_.detach();
+    } catch (...) {
+    }
+  }
 }
 
 uint64_t StatusUi::icon_registrations() const noexcept {

@@ -33,10 +33,12 @@
 #include <cstddef>  // offsetof — FamoSkin size negotiation for caret_width
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
 #include "../famo_candidate_access.h"
+#include "../famo_c_abi_boundary.h"
 #include "../famo_candidate_ui.h"
 
 #ifdef FAMO_CANDIDATE_UI_BENCHMARK_COUNTERS
@@ -932,38 +934,37 @@ int32_t StatusBarPaintImpl(const FamoStatusBarSpec* spec, const FamoSkin* skin,
   return FAMO_UI_E_PAINT_FAILED;  // no C++ exception escapes the paint (R6)
 }
 
-}  // namespace
-
-// ── FamoTextResources lifecycle + measurement callback ───────────────────────
-extern "C" FamoTextResources* FamoTextResourcesCreate(const FamoSkin* skin,
-                                                       uint32_t dpi) {
-  if (!SkinResourceInputsValid(skin)) return nullptr;
-  FamoTextResources* res = new (std::nothrow) FamoTextResources();
-  if (!res) return nullptr;
-
-  Gdiplus::GdiplusStartupInput gsi;
-  if (Gdiplus::GdiplusStartup(&res->gdiplus_token, &gsi, nullptr) != Gdiplus::Ok) {
-    delete res;
-    return nullptr;
-  }
-  if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                               res->d2d.GetAddressOf())) ||
-      FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                                 reinterpret_cast<IUnknown**>(res->dwrite.GetAddressOf())))) {
-    ULONG_PTR tok = res->gdiplus_token;
-    delete res;
-    Gdiplus::GdiplusShutdown(tok);
-    return nullptr;
-  }
-  FamoTextResourcesReconfigure(res, skin, dpi);
-  return res;
+bool ResourceFailureIs(const char* phase) noexcept {
+  char value[32]{};
+  const DWORD length = GetEnvironmentVariableA(
+      "FAMO_TEST_CANDIDATE_UI_RESOURCE_FAILURE", value,
+      static_cast<DWORD>(std::size(value)));
+  return length > 0 && length < std::size(value) &&
+         std::strcmp(value, phase) == 0;
 }
 
-extern "C" int32_t FamoTextResourcesReconfigure(FamoTextResources* res,
-                                                  const FamoSkin* skin,
-                                                  uint32_t dpi) {
+void TextResourcesDiscardImpl(FamoTextResources* res) {
+  if (!res) return;
+  res->text_brush.Reset();
+  res->text_target.Reset();
+}
+
+void TextResourcesDestroyImpl(FamoTextResources* res) {
+  if (!res) return;
+  const ULONG_PTR token = res->gdiplus_token;
+  ReleaseTextSurface(res);
+  delete res;  // releases the D2D/DWrite ComPtrs
+  if (token)
+    Gdiplus::GdiplusShutdown(token);
+}
+
+int32_t TextResourcesReconfigureImpl(FamoTextResources* res,
+                                     const FamoSkin* skin,
+                                     uint32_t dpi) {
   if (!res || !SkinResourceInputsValid(skin) || !res->dwrite)
     return FAMO_UI_E_INVALID_ARGUMENT;
+  if (ResourceFailureIs("reconfigure"))
+    throw std::bad_alloc();
   if (dpi == 0) dpi = 96;
   ComPtr<IDWriteTextFormat> formats[3];
   const FamoFontSpec* specs[3] = {&skin->label_font, &skin->text_font,
@@ -978,82 +979,208 @@ extern "C" int32_t FamoTextResourcesReconfigure(FamoTextResources* res,
   return FAMO_UI_OK;
 }
 
-extern "C" void FamoTextResourcesDiscardDeviceResources(
-    FamoTextResources* res) {
-  if (!res) return;
-  res->text_brush.Reset();
-  res->text_target.Reset();
+FamoTextResources* TextResourcesCreateCpp(const FamoSkin* skin,
+                                          uint32_t dpi) noexcept {
+  FamoTextResources* resources = nullptr;
+  try {
+    if (!SkinResourceInputsValid(skin))
+      return nullptr;
+    if (ResourceFailureIs("create"))
+      throw std::bad_alloc();
+    resources = new FamoTextResources();
+
+    Gdiplus::GdiplusStartupInput startup;
+    if (Gdiplus::GdiplusStartup(
+            &resources->gdiplus_token, &startup, nullptr) != Gdiplus::Ok) {
+      TextResourcesDestroyImpl(resources);
+      return nullptr;
+    }
+    if (FAILED(D2D1CreateFactory(
+            D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            resources->d2d.GetAddressOf())) ||
+        FAILED(DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(
+                resources->dwrite.GetAddressOf()))) ||
+        TextResourcesReconfigureImpl(resources, skin, dpi) != FAMO_UI_OK) {
+      TextResourcesDestroyImpl(resources);
+      return nullptr;
+    }
+    return resources;
+  } catch (...) {
+    TextResourcesDestroyImpl(resources);
+    return nullptr;
+  }
 }
 
-extern "C" void FamoTextResourcesDestroy(FamoTextResources* res) {
-  if (!res) return;
-  ULONG_PTR tok = res->gdiplus_token;
-  ReleaseTextSurface(res);
-  delete res;  // releases the D2D/DWrite ComPtrs
-  Gdiplus::GdiplusShutdown(tok);
+int32_t TextResourcesReconfigureCpp(FamoTextResources* resources,
+                                    const FamoSkin* skin,
+                                    uint32_t dpi) noexcept {
+  try {
+    return TextResourcesReconfigureImpl(resources, skin, dpi);
+  } catch (...) {
+    return FAMO_UI_E_PAINT_FAILED;
+  }
 }
 
-extern "C" int32_t FamoTextMeasure(void* user, int32_t which, const char* utf8,
-                                   uint32_t utf8_len) {
-  FamoTextResources* res = static_cast<FamoTextResources*>(user);
-  if (!res || which < 0 || which > 2 || !utf8 || utf8_len == 0) return 0;
-  IDWriteTextFormat* fmt = res->fmt[which].Get();
-  if (!fmt) return 0;
-  std::wstring w = Widen(utf8, utf8_len);
-  if (w.empty()) return 0;
-  ComPtr<IDWriteTextLayout> tl;
-  if (FAILED(res->dwrite->CreateTextLayout(w.c_str(), static_cast<UINT32>(w.size()),
-                                           fmt, 1e6f, 1e6f, &tl)))
+void TextResourcesDiscardCpp(FamoTextResources* resources) noexcept {
+  try {
+    TextResourcesDiscardImpl(resources);
+  } catch (...) {
+  }
+}
+
+void TextResourcesDestroyCpp(FamoTextResources* resources) noexcept {
+  try {
+    TextResourcesDestroyImpl(resources);
+  } catch (...) {
+  }
+}
+
+int32_t TextMeasureCpp(void* user, int32_t which, const char* utf8,
+                       uint32_t utf8_len) noexcept {
+  try {
+    if (ResourceFailureIs("measure"))
+      throw std::bad_alloc();
+    auto* resources = static_cast<FamoTextResources*>(user);
+    if (!resources || which < 0 || which > 2 || !utf8 || utf8_len == 0)
+      return 0;
+    IDWriteTextFormat* format = resources->fmt[which].Get();
+    if (!format)
+      return 0;
+    std::wstring wide = Widen(utf8, utf8_len);
+    if (wide.empty())
+      return 0;
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(resources->dwrite->CreateTextLayout(
+            wide.c_str(), static_cast<UINT32>(wide.size()), format,
+            1e6f, 1e6f, &layout)))
+      return 0;
+    FAMO_BENCHMARK_COUNT(text_layout);
+    DWRITE_TEXT_METRICS metrics{};
+    if (FAILED(layout->GetMetrics(&metrics)))
+      return 0;
+    return static_cast<int32_t>(
+        metrics.widthIncludingTrailingWhitespace + 0.5f);
+  } catch (...) {
     return 0;
-  FAMO_BENCHMARK_COUNT(text_layout);
-  DWRITE_TEXT_METRICS tm = {};
-  if (FAILED(tl->GetMetrics(&tm))) return 0;
-  return static_cast<int32_t>(tm.widthIncludingTrailingWhitespace + 0.5f);
+  }
 }
 
 #ifdef FAMO_CANDIDATE_UI_BENCHMARK_COUNTERS
-extern "C" void FamoBenchmarkRenderCountersReset() {
-  g_benchmark_counters = {};
+void BenchmarkCountersResetCpp() noexcept {
+  try {
+    g_benchmark_counters = {};
+  } catch (...) {
+  }
 }
 
-extern "C" FamoBenchmarkRenderCounters FamoBenchmarkRenderCountersSnapshot() {
-  return g_benchmark_counters;
+FamoBenchmarkRenderCounters BenchmarkCountersSnapshotCpp() noexcept {
+  try {
+    return g_benchmark_counters;
+  } catch (...) {
+    return {};
+  }
+}
+#endif
+
+int32_t CandidateUiPaintCpp(const FamoCompositionView* view,
+                            const FamoSkin* skin,
+                            const FamoLayoutInput* input,
+                            const FamoLayoutResult* layout,
+                            FamoTextResources* resources,
+                            void* memory_dc) noexcept {
+  try {
+    if (!view || !skin || !input || !layout || !resources || !memory_dc)
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    if (!CandidatePaintInputsValid(view, skin, input, layout))
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    return PaintImpl(view, skin, input, layout, resources,
+                     static_cast<HDC>(memory_dc));
+  } catch (...) {
+    return FAMO_UI_E_PAINT_FAILED;
+  }
+}
+
+int32_t StatusBarPaintCpp(const FamoStatusBarSpec* spec,
+                          const FamoSkin* skin,
+                          FamoTextResources* resources,
+                          void* memory_dc) noexcept {
+  try {
+    if (!spec || !skin || !resources || !memory_dc)
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    if (spec->size < sizeof(FamoStatusBarSpec) ||
+        skin->size < offsetof(FamoSkin, caret_width) ||
+        (spec->button_count > 0 && !spec->buttons))
+      return FAMO_UI_E_INVALID_ARGUMENT;
+    return StatusBarPaintImpl(
+        spec, skin, resources, static_cast<HDC>(memory_dc));
+  } catch (...) {
+    return FAMO_UI_E_PAINT_FAILED;
+  }
+}
+
+}  // namespace
+
+// ── FamoTextResources lifecycle + measurement callback ───────────────────────
+extern "C" FamoTextResources* FamoTextResourcesCreate(
+    const FamoSkin* skin, uint32_t dpi) noexcept {
+  FAMO_C_ABI_SEH_RETURN(TextResourcesCreateCpp(skin, dpi), nullptr);
+}
+
+extern "C" int32_t FamoTextResourcesReconfigure(
+    FamoTextResources* resources, const FamoSkin* skin,
+    uint32_t dpi) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      TextResourcesReconfigureCpp(resources, skin, dpi),
+      FAMO_UI_E_PAINT_FAILED);
+}
+
+extern "C" void FamoTextResourcesDiscardDeviceResources(
+    FamoTextResources* resources) noexcept {
+  FAMO_C_ABI_SEH_VOID(TextResourcesDiscardCpp(resources));
+}
+
+extern "C" void FamoTextResourcesDestroy(
+    FamoTextResources* resources) noexcept {
+  FAMO_C_ABI_SEH_VOID(TextResourcesDestroyCpp(resources));
+}
+
+extern "C" int32_t FamoTextMeasure(
+    void* user, int32_t which, const char* utf8,
+    uint32_t utf8_len) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      TextMeasureCpp(user, which, utf8, utf8_len), 0);
+}
+
+#ifdef FAMO_CANDIDATE_UI_BENCHMARK_COUNTERS
+extern "C" void FamoBenchmarkRenderCountersReset() noexcept {
+  FAMO_C_ABI_SEH_VOID(BenchmarkCountersResetCpp());
+}
+
+extern "C" FamoBenchmarkRenderCounters
+FamoBenchmarkRenderCountersSnapshot() noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      BenchmarkCountersSnapshotCpp(), FamoBenchmarkRenderCounters{});
 }
 #endif
 
 // ── Paint entry point: SEH-wraps PaintImpl so a hard fault can't drop a key ────
-extern "C" int32_t FamoCandidateUiPaint(const FamoCompositionView* view,
-                                        const FamoSkin* skin,
-                                        const FamoLayoutInput* input,
-                                        const FamoLayoutResult* layout,
-                                        FamoTextResources* res, void* mem_dc) {
-  if (!view || !skin || !input || !layout || !res || !mem_dc)
-    return FAMO_UI_E_INVALID_ARGUMENT;
-  if (!CandidatePaintInputsValid(view, skin, input, layout))
-    return FAMO_UI_E_INVALID_ARGUMENT;
-  // This frame has no unwinding locals → legal to guard with SEH; PaintImpl holds
-  // the C++ objects and catches C++ exceptions itself. __except only sees hard
-  // faults (e.g. a bogus DC), so a paint crash degrades to a hidden popup, never
-  // a dropped keystroke or corrupted session (design §6 crash isolation, R6).
-  __try {
-    return PaintImpl(view, skin, input, layout, res, static_cast<HDC>(mem_dc));
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return FAMO_UI_E_PAINT_FAILED;
-  }
+extern "C" int32_t FamoCandidateUiPaint(
+    const FamoCompositionView* view, const FamoSkin* skin,
+    const FamoLayoutInput* input, const FamoLayoutResult* layout,
+    FamoTextResources* resources, void* memory_dc) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      CandidateUiPaintCpp(
+          view, skin, input, layout, resources, memory_dc),
+      FAMO_UI_E_PAINT_FAILED);
 }
 
 // ── Status bar paint entry point: same SEH contract as the candidate paint ────
-extern "C" int32_t FamoStatusBarPaint(const FamoStatusBarSpec* spec,
-                                      const FamoSkin* skin,
-                                      FamoTextResources* res, void* mem_dc) {
-  if (!spec || !skin || !res || !mem_dc) return FAMO_UI_E_INVALID_ARGUMENT;
-  if (spec->size < sizeof(FamoStatusBarSpec) ||
-      skin->size < offsetof(FamoSkin, caret_width) ||
-      (spec->button_count > 0 && !spec->buttons))
-    return FAMO_UI_E_INVALID_ARGUMENT;
-  __try {
-    return StatusBarPaintImpl(spec, skin, res, static_cast<HDC>(mem_dc));
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    return FAMO_UI_E_PAINT_FAILED;
-  }
+extern "C" int32_t FamoStatusBarPaint(
+    const FamoStatusBarSpec* spec, const FamoSkin* skin,
+    FamoTextResources* resources, void* memory_dc) noexcept {
+  FAMO_C_ABI_SEH_RETURN(
+      StatusBarPaintCpp(spec, skin, resources, memory_dc),
+      FAMO_UI_E_PAINT_FAILED);
 }

@@ -73,6 +73,7 @@ std::unordered_map<void*, Allocation> g_allocations;
 int g_invalid_frees = 0;
 int g_damaged_allocation_guards = 0;
 int g_failures = 0;
+int64_t g_allocations_before_failure = -1;
 
 void Expect(bool condition, const char* expression, int line) {
   if (condition) return;
@@ -84,6 +85,10 @@ void Expect(bool condition, const char* expression, int line) {
 #define EXPECT(condition) Expect((condition), #condition, __LINE__)
 
 void* FAMO_ENGINE_CALL TrackedAlloc(size_t bytes) {
+  if (g_allocations_before_failure == 0)
+    return nullptr;
+  if (g_allocations_before_failure > 0)
+    --g_allocations_before_failure;
   auto* allocation = static_cast<unsigned char*>(
       std::malloc(bytes + kAllocationGuardBytes));
   if (!allocation) return nullptr;
@@ -359,6 +364,42 @@ void CheckOtherQuerySeams(FamoEngineApi& api, FamoEngineContext* context) {
   EXPECT(g_allocations.empty());
 }
 
+void CheckRimeAllocationFailures(FamoEngineApi& api,
+                                 FamoEngineContext* context) {
+  GuardedView guarded;
+  const uint32_t caller_size =
+      static_cast<uint32_t>(sizeof(FamoCompositionView));
+  const auto expect_status_failure = [&](int64_t allocations) {
+    FamoCompositionView* view = guarded.Reset(caller_size);
+    const auto before = guarded.bytes;
+    g_allocations_before_failure = allocations;
+    const int32_t result = api.get_status(context, view);
+    g_allocations_before_failure = -1;
+    EXPECT(result == FAMO_ENGINE_E_RUNTIME);
+    EXPECT(guarded.bytes == before);
+    EXPECT(g_allocations.empty());
+  };
+
+  // Fail preedit, candidate-array, and first candidate-string allocation.
+  // Every path must return an error without publishing a partial view and
+  // release allocations made before the fault.
+  expect_status_failure(0);
+  expect_status_failure(2);
+  expect_status_failure(3);
+
+  // A commit query is consumptive. If its very first copy fails, the v1
+  // adapter must still fail the call and leave no half-owned output.
+  FamoKeyEvent commit = KeyDown(' ');
+  FamoCompositionView* view = guarded.Reset(caller_size);
+  const auto before = guarded.bytes;
+  g_allocations_before_failure = 0;
+  const int32_t result = api.process_key(context, &commit, view);
+  g_allocations_before_failure = -1;
+  EXPECT(result == FAMO_ENGINE_E_RUNTIME);
+  EXPECT(guarded.bytes == before);
+  EXPECT(g_allocations.empty());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -423,6 +464,34 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  FamoEngineContext* malformed_context =
+      reinterpret_cast<FamoEngineContext*>(
+          static_cast<uintptr_t>(1));
+  FamoUtf8String huge_declared{
+      sizeof(FamoUtf8String), "x",
+      FAMO_ENGINE_V2_MAX_STRING_BYTES + 1u};
+  EXPECT(api.create_context(&huge_declared, &malformed_context) ==
+         FAMO_ENGINE_E_INVALID_ARGUMENT);
+  EXPECT(malformed_context == nullptr);
+  const char invalid_utf8_bytes[] = {
+      static_cast<char>(0xc0), static_cast<char>(0xaf)};
+  FamoUtf8String invalid_utf8{
+      sizeof(FamoUtf8String), invalid_utf8_bytes, 2};
+  malformed_context =
+      reinterpret_cast<FamoEngineContext*>(
+          static_cast<uintptr_t>(1));
+  EXPECT(api.create_context(&invalid_utf8, &malformed_context) ==
+         FAMO_ENGINE_E_INVALID_ARGUMENT);
+  EXPECT(malformed_context == nullptr);
+  FamoUtf8String null_nonempty{
+      sizeof(FamoUtf8String), nullptr, 1};
+  malformed_context =
+      reinterpret_cast<FamoEngineContext*>(
+          static_cast<uintptr_t>(1));
+  EXPECT(api.create_context(&null_nonempty, &malformed_context) ==
+         FAMO_ENGINE_E_INVALID_ARGUMENT);
+  EXPECT(malformed_context == nullptr);
+
   const char* context_schema =
       deterministic_test_engine ? "" : kRimeFixtureSchema;
   bool fixture_ready = true;
@@ -448,6 +517,8 @@ int main(int argc, char** argv) {
       if (RecreateContext(api, &context, context_schema))
         CheckLegacyCandidateStride(api, context, kV11FieldSpan);
       CheckOtherQuerySeams(api, context);
+      if (!deterministic_test_engine)
+        CheckRimeAllocationFailures(api, context);
     }
   }
 

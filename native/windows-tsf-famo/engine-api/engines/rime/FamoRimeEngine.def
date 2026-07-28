@@ -1,3 +1,4 @@
 LIBRARY FamoRimeEngine
 EXPORTS
     FamoCreateEngineApi
+    FamoCreateEngineApiV2

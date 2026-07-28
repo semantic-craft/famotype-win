@@ -74,6 +74,25 @@ public sealed class InputMethodListTests
         Assert.Contains("TfIppmfDontCareCurrentInputLanguage", source);
     }
 
+    [Fact]
+    public void UserListProbe_RecognizesOnlyTheExactRegistryValueName()
+    {
+        Assert.True(InputMethodList.ContainsFamoTipValueName(
+            [InputMethodList.FamoTip.ToLowerInvariant()]));
+        Assert.False(InputMethodList.ContainsFamoTipValueName(
+            ["UnrelatedValue", $"prefix-{InputMethodList.FamoTip}"]));
+
+        string source = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings.Core/InputMethodList.cs"));
+        string probe = source[source.IndexOf(
+            "public static bool TryIsFamoInUserList",
+            StringComparison.Ordinal)..source.IndexOf(
+            "private static (ushort LangId",
+            StringComparison.Ordinal)];
+        Assert.DoesNotContain("GetValue(", probe);
+        Assert.DoesNotContain("ValueContainsTip", probe);
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;

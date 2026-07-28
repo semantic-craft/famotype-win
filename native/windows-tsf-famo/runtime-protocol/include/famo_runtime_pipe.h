@@ -24,8 +24,8 @@ class RetirementGate;
 class PipeServerStop {
 public:
   bool Register(HANDLE pipe);
-  void Unregister(HANDLE pipe);
-  void Stop();
+  void Unregister(HANDLE pipe) noexcept;
+  void Stop() noexcept;
 
 private:
   std::mutex mutex_;
@@ -51,6 +51,17 @@ enum class ServerFault {
   OpenSessionUnavailable,
   UiHang,
   LateReply,
+  DisconnectBeforeExecute,
+  DisconnectAfterDispatch,
+  CopyFailureAfterMutation,
+};
+
+struct DeliveryResult {
+  // Status of the delivery-control operation. Ok means final_reply is the
+  // exact cached business response; its own status remains authoritative.
+  Status status = Status::Unavailable;
+  Frame final_reply;
+  std::chrono::milliseconds elapsed{0};
 };
 
 class PipeRuntimePort {
@@ -66,13 +77,27 @@ public:
                std::chrono::milliseconds timeout, std::string *error,
                const std::atomic<bool> *cancelled = nullptr);
   void CancelConnect();
-  void CancelCall();
+  void CancelCall(bool preserve_connection_generation = false);
   // Control path only. It may cancel I/O and join the worker.
-  void Stop();
+  void Stop() noexcept;
 
   // Hot path. It only enqueues to an already-ready worker and waits until one
   // absolute deadline. It never connects, launches, cancels, or joins.
   CallResult Call(Frame &&request, std::chrono::milliseconds deadline);
+  CallResult Call(Frame &&request,
+                  std::chrono::steady_clock::time_point absolute_deadline);
+  // Delivery-tracked business calls use one caller-owned absolute deadline for
+  // both Prepare and Execute. Claim/ACK may be issued later by recovery work.
+  CallResult Prepare(Frame &&request,
+                     std::chrono::steady_clock::time_point absolute_deadline);
+  DeliveryResult
+  ExecutePrepared(const DeliveryReference &reference,
+                  std::chrono::steady_clock::time_point absolute_deadline);
+  DeliveryResult
+  Claim(const DeliveryReference &reference,
+        std::chrono::steady_clock::time_point absolute_deadline);
+  CallResult Ack(const DeliveryReference &reference,
+                 std::chrono::steady_clock::time_point absolute_deadline);
   // Hot path. Overwrites the previous pending UI-only update without doing
   // pipe I/O. Best-effort UI work uses an independent pipe and worker.
   void Post(Frame &&request);
@@ -82,6 +107,9 @@ public:
 
   ChannelState state() const;
   uint64_t connection_generation() const;
+  // Exact process identity authenticated during the primary pipe handshake.
+  // A zero identity means the channel is not currently authenticated.
+  PipeClientIdentity server_identity() const noexcept;
 
 private:
   struct WorkItem {
@@ -93,9 +121,16 @@ private:
     bool done = false;
   };
 
-  void WorkerMain();
-  void UiWorkerMain();
-  void OpenCircuit();
+  void WorkerMain() noexcept;
+  void UiWorkerMain() noexcept;
+  void OpenCircuit(bool preserve_connection_generation = false);
+  CallResult CallUntil(Frame &&request,
+                       std::chrono::steady_clock::time_point absolute_deadline);
+  Frame DeliveryControl(Command command,
+                        const DeliveryReference &reference) const;
+  DeliveryResult DeliveryCall(
+      Command command, const DeliveryReference &reference,
+      std::chrono::steady_clock::time_point absolute_deadline);
 
   mutable std::timed_mutex mutex_;
   std::mutex connect_mutex_;
@@ -106,6 +141,9 @@ private:
   HANDLE connecting_pipe_ = INVALID_HANDLE_VALUE;
   std::atomic<ChannelState> state_{ChannelState::NotReady};
   std::atomic<uint64_t> connection_generation_{0};
+  std::atomic<uint64_t> server_creation_time_{0};
+  std::atomic<uint32_t> server_process_id_{0};
+  std::atomic<std::shared_ptr<const Correlation>> connection_identity_;
   std::atomic<bool> slot_busy_{false};
   std::shared_ptr<pipe_io::RetirementGate> retirement_;
   bool stop_ = false;
@@ -127,7 +165,8 @@ public:
   bool ServeOnce(const PipeEndpoint &endpoint, RuntimeService *service,
                  ServerFault fault, std::chrono::milliseconds accept_timeout,
                  std::string *error, uint32_t fault_after_process_keys = 0,
-                 PipeServerStop *stop = nullptr);
+                 PipeServerStop *stop = nullptr,
+                 bool ui_only_endpoint = false);
 };
 
 class RuntimeControlService;

@@ -39,6 +39,9 @@ configure_fixture_repo() {
 create_ice_remote() {
   local work_dir="${TEST_ROOT}/ice-work"
   ICE_REMOTE="${TEST_ROOT}/ice.git"
+  SYMLINK_OUTSIDE="${TEST_ROOT}/symlink-outside"
+  mkdir -p "${SYMLINK_OUTSIDE}"
+  write_fixture_file "${SYMLINK_OUTSIDE}/sentinel.txt" "unchanged"
   git init --quiet "${work_dir}"
   configure_fixture_repo "${work_dir}"
 
@@ -55,6 +58,12 @@ create_ice_remote() {
   git -C "${work_dir}" tag selfcheck-pin "${ICE_PIN_SHA}"
   git -C "${work_dir}" commit --quiet --allow-empty -m "default head"
   ICE_DEFAULT_SHA="$(git -C "${work_dir}" rev-parse HEAD)"
+  ln -s "${SYMLINK_OUTSIDE}" "${work_dir}/lua"
+  git -C "${work_dir}" add lua
+  git -C "${work_dir}" commit --quiet -m "malicious payload symlink"
+  ICE_SYMLINK_SHA="$(git -C "${work_dir}" rev-parse HEAD)"
+  git -C "${work_dir}" tag selfcheck-symlink "${ICE_SYMLINK_SHA}"
+  git -C "${work_dir}" reset --hard --quiet "${ICE_DEFAULT_SHA}"
   git -C "${work_dir}" branch -M main
 
   git clone --quiet --bare "${work_dir}" "${ICE_REMOTE}"
@@ -243,6 +252,19 @@ assert_equal "${WUBI_REPO_URL}" "$(repo_origin "${canonical_default_case}" rime-
 assert_cache_residue_removed "${canonical_default_case}" \
   "unpinned online update must clean managed repositories"
 
+symlink_case="$(make_case payload-symlink)"
+set +e
+run_pinned "${symlink_case}" "${ICE_SYMLINK_SHA}" "${WUBI_PIN_SHA}" \
+  "${TEST_ROOT}/payload-symlink.log"
+symlink_status=$?
+set -e
+[ "${symlink_status}" -ne 0 ] \
+  || fail "upstream payload symlink must fail closed"
+assert_equal "unchanged" "$(cat "${SYMLINK_OUTSIDE}/sentinel.txt")" \
+  "payload symlink rejection must preserve the outside sentinel"
+[ "$(find "${SYMLINK_OUTSIDE}" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = "1" ] \
+  || fail "payload symlink must not create files outside the payload"
+
 ice_before_invalid="$(repo_head "${first_sha_case}" rime-ice)"
 set +e
 run_pinned "${first_sha_case}" refs/tags/missing-ice "${WUBI_PIN_SHA}" \
@@ -303,3 +325,4 @@ printf '[assemble-selfcheck] PASS: unpinned updates restore canonical origins\n'
 printf '[assemble-selfcheck] PASS: invalid refs fail closed\n'
 printf '[assemble-selfcheck] PASS: unpinned offline mode retains valid caches\n'
 printf '[assemble-selfcheck] PASS: managed caches exclude untracked and ignored residue\n'
+printf '[assemble-selfcheck] PASS: upstream payload symlinks fail closed\n'

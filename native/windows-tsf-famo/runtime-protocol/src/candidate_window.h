@@ -24,6 +24,13 @@ bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
                         uint32_t page_index, uint32_t page_size,
                         PreviewSelection *selection) noexcept;
 
+// Sends a click only to the message-only window owned by the exact
+// authenticated TSF process. source_window is carried in WM_COPYDATA.wParam so
+// the receiver can independently bind the click to this Runtime process.
+bool SendPreviewSelectionToOwner(
+    HWND source_window, const PreviewSelectionRequest &request,
+    const PipeClientIdentity &selection_owner) noexcept;
+
 bool PlanScrollTransition(const FamoLayoutResult &previous,
                           const FamoLayoutResult &next,
                           uint32_t previous_page, uint32_t next_page,
@@ -62,7 +69,7 @@ public:
 
   bool Start();
   bool Prewarm();
-  void Stop();
+  void Stop() noexcept;
   void
   Publish(std::shared_ptr<const RuntimeSnapshot> snapshot) noexcept override;
   bool

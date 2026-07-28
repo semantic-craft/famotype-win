@@ -335,12 +335,12 @@ public sealed class CandidateFormatTests
         AssertPatchHunkCopiesStyleBeforeSchemaLoad(
             abiPatch,
             "void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode)",
-            "+      pair.second.style = m_base_style;",
+            "pair.second.style = m_base_style;",
             "+      _LoadSchemaSpecificSettings(pair.first, schema_id);");
         AssertPatchHunkCopiesStyleBeforeSchemaLoad(
             abiPatch,
             "void RimeWithWeaselHandler::ReloadStyleOverlay(WeaselSessionId ipc_id,",
-            "+      pair.second.style = m_base_style;",
+            "pair.second.style = m_base_style;",
             "+      _LoadSchemaSpecificSettings(pair.first, schema_id);");
     }
 
@@ -355,13 +355,18 @@ public sealed class CandidateFormatTests
             StringComparison.Ordinal);
         Assert.True(hunk >= 0, "engine-abi.patch must update ReloadStyleOverlay");
 
-        int nextHunk = abiPatch.IndexOf("\n@@ ", hunk + 1, StringComparison.Ordinal);
-        string reloadHunk = abiPatch.Substring(hunk, (nextHunk < 0 ? abiPatch.Length : nextHunk) - hunk);
+        int nextFunction = abiPatch.IndexOf(
+            "bool RimeWithWeaselHandler::_ApplyFamoOptions(",
+            hunk + 1,
+            StringComparison.Ordinal);
+        string reloadHunk = abiPatch.Substring(
+            hunk,
+            (nextFunction < 0 ? abiPatch.Length : nextFunction) - hunk);
         Assert.Contains("+    if (_RefillAbiView(pair.second.engine_ctx)) {", reloadHunk);
-        Assert.Contains("+      std::string schema_id =", reloadHunk);
-        Assert.Contains("+          m_abi_view.schema_id.data ? m_abi_view.schema_id.data : \"\";", reloadHunk);
+        Assert.Contains("+      std::string schema_id = FamoString(m_abi_result->view.schema_id);", reloadHunk);
         Assert.Contains("+      _LoadSchemaSpecificSettings(pair.first, schema_id);", reloadHunk);
         Assert.Contains("-    if (rime_api->get_status(to_session_id(pair.first), &status)) {", reloadHunk);
+        Assert.DoesNotContain("m_abi_view", reloadHunk);
     }
 
     [Fact]
@@ -374,8 +379,8 @@ public sealed class CandidateFormatTests
 
         Assert.Contains("@@ -261,6 +313,110 @@ void RimeWithWeaselHandler::UpdateColorTheme(BOOL darkMode)", instantPatch);
         Assert.Contains("+  if (m_active_session) {\n+    m_ui->style() = get_session_status(m_active_session).style;\n+    _UpdateUI(m_active_session);\n+  }", instantPatch);
-        Assert.Contains("+      if (m_ui) {\n+        m_ui->style() = get_session_status(pair.first).style;\n+        _UpdateUI(pair.first);\n+      }", abiPatch);
-        Assert.Contains("+    _RefillAbiView(get_session_status(ipc_id).engine_ctx);", abiPatch);
+        Assert.Contains("+      if (m_ui) {\n+        m_ui->style() = pair.second.style;\n+        _UpdateUI(pair.first);\n+      }", abiPatch);
+        Assert.Contains("+      _RefillAbiView(requested->engine_ctx);", abiPatch);
         Assert.DoesNotContain("redraw_session", abiPatch);
     }
 
@@ -454,6 +459,10 @@ public sealed class CandidateFormatTests
         int schema = patch.IndexOf(schemaLine, hunk, StringComparison.Ordinal);
         Assert.True(style >= 0, $"Missing style refresh line after: {hunkAnchor}");
         Assert.True(schema >= 0, $"Missing schema load line after: {hunkAnchor}");
+        int styleLineStart = patch.LastIndexOf('\n', style);
+        Assert.True(
+            styleLineStart < 0 || styleLineStart + 1 >= patch.Length || patch[styleLineStart + 1] != '-',
+            $"Style refresh must remain in the resulting hunk after: {hunkAnchor}");
         Assert.True(style < schema, $"Session style must refresh before schema settings after: {hunkAnchor}");
     }
 

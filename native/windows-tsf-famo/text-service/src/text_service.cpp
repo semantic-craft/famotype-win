@@ -6,6 +6,9 @@
 #include <new>
 #include <utility>
 
+#include <bcrypt.h>
+
+#include "abi_boundary.h"
 #include "famo_guids.h"
 #include "famo_install_state.h"
 #include "module_state.h"
@@ -18,6 +21,121 @@ std::atomic<uint64_t> g_activation_generation{0};
 constexpr UINT kRecoveryMessage = WM_APP + 0x46;
 constexpr int kSessionOpenAttempts = 3;
 constexpr std::chrono::milliseconds kSessionRetryDelay{20};
+constexpr size_t kMaxTerminalAbandonDebts = 64;
+constexpr size_t kMaxTerminalDebtRetriesPerConnect = 4;
+
+struct TerminalAbandonDebt {
+  std::wstring endpoint_suffix;
+  std::wstring runtime_executable;
+  runtime::Correlation identity;
+};
+
+std::mutex g_terminal_debt_mutex;
+std::deque<TerminalAbandonDebt> g_terminal_abandon_debts;
+
+bool SameConnectionEpoch(const runtime::Correlation &left,
+                         const runtime::Correlation &right) {
+  return left.client_id == right.client_id &&
+         left.activation_generation == right.activation_generation &&
+         left.connection_generation == right.connection_generation;
+}
+
+runtime::Correlation ConnectionIdentity(runtime::Correlation identity) {
+  identity.session_id = 0;
+  identity.session_generation = 0;
+  identity.sequence = 0;
+  return identity;
+}
+
+void RememberTerminalAbandonDebt(
+    std::wstring_view endpoint_suffix,
+    std::wstring_view runtime_executable,
+    const runtime::Correlation &identity) noexcept {
+  try {
+    const runtime::Correlation connection = ConnectionIdentity(identity);
+    std::lock_guard lock(g_terminal_debt_mutex);
+    const auto existing = std::find_if(
+        g_terminal_abandon_debts.begin(), g_terminal_abandon_debts.end(),
+        [&](const TerminalAbandonDebt &entry) {
+          return entry.endpoint_suffix == endpoint_suffix &&
+                 entry.runtime_executable == runtime_executable &&
+                 SameConnectionEpoch(entry.identity, connection);
+        });
+    if (existing != g_terminal_abandon_debts.end())
+      return;
+    if (g_terminal_abandon_debts.size() >= kMaxTerminalAbandonDebts)
+      g_terminal_abandon_debts.pop_front();
+    g_terminal_abandon_debts.push_back(
+        {std::wstring(endpoint_suffix), std::wstring(runtime_executable),
+         connection});
+  } catch (...) {
+    // The runtime process is still bounded independently. Debt is a
+    // best-effort same-process retry aid, never the authority for correctness.
+  }
+}
+
+std::optional<TerminalAbandonDebt> TakeTerminalAbandonDebt(
+    std::wstring_view endpoint_suffix,
+    std::wstring_view runtime_executable) noexcept {
+  try {
+    std::lock_guard lock(g_terminal_debt_mutex);
+    const auto found = std::find_if(
+        g_terminal_abandon_debts.begin(), g_terminal_abandon_debts.end(),
+        [&](const TerminalAbandonDebt &entry) {
+          return entry.endpoint_suffix == endpoint_suffix &&
+                 entry.runtime_executable == runtime_executable;
+        });
+    if (found == g_terminal_abandon_debts.end())
+      return std::nullopt;
+    TerminalAbandonDebt debt = std::move(*found);
+    g_terminal_abandon_debts.erase(found);
+    return debt;
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+bool SendTerminalAbandon(
+    const runtime::PipeEndpoint &endpoint, std::wstring_view expected_runtime,
+    const runtime::Correlation &identity,
+    const std::atomic<bool> *cancelled = nullptr) {
+  runtime::PipeRuntimePort port;
+  std::string error;
+  const runtime::Correlation connection = ConnectionIdentity(identity);
+  if (!port.Connect(endpoint, expected_runtime, connection,
+                    std::chrono::milliseconds(100), &error, cancelled)) {
+    return false;
+  }
+  runtime::Frame abandon;
+  abandon.command = runtime::Command::AbandonConnection;
+  abandon.correlation = connection;
+  const runtime::CallResult result =
+      port.Call(std::move(abandon), runtime::kHardCallDeadline);
+  port.Stop();
+  return result.status == runtime::Status::Ok ||
+         result.status == runtime::Status::StaleRequest;
+}
+
+void RetryTerminalAbandonDebts(
+    std::wstring_view endpoint_suffix,
+    std::wstring_view runtime_executable,
+    const runtime::PipeEndpoint &endpoint, std::wstring_view expected_runtime,
+    const std::atomic<bool> *cancelled) {
+  for (size_t attempt = 0;
+       attempt < kMaxTerminalDebtRetriesPerConnect; ++attempt) {
+    std::optional<TerminalAbandonDebt> debt =
+        TakeTerminalAbandonDebt(endpoint_suffix, runtime_executable);
+    if (!debt)
+      return;
+    if (SendTerminalAbandon(endpoint, expected_runtime, debt->identity,
+                            cancelled)) {
+      continue;
+    }
+    RememberTerminalAbandonDebt(debt->endpoint_suffix,
+                                debt->runtime_executable, debt->identity);
+    return;
+  }
+}
 
 ComPtr<ITfContext> TopContext(ITfDocumentMgr *document) {
   ComPtr<ITfContext> context;
@@ -33,6 +151,33 @@ bool TimingEnabled() {
   return length > 0 && length < std::size(value) &&
          (wcscmp(value, L"1") == 0 || _wcsicmp(value, L"true") == 0 ||
           _wcsicmp(value, L"yes") == 0);
+}
+
+bool SameLogicalSession(const runtime::Correlation &left,
+                        const runtime::Correlation &right) {
+  return left.client_id == right.client_id &&
+         left.activation_generation == right.activation_generation &&
+         left.connection_generation == right.connection_generation &&
+         left.session_id == right.session_id &&
+         left.session_generation == right.session_generation;
+}
+
+bool RefreshSelectionCapability(runtime::UiState *state) {
+  if (!state)
+    return false;
+  runtime::SelectionCapability capability;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (BCryptGenRandom(
+            nullptr, reinterpret_cast<PUCHAR>(&capability),
+            static_cast<ULONG>(sizeof(capability)),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0 &&
+        capability) {
+      state->selection_capability = capability;
+      return true;
+    }
+  }
+  state->selection_capability = {};
+  return false;
 }
 
 } // namespace
@@ -99,12 +244,44 @@ HRESULT TextService::Activate(ITfThreadMgr *thread_manager,
 
 HRESULT TextService::ActivateEx(ITfThreadMgr *thread_manager,
                                 TfClientId client_id, DWORD) {
-  return ActivateCore(thread_manager, client_id, true);
+  const HRESULT result = ComBoundary(
+      [&] { return ActivateCore(thread_manager, client_id, true); });
+  if (FAILED(result))
+    ForceDeactivateCleanup();
+  return result;
 }
 
 HRESULT TextService::ActivateForTest(ITfThreadMgr *thread_manager,
                                      TfClientId client_id) {
-  return ActivateCore(thread_manager, client_id, false);
+  const HRESULT result = ComBoundary(
+      [&] { return ActivateCore(thread_manager, client_id, false); });
+  if (FAILED(result))
+    ForceDeactivateCleanup();
+  return result;
+}
+
+bool TextService::PreviewSelectionStateForTest(
+    HWND *target,
+    runtime::PreviewSelectionRequest *request) const noexcept {
+  if (!target || !request || !OnActivationThread() || !recovery_window_)
+    return false;
+  for (const auto &entry : contexts_) {
+    if (entry->close_requested || !entry->ui_state.focused ||
+        entry->selection_capability_sequence == 0 ||
+        !entry->ui_state.selection_capability) {
+      continue;
+    }
+    *target = recovery_window_;
+    *request = {
+        entry->state.session_identity(),
+        entry->selection_capability_sequence,
+        0,
+        0,
+        entry->ui_state.selection_capability,
+    };
+    return true;
+  }
+  return false;
 }
 
 HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
@@ -115,6 +292,10 @@ HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
   activation_thread_ = GetCurrentThreadId();
   client_id_ = client_id;
   thread_manager_ = ComPtr<ITfThreadMgr>(thread_manager);
+  if (GetEnvironmentVariableA("FAMO_TEST_ACTIVATION_ALLOCATION_FAILURE",
+                              nullptr, 0) != 0) {
+    throw std::bad_alloc();
+  }
   runtime_client_id_ =
       (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
       static_cast<uint64_t>(GetTickCount64()) ^
@@ -181,12 +362,129 @@ HRESULT TextService::Deactivate() {
     return S_OK;
   if (!OnActivationThread())
     return RPC_E_WRONG_THREAD;
+  const HRESULT result = ComBoundary([&] { return DeactivateCore(); });
+  ForceDeactivateCleanup();
+  return result;
+}
+
+HRESULT TextService::DeactivateCore() {
+  if (GetEnvironmentVariableA("FAMO_TEST_DEACTIVATE_ALLOCATION_FAILURE",
+                              nullptr, 0) != 0) {
+    throw std::bad_alloc();
+  }
+  for (auto &entry : contexts_) {
+    entry->close_requested = true;
+    SetFocused(entry.get(), false);
+  }
+  const auto delivery_drain_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+  while (!contexts_.empty() &&
+         std::chrono::steady_clock::now() < delivery_drain_deadline) {
+    ProcessRecoveryWork();
+    if (contexts_.empty())
+      break;
+    bool has_delivery = false;
+    for (const auto &entry : contexts_) {
+      has_delivery = has_delivery || entry->pending_delivery ||
+                     entry->applied_delivery ||
+                     entry->delivery_work_pending;
+    }
+    if (!has_delivery) {
+      FinalizeClosingContexts();
+      break;
+    }
+    Sleep(5);
+  }
 
   StopSessionWorker();
-  StopRecoveryWindow();
-  for (auto &entry : contexts_)
-    CloseEntry(entry.get());
+  ApplyDeliveryResult();
+  FinalizeClosingContexts();
+
+  // TSF requires Deactivate to release every thread-manager reference before
+  // returning. If exact delivery recovery still could not finish, terminate
+  // the authenticated logical connection explicitly. This is not an ACK and
+  // never claims that a commit reached the document.
+  std::vector<runtime::Correlation> abandon_identities;
+  try {
+    abandon_identities.reserve(contexts_.size());
+  } catch (...) {
+  }
+  const auto remember_identity =
+      [&](const runtime::DeliveryReference &reference) {
+        const runtime::Correlation connection =
+            ConnectionIdentity(reference.correlation);
+        const bool duplicate =
+            std::any_of(abandon_identities.begin(),
+                        abandon_identities.end(),
+                        [&](const runtime::Correlation &known) {
+                          return SameConnectionEpoch(known, connection);
+                        });
+        if (duplicate)
+          return;
+        try {
+          abandon_identities.push_back(connection);
+        } catch (...) {
+          RememberTerminalAbandonDebt(runtime_endpoint_suffix_,
+                                      runtime_executable_name_, connection);
+        }
+      };
+  for (const auto &owned : contexts_) {
+    if (owned->pending_delivery)
+      remember_identity(*owned->pending_delivery);
+    if (owned->applied_delivery)
+      remember_identity(*owned->applied_delivery);
+  }
+  for (const runtime::Correlation &connection : abandon_identities) {
+    runtime_port_.Stop();
+    bool resolved = false;
+    if (ConnectRuntime(connection, false)) {
+      runtime::Frame abandon;
+      abandon.command = runtime::Command::AbandonConnection;
+      abandon.correlation = connection;
+      const runtime::CallResult abandoned =
+          runtime_port_.Call(std::move(abandon),
+                             runtime::kHardCallDeadline);
+      resolved = abandoned.status == runtime::Status::Ok ||
+                 abandoned.status == runtime::Status::StaleRequest;
+    }
+    if (!resolved) {
+      RememberTerminalAbandonDebt(runtime_endpoint_suffix_,
+                                  runtime_executable_name_, connection);
+      OutputDebugStringA(
+          "FamoTextService terminal delivery abandon deferred\n");
+    }
+  }
+
+  for (auto &owned : contexts_) {
+    ContextEntry *entry = owned.get();
+    std::string confirmed_preedit = entry->recovery_preedit;
+    const RecoveryPlan recovery = entry->state.Fail();
+    if (confirmed_preedit.empty() && recovery.commit_preedit)
+      confirmed_preedit = *recovery.commit_preedit;
+    if (!confirmed_preedit.empty()) {
+      (void)entry->composition.Recover(
+          entry->context.get(), client_id_, confirmed_preedit,
+          static_cast<ITfCompositionSink *>(this));
+    }
+    if (entry->candidates)
+      entry->candidates->End();
+    entry->composition.ResetBehaviorState();
+    entry->ui_state.show_allowed = false;
+    SetFocused(entry, false);
+    if (entry->layout_sink_cookie != TF_INVALID_COOKIE) {
+      ComPtr<ITfSource> source;
+      if (SUCCEEDED(entry->context->QueryInterface(
+              IID_ITfSource,
+              reinterpret_cast<void **>(source.put())))) {
+        source->UnadviseSink(entry->layout_sink_cookie);
+      }
+      entry->layout_sink_cookie = TF_INVALID_COOKIE;
+    }
+    entry->composition.End(entry->context.get(), client_id_);
+    entry->state.Close();
+  }
   contexts_.clear();
+  StopRecoveryWindow();
 
   if (keystroke_manager_ && key_sink_advised_)
     keystroke_manager_->UnadviseKeyEventSink(client_id_);
@@ -207,11 +505,92 @@ HRESULT TextService::Deactivate() {
   return S_OK;
 }
 
+void TextService::ForceDeactivateCleanup() noexcept {
+  // Idempotent, allocation-free release barrier for both normal deactivation
+  // and any exception caught at the COM boundary.
+  StopSessionWorker();
+  try {
+    runtime_port_.Stop();
+  } catch (...) {
+  }
+  try {
+    StopRecoveryWindow();
+  } catch (...) {
+    recovery_window_ = nullptr;
+    recovery_message_posted_ = false;
+  }
+  for (auto &owned : contexts_) {
+    ContextEntry *entry = owned.get();
+    if (!entry)
+      continue;
+    try {
+      if (entry->candidates)
+        entry->candidates->End();
+    } catch (...) {
+    }
+    try {
+      entry->composition.ResetBehaviorState();
+      entry->composition.End(entry->context.get(), client_id_);
+    } catch (...) {
+    }
+    try {
+      if (entry->layout_sink_cookie != TF_INVALID_COOKIE && entry->context) {
+        ComPtr<ITfSource> source;
+        if (SUCCEEDED(entry->context->QueryInterface(
+                IID_ITfSource, reinterpret_cast<void **>(source.put())))) {
+          source->UnadviseSink(entry->layout_sink_cookie);
+        }
+      }
+    } catch (...) {
+    }
+    entry->layout_sink_cookie = TF_INVALID_COOKIE;
+    try {
+      entry->state.Close();
+    } catch (...) {
+    }
+  }
+  contexts_.clear();
+  try {
+    if (keystroke_manager_ && key_sink_advised_)
+      keystroke_manager_->UnadviseKeyEventSink(client_id_);
+  } catch (...) {
+  }
+  key_sink_advised_ = false;
+  try {
+    if (thread_manager_ && thread_sink_cookie_ != TF_INVALID_COOKIE) {
+      ComPtr<ITfSource> source;
+      if (SUCCEEDED(thread_manager_->QueryInterface(
+              IID_ITfSource, reinterpret_cast<void **>(source.put())))) {
+        source->UnadviseSink(thread_sink_cookie_);
+      }
+    }
+  } catch (...) {
+  }
+  thread_sink_cookie_ = TF_INVALID_COOKIE;
+  ui_manager_.reset();
+  keystroke_manager_.reset();
+  thread_manager_.reset();
+  client_id_ = TF_CLIENTID_NULL;
+  activation_thread_ = 0;
+}
+
 bool TextService::OnActivationThread() const {
   return activation_thread_ != 0 && activation_thread_ == GetCurrentThreadId();
 }
 
-bool TextService::ConnectRuntime(const runtime::Correlation &identity) {
+bool TextService::RenewSelectionCapability(
+    ContextEntry *entry, uint64_t composition_sequence) noexcept {
+  if (!entry)
+    return false;
+  entry->selection_capability_sequence = 0;
+  if (!RefreshSelectionCapability(&entry->ui_state))
+    return false;
+  entry->selection_capability_sequence = composition_sequence;
+  return true;
+}
+
+bool TextService::ConnectRuntime(const runtime::Correlation &identity,
+                                 bool retry_terminal_debt) {
   if (runtime_port_.state() == runtime::ChannelState::Ready &&
       runtime_port_.connection_generation() ==
           identity.connection_generation) {
@@ -244,6 +623,11 @@ bool TextService::ConnectRuntime(const runtime::Correlation &identity) {
     }
     deadline = std::chrono::seconds(2);
   }
+  if (retry_terminal_debt) {
+    RetryTerminalAbandonDebts(
+        runtime_endpoint_suffix_, runtime_executable_name_, endpoint, expected,
+        &session_worker_stop_);
+  }
   runtime::Correlation connection = identity;
   connection.session_id = 0;
   connection.session_generation = 0;
@@ -258,6 +642,12 @@ HRESULT TextService::EnsureContext(ITfContext *context,
     return E_INVALIDARG;
   ApplySessionResult();
   ContextEntry *entry = FindContext(context);
+  if (entry && entry->close_requested)
+    return S_FALSE;
+  if (entry && entry->delivery_quarantined)
+    return S_FALSE;
+  if (entry && !ApplyDeferredDelivery(entry))
+    return S_FALSE;
   if (entry && entry->recovery_cleanup_required) {
     ProcessRecoveryWork();
     if (entry->recovery_cleanup_required)
@@ -302,6 +692,11 @@ bool TextService::StartSessionWorker() {
   session_disconnect_requested_.store(false);
   session_request_.store(nullptr);
   session_result_.store(nullptr);
+  {
+    std::lock_guard lock(delivery_queue_mutex_);
+    delivery_requests_.clear();
+    delivery_results_.clear();
+  }
   desired_session_.store(nullptr);
   try {
     session_worker_ = std::thread(&TextService::SessionWorkerMain, this);
@@ -311,17 +706,33 @@ bool TextService::StartSessionWorker() {
   return true;
 }
 
-void TextService::StopSessionWorker() {
+void TextService::StopSessionWorker() noexcept {
   session_worker_stop_.store(true);
   session_retry_wake_.notify_all();
-  runtime_port_.CancelConnect();
-  runtime_port_.CancelCall();
+  try {
+    runtime_port_.CancelConnect();
+    runtime_port_.CancelCall(true);
+  } catch (...) {
+  }
   session_worker_epoch_.fetch_add(1);
   session_worker_epoch_.notify_all();
-  if (session_worker_.joinable())
-    session_worker_.join();
+  try {
+    if (session_worker_.joinable())
+      session_worker_.join();
+  } catch (...) {
+    try {
+      if (session_worker_.joinable())
+        session_worker_.detach();
+    } catch (...) {
+    }
+  }
   session_request_.store(nullptr);
   session_result_.store(nullptr);
+  try {
+    std::lock_guard lock(delivery_queue_mutex_);
+    delivery_requests_.clear();
+  } catch (...) {
+  }
   desired_session_.store(nullptr);
   session_disconnect_requested_.store(false);
   session_worker_stop_.store(false);
@@ -364,59 +775,82 @@ void TextService::PostRecoveryWork() {
 
 void TextService::ProcessRecoveryWork() {
   recovery_message_posted_ = false;
+  ApplyDeliveryResult();
   for (auto &owned : contexts_) {
     ContextEntry *entry = owned.get();
-    if (!entry->recovery_cleanup_required || entry->recovery_preedit.empty())
-      continue;
-    const HRESULT recovered = entry->composition.Recover(
-        entry->context.get(), client_id_, entry->recovery_preedit,
-        static_cast<ITfCompositionSink *>(this));
-    if (SUCCEEDED(recovered)) {
-      entry->recovery_cleanup_required = false;
-      entry->recovery_preedit.clear();
+    if (entry->recovery_cleanup_required &&
+        !entry->recovery_preedit.empty()) {
+      const HRESULT recovered = entry->composition.Recover(
+          entry->context.get(), client_id_, entry->recovery_preedit,
+          static_cast<ITfCompositionSink *>(this));
+      if (SUCCEEDED(recovered)) {
+        entry->recovery_cleanup_required = false;
+        entry->recovery_preedit.clear();
+      }
+    }
+    if (!entry->delivery_quarantined)
+      (void)ApplyDeferredDelivery(entry);
+    if (!entry->delivery_work_pending) {
+      if (entry->pending_delivery && !entry->delivery_quarantined) {
+        ScheduleDeliveryWork(entry, entry->pending_delivery_work,
+                             *entry->pending_delivery);
+      } else if (entry->applied_delivery &&
+                 (!entry->ui_state.focused || entry->close_requested)) {
+        ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
+                             *entry->applied_delivery);
+      }
     }
   }
   ApplySessionResult();
+  FinalizeClosingContexts();
 }
 
 LRESULT CALLBACK TextService::RecoveryWindowProc(HWND window, UINT message,
                                                  WPARAM wparam,
                                                  LPARAM lparam) {
-  if (message == WM_NCCREATE) {
-    const auto *create = reinterpret_cast<const CREATESTRUCTW *>(lparam);
-    SetWindowLongPtrW(window, GWLP_USERDATA,
-                      reinterpret_cast<LONG_PTR>(create->lpCreateParams));
-  }
-  auto *service = reinterpret_cast<TextService *>(
-      GetWindowLongPtrW(window, GWLP_USERDATA));
-  if (!service)
+  return BoundaryOr<LRESULT>(FALSE, [&] {
+    if (message == WM_NCCREATE) {
+      const auto *create = reinterpret_cast<const CREATESTRUCTW *>(lparam);
+      if (!create)
+        return static_cast<LRESULT>(FALSE);
+      SetWindowLongPtrW(window, GWLP_USERDATA,
+                        reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    }
+    auto *service = reinterpret_cast<TextService *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (!service)
+      return DefWindowProcW(window, message, wparam, lparam);
+    if (message == kRecoveryMessage) {
+      service->ProcessRecoveryWork();
+      return static_cast<LRESULT>(0);
+    }
+    if (message == WM_COPYDATA) {
+      const auto *copy = reinterpret_cast<const COPYDATASTRUCT *>(lparam);
+      if (!copy || copy->dwData != runtime::kPreviewSelectionCopyDataId ||
+          copy->cbData != sizeof(runtime::PreviewSelectionRequest) ||
+          !copy->lpData)
+        return static_cast<LRESULT>(FALSE);
+      return static_cast<LRESULT>(
+          service->HandlePreviewSelection(
+              reinterpret_cast<HWND>(wparam),
+              *static_cast<const runtime::PreviewSelectionRequest *>(
+                  copy->lpData))
+              ? TRUE
+              : FALSE);
+    }
+    if (message == WM_NCDESTROY) {
+      SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+      service->recovery_window_ = nullptr;
+    }
     return DefWindowProcW(window, message, wparam, lparam);
-  if (message == kRecoveryMessage) {
-    service->ProcessRecoveryWork();
-    return 0;
-  }
-  if (message == WM_COPYDATA) {
-    const auto *copy = reinterpret_cast<const COPYDATASTRUCT *>(lparam);
-    if (!copy || copy->dwData != runtime::kPreviewSelectionCopyDataId ||
-        copy->cbData != sizeof(runtime::PreviewSelectionRequest) ||
-        !copy->lpData)
-      return FALSE;
-    return service->HandlePreviewSelection(
-               *static_cast<const runtime::PreviewSelectionRequest *>(
-                   copy->lpData))
-               ? TRUE
-               : FALSE;
-  }
-  if (message == WM_NCDESTROY) {
-    SetWindowLongPtrW(window, GWLP_USERDATA, 0);
-    service->recovery_window_ = nullptr;
-  }
-  return DefWindowProcW(window, message, wparam, lparam);
+  });
 }
 
 void TextService::ScheduleSession(ContextEntry *entry,
                                   SessionWarmupReason reason) {
   if (!entry || entry->session_pending)
+    return;
+  if (!RenewSelectionCapability(entry, 0))
     return;
   uint64_t generation = runtime_port_.connection_generation();
   if (runtime_port_.state() != runtime::ChannelState::Ready) {
@@ -468,9 +902,107 @@ void TextService::ScheduleSession(ContextEntry *entry,
   }
 }
 
-void TextService::SessionWorkerMain() {
+void TextService::ScheduleDeliveryWork(
+    ContextEntry *entry, DeliveryWorkKind kind,
+    const runtime::DeliveryReference &reference) {
+  if (!entry || entry->delivery_work_pending || !session_worker_.joinable())
+    return;
+  entry->pending_delivery_work = kind;
+  try {
+    runtime::Correlation identity = reference.correlation;
+    identity.sequence = 0;
+    auto request = std::make_shared<const DeliveryWorkRequest>(
+        DeliveryWorkRequest{identity, reference, kind});
+    {
+      std::lock_guard lock(delivery_queue_mutex_);
+      if (delivery_requests_.size() >= kMaxQueuedDeliveryWork)
+        return;
+      entry->delivery_work_pending = true;
+      try {
+        delivery_requests_.push_back(std::move(request));
+      } catch (...) {
+        entry->delivery_work_pending = false;
+        throw;
+      }
+    }
+    session_worker_epoch_.fetch_add(1);
+    session_worker_epoch_.notify_one();
+    session_retry_wake_.notify_all();
+  } catch (...) {
+    entry->delivery_work_pending = false;
+  }
+}
+
+TextService::DeliveryAttempt
+TextService::SendDelivery(ContextEntry *entry, runtime::Frame &&request) {
+  DeliveryAttempt attempt;
+  attempt.reference = {request.command, request.correlation};
+  if (!entry)
+    return attempt;
+
+  const bool acknowledges_previous =
+      entry->applied_delivery &&
+      SameLogicalSession(entry->applied_delivery->correlation,
+                         request.correlation);
+  if (acknowledges_previous)
+    request.flags |= runtime::kFlagAcknowledgePrevious;
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = started + runtime::kHardCallDeadline;
+  const runtime::CallResult prepared =
+      runtime_port_.Prepare(std::move(request), deadline);
+  const bool explicit_response =
+      prepared.reply.flags == runtime::kFlagResponse &&
+      prepared.reply.command == attempt.reference.command &&
+      prepared.reply.correlation == attempt.reference.correlation;
+  if (!explicit_response ||
+      prepared.status != runtime::Status::Prepared) {
+    attempt.state = explicit_response
+                        ? DeliveryAttemptState::Rejected
+                        : DeliveryAttemptState::PrepareUnknown;
+    attempt.status = prepared.status;
+    attempt.elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+    return attempt;
+  }
+
+  if (acknowledges_previous)
+    entry->applied_delivery.reset();
+  runtime::DeliveryResult executed =
+      runtime_port_.ExecutePrepared(attempt.reference, deadline);
+  attempt.elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - started);
+  attempt.status = executed.status;
+  if (executed.status == runtime::Status::Ok) {
+    attempt.state = DeliveryAttemptState::Final;
+    attempt.final_reply = std::move(executed.final_reply);
+  } else {
+    attempt.state = DeliveryAttemptState::PreparedAmbiguous;
+  }
+  return attempt;
+}
+
+void TextService::SessionWorkerMain() noexcept {
+  try {
   uint64_t observed_epoch = session_worker_epoch_.load();
   while (!session_worker_stop_.load()) {
+    std::shared_ptr<const DeliveryWorkRequest> delivery;
+    {
+      std::lock_guard lock(delivery_queue_mutex_);
+      if (!delivery_requests_.empty()) {
+        delivery = std::move(delivery_requests_.front());
+        delivery_requests_.pop_front();
+      }
+    }
+    if (delivery)
+      session_retry_wake_.notify_all();
+    if (delivery) {
+      ProcessDeliveryWork(delivery);
+      observed_epoch = session_worker_epoch_.load();
+      continue;
+    }
     const bool disconnect = session_disconnect_requested_.exchange(false);
     std::shared_ptr<const SessionWarmupRequest> request =
         session_request_.exchange(nullptr);
@@ -589,6 +1121,103 @@ void TextService::SessionWorkerMain() {
       }
     }
   }
+  } catch (...) {
+    try {
+      runtime_port_.Poison();
+      session_result_.store(nullptr);
+      desired_session_.store(nullptr);
+      if (recovery_window_)
+        PostMessageW(recovery_window_, kRecoveryMessage, 0, 0);
+    } catch (...) {
+    }
+  }
+}
+
+void TextService::ProcessDeliveryWork(
+    const std::shared_ptr<const DeliveryWorkRequest> &request) {
+  if (!request || session_worker_stop_.load())
+    return;
+
+  runtime::Status status = runtime::Status::Unavailable;
+  runtime::Frame final_reply;
+  if (ConnectRuntime(request->identity) && !session_worker_stop_.load()) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + runtime::kHardCallDeadline;
+    if (request->kind == DeliveryWorkKind::Recover) {
+      runtime::DeliveryResult result =
+          runtime_port_.Claim(request->reference, deadline);
+      if (result.status == runtime::Status::Prepared) {
+        result = runtime_port_.ExecutePrepared(
+            request->reference,
+            std::chrono::steady_clock::now() +
+                runtime::kHardCallDeadline);
+      }
+      status = result.status;
+      if (status == runtime::Status::Ok)
+        final_reply = std::move(result.final_reply);
+    } else {
+      status =
+          runtime_port_
+              .Ack(request->reference,
+                   std::chrono::steady_clock::now() +
+                       runtime::kHardCallDeadline)
+              .status;
+    }
+  }
+
+  const bool retryable =
+      status == runtime::Status::Unavailable ||
+      status == runtime::Status::Timeout ||
+      status == runtime::Status::RecoveryPending;
+  if (retryable && !session_worker_stop_.load()) {
+    std::unique_lock retry_lock(session_retry_mutex_);
+    session_retry_wake_.wait_for(retry_lock, kSessionRetryDelay, [&] {
+      return session_worker_stop_.load();
+    });
+    if (!session_worker_stop_.load()) {
+      bool requeued = false;
+      try {
+        std::lock_guard lock(delivery_queue_mutex_);
+        if (delivery_requests_.size() < kMaxQueuedDeliveryWork) {
+          delivery_requests_.push_back(request);
+          requeued = true;
+        }
+      } catch (...) {
+      }
+      if (requeued) {
+        session_worker_epoch_.fetch_add(1);
+        session_worker_epoch_.notify_one();
+        return;
+      }
+    }
+  }
+  if (session_worker_stop_.load())
+    return;
+
+  try {
+    auto result = std::make_shared<const DeliveryWorkResult>(
+        DeliveryWorkResult{request->identity, request->reference,
+                           request->kind, status, std::move(final_reply)});
+    bool published = false;
+    while (!published && !session_worker_stop_.load()) {
+      {
+        std::lock_guard lock(delivery_queue_mutex_);
+        if (delivery_results_.size() < kMaxQueuedDeliveryWork) {
+          delivery_results_.push_back(result);
+          published = true;
+        }
+      }
+      if (!published) {
+        std::unique_lock retry_lock(session_retry_mutex_);
+        session_retry_wake_.wait_for(retry_lock, kSessionRetryDelay, [&] {
+          return session_worker_stop_.load();
+        });
+      }
+    }
+    if (published && recovery_window_)
+      PostMessageW(recovery_window_, kRecoveryMessage, 0, 0);
+  } catch (...) {
+  }
 }
 
 void TextService::ReportTiming(const char *operation,
@@ -644,8 +1273,215 @@ void TextService::ApplySessionResult() {
   }
 }
 
+void TextService::ApplyDeliveryResult() {
+  for (;;) {
+    std::shared_ptr<const DeliveryWorkResult> result;
+    {
+      std::lock_guard lock(delivery_queue_mutex_);
+      if (delivery_results_.empty())
+        break;
+      result = std::move(delivery_results_.front());
+      delivery_results_.pop_front();
+    }
+    session_retry_wake_.notify_all();
+    if (result)
+      ApplyOneDeliveryResult(*result);
+  }
+}
+
+void TextService::ApplyOneDeliveryResult(
+    const DeliveryWorkResult &delivery_result) {
+  const DeliveryWorkResult *result = &delivery_result;
+  if (result->identity.activation_generation != activation_generation_)
+    return;
+
+  ContextEntry *entry = nullptr;
+  for (auto &owned : contexts_) {
+    if (SameLogicalSession(owned->state.session_identity(),
+                           result->reference.correlation)) {
+      entry = owned.get();
+      break;
+    }
+  }
+  if (!entry)
+    return;
+
+  entry->delivery_work_pending = false;
+  if (result->kind == DeliveryWorkKind::Ack) {
+    if (entry->applied_delivery &&
+        *entry->applied_delivery == result->reference &&
+        (result->status == runtime::Status::Ok ||
+         result->status == runtime::Status::StaleRequest)) {
+      entry->applied_delivery.reset();
+    } else if (entry->applied_delivery &&
+               *entry->applied_delivery == result->reference &&
+               result->status != runtime::Status::StaleRequest) {
+      ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
+                           result->reference);
+    }
+    if (entry->recover_after_delivery_ack &&
+        !entry->delivery_work_pending) {
+      entry->recover_after_delivery_ack = false;
+      RecoverConnection();
+      return;
+    }
+    if (!entry->ui_state.focused)
+      DisconnectRuntimeIfIdle();
+    return;
+  }
+
+  if (!entry->pending_delivery ||
+      *entry->pending_delivery != result->reference ||
+      entry->pending_delivery_work != result->kind) {
+    return;
+  }
+
+  if (result->kind == DeliveryWorkKind::Cancel) {
+    if (result->status == runtime::Status::Unavailable ||
+        result->status == runtime::Status::Timeout ||
+        result->status == runtime::Status::RecoveryPending) {
+      ScheduleDeliveryWork(entry, DeliveryWorkKind::Cancel,
+                           result->reference);
+      return;
+    }
+    const bool cancelled = result->status == runtime::Status::Ok;
+    // The recovery worker addresses the exact logical delivery identity. A
+    // StaleRequest from that authenticated runtime is authoritative evidence
+    // that an unconfirmed Prepare never became durable; it is therefore safe
+    // to pass the original key and continue the same session.
+    const bool safe_missing =
+        result->status == runtime::Status::StaleRequest;
+    entry->pending_delivery.reset();
+    if (cancelled || safe_missing) {
+      entry->state.CompleteUnhandled();
+      if (entry->pending_physical_key) {
+        entry->composition.ObserveUnhandledKey(entry->pending_windows_key,
+                                               entry->pending_key_down);
+      }
+      entry->pending_physical_key = false;
+      if (!entry->ui_state.focused && entry->applied_delivery) {
+        ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
+                             *entry->applied_delivery);
+      }
+      return;
+    }
+    entry->pending_physical_key = false;
+    if (entry->applied_delivery) {
+      entry->recover_after_delivery_ack = true;
+      ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
+                           *entry->applied_delivery);
+      return;
+    }
+    RecoverConnection();
+    return;
+  }
+
+  if (result->status == runtime::Status::Unavailable ||
+      result->status == runtime::Status::Timeout ||
+      result->status == runtime::Status::RecoveryPending) {
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Recover,
+                         result->reference);
+    return;
+  }
+  if (result->status != runtime::Status::Ok ||
+      result->final_reply.flags != runtime::kFlagResponse ||
+      result->final_reply.command != result->reference.command ||
+      result->final_reply.correlation != result->reference.correlation ||
+      !entry->state.AcceptReply(result->final_reply.correlation)) {
+    entry->pending_delivery.reset();
+    entry->pending_physical_key = false;
+    RecoverConnection();
+    return;
+  }
+
+  if (result->final_reply.status != runtime::Status::Ok) {
+    QuarantineDelivery(entry);
+    return;
+  }
+
+  runtime::Composition composition;
+  std::string error;
+  if (!runtime::DecodeComposition(result->final_reply.payload, &composition,
+                                  &error)) {
+    QuarantineDelivery(entry);
+    return;
+  }
+  if (composition.handled) {
+    if (FAILED(ApplyRuntimeComposition(entry, composition))) {
+      entry->deferred_delivery_composition = std::move(composition);
+      return;
+    }
+    entry->state.ApplySucceeded(composition);
+    UpdateCandidates(entry, composition);
+  } else {
+    // The original callback conservatively swallowed an ambiguous prepared
+    // key, so this late unhandled result cannot be passed through retroactively.
+    entry->state.CompleteUnhandled();
+  }
+  entry->pending_delivery.reset();
+  entry->pending_physical_key = false;
+  entry->applied_delivery = result->reference;
+  if (!entry->ui_state.focused) {
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack, result->reference);
+  }
+}
+
+bool TextService::ApplyDeferredDelivery(ContextEntry *entry) {
+  if (!entry || !entry->deferred_delivery_composition)
+    return true;
+  if (entry->delivery_quarantined || !entry->pending_delivery ||
+      !entry->state.AcceptReply(
+          entry->pending_delivery->correlation)) {
+    QuarantineDelivery(entry);
+    return false;
+  }
+  if (FAILED(
+          ApplyRuntimeComposition(entry, *entry->deferred_delivery_composition)))
+    return false;
+  const runtime::DeliveryReference completed = *entry->pending_delivery;
+  entry->state.ApplySucceeded(*entry->deferred_delivery_composition);
+  UpdateCandidates(entry, *entry->deferred_delivery_composition);
+  entry->deferred_delivery_composition.reset();
+  entry->pending_delivery.reset();
+  entry->pending_physical_key = false;
+  entry->applied_delivery = completed;
+  if (!entry->ui_state.focused)
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack, completed);
+  return true;
+}
+
+void TextService::QuarantineDelivery(ContextEntry *entry) {
+  if (!entry || entry->delivery_quarantined)
+    return;
+  entry->delivery_quarantined = true;
+  entry->delivery_work_pending = false;
+  entry->deferred_delivery_composition.reset();
+  entry->pending_physical_key = false;
+  if (entry->candidates)
+    entry->candidates->End();
+  entry->ui_state.show_allowed = false;
+  entry->composition.ResetBehaviorState();
+  const RecoveryPlan recovery = entry->state.Fail();
+  if (recovery.commit_preedit) {
+    entry->recovery_preedit = *recovery.commit_preedit;
+    entry->recovery_cleanup_required = true;
+  }
+  // Retain pending_delivery and do not ACK it. The engine action must never be
+  // replayed, while a malformed snapshot or failed host contract must not be
+  // mistaken for an applied commit.
+  runtime_port_.Poison();
+  PostRecoveryWork();
+}
+
 void TextService::DisconnectRuntimeIfIdle() {
-  for (const auto &entry : contexts_) {
+  for (auto &entry : contexts_) {
+    if (entry->pending_delivery || entry->delivery_work_pending)
+      return;
+    if (entry->applied_delivery) {
+      ScheduleDeliveryWork(entry.get(), DeliveryWorkKind::Ack,
+                           *entry->applied_delivery);
+      return;
+    }
     if (entry->ui_state.focused || !entry->state.displayed().preedit.empty() ||
         entry->state.pending_sequence() != 0) {
       return;
@@ -677,27 +1513,75 @@ TextService::ContextEntry *TextService::FindContext(ITfContext *context) {
 }
 
 void TextService::CloseContext(ITfContext *context) {
+  ApplyDeliveryResult();
   const auto found = std::find_if(
       contexts_.begin(), contexts_.end(), [&](const auto &entry) {
         return SameComObject(entry->context.get(), context);
       });
   if (found == contexts_.end())
     return;
-  CloseEntry(found->get());
-  contexts_.erase(found);
+  (*found)->close_requested = true;
+  SetFocused(found->get(), false);
+  if (CloseEntry(found->get())) {
+    contexts_.erase(found);
+  } else {
+    PostRecoveryWork();
+  }
 }
 
-void TextService::CloseEntry(ContextEntry *entry) {
+void TextService::FinalizeClosingContexts() {
+  for (size_t index = 0; index < contexts_.size();) {
+    ContextEntry *entry = contexts_[index].get();
+    if (entry->close_requested && CloseEntry(entry)) {
+      contexts_.erase(contexts_.begin() + static_cast<ptrdiff_t>(index));
+    } else {
+      ++index;
+    }
+  }
+}
+
+bool TextService::CloseEntry(ContextEntry *entry) {
   if (!entry)
-    return;
-  ApplySessionResult();
+    return true;
+  entry->close_requested = true;
+  SetFocused(entry, false);
   if (entry->candidates)
     entry->candidates->End();
+  entry->ui_state.show_allowed = false;
+
+  if (!entry->delivery_quarantined &&
+      !ApplyDeferredDelivery(entry)) {
+    return false;
+  }
+  if (entry->pending_delivery) {
+    if (!entry->delivery_quarantined && !entry->delivery_work_pending) {
+      ScheduleDeliveryWork(entry, entry->pending_delivery_work,
+                           *entry->pending_delivery);
+    }
+    return false;
+  }
+  if (entry->applied_delivery) {
+    if (!entry->delivery_work_pending) {
+      ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
+                           *entry->applied_delivery);
+    }
+    return false;
+  }
+  if (entry->delivery_work_pending)
+    return false;
+
+  {
+    std::lock_guard lock(session_publication_mutex_);
+    const std::shared_ptr<const runtime::Correlation> desired =
+        desired_session_.load();
+    if (desired && *desired == entry->pending_session)
+      desired_session_.store(nullptr);
+    entry->session_pending = false;
+    entry->pending_session = {};
+  }
   entry->composition.ResetBehaviorState();
   entry->recovery_cleanup_required = false;
   entry->recovery_preedit.clear();
-  entry->ui_state.show_allowed = false;
-  SetFocused(entry, false);
   if (entry->layout_sink_cookie != TF_INVALID_COOKIE) {
     ComPtr<ITfSource> source;
     if (SUCCEEDED(entry->context->QueryInterface(
@@ -706,24 +1590,24 @@ void TextService::CloseEntry(ContextEntry *entry) {
     entry->layout_sink_cookie = TF_INVALID_COOKIE;
   }
   entry->composition.End(entry->context.get(), client_id_);
-  bool close_failed = false;
   if (runtime_port_.state() == runtime::ChannelState::Ready) {
     const auto correlation = entry->state.PlanClose();
     if (correlation) {
       runtime::Frame close;
       close.command = runtime::Command::CloseSession;
       close.correlation = *correlation;
-      close_failed =
-          runtime_port_.Call(std::move(close), runtime::kHardCallDeadline)
-              .status != runtime::Status::Ok;
+      if (runtime_port_.Call(std::move(close), runtime::kHardCallDeadline)
+              .status != runtime::Status::Ok) {
+        runtime_port_.Poison();
+      }
     }
   }
   entry->state.Close();
-  if (close_failed && session_worker_.joinable())
-    RecoverConnection();
+  return true;
 }
 
 HRESULT TextService::OnSetFocus(BOOL foreground) {
+  return BoundaryOr<HRESULT>(S_OK, [&] {
   if (!thread_manager_ || !OnActivationThread())
     return S_OK;
   ApplySessionResult();
@@ -742,24 +1626,33 @@ HRESULT TextService::OnSetFocus(BOOL foreground) {
     }
   }
   return S_OK;
+  });
 }
 
 HRESULT TextService::OnInitDocumentMgr(ITfDocumentMgr *) { return S_OK; }
 
 HRESULT TextService::OnUninitDocumentMgr(ITfDocumentMgr *document) {
+  return BoundaryOr<HRESULT>(S_OK, [&] {
   for (size_t index = 0; index < contexts_.size();) {
     if (SameComObject(contexts_[index]->document.get(), document)) {
-      CloseEntry(contexts_[index].get());
-      contexts_.erase(contexts_.begin() + static_cast<ptrdiff_t>(index));
+      contexts_[index]->close_requested = true;
+      SetFocused(contexts_[index].get(), false);
+      if (CloseEntry(contexts_[index].get())) {
+        contexts_.erase(contexts_.begin() + static_cast<ptrdiff_t>(index));
+      } else {
+        ++index;
+      }
     } else {
       ++index;
     }
   }
   return S_OK;
+  });
 }
 
 HRESULT TextService::OnSetFocus(ITfDocumentMgr *focus,
                                 ITfDocumentMgr *previous) {
+  return ComBoundary([&] {
   if (!OnActivationThread())
     return RPC_E_WRONG_THREAD;
   ApplySessionResult();
@@ -772,13 +1665,15 @@ HRESULT TextService::OnSetFocus(ITfDocumentMgr *focus,
     SetFocused(FindContext(context.get()), true);
   }
   return S_OK;
+  });
 }
 
 HRESULT TextService::OnPushContext(ITfContext *context) {
-  return EnsureContext(context);
+  return ComBoundary([&] { return EnsureContext(context); });
 }
 
 HRESULT TextService::OnPopContext(ITfContext *context) {
+  return ComBoundary([&] {
   ComPtr<ITfDocumentMgr> document;
   if (context)
     context->GetDocumentMgr(document.put());
@@ -787,7 +1682,8 @@ HRESULT TextService::OnPopContext(ITfContext *context) {
   if (!top || SameComObject(top.get(), context)) {
     const auto previous = std::find_if(
         contexts_.rbegin(), contexts_.rend(), [&](const auto &entry) {
-          return SameComObject(entry->document.get(), document.get());
+          return !entry->close_requested &&
+                 SameComObject(entry->document.get(), document.get());
         });
     top = previous == contexts_.rend()
               ? ComPtr<ITfContext>()
@@ -796,10 +1692,12 @@ HRESULT TextService::OnPopContext(ITfContext *context) {
   if (top)
     EnsureContext(top.get());
   return S_OK;
+  });
 }
 
 HRESULT TextService::OnCompositionTerminated(TfEditCookie,
                                              ITfComposition *composition) {
+  return BoundaryOr<HRESULT>(S_OK, [&] {
   for (auto &entry : contexts_) {
     if (entry->composition.CompositionTerminated(composition)) {
       entry->recovery_cleanup_required = false;
@@ -813,18 +1711,21 @@ HRESULT TextService::OnCompositionTerminated(TfEditCookie,
     }
   }
   return S_OK;
+  });
 }
 
 HRESULT CreateTextServiceInstance(REFIID iid, void **object) {
   if (!object)
     return E_POINTER;
   *object = nullptr;
-  auto *service = new (std::nothrow) TextService();
-  if (!service)
-    return E_OUTOFMEMORY;
-  const HRESULT result = service->QueryInterface(iid, object);
-  service->Release();
-  return result;
+  return ComBoundary([&] {
+    auto *service = new (std::nothrow) TextService();
+    if (!service)
+      return E_OUTOFMEMORY;
+    const HRESULT result = service->QueryInterface(iid, object);
+    service->Release();
+    return result;
+  });
 }
 
 } // namespace famo::tsf

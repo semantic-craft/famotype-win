@@ -52,8 +52,9 @@ internal sealed class AiProviderChatCompletionClient
             Encoding.UTF8,
             "application/json");
 
-        using HttpResponseMessage response = await _http.SendAsync(request, cancellationToken);
-        string json = await response.Content.ReadAsStringAsync(cancellationToken);
+        using HttpResponseMessage response = await _http.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        string json = await ReadResponseAsync(response, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException($"AI 请求失败：HTTP {(int)response.StatusCode} {ExtractErrorMessage(json)}".Trim());
@@ -107,14 +108,31 @@ internal sealed class AiProviderChatCompletionClient
             Encoding.UTF8,
             "application/json");
 
-        using HttpResponseMessage response = await _http.SendAsync(request, cancellationToken);
-        string json = await response.Content.ReadAsStringAsync(cancellationToken);
+        using HttpResponseMessage response = await _http.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        string json = await ReadResponseAsync(response, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
             throw new InvalidOperationException($"来源核验请求失败：HTTP {(int)response.StatusCode} {ExtractErrorMessage(json)}".Trim());
         }
 
         return new AiProviderChatCompletionResult(RenderSourceVerification(json), profile.Id, profile.Model);
+    }
+
+    private static async Task<string> ReadResponseAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await BoundedHttpContent.ReadUtf8Async(
+                response.Content, cancellationToken);
+        }
+        catch (InvalidDataException ex)
+        {
+            throw new InvalidOperationException(
+                "AI 响应过大，已停止读取。", ex);
+        }
     }
 
     private static string BuildRequestJson(
@@ -433,7 +451,7 @@ internal sealed class AiProviderChatCompletionClient
                 && error.TryGetProperty("message", out JsonElement message)
                 && message.ValueKind == JsonValueKind.String)
             {
-                return message.GetString() ?? "";
+                return TextElementTruncator.Truncate(message.GetString() ?? "", 160);
             }
         }
         catch (JsonException)
