@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.3"
+  #define AppVersion  "1.5.4"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -346,12 +346,14 @@ begin
   Result := Lowercase(Text);
 end;
 
+function FixedInstallRoot: String; forward;
+
 function EnsureTransactionTarget: String;
 begin
   if TransactionId = '' then
     TransactionId := NewIdentityNonce;
   if TransactionTarget = '' then
-    TransactionTarget := AddBackslash(ExpandConstant('{app}')) +
+    TransactionTarget := AddBackslash(FixedInstallRoot) +
       'versions\{#AppVersion}-{#ManifestPrefix}-' + TransactionId;
   Result := TransactionTarget;
 end;
@@ -672,6 +674,11 @@ begin
   Result := RemoveBackslashUnlessRoot(ExpandFileName(PathNormalizeSlashes(Path)));
 end;
 
+function FixedInstallRoot: String;
+begin
+  Result := NormalizeDirectoryPath(ExpandConstant('{autopf}\Famo'));
+end;
+
 function TryGetPathAttributes(const Path: String; var Exists: Boolean;
   var Attributes: Cardinal): Boolean;
 var
@@ -943,7 +950,7 @@ var
     ExpectedLeaf: String;
 begin
   VersionsRoot := NormalizeDirectoryPath(
-    AddBackslash(ExpandConstant('{app}')) + 'versions');
+    AddBackslash(FixedInstallRoot) + 'versions');
   ExpectedLeaf := PreviousVersion + '-' +
     Copy(PreviousManifestHash, 1, 12) + '-' +
     PreviousCompatibilityTransactionId;
@@ -1295,9 +1302,12 @@ begin
     Exit;
   end;
   if (PreviousProfileTool <> '') and FileExists(PreviousProfileTool) then
-    Result := RunAndRequire(PreviousProfileTool, 'unregister-machine', False)
-  else
-    Result := RunRegSvr32(PreviousHost, True);
+    if RunAndRequire(PreviousProfileTool, 'unregister-machine', False) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  Result := RunRegSvr32(PreviousHost, True);
 end;
 
 function RegisterPreviousRegistration: Boolean;
@@ -1313,9 +1323,12 @@ begin
     Exit;
   end;
   if (PreviousProfileTool <> '') and FileExists(PreviousProfileTool) then
-    Result := RunAndRequire(PreviousProfileTool, 'register-machine', False)
-  else
-    Result := RunRegSvr32(PreviousHost, False);
+    if RunAndRequire(PreviousProfileTool, 'register-machine', False) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  Result := RunRegSvr32(PreviousHost, False);
 end;
 
 function DetectLoadedPreviousHost: Boolean;
@@ -1389,15 +1402,12 @@ end;
 
 procedure RequireFixedProtectedInstallRoot;
 var
-  AppRoot, FixedRoot, ProgramFilesRoot, DriveRoot, ProgramFilesFinalPath,
+  AppRoot, ProgramFilesRoot, DriveRoot, ProgramFilesFinalPath,
     ProgramFilesObjectId, AppFinalPath, AppObjectId: String;
   AppAttributes, ProgramFilesAttributes: Cardinal;
   AppExists, ProgramFilesExists: Boolean;
 begin
-  AppRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
-  FixedRoot := NormalizeDirectoryPath(ExpandConstant('{autopf}\Famo'));
-  if not PathSame(AppRoot, FixedRoot) then
-    RaiseException('custom /DIR install roots are not allowed');
+  AppRoot := FixedInstallRoot;
   ProgramFilesRoot := NormalizeDirectoryPath(ExpandConstant('{autopf}'));
   DriveRoot := AddBackslash(ExtractFileDrive(ProgramFilesRoot));
   if not PathIsNonReparseOrMissing(DriveRoot) or
@@ -1418,6 +1428,16 @@ begin
   if not ValidateProtectedChild(AppRoot, 'pending') or
      not ValidateProtectedChild(AppRoot, 'versions') then
     RaiseException('protected transaction roots are unsafe');
+end;
+
+procedure RequireSelectedFixedInstallRoot;
+var
+  SelectedRoot: String;
+begin
+  SelectedRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
+  if not PathSame(SelectedRoot, FixedInstallRoot) then
+    RaiseException('custom /DIR install roots are not allowed');
+  RequireFixedProtectedInstallRoot;
 end;
 
 function IdentityRecordValue(Lines: TArrayOfString;
@@ -1547,19 +1567,20 @@ var
   PendingRoot, PendingDirectory, EmbeddedManifest, EmbeddedBroker, Broker,
     IdentityRecord, PipeId, Challenge, Parameters, FormatText, CapturedPipeId,
     CapturedChallenge, CapturedSid, CapturedSession, CapturedAccount,
-    ResumeText, Failure, CleanupFailure, ExpectedBrokerHash,
+  ResumeText, Failure, CleanupFailure, ExpectedBrokerHash,
     BrokerFinalPath, BrokerObjectId, DirectoryFinalPath,
     DirectoryObjectId: String;
   Lines: TArrayOfString;
   ServerResult, Attempts: Integer;
   ExpectedBrokerSize, ActualBrokerSize: Int64;
+  RecordLoaded: Boolean;
 begin
   PipeId := NewIdentityNonce;
   Challenge := NewIdentityNonce;
   if CompareText(PipeId, Challenge) = 0 then
     RaiseException('original-user identity nonces collided');
 
-  PendingRoot := AddBackslash(ExpandConstant('{app}')) + 'pending';
+  PendingRoot := AddBackslash(FixedInstallRoot) + 'pending';
   PendingDirectory := AddBackslash(PendingRoot) + 'identity-' + PipeId;
   ArmHelperCleanupDebt(DebtKindIdentityHelper, PipeId);
   FailIfRequested('after-identity-helper-debt');
@@ -1629,13 +1650,17 @@ begin
     if not RunAndRequire(Broker, Parameters, False) then
       RaiseException('original-user token proof failed');
 
+    RecordLoaded := False;
     for Attempts := 1 to 150 do
     begin
-      if FileExists(IdentityRecord) then Break;
+      if FileExists(IdentityRecord) then
+      begin
+        RecordLoaded := LoadStringsFromFile(IdentityRecord, Lines);
+        if RecordLoaded then Break;
+      end;
       Sleep(100);
     end;
-    if not FileExists(IdentityRecord) or
-       not LoadStringsFromFile(IdentityRecord, Lines) then
+    if not RecordLoaded then
       RaiseException('original-user identity record missing');
     if (GetArrayLength(Lines) <> 7) or
        not IdentityRecordValue(Lines, 'format', FormatText) or
@@ -1720,7 +1745,7 @@ var
 begin
   Result := False;
   Nonce := NewIdentityNonce;
-  PendingRoot := AddBackslash(ExpandConstant('{app}')) + 'pending';
+  PendingRoot := AddBackslash(FixedInstallRoot) + 'pending';
   ProtectedDirectory := AddBackslash(PendingRoot) +
     'machine-cleanup-' + Nonce;
   ProtectedManifest := AddBackslash(ProtectedDirectory) +
@@ -2107,7 +2132,7 @@ begin
   PendingHandle := InvalidHandleValue;
   HelperHandle := InvalidHandleValue;
   HelperFinalPath := '';
-  AppRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
+  AppRoot := FixedInstallRoot;
   ExpectedPendingRoot := NormalizeDirectoryPath(
     AddBackslash(AppRoot) + 'pending');
   if not PathSame(PendingRoot, ExpectedPendingRoot) or
@@ -2139,7 +2164,7 @@ var
   AppRoot, Drive, VolumePath: String;
   VolumeHandle: THandle;
 begin
-  AppRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
+  AppRoot := FixedInstallRoot;
   Drive := ExtractFileDrive(AppRoot);
   if Length(Drive) <> 2 then
     RaiseException('helper cleanup volume is not a fixed drive');
@@ -2194,7 +2219,7 @@ var
   FindRec: TFindRec;
 begin
   Result := False;
-  AppRoot := NormalizeDirectoryPath(ExpandConstant('{app}'));
+  AppRoot := FixedInstallRoot;
   ExpectedPendingRoot := NormalizeDirectoryPath(
     AddBackslash(AppRoot) + 'pending');
   if not PathSame(PendingRoot, ExpectedPendingRoot) or
@@ -2313,7 +2338,7 @@ begin
   end;
 
   PendingRoot := NormalizeDirectoryPath(
-    AddBackslash(ExpandConstant('{app}')) + 'pending');
+    AddBackslash(FixedInstallRoot) + 'pending');
   if Kind = DebtKindIdentityHelper then
   begin
     HelperDirectory := NormalizeDirectoryPath(
@@ -2818,11 +2843,13 @@ begin
     Result := ValidJournalObjectId(Journal.PendingObjectId);
     Exit;
   end;
+  { Journal semantics must remain stable for historical generations after a
+    later generation creates the target. LoadPendingState separately requires
+    a pinned object ID whenever the current target exists. }
   Result :=
-    ((Journal.Phase = PhasePrepared) or
-     (Journal.Phase = PhaseRollbackIntent) or
-     (Journal.Phase = PhaseRolledBack)) and
-    not DirExists(NormalizeDirectoryPath(Journal.PendingTarget));
+    (Journal.Phase = PhasePrepared) or
+    (Journal.Phase = PhaseRollbackIntent) or
+    (Journal.Phase = PhaseRolledBack);
 end;
 
 function ValidateJournalSemantics(const Journal: TTransactionJournal;
@@ -2835,11 +2862,11 @@ begin
   try
     Generation := StrToIntDef(Journal.Generation, 0);
     ExpectedTarget := NormalizeDirectoryPath(
-      AddBackslash(ExpandConstant('{app}')) +
+      AddBackslash(FixedInstallRoot) +
       'versions\' + Journal.Version + '-' +
       Copy(Journal.ManifestHash, 1, 12) + '-' + ExpectedId);
     ExpectedRecovery := NormalizeDirectoryPath(
-      AddBackslash(ExpandConstant('{app}')) + 'pending\' + ExpectedId +
+      AddBackslash(FixedInstallRoot) + 'pending\' + ExpectedId +
       '\Famo-Resume-' + ExpectedId + '.exe');
     ExpectedTask := '\Famo\Transaction-' + ExpectedId;
     Result :=
@@ -2897,8 +2924,6 @@ begin
        (Journal.PreviousProfileEnabled = '1')) and
       ((Journal.PreviousInputTipPresent = '0') or
        (Journal.PreviousInputTipPresent = '1')) and
-      ((Journal.PreviousProfileActive <> '1') or
-       (Journal.PreviousProfileEnabled = '1')) and
       ((Journal.PreviousTarget <> '') or
        ((Journal.PreviousProfileActive = '0') and
         (Journal.PreviousProfileEnabled = '0') and
@@ -3445,7 +3470,7 @@ begin
     Exit;
   try
     VersionsRoot := NormalizeDirectoryPath(
-      AddBackslash(ExpandConstant('{app}')) + 'versions');
+      AddBackslash(FixedInstallRoot) + 'versions');
     NormalizedTarget := NormalizeDirectoryPath(Target);
     ExpectedLeaf := '{#AppVersion}-{#ManifestPrefix}-' + ExpectedId;
     if PathSame(NormalizedTarget, VersionsRoot) or
@@ -3493,7 +3518,7 @@ procedure PrepareTransaction;
 var
   ValidatedTarget: String;
 begin
-  RequireFixedProtectedInstallRoot;
+  RequireSelectedFixedInstallRoot;
   EnsureTransactionTarget;
   if not ValidateTransactionTarget(TransactionTarget, TransactionId,
     PreviousTarget, ValidatedTarget) then
@@ -3512,6 +3537,9 @@ begin
   end;
   if DirExists(TransactionTarget) then RaiseException('transaction target already exists');
   SnapshotPreviousState;
+  JournalResumeInstaller := '';
+  JournalResumeInstallerHash := '';
+  JournalTaskName := '';
   JournalAppVersion := '{#AppVersion}';
   JournalManifestHash := Uppercase('{#ManifestHash}');
   JournalPendingFinalTarget := TransactionTarget;
@@ -3554,9 +3582,9 @@ begin
      not PathSame(ExtractFileDir(PreviousFinalPath),
        JournalPreviousFinalTarget) then
     RaiseException('runtime version comparison path identity mismatch');
-  if not GetPackedVersion(NewRuntime, NewVersion) or
-     not GetPackedVersion(PreviousServer, PreviousPackedVersion) then
-    RaiseException('runtime version metadata is unavailable');
+  if not StrToVersion(JournalAppVersion + '.0', NewVersion) or
+     not StrToVersion(PreviousVersion + '.0', PreviousPackedVersion) then
+    RaiseException('manifest version metadata is unavailable');
   if ComparePackedVersion(NewVersion, PreviousPackedVersion) < 0 then
   begin
     if not JournalAllowDowngrade then
@@ -3642,22 +3670,27 @@ end;
 
 function RecoveryTaskFolderSecurityDescriptor: String;
 begin
-  Result := 'D:P(A;;FA;;;SY)(A;;FA;;;BA)';
+  Result := 'D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;' +
+    OriginalUserSid + ')';
 end;
 
 function ValidateRecoveryTaskXml(const Xml, InstallerPath,
   Arguments: String): Boolean;
 var
-  UserTag, CommandTag, ArgumentsTag, TaskSddl, SecurityTag,
-    TriggerElement, SettingsElement: String;
+  UserTag, TriggerUserTag, CommandTag, ArgumentsTag, TaskSddl, SecurityTag,
+    PrincipalElement, TriggerElement, SettingsElement: String;
 begin
   UserTag := '<UserId>' + XmlEscape(OriginalUserSid) + '</UserId>';
+  TriggerUserTag := '<UserId>' + XmlEscape(OriginalUserAccount) +
+    '</UserId>';
   CommandTag := '<Command>' + XmlEscape(InstallerPath) + '</Command>';
   ArgumentsTag := '<Arguments>' + XmlEscape(Arguments) + '</Arguments>';
   TaskSddl := RecoveryTaskSecurityDescriptor;
   SecurityTag := '<SecurityDescriptor>' + XmlEscape(TaskSddl) +
     '</SecurityDescriptor>';
   Result :=
+    ExtractUniqueXmlElement(Xml, '<Principal id="OriginalUser">',
+      '</Principal>', PrincipalElement) and
     ExtractUniqueXmlElement(Xml, '<LogonTrigger>', '</LogonTrigger>',
       TriggerElement) and
     ExtractUniqueXmlElement(Xml, '<Settings>', '</Settings>',
@@ -3668,11 +3701,18 @@ begin
     (CountText(Xml, '<Actions Context="OriginalUser">') = 1) and
     (CountText(Xml, '<Exec>') = 1) and
     (CountText(Xml, SecurityTag) = 1) and
-    (CountText(Xml, UserTag) = 2) and
-    (CountText(Xml, '<Enabled>true</Enabled>') = 2) and
+    (CountText(PrincipalElement, '<UserId>') = 1) and
+    (CountText(PrincipalElement, UserTag) = 1) and
+    (CountText(TriggerElement, '<UserId>') = 1) and
+    ((CountText(TriggerElement, UserTag) = 1) or
+     (CountText(TriggerElement, TriggerUserTag) = 1)) and
     (CountText(Xml, '<Enabled>false</Enabled>') = 0) and
-    (CountText(TriggerElement, '<Enabled>true</Enabled>') = 1) and
-    (CountText(SettingsElement, '<Enabled>true</Enabled>') = 1) and
+    (CountText(TriggerElement, '<Enabled>') <= 1) and
+    (CountText(TriggerElement, '<Enabled>') =
+      CountText(TriggerElement, '<Enabled>true</Enabled>')) and
+    (CountText(SettingsElement, '<Enabled>') <= 1) and
+    (CountText(SettingsElement, '<Enabled>') =
+      CountText(SettingsElement, '<Enabled>true</Enabled>')) and
     (CountText(Xml, '<LogonType>InteractiveToken</LogonType>') = 1) and
     (CountText(Xml, '<RunLevel>HighestAvailable</RunLevel>') = 1) and
     (CountText(Xml, CommandTag) = 1) and
@@ -3699,7 +3739,7 @@ function ExpectedRecoveryDirectory(const Id: String): String;
 begin
   if not ValidTransactionId(Id) then
     RaiseException('invalid recovery transaction id');
-  Result := AddBackslash(ExpandConstant('{app}')) + 'pending\' + Id;
+  Result := AddBackslash(FixedInstallRoot) + 'pending\' + Id;
 end;
 
 function ExpectedRecoveryInstaller(const Id: String): String;
@@ -3788,10 +3828,10 @@ var
 begin
   Result := False;
   RecoveryDirectory := ExpectedRecoveryDirectory(Id);
-  PendingRoot := AddBackslash(ExpandConstant('{app}')) + 'pending';
+  PendingRoot := AddBackslash(FixedInstallRoot) + 'pending';
   if (CompareText(NormalizeDirectoryPath(InstallerPath),
        NormalizeDirectoryPath(ExpectedRecoveryInstaller(Id))) <> 0) or
-     not ValidateProtectedChild(ExpandConstant('{app}'), 'pending') or
+     not ValidateProtectedChild(FixedInstallRoot, 'pending') or
      not ValidateProtectedChild(PendingRoot, Id) or
      not TryGetPathAttributes(RecoveryDirectory, DirectoryExists,
        DirectoryAttributes) or
@@ -3853,7 +3893,7 @@ begin
       RaiseException('retained recovery installer identity mismatch');
     Exit;
   end;
-  RecoveryRoot := AddBackslash(ExpandConstant('{app}')) + 'pending';
+  RecoveryRoot := AddBackslash(FixedInstallRoot) + 'pending';
   RecoveryDirectory := ExpectedRecoveryDirectory(TransactionId);
   if DirExists(RecoveryDirectory) or
      not ForceDirectories(RecoveryDirectory) or
@@ -3896,6 +3936,30 @@ end;
 function RecoveryTaskExistsByCom(const TaskName: String;
   var Exists: Boolean): Boolean; forward;
 
+function SaveStringsToUTF16LEFile(const FileName: String;
+  const Lines: TArrayOfString): Boolean;
+var
+  Stream: TFileStream;
+  Text: String;
+  I: Integer;
+begin
+  Result := False;
+  Text := #$FEFF;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+    Text := Text + Lines[I] + #13#10;
+  try
+    Stream := TFileStream.Create(FileName, fmCreate);
+    try
+      Stream.WriteBuffer(Text, Length(Text) * 2);
+      Result := True;
+    finally
+      Stream.Free;
+    end;
+  except
+    Result := False;
+  end;
+end;
+
 procedure ScheduleRecoveryTask;
 var
   RecoveryDirectory, Destination, TaskXml,
@@ -3926,7 +3990,7 @@ begin
   TransitionTransactionPhase(PhaseResumeArmed);
 
   SetArrayLength(Lines, 31);
-  Lines[0] := '<?xml version="1.0" encoding="UTF-8"?>';
+  Lines[0] := '<?xml version="1.0" encoding="UTF-16"?>';
   Lines[1] := '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">';
   Lines[2] := '  <RegistrationInfo>';
   Lines[3] := '    <Description>Famo transaction ' + TransactionId + '</Description>';
@@ -3959,7 +4023,7 @@ begin
     '</Arguments></Exec>';
   Lines[29] := '  </Actions>';
   Lines[30] := '</Task>';
-  if not SaveStringsToUTF8FileWithoutBOM(TaskXml, Lines, False) then
+  if not SaveStringsToUTF16LEFile(TaskXml, Lines) then
     RaiseException('cannot write recovery task XML');
   try
     Parameters := ' /Create /TN ' + AddQuotes(TaskName) +
@@ -3988,7 +4052,8 @@ end;
 function RecoveryTaskExistsByCom(const TaskName: String;
   var Exists: Boolean): Boolean;
 var
-  Service, RootFolder, Folders, Folder, Tasks, Task, Subfolders: Variant;
+  Service, RootFolder, Folders, Candidate, Folder, Tasks, Task,
+    Subfolders: Variant;
   I, Matches: Integer;
   FamoFolderFound: Boolean;
   ActualSddl: String;
@@ -4003,11 +4068,12 @@ begin
     FamoFolderFound := False;
     for I := 1 to Folders.Count do
     begin
-      Folder := Folders.Item(I);
-      if CompareText(Folder.Path, '\Famo') = 0 then
+      Candidate := Folders.Item(I);
+      if CompareText(Candidate.Path, '\Famo') = 0 then
       begin
         if FamoFolderFound then Exit;
         FamoFolderFound := True;
+        Folder := Candidate;
         Tasks := Folder.GetTasks(1);
       end;
     end;
@@ -4510,7 +4576,8 @@ var
   ResultCode: Integer;
   RestoreSettings, ValidatedTarget, PriorFinalPath, PriorObjectId,
   EnableCommand, CheckCommand: String;
-  UserRollbackOk, HadUserStateIntent, CurrentPayloadTrusted,
+  UserRollbackOk, HadUserStateIntent, HadProfileMutationIntent,
+    CurrentPayloadTrusted,
     TargetCleanupComplete, HasReadyCommitDebt: Boolean;
 begin
   if RollbackComplete then Exit;
@@ -4529,6 +4596,12 @@ begin
     (JournalPhase = PhaseUserStatePrepared) or
     (JournalPhase = PhaseUserStateApplied) or
     (JournalPhase = PhaseVerifyIntent);
+  HadProfileMutationIntent :=
+    HadUserStateIntent or
+    (JournalPhase = PhaseDetachIntent) or
+    (JournalPhase = PhasePendingReboot) or
+    (JournalPhase = PhaseActivateIntent) or
+    (JournalPhase = PhaseMachineRegistered);
   HasReadyCommitDebt := TransactionDebtPresent(
     'UserCleanupDebt', DebtKindSeedCommit);
   if HasReadyCommitDebt and (SeedReceiptHash = '') then
@@ -4601,52 +4674,55 @@ begin
   begin
     if not RegisterPreviousRegistration then
       RaiseException('previous profile rollback failed');
-    if PreviousProfileEnabled then
+    if HadProfileMutationIntent then
     begin
-      EnableCommand := 'enable';
-      CheckCommand := 'check';
-    end
-    else
-    begin
-      EnableCommand := 'disable';
-      CheckCommand := 'check-disabled';
-    end;
-    if CurrentPayloadTrusted then
-    begin
-      if not ValidateCurrentPayloadForExecution or
-         not RunAndRequire(ProfileTool(TransactionTarget),
-           'clear-user-com-shadow ' + OriginalUserSid, True) or
-         not ValidateCurrentPayloadForExecution or
-         not ValidatePreviousPayloadForExecution or
-         not RunAndRequire(PreviousRegistrationTool, EnableCommand, True) or
-         not ValidateCurrentPayloadForExecution or
-         not ValidatePreviousPayloadForExecution or
-         not RunAndRequire(PreviousRegistrationTool, CheckCommand, True) then
+      if PreviousProfileEnabled then
+      begin
+        EnableCommand := 'enable';
+        CheckCommand := 'check';
+      end
+      else
+      begin
+        EnableCommand := 'disable';
+        CheckCommand := 'check-disabled';
+      end;
+      if CurrentPayloadTrusted then
+      begin
+        if not ValidateCurrentPayloadForExecution or
+           not RunAndRequire(ProfileTool(TransactionTarget),
+             'clear-user-com-shadow ' + OriginalUserSid, True) or
+           not ValidateCurrentPayloadForExecution or
+           not ValidatePreviousPayloadForExecution or
+           not RunAndRequire(PreviousRegistrationTool, EnableCommand, True) or
+           not ValidateCurrentPayloadForExecution or
+           not ValidatePreviousPayloadForExecution or
+           not RunAndRequire(PreviousRegistrationTool, CheckCommand, True) then
+          UserRollbackOk := False;
+      end
+      else
         UserRollbackOk := False;
-    end
-    else
-      UserRollbackOk := False;
-    RestoreSettings := AddBackslash(PreviousTarget) +
-      'settings\FamoSettings.exe';
-    if not FileExists(RestoreSettings) then
-      RestoreSettings := AddBackslash(TransactionTarget) +
+      RestoreSettings := AddBackslash(PreviousTarget) +
         'settings\FamoSettings.exe';
-    if PreviousInputTipPresent and
-       (not CurrentPayloadTrusted or
-        not ValidateCurrentPayloadForExecution or
-        ((CompareText(ExtractFileDir(ExtractFileDir(RestoreSettings)),
-           NormalizeDirectoryPath(PreviousTarget)) = 0) and
-         not ValidatePreviousPayloadForExecution) or
-        not RunAndRequire(RestoreSettings, '--add-input-tip', True)) then
-      UserRollbackOk := False;
-    if PreviousProfileActive and
-      (not CurrentPayloadTrusted or
-       not ValidateCurrentPayloadForExecution or
-       not ValidatePreviousPayloadForExecution or
-       not RunAndRequire(PreviousRegistrationTool, 'activate', True)) then
-    begin
-      UserRollbackOk := False;
-      Log('previous profile activation deferred; available via Win+Space');
+      if not FileExists(RestoreSettings) then
+        RestoreSettings := AddBackslash(TransactionTarget) +
+          'settings\FamoSettings.exe';
+      if PreviousInputTipPresent and
+         (not CurrentPayloadTrusted or
+          not ValidateCurrentPayloadForExecution or
+          ((CompareText(ExtractFileDir(ExtractFileDir(RestoreSettings)),
+             NormalizeDirectoryPath(PreviousTarget)) = 0) and
+           not ValidatePreviousPayloadForExecution) or
+          not RunAndRequire(RestoreSettings, '--add-input-tip', True)) then
+        UserRollbackOk := False;
+      if PreviousProfileActive and
+        (not CurrentPayloadTrusted or
+         not ValidateCurrentPayloadForExecution or
+         not ValidatePreviousPayloadForExecution or
+         not RunAndRequire(PreviousRegistrationTool, 'activate', True)) then
+      begin
+        UserRollbackOk := False;
+        Log('previous profile activation deferred; available via Win+Space');
+      end;
     end;
     if (PreviousServer <> '') and FileExists(PreviousServer) then
     begin
@@ -5140,7 +5216,7 @@ begin
     RaiseException('malformed legacy version cleanup debt blocks retention');
   ArmTransactionDebt('VersionCleanupDebt', DebtKindVersionRetention);
   VersionsRoot := NormalizeDirectoryPath(
-    AddBackslash(ExpandConstant('{app}')) + 'versions');
+    AddBackslash(FixedInstallRoot) + 'versions');
   if not TryGetPathAttributes(VersionsRoot, RootExists, RootAttributes) then
     RaiseException('versions root state is unavailable during retention');
   if not RootExists then
@@ -5318,8 +5394,8 @@ begin
   begin
     Result := TryGetFinalObjectInfo(TransactionTarget, FinalTarget, ObjectId) and
       (CompareText(FinalTarget, JournalPendingFinalTarget) = 0) and
-      ((JournalPendingObjectId = '') or
-       (CompareText(ObjectId, JournalPendingObjectId) = 0));
+      (JournalPendingObjectId <> '') and
+      (CompareText(ObjectId, JournalPendingObjectId) = 0);
     if not Result then Exit;
   end
   else if (JournalPhase <> PhasePrepared) and
@@ -5340,7 +5416,7 @@ begin
   end;
   if JournalResumeInstaller <> '' then
   begin
-    ExpectedRecovery := AddBackslash(ExpandConstant('{app}')) + 'pending\' +
+    ExpectedRecovery := AddBackslash(FixedInstallRoot) + 'pending\' +
       TransactionId + '\Famo-Resume-' + TransactionId + '.exe';
     Result := CompareText(JournalResumeInstaller, ExpectedRecovery) = 0;
     if FileExists(JournalResumeInstaller) then
@@ -5852,6 +5928,8 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Failure: String;
 begin
   if CurStep = ssInstall then PrepareTransaction;
   if CurStep = ssPostInstall then
@@ -5934,10 +6012,12 @@ begin
         end;
       end;
     except
+      Failure := GetExceptionMessage;
+      Log('installation failed before rollback: ' + Failure);
       if (JournalPhase <> PhaseReady) and
          (JournalPhase <> PhaseRolledBack) then
         RollbackTransaction;
-      RaiseException(GetExceptionMessage);
+      RaiseException(Failure);
     end;
   end;
 end;
@@ -6190,7 +6270,7 @@ begin
        (CompareText(JournalPendingObjectId, ObjectId) <> 0) then
       RaiseException('invalid committed Ready uninstall intent');
     ExpectedTarget := NormalizeDirectoryPath(
-      AddBackslash(ExpandConstant('{app}')) + 'versions\' +
+      AddBackslash(FixedInstallRoot) + 'versions\' +
       JournalAppVersion + '-' + Copy(JournalManifestHash, 1, 12) +
       '-' + ActiveId);
   end
@@ -6205,7 +6285,7 @@ begin
          PreviousCompatibilityTransactionId) then
       RaiseException('invalid committed legacy uninstall intent');
     ExpectedTarget := NormalizeDirectoryPath(
-      AddBackslash(ExpandConstant('{app}')) + 'versions\' +
+      AddBackslash(FixedInstallRoot) + 'versions\' +
       PreviousVersion + '-' + Copy(PreviousManifestHash, 1, 12) +
       '-' + PreviousCompatibilityTransactionId);
   end
@@ -6389,7 +6469,7 @@ begin
       RaiseException('machine COM registration survived uninstall');
     if not UninstallDeleteArmed then
       CleanupAllValidatedRecoveryArtifacts;
-    VersionsRoot := ExpandConstant('{app}\versions');
+    VersionsRoot := AddBackslash(FixedInstallRoot) + 'versions';
     if DirExists(VersionsRoot) then
     begin
       if not TryGetFinalObjectInfo(VersionsRoot, TreeFinalPath,
@@ -6400,7 +6480,7 @@ begin
          not ScheduleLoadedHostResidueForRestart(VersionsRoot) then
         RaiseException('cannot schedule transaction version cleanup');
     end;
-    PendingRoot := ExpandConstant('{app}\pending');
+    PendingRoot := AddBackslash(FixedInstallRoot) + 'pending';
     if DirExists(PendingRoot) then
     begin
       if not TryGetFinalObjectInfo(PendingRoot, TreeFinalPath,

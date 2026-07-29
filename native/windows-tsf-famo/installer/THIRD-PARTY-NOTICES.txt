@@ -50,10 +50,20 @@ Upstream: https://github.com/microsoft/WindowsAppSDK
 Use: self-contained WinUI runtime and resources shipped with FamoSettings.
 
 --------------------------------------------------------------------------------
+6. WinSparkle
+--------------------------------------------------------------------------------
+License: MIT
+Upstream: https://github.com/vslavik/winsparkle
+Use: signed appcast update checking, download verification, and installer launch
+     from FamoSettings.
+Full notice: WinSparkle-LICENSE.txt
+
+--------------------------------------------------------------------------------
 Notes
 --------------------------------------------------------------------------------
 - FamoTextService.dll and FamoRuntime.exe are the clean native Famo host/runtime;
-  no legacy TSF host, server, deployer, or updater binary is distributed.
+  no legacy TSF host, server, or deployer binary is distributed. WinSparkle is
+  bundled only with the WinUI settings panel.
 - The Windows system libraries and Microsoft Visual C++ runtime resolved from
   the operating system are not copied into this payload.
 - 7-Zip, curl, and design-reference source trees are not distributed.

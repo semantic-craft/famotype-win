@@ -53,6 +53,38 @@ setup 与 uninstall 从各自初始化入口的第一步起就持有同一个独
 
 产物为 `dist\Famo-Setup-<version>.exe`。构建脚本会输出 SHA-256；`staging\`、`dist\` 和安装器 exe 不入库。
 
+## 自动更新发布
+
+更新客户端固定读取 Windows 仓库的
+`releases/latest/download/appcast.xml`；appcast 内的安装包 URL 固定到同版本不可变 tag，
+并带 `windows-x64`、EdDSA 签名和
+`/SILENT /SP- /NOICONS /NORESTART`。发现新版后仍由用户确认，安装事务与手动覆盖安装完全相同。
+
+Windows EdDSA 私钥只放在发布机的密钥存储中，不入仓库。脚本会从私钥派生公钥，
+并与客户端内置公钥逐字比对；不匹配时拒绝生成 appcast。发布前先设置正式私钥，
+用同一密钥完成本地签名自检，再为正式安装包生成 appcast：
+
+```powershell
+$env:FAMO_UPDATE_PRIVATE_KEY = '<仓库外私钥路径>'
+.\make-appcast-selftest.ps1
+.\make-appcast.ps1 -AppVersion 1.5.4
+```
+
+若从 WSL 调用 Windows PowerShell，须用 Windows `cmd.exe` 作为宿主，避免 WSL
+直接启动 `pwsh.exe` 时不等待 WinSparkle GUI 子系统工具：
+
+```powershell
+cmd.exe /d /c "set FAMO_UPDATE_PRIVATE_KEY=C:\path\to\key&& pwsh -NonInteractive -NoLogo -NoProfile -File .\native\windows-tsf-famo\installer\make-appcast-selftest.ps1"
+```
+
+把 `Famo-Setup-<version>.exe` 与 `appcast.xml` 一起上传到同一个 Windows Release；不得把
+macOS appcast、安装包或 tag 混入本仓。脚本只生成本地资产，不创建或修改 GitHub Release。
+
+本地自检只覆盖正式私钥与内置公钥配对、appcast 元数据、EdDSA 签名生成与验签；
+它不访问真实 GitHub appcast，也不覆盖 WinSparkle 更新窗口和下载、篡改签名拒绝、
+UAC 提权、应用优雅退出，或 Win10 / Win11 上从旧版本到新版本的事务安装与回滚。
+发布前须在真实 Release 资产上另行完成这些人工/真机验证。
+
 ## 验证
 
 - `Test-FamoHealth.ps1` 检查事务终态、Stable identity、完整 manifest、COM/profile、精确 runtime 路径和有界 control pipe；`PendingReboot` 还要求 runtime 缺席，并从 v2 journal 验证恢复安装器/hash 以及精确 SID 的 Task Scheduler XML。
