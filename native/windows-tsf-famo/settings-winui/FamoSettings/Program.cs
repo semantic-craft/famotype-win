@@ -152,7 +152,7 @@ public static class Program
             {
                 return 1;
             }
-            if (!InputMethodList.EnsureFamoInUserList(logFailures: false))
+            if (!InputMethodList.EnsureFamoInUserList())
             {
                 Console.Error.WriteLine(
                     "transactional EnsureFamoInUserList returned false");
@@ -168,6 +168,8 @@ public static class Program
         }
         catch (Exception ex)
         {
+            FamoLog.Append(
+                $"--apply-seed-transaction failed: {ex.Message}");
             Console.Error.WriteLine($"--apply-seed-transaction failed: {ex.Message}");
             return 1;
         }

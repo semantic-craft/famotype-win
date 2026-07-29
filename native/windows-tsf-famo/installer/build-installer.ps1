@@ -8,7 +8,7 @@
 param(
   [string] $NativeOutput = '',
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.5.5',
+  [string] $AppVersion = '1.5.6',
   [ValidateSet('Stable')]
   [string] $Identity = 'Stable',
   [string] $Configuration = 'Release',

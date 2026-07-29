@@ -471,7 +471,7 @@ function Test-RecoveryTask {
     $originalUserAccount = [string]$record.OriginalUserAccount
     $expectedTask = "\Famo\Transaction-$id"
     $expectedInstaller = Join-Path $env:ProgramFiles "Famo\pending\$id\Famo-Resume-$id.exe"
-    $expectedArguments = "/FamoRecover=$id /FamoManifest=$($record.ManifestHash) /FamoVersion=$($record.Version) /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+    $expectedArguments = "/FamoRecover=$id /FamoManifest=$($record.ManifestHash) /FamoVersion=$($record.Version) /SILENT /SP- /NORESTART"
     $expectedSddl = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;$sid)"
     if ($taskName -cne $expectedTask -or -not (Same-Path $installer $expectedInstaller) -or
         $installerHash -notmatch '^[0-9A-Fa-f]{64}$' -or

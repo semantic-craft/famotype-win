@@ -7,7 +7,7 @@
 #>
 param(
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.5.5',
+  [string] $AppVersion = '1.5.6',
   [string] $InstallerPath = '',
   [string] $PrivateKeyPath = $env:FAMO_UPDATE_PRIVATE_KEY,
   [string] $OutputPath = ''
@@ -107,7 +107,7 @@ $xml = @"
                  type="application/octet-stream"
                  sparkle:os="windows-x64"
                  sparkle:edSignature="$signature"
-                 sparkle:installerArguments="/SILENT /SP- /NOICONS /NORESTART" />
+                 sparkle:installerArguments="/SILENT /SP- /NOICONS" />
     </item>
   </channel>
 </rss>

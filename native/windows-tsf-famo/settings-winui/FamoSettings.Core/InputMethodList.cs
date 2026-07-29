@@ -25,7 +25,11 @@ public static class InputMethodList
     private const uint TfIppmfForSession = 0x20000000;
     private static readonly Guid InputProcessorProfilesClsid = new("33C53A50-F456-4884-B049-85FD643ECFED");
 
-    [DllImport("input.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    [DllImport(
+        "input.dll",
+        CharSet = CharSet.Unicode,
+        ExactSpelling = true,
+        SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool InstallLayoutOrTip(string psz, uint dwFlags);
 
@@ -49,13 +53,65 @@ public static class InputMethodList
     /// 失败可见：落一行日志到 %LOCALAPPDATA%\Famo\log\（P1-B，此前 catch 静默吞错）。</summary>
     public static bool EnsureFamoInUserList(bool logFailures = true)
     {
-        try { return InstallLayoutOrTip(FamoTip, 0); }
-        catch (Exception ex)
+        int lastError = 0;
+        Exception? lastException = null;
+        bool result = RetryEnsureFamoInUserList(
+            install: () =>
+            {
+                try
+                {
+                    bool installed = InstallLayoutOrTip(FamoTip, 0);
+                    if (!installed)
+                    {
+                        lastError = Marshal.GetLastPInvokeError();
+                    }
+                    return installed;
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    return false;
+                }
+            },
+            isAlreadyPresent: () =>
+                TryIsFamoInUserList(out bool present) && present,
+            delay: Thread.Sleep,
+            maxAttempts: 20,
+            delayMilliseconds: 500);
+        if (!result && logFailures)
         {
-            if (logFailures)
-                FamoLog.Append($"InstallLayoutOrTip(install) failed: {ex.Message}");
-            return false;
+            string detail = lastException is null
+                ? $"Win32={lastError}"
+                : lastException.Message;
+            FamoLog.Append(
+                $"InstallLayoutOrTip(install) failed after retry: {detail}");
         }
+        return result;
+    }
+
+    internal static bool RetryEnsureFamoInUserList(
+        Func<bool> install,
+        Func<bool> isAlreadyPresent,
+        Action<int> delay,
+        int maxAttempts,
+        int delayMilliseconds)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxAttempts, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(delayMilliseconds);
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            _ = install();
+            if (isAlreadyPresent())
+            {
+                return true;
+            }
+            if (attempt < maxAttempts)
+            {
+                delay(delayMilliseconds);
+            }
+        }
+        return false;
     }
 
     /// <summary>切换当前桌面到法墨。失败只记日志：输入法已进列表时，用户仍可 Win+Space 手动切换。</summary>

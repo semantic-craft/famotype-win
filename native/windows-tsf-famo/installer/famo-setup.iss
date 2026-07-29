@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.5"
+  #define AppVersion  "1.5.6"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -37,6 +37,7 @@ PrivilegesRequired=admin
 SetupMutex=FamoInstallerTransactionV2,Global\FamoInstallerTransactionV2
 CloseApplications=no
 RestartApplications=no
+SetupLogging=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 LicenseFile={#StagingDir}\payload\licenses\LICENSE
@@ -45,6 +46,10 @@ UninstallDisplayIcon={code:GetActiveSettings}
 
 [Languages]
 Name: "zh"; MessagesFile: "compiler:Default.isl"
+
+[Messages]
+FinishedRestartLabel=法墨的新版本文件已经安装，但旧输入法模块仍被 Windows 占用。必须重新启动电脑才能完成切换并显示新输入法。是否现在重启？
+FinishedRestartMessage=法墨的新版本文件已经安装，但旧输入法模块仍被 Windows 占用。必须重新启动电脑才能完成切换并显示新输入法。%n%n是否现在重启？
 
 [Files]
 ; Every repair extracts a complete payload to a fresh immutable transaction target.
@@ -220,6 +225,12 @@ var
   LoadedHostHash: String;
   LoadedHostVersion: String;
   LoadedHostExpectedHash: String;
+  CurrentPayloadProofValid: Boolean;
+  CurrentPayloadProofFinalTarget: String;
+  CurrentPayloadProofObjectId: String;
+  CurrentPayloadProofManifestFinalPath: String;
+  CurrentPayloadProofManifestObjectId: String;
+  CurrentPayloadProofManifestHash: String;
   ResumeMode: Boolean;
   RollbackMode: Boolean;
   PendingTerminal: Boolean;
@@ -499,8 +510,10 @@ var
   Broker, BrokerParameters: String;
 begin
   Result := -1;
-  if not ValidateCurrentPayloadForExecution or
-     not ValidateManagedExecutableForExecution(FileName) then
+  { ValidateManagedExecutableForExecution proves the complete current payload
+    for every supported desktop executable, including the embedded broker.
+    Calling the full proof separately here doubled every 641-file scan. }
+  if not ValidateManagedExecutableForExecution(FileName) then
     Exit;
   if not BuildBoundDesktopParameters(FileName, Parameters, WaitForExit,
        Broker, BrokerParameters) then
@@ -1247,19 +1260,75 @@ begin
   end;
 end;
 
+function CachedCurrentPayloadExecutionProofMatches: Boolean;
+var
+  TargetFinalPath, TargetObjectId, Manifest, ManifestFinalPath,
+    ManifestObjectId: String;
+begin
+  { Cache only within this elevated Setup process. The target inherits the
+    Program Files ACL, while every desktop child runs with the original
+    non-elevated token. Re-pin the target and manifest objects on every use,
+    and invalidate the cache before any target deletion. }
+  Result := False;
+  Manifest := AddBackslash(TransactionTarget) + 'payload-manifest.txt';
+  if not CurrentPayloadProofValid or
+     (CompareText(CurrentPayloadProofManifestHash,
+       JournalManifestHash) <> 0) or
+     not FinalObjectsSame(CurrentPayloadProofFinalTarget,
+       CurrentPayloadProofObjectId, JournalPendingFinalTarget,
+       JournalPendingObjectId) or
+     not TryGetFinalObjectInfo(TransactionTarget, TargetFinalPath,
+       TargetObjectId) or
+     not TryGetFinalObjectInfo(Manifest, ManifestFinalPath,
+       ManifestObjectId) then
+    Exit;
+  Result :=
+    FinalObjectsSame(TargetFinalPath, TargetObjectId,
+      CurrentPayloadProofFinalTarget, CurrentPayloadProofObjectId) and
+    FinalObjectsSame(ManifestFinalPath, ManifestObjectId,
+      CurrentPayloadProofManifestFinalPath,
+      CurrentPayloadProofManifestObjectId) and
+    PathSame(ExtractFileDir(ManifestFinalPath), TargetFinalPath) and
+    (CompareText(GetSHA256OfFile(Manifest), JournalManifestHash) = 0);
+end;
+
 function ValidateCurrentPayloadForExecution: Boolean;
 var
-  PinnedFinalTarget, PinnedObjectId: String;
+  PinnedFinalTarget, PinnedObjectId, Manifest, ManifestFinalPath,
+    ManifestObjectId: String;
 begin
   Result := False;
   PinnedFinalTarget := JournalPendingFinalTarget;
   PinnedObjectId := JournalPendingObjectId;
   if (PinnedFinalTarget = '') or (PinnedObjectId = '') then Exit;
+  if CachedCurrentPayloadExecutionProofMatches then
+  begin
+    Result := True;
+    Exit;
+  end;
+  CurrentPayloadProofValid := False;
   try
     try
       VerifyPayloadOrFail;
       Result := FinalObjectsSame(JournalPendingFinalTarget,
         JournalPendingObjectId, PinnedFinalTarget, PinnedObjectId);
+      Manifest := AddBackslash(TransactionTarget) +
+        'payload-manifest.txt';
+      if Result and
+         TryGetFinalObjectInfo(Manifest, ManifestFinalPath,
+           ManifestObjectId) and
+         PathSame(ExtractFileDir(ManifestFinalPath),
+           JournalPendingFinalTarget) then
+      begin
+        CurrentPayloadProofFinalTarget := PinnedFinalTarget;
+        CurrentPayloadProofObjectId := PinnedObjectId;
+        CurrentPayloadProofManifestFinalPath := ManifestFinalPath;
+        CurrentPayloadProofManifestObjectId := ManifestObjectId;
+        CurrentPayloadProofManifestHash := JournalManifestHash;
+        CurrentPayloadProofValid := True;
+      end
+      else
+        Result := False;
     except
       Log('current payload execution proof failed: ' + GetExceptionMessage);
       Result := False;
@@ -3832,7 +3901,7 @@ begin
   Result := '/FamoRecover=' + Id +
     ' /FamoManifest=' + JournalManifestHash +
     ' /FamoVersion=' + JournalAppVersion +
-    ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART';
+    ' /SILENT /SP- /NORESTART';
 end;
 
 function EnsureRecoveryTaskFolderByCom: Boolean;
@@ -4854,6 +4923,7 @@ begin
       JournalAppVersion, JournalManifestHash, PreviousTarget,
       ValidatedTarget) then
       RaiseException('unsafe transaction target refused during rollback');
+    CurrentPayloadProofValid := False;
     if not DelTree(ValidatedTarget, True, True, True) then
       RaiseException('transaction target deletion failed during rollback');
     TargetCleanupComplete := not DirExists(ValidatedTarget);
@@ -5024,6 +5094,7 @@ begin
       ValidatedTarget) then
       RaiseException(
         'unsafe partial transaction target refused during debt retry');
+    CurrentPayloadProofValid := False;
     if DelTree(ValidatedTarget, True, True, True) then
       TargetCleanupComplete := not DirExists(ValidatedTarget);
     if not TargetCleanupComplete and DirExists(ValidatedTarget) then
@@ -6005,6 +6076,7 @@ begin
   RollbackComplete := False;
   RuntimeStarted := False;
   TerminalRecoveryTargetDeleteBlocked := False;
+  CurrentPayloadProofValid := False;
 end;
 
 function InitializeSetup: Boolean;
@@ -6086,19 +6158,16 @@ begin
       if not RecoverTerminalTransaction then
       begin
         Log('ordinary setup deferred by terminal transaction cleanup');
-        if not WizardSilent then
-        begin
-          if TerminalRecoveryTargetDeleteBlocked then
-            MsgBox(
-              '上次更新的旧输入法文件仍未能清理，通常是文件仍被系统占用。' + #13#10 +
-              '请重新启动 Windows，然后再次运行此安装包。',
-              mbInformation, MB_OK)
-          else
-            MsgBox(
-              '无法完成上次更新的安全恢复，安装未继续。' + #13#10 +
-              '请保留安装日志并联系支持。',
-              mbError, MB_OK);
-        end;
+        if TerminalRecoveryTargetDeleteBlocked then
+          SuppressibleMsgBox(
+            '上次更新的旧输入法文件仍未能清理，通常是文件仍被系统占用。' + #13#10 +
+            '请重新启动 Windows，然后再次运行此安装包。',
+            mbInformation, MB_OK, IDOK)
+        else
+          SuppressibleMsgBox(
+            '无法完成上次更新的安全恢复，安装未继续。' + #13#10 +
+            '请保留安装日志并联系支持。',
+            mbError, MB_OK, IDOK);
         Result := False;
         Exit;
       end;

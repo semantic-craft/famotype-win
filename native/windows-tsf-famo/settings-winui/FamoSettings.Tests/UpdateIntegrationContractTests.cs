@@ -65,6 +65,9 @@ public sealed class UpdateIntegrationContractTests
         Assert.Contains("sparkle:edSignature", release);
         Assert.Contains("sparkle:os=\"windows-x64\"", release);
         Assert.Contains(
+            "sparkle:installerArguments=\"/SILENT /SP- /NOICONS\"",
+            release);
+        Assert.DoesNotContain(
             "sparkle:installerArguments=\"/SILENT /SP- /NOICONS /NORESTART\"",
             release);
         Assert.Contains("/releases/download/$AppVersion/", release);
@@ -78,7 +81,7 @@ public sealed class UpdateIntegrationContractTests
     }
 
     [Fact]
-    public void ReleaseMetadataIsPreparedFor155()
+    public void ReleaseMetadataIsPreparedFor156()
     {
         string build = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/installer/build-installer.ps1"));
@@ -89,10 +92,10 @@ public sealed class UpdateIntegrationContractTests
         string sbom = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/installer/SBOM.spdx.json"));
 
-        Assert.Contains("[string] $AppVersion = '1.5.5'", build);
-        Assert.Contains("[string] $AppVersion = '1.5.5'", appcast);
-        Assert.Contains("#define AppVersion  \"1.5.5\"", installer);
-        Assert.Contains("\"versionInfo\": \"1.5.5\"", sbom);
+        Assert.Contains("[string] $AppVersion = '1.5.6'", build);
+        Assert.Contains("[string] $AppVersion = '1.5.6'", appcast);
+        Assert.Contains("#define AppVersion  \"1.5.6\"", installer);
+        Assert.Contains("\"versionInfo\": \"1.5.6\"", sbom);
     }
 
     private static string RepoFile(string relativePath)
