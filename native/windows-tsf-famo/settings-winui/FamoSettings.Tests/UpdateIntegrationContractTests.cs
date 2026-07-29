@@ -77,6 +77,24 @@ public sealed class UpdateIntegrationContractTests
         Assert.Contains("Win10 / Win11", releaseDocs);
     }
 
+    [Fact]
+    public void ReleaseMetadataIsPreparedFor154()
+    {
+        string build = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/installer/build-installer.ps1"));
+        string appcast = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/installer/make-appcast.ps1"));
+        string installer = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/installer/famo-setup.iss"));
+        string sbom = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/installer/SBOM.spdx.json"));
+
+        Assert.Contains("[string] $AppVersion = '1.5.4'", build);
+        Assert.Contains("[string] $AppVersion = '1.5.4'", appcast);
+        Assert.Contains("#define AppVersion  \"1.5.4\"", installer);
+        Assert.Contains("\"versionInfo\": \"1.5.4\"", sbom);
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;
