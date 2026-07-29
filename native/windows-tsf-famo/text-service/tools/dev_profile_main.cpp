@@ -684,6 +684,90 @@ bool ExecutableLeafMatches(const std::wstring &path,
                   std::wstring(expected_leaf).c_str()) == 0;
 }
 
+HRESULT ForceStopExactRuntime(const std::wstring &runtime,
+                              std::wstring_view expected_sid) {
+  DWORD session = 0;
+  wchar_t key[CCH_RM_SESSION_KEY + 1]{};
+  DWORD result = RmStartSession(&session, 0, key);
+  if (result != ERROR_SUCCESS)
+    return HRESULT_FROM_WIN32(result);
+
+  HRESULT outcome = E_FAIL;
+  const wchar_t *resources[] = {runtime.c_str()};
+  result = RmRegisterResources(session, 1, resources, 0, nullptr, 0, nullptr);
+  UINT needed = 0;
+  UINT count = 0;
+  DWORD reasons = 0;
+  if (result == ERROR_SUCCESS)
+    result = RmGetList(session, &needed, &count, nullptr, &reasons);
+  if (result == ERROR_SUCCESS && needed == 0) {
+    outcome = S_OK;
+  } else if (result == ERROR_MORE_DATA && needed > 0) {
+    std::vector<RM_PROCESS_INFO> processes(needed);
+    count = needed;
+    result =
+        RmGetList(session, &needed, &count, processes.data(), &reasons);
+    bool exact = result == ERROR_SUCCESS && count > 0;
+    for (UINT index = 0; exact && index < count; ++index) {
+      HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                   processes[index].Process.dwProcessId);
+      if (!process) {
+        exact = GetLastError() == ERROR_INVALID_PARAMETER;
+        continue;
+      }
+      std::vector<wchar_t> image(32768);
+      DWORD length = static_cast<DWORD>(image.size());
+      HANDLE token = nullptr;
+      exact = QueryFullProcessImageNameW(process, 0, image.data(), &length) &&
+              _wcsicmp(std::wstring(image.data(), length).c_str(),
+                       runtime.c_str()) == 0 &&
+              OpenProcessToken(process, TOKEN_QUERY, &token) &&
+              TokenMatchesSid(token, expected_sid);
+      if (token)
+        CloseHandle(token);
+      CloseHandle(process);
+    }
+    if (!exact) {
+      outcome = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+    } else {
+      result = RmShutdown(session, RmForceShutdown, nullptr);
+      outcome =
+          result == ERROR_SUCCESS ? S_OK : HRESULT_FROM_WIN32(result);
+    }
+  } else {
+    outcome = HRESULT_FROM_WIN32(result);
+  }
+  RmEndSession(session);
+  return outcome;
+}
+
+HRESULT StopRuntimeAsDesktopUser(const std::wstring &runtime,
+                                 std::wstring_view expected_sid) {
+  if (!ExecutableLeafMatches(runtime, L"FamoRuntime.exe"))
+    return E_INVALIDARG;
+
+  const HRESULT shutdown =
+      RunAsDesktopUser(runtime, L"--control shutdown", true, expected_sid);
+  HRESULT absent = WaitForExecutableExit(runtime);
+  if (SUCCEEDED(absent))
+    return S_OK;
+
+  // The native runtime accepts /q as its compatibility shutdown spelling.
+  // Retry it only when the control command failed and the exact executable is
+  // still present; neither command ever force-terminates an input host.
+  if (FAILED(shutdown)) {
+    RunAsDesktopUser(runtime, L"/q", true, expected_sid);
+    absent = WaitForExecutableExit(runtime);
+  }
+  if (FAILED(absent)) {
+    const HRESULT forced = ForceStopExactRuntime(runtime, expected_sid);
+    if (FAILED(forced))
+      return forced;
+    absent = WaitForExecutableExit(runtime);
+  }
+  return absent;
+}
+
 bool ResolveDesktopOperation(std::wstring_view kind,
                              std::wstring_view operation,
                              std::wstring_view sid,
@@ -792,7 +876,7 @@ bool ResolveDesktopOperation(std::wstring_view kind,
       return true;
     }
     if (operation == L"quit") {
-      *arguments = L"/quit";
+      *arguments = L"/q";
       return true;
     }
     if (operation == L"deploy") {
@@ -1869,6 +1953,17 @@ int wmain(int argc, wchar_t **argv) {
     return RunBoundDesktopOperation(argv[2], L"nowait", L"runtime", L"start",
                                     directory + L"\\FamoRuntime.exe");
   }
+  if (argc == 4 &&
+      std::wstring_view(argv[1]) == L"stop-runtime-for") {
+    const HRESULT result = StopRuntimeAsDesktopUser(argv[3], argv[2]);
+    if (FAILED(result)) {
+      std::fwprintf(stderr, L"runtime stop readback failed: 0x%08lx\n",
+                    static_cast<unsigned long>(result));
+      return 1;
+    }
+    std::wprintf(L"runtime_stopped=yes path=%ls\n", argv[3]);
+    return 0;
+  }
   if (argc >= 2 && std::wstring_view(argv[1]) == L"loaded") {
     if (argc != 3)
       return 2;
@@ -1928,7 +2023,7 @@ int wmain(int argc, wchar_t **argv) {
   if (argc != 2) {
     std::fwprintf(
         stderr,
-        L"usage: FamoProfileTool register|register-machine|register-disabled|enable|disable|activate|check|check-machine|check-disabled|check-absent|is-active|is-enabled|switch-away|start-runtime|start-runtime-for <sid>|desktop-run-for <sid> wait|nowait <kind> <operation> <executable>|cleanup-user|cleanup-user-for <sid>|delete-user-data-for <sid>|delete-user-data-current <sid>|clear-user-com-shadow <sid>|unregister|unregister-machine|unregister-machine-direct|loaded <dll>|capture-original-user <pipe-id> <challenge> <record>|capture-original-user-for <sid> <pipe-id> <challenge> <record>|prove-current-token <pipe-id> <challenge>|prove-shell-token <pipe-id> <challenge>|prove-shell-token-for <sid> <pipe-id> <challenge>\n");
+        L"usage: FamoProfileTool register|register-machine|register-disabled|enable|disable|activate|check|check-machine|check-disabled|check-absent|is-active|is-enabled|switch-away|start-runtime|start-runtime-for <sid>|stop-runtime-for <sid> <executable>|desktop-run-for <sid> wait|nowait <kind> <operation> <executable>|cleanup-user|cleanup-user-for <sid>|delete-user-data-for <sid>|delete-user-data-current <sid>|clear-user-com-shadow <sid>|unregister|unregister-machine|unregister-machine-direct|loaded <dll>|capture-original-user <pipe-id> <challenge> <record>|capture-original-user-for <sid> <pipe-id> <challenge> <record>|prove-current-token <pipe-id> <challenge>|prove-shell-token <pipe-id> <challenge>|prove-shell-token-for <sid> <pipe-id> <challenge>\n");
     return 2;
   }
   const std::wstring_view command(argv[1]);
