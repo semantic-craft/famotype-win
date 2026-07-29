@@ -143,6 +143,15 @@ public sealed class InstallerContractTests
         Assert.Contains("' /FamoManifest=' + JournalManifestHash", iss);
         Assert.Contains("' /FamoVersion=' + JournalAppVersion", iss);
         Assert.Contains("ValidateRecoveryTaskXml", scheduleBody);
+        Assert.Contains(
+            "SaveStringsToUTF16LEFile(TaskXml, Lines)",
+            scheduleBody);
+        Assert.DoesNotContain(
+            "SaveStringsToUTF8File",
+            scheduleBody);
+        Assert.Contains(
+            "'<?xml version=\"1.0\" encoding=\"UTF-16\"?>'",
+            scheduleBody);
         Assert.Contains("TransitionTransactionPhase(PhaseResumeArmed)", scheduleBody);
         int ensureFolder = Position(scheduleBody, "EnsureRecoveryTaskFolderByCom");
         int proveFresh = Position(
@@ -174,7 +183,18 @@ public sealed class InstallerContractTests
         Assert.Contains("RecoveryTaskFolderSecurityDescriptor", folderBody);
         Assert.Contains("Folder.GetSecurityDescriptor(", folderBody);
         Assert.Contains("(Tasks.Count = 0) and (Subfolders.Count = 0)", folderBody);
-        Assert.Contains("'D:P(A;;FA;;;SY)(A;;FA;;;BA)'", iss);
+        Assert.Contains(
+            "'D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;' +",
+            iss);
+        Assert.Contains("OriginalUserSid + ')'", iss);
+        int utf16Writer = Position(
+            iss, "function SaveStringsToUTF16LEFile");
+        string utf16WriterBody = iss[
+            utf16Writer..Position(
+                iss, "procedure ScheduleRecoveryTask", utf16Writer)];
+        Assert.Contains("#$FEFF", utf16WriterBody);
+        Assert.Contains("TFileStream.Create(FileName, fmCreate)", utf16WriterBody);
+        Assert.Contains("Length(Text) * 2", utf16WriterBody);
 
         int taskValidator = Position(iss, "function ValidateRecoveryTaskXml");
         string taskValidatorBody = iss[taskValidator..Position(iss, "function ExpectedRecoveryDirectory", taskValidator)];
@@ -190,8 +210,20 @@ public sealed class InstallerContractTests
         }
         Assert.Contains("ExtractUniqueXmlElement(Xml, '<LogonTrigger>'", taskValidatorBody);
         Assert.Contains("ExtractUniqueXmlElement(Xml, '<Settings>'", taskValidatorBody);
-        Assert.Contains("(CountText(Xml, '<Enabled>true</Enabled>') = 2)", taskValidatorBody);
+        Assert.Contains(
+            "ExtractUniqueXmlElement(Xml, '<Principal id=\"OriginalUser\">'",
+            taskValidatorBody);
+        Assert.Contains("XmlEscape(OriginalUserAccount)", taskValidatorBody);
+        Assert.Contains(
+            "(CountText(TriggerElement, '<Enabled>') <= 1)",
+            taskValidatorBody);
+        Assert.Contains(
+            "(CountText(SettingsElement, '<Enabled>') <= 1)",
+            taskValidatorBody);
         Assert.Contains("(CountText(Xml, '<Enabled>false</Enabled>') = 0)", taskValidatorBody);
+        Assert.DoesNotContain(
+            "(CountText(Xml, '<Enabled>true</Enabled>') = 2)",
+            taskValidatorBody);
         Assert.DoesNotContain("RunOnceKey", iss);
         Assert.DoesNotContain("FamoResumePending", iss);
 
@@ -225,6 +257,26 @@ public sealed class InstallerContractTests
         Assert.Contains("'check-machine'", registerBody);
         Assert.DoesNotContain("'register'", registerBody);
 
+        int unregisterPrevious = Position(
+            iss, "function UnregisterPreviousRegistration");
+        int registerPrevious = Position(
+            iss, "function RegisterPreviousRegistration", unregisterPrevious);
+        string unregisterPreviousBody = iss[unregisterPrevious..registerPrevious];
+        string registerPreviousBody = iss[registerPrevious..Position(
+            iss, "function DetectLoadedPreviousHost", registerPrevious)];
+        Assert.Contains(
+            "if RunAndRequire(PreviousProfileTool, 'unregister-machine', False) then",
+            unregisterPreviousBody);
+        Assert.Contains(
+            "Result := RunRegSvr32(PreviousHost, True)",
+            unregisterPreviousBody);
+        Assert.Contains(
+            "if RunAndRequire(PreviousProfileTool, 'register-machine', False) then",
+            registerPreviousBody);
+        Assert.Contains(
+            "Result := RunRegSvr32(PreviousHost, False)",
+            registerPreviousBody);
+
         int userState = Position(iss, "procedure InstallUserState");
         string userBody = iss[userState..Position(iss, "procedure RollbackTransaction", userState)];
         int prepare = Position(userBody, "--prepare-seed-transaction");
@@ -242,7 +294,13 @@ public sealed class InstallerContractTests
         int policy = Position(iss, "procedure CheckDowngradePolicy");
         string policyBody = iss[policy..Position(iss, "procedure SwitchRegistration", policy)];
 
-        Assert.Contains("GetPackedVersion", policyBody);
+        Assert.Contains(
+            "StrToVersion(JournalAppVersion + '.0', NewVersion)",
+            policyBody);
+        Assert.Contains(
+            "StrToVersion(PreviousVersion + '.0', PreviousPackedVersion)",
+            policyBody);
+        Assert.DoesNotContain("GetPackedVersion", policyBody);
         Assert.Contains("ComparePackedVersion(NewVersion, PreviousPackedVersion) < 0", policyBody);
         Assert.Contains("if not JournalAllowDowngrade then", policyBody);
         Assert.Contains("{param:FamoAllowDowngrade|}", iss);
@@ -256,24 +314,117 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void Installer_AcceptsObservedActiveButDisabledProfileSnapshots()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        string health = RepoText(
+            "native/windows-tsf-famo/weasel-fork/tests/Test-FamoHealth.ps1");
+        int semantics = Position(iss, "function ValidateJournalSemantics");
+        string semanticsBody = iss[
+            semantics..Position(
+                iss, "function ValidateCurrentJournalArtifact", semantics)];
+        int capture = Position(iss, "procedure CapturePreviousUserState");
+        string captureBody = iss[
+            capture..Position(iss, "function ReadPreparedSeedReceiptHash", capture)];
+
+        Assert.Contains("PreviousProfileActive = '1'", semanticsBody);
+        Assert.Contains("PreviousProfileEnabled = '1'", semanticsBody);
+        Assert.DoesNotContain(
+            "(Journal.PreviousProfileActive <> '1')",
+            semanticsBody);
+        Assert.Contains("'is-active'", captureBody);
+        Assert.Contains("'is-enabled'", captureBody);
+        Assert.DoesNotContain(
+            "[string]$record.PreviousProfileActive -eq '1' -and",
+            health);
+    }
+
+    [Fact]
+    public void Installer_RollbackRestoresProfileOnlyAfterMutationIntent()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int rollback = Position(iss, "procedure RollbackTransaction");
+        string rollbackBody = iss[
+            rollback..Position(
+                iss, "function RetryRolledBackCleanupDebt", rollback)];
+
+        int derive = Position(
+            rollbackBody, "HadProfileMutationIntent :=");
+        int rollbackIntent = Position(
+            rollbackBody,
+            "TransitionTransactionPhase(PhaseRollbackIntent)",
+            derive);
+        int profileGate = Position(
+            rollbackBody, "if HadProfileMutationIntent then", rollbackIntent);
+        int profileRestore = Position(
+            rollbackBody, "EnableCommand := 'enable'", profileGate);
+        int runtimeRestore = Position(
+            rollbackBody, "RunBoundDesktopExitCode(PreviousServer", profileRestore);
+
+        Assert.True(
+            derive < rollbackIntent &&
+            rollbackIntent < profileGate &&
+            profileGate < profileRestore &&
+            profileRestore < runtimeRestore);
+        Assert.Contains("JournalPhase = PhaseDetachIntent", rollbackBody);
+        Assert.Contains("JournalPhase = PhasePendingReboot", rollbackBody);
+        Assert.Contains("JournalPhase = PhaseActivateIntent", rollbackBody);
+        Assert.Contains("JournalPhase = PhaseMachineRegistered", rollbackBody);
+    }
+
+    [Fact]
+    public void Installer_LogsTheOriginalFailureBeforeRollbackCompensation()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int changed = Position(iss, "procedure CurStepChanged");
+        string changedBody = iss[
+            changed..Position(iss, "function NeedRestart", changed)];
+        int capture = Position(
+            changedBody, "Failure := GetExceptionMessage");
+        int log = Position(
+            changedBody,
+            "Log('installation failed before rollback: ' + Failure)",
+            capture);
+        int rollback = Position(
+            changedBody, "RollbackTransaction", log);
+        int raise = Position(
+            changedBody, "RaiseException(Failure)", rollback);
+        Assert.True(capture < log && log < rollback && rollback < raise);
+    }
+
+    [Fact]
     public void Installer_RejectsDirOverridesAndReparseProtectedRootsBeforeCapture()
     {
         string iss = InstallerText("famo-setup.iss");
+        int fixedRoot = Position(iss, "function FixedInstallRoot");
         int rootGuard = Position(iss, "procedure RequireFixedProtectedInstallRoot");
-        string rootGuardBody = iss[rootGuard..Position(iss, "procedure CaptureOriginalUserIdentity", rootGuard)];
+        int selectedRootGuard = Position(iss, "procedure RequireSelectedFixedInstallRoot", rootGuard);
+        string fixedRootBody = iss[fixedRoot..rootGuard];
+        string rootGuardBody = iss[rootGuard..selectedRootGuard];
+        string selectedRootBody = iss[selectedRootGuard..Position(
+            iss, "procedure CaptureOriginalUserIdentity", selectedRootGuard)];
 
-        Assert.Contains("NormalizeDirectoryPath(ExpandConstant('{app}'))", rootGuardBody);
-        Assert.Contains("NormalizeDirectoryPath(ExpandConstant('{autopf}\\Famo'))", rootGuardBody);
-        Assert.Contains("if not PathSame(AppRoot, FixedRoot) then", rootGuardBody);
+        Assert.Contains("NormalizeDirectoryPath(ExpandConstant('{autopf}\\Famo'))", fixedRootBody);
+        Assert.Contains("AppRoot := FixedInstallRoot", rootGuardBody);
         Assert.Contains("PathIsNonReparseOrMissing", rootGuardBody);
         Assert.Contains("ValidateProtectedChild", rootGuardBody);
+        Assert.Contains("NormalizeDirectoryPath(ExpandConstant('{app}'))", selectedRootBody);
+        Assert.Contains("if not PathSame(SelectedRoot, FixedInstallRoot) then", selectedRootBody);
+        Assert.Equal(1, iss.Split("ExpandConstant('{app}')").Length - 1);
 
         int initialize = Position(iss, "function InitializeSetup");
         string initializeBody = iss[initialize..Position(iss, "procedure CurStepChanged", initialize)];
         Assert.Contains("RequireFixedProtectedInstallRoot", initializeBody);
+        Assert.DoesNotContain("ExpandConstant('{app}')", initializeBody);
         Assert.True(
             Position(initializeBody, "RequireFixedProtectedInstallRoot") <
             Position(initializeBody, "LoadPendingState"));
+
+        int prepare = Position(iss, "procedure PrepareTransaction");
+        string prepareBody = iss[prepare..Position(iss, "procedure SwitchRegistration", prepare)];
+        Assert.True(
+            Position(prepareBody, "RequireSelectedFixedInstallRoot") <
+            Position(prepareBody, "EnsureTransactionTarget"));
     }
 
     [Fact]
@@ -310,6 +461,20 @@ public sealed class InstallerContractTests
         string prepareBody = iss[prepare..Position(iss, "procedure CheckDowngradePolicy", prepare)];
         Assert.Contains("(JournalPhase <> PhasePrepared) and", prepareBody);
         Assert.Contains("not DirExists(TransactionTarget)", prepareBody);
+        int snapshot = Position(prepareBody, "SnapshotPreviousState");
+        int clearResumeInstaller = Position(
+            prepareBody, "JournalResumeInstaller := ''", snapshot);
+        int clearResumeHash = Position(
+            prepareBody, "JournalResumeInstallerHash := ''", clearResumeInstaller);
+        int clearTask = Position(
+            prepareBody, "JournalTaskName := ''", clearResumeHash);
+        int prepared = Position(
+            prepareBody, "TransitionTransactionPhase(PhasePrepared)", clearTask);
+        Assert.True(
+            snapshot < clearResumeInstaller &&
+            clearResumeInstaller < clearResumeHash &&
+            clearResumeHash < clearTask &&
+            clearTask < prepared);
 
         int initialize = Position(iss, "function InitializeSetup");
         string initializeBody = iss[initialize..Position(iss, "procedure CurStepChanged", initialize)];
@@ -344,8 +509,10 @@ public sealed class InstallerContractTests
     {
         string iss = InstallerText("famo-setup.iss");
         int enumerate = Position(iss, "function RecoveryTaskExistsByCom");
+        int ownership = Position(iss, "function JournalOwnsRecoveryTask", enumerate);
         int cleanup = Position(iss, "procedure DeleteRecoveryTask", enumerate);
         string enumerateBody = iss[enumerate..cleanup];
+        string enumerateOnly = iss[enumerate..ownership];
         string cleanupBody = iss[cleanup..Position(iss, "procedure WritePendingRegistry", cleanup)];
 
         foreach (string contract in new[]
@@ -355,10 +522,12 @@ public sealed class InstallerContractTests
             "CompareText(Task.Path, TaskName)", "if Matches > 1 then Exit",
             "RecoveryTaskFolderSecurityDescriptor", "Subfolders.Count <> 0",
             "if CompareText(Task.Path, TaskName) <> 0 then Exit",
+            "Candidate := Folders.Item(I)", "Folder := Candidate",
         })
         {
             Assert.Contains(contract, enumerateBody);
         }
+        Assert.DoesNotContain("Folder := Folders.Item(I)", enumerateOnly);
 
         int confirmPresent = Position(
             cleanupBody, "RecoveryTaskExistsByCom(TaskName, TaskExists)");
@@ -1327,7 +1496,7 @@ public sealed class InstallerContractTests
         Assert.Contains("DllUnregisterMachine", profileTool);
         Assert.Contains("DeleteUserData", iss);
         Assert.Contains("UninstallSilent", iss);
-        Assert.Contains(@"{app}\versions", iss);
+        Assert.Contains("AddBackslash(FixedInstallRoot) + 'versions'", iss);
 
         int post = Position(iss, "procedure CurUninstallStepChanged");
         string postBody = iss[post..];
@@ -1855,6 +2024,14 @@ public sealed class InstallerContractTests
             "FailIfRequested('after-identity-helper-debt')", captureBody);
         Assert.Contains(
             "FailIfRequested('after-identity-helper-create')", captureBody);
+        Assert.Contains("RecordLoaded := False", captureBody);
+        int recordPoll = Position(captureBody, "for Attempts := 1 to 150");
+        int recordLoad = Position(
+            captureBody, "LoadStringsFromFile(IdentityRecord, Lines)", recordPoll);
+        int recordBreak = Position(captureBody, "Break", recordLoad);
+        Assert.True(recordPoll < recordLoad && recordLoad < recordBreak);
+        Assert.DoesNotContain(
+            "if FileExists(IdentityRecord) then Break", captureBody);
         Assert.Contains("CleanupExactHelperAndDebt(TransactionId", captureBody);
         Assert.Contains("DebtKindIdentityHelper, PipeId", captureBody);
 
@@ -2084,13 +2261,20 @@ public sealed class InstallerContractTests
         Assert.Contains("OriginalUserSid", health);
         Assert.Contains("schtasks.exe", health);
         Assert.Contains("expectedSddl", health);
-        Assert.Contains("principals[0].id", health);
-        Assert.Contains("actions[0].Context", health);
+        Assert.Contains("($principals[0]).GetAttribute('id')", health);
+        Assert.Contains("($actions[0]).GetAttribute('Context')", health);
         Assert.Contains("triggerElements.Count -ne 1", health);
         Assert.Contains("actionElements.Count -ne 1", health);
-        Assert.Contains("triggerEnabled.Count -ne 1", health);
-        Assert.Contains("settingsEnabled.Count -ne 1", health);
-        Assert.Contains("$enabled.Count -ne 2", health);
+        Assert.Contains("triggerEnabled.Count -gt 1", health);
+        Assert.Contains("settingsEnabled.Count -gt 1", health);
+        Assert.Contains("$principalUserIds", health);
+        Assert.Contains("$triggerUserIds", health);
+        Assert.Contains("$record.OriginalUserAccount", health);
+        Assert.Contains("$principals = @(& $nodes 'Principal')", health);
+        Assert.Contains("$commands = @(& $nodes 'Command')", health);
+        Assert.Contains(".InnerText", health);
+        Assert.DoesNotContain(".'#text'", health);
+        Assert.DoesNotContain("$enabled.Count -ne 2", health);
         Assert.Contains("function Get-FamoRecoveryTaskInventory", health);
         Assert.Contains("GetSecurityDescriptor(4)", health);
         Assert.Contains("$famoFolder.GetTasks(1)", health);
@@ -2098,7 +2282,9 @@ public sealed class InstallerContractTests
         Assert.Contains("folderPresent", health);
         Assert.Contains("folderSddl", health);
         Assert.Contains("subfolders", health);
-        Assert.Contains("'D:P(A;;FA;;;SY)(A;;FA;;;BA)'", health);
+        Assert.Contains(
+            "\"D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;$($journalInfo.record.OriginalUserSid))\"",
+            health);
         Assert.Contains("-not $recoveryTaskInventory.folderPresent", health);
         Assert.Contains("Add-Check 'H10' 'S0'", health);
         Assert.Contains("Add-Check 'H11' 'S1'", health);
@@ -2125,20 +2311,31 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
-    public void JournalIdentityValidationIsPhaseAwareForAnAbsentPreparedTarget()
+    public void JournalIdentityValidationKeepsHistoricalGenerationsStableAndCurrentTargetPinned()
     {
         string iss = InstallerText("famo-setup.iss");
         string health = RepoText(
             "native/windows-tsf-famo/weasel-fork/tests/Test-FamoHealth.ps1");
+        int phaseValidation = Position(
+            iss, "function ValidPendingObjectIdForPhase");
+        string phaseValidationBody = iss[
+            phaseValidation..Position(
+                iss, "function ValidateJournalSemantics", phaseValidation)];
+        int pendingLoad = Position(iss, "function LoadPendingState");
+        string pendingLoadBody = iss[
+            pendingLoad..Position(
+                iss, "function InspectJournalGenerations", pendingLoad)];
 
-        Assert.Contains("function ValidPendingObjectIdForPhase", iss);
-        Assert.Contains("Journal.Phase = PhasePrepared", iss);
-        Assert.Contains("Journal.Phase = PhaseRollbackIntent", iss);
-        Assert.Contains("Journal.Phase = PhaseRolledBack", iss);
-        Assert.Contains(
-            "not DirExists(NormalizeDirectoryPath(Journal.PendingTarget))",
-            iss);
+        Assert.Contains("Journal.Phase = PhasePrepared", phaseValidationBody);
+        Assert.Contains("Journal.Phase = PhaseRollbackIntent", phaseValidationBody);
+        Assert.Contains("Journal.Phase = PhaseRolledBack", phaseValidationBody);
+        Assert.DoesNotContain("DirExists(", phaseValidationBody);
         Assert.Contains("ValidPendingObjectIdForPhase(Journal)", iss);
+        Assert.Contains("if DirExists(TransactionTarget)", pendingLoadBody);
+        Assert.Contains("(JournalPendingObjectId <> '')", pendingLoadBody);
+        Assert.Contains(
+            "(CompareText(ObjectId, JournalPendingObjectId) = 0)",
+            pendingLoadBody);
         Assert.Contains("$phaseAllowsAbsentPendingObject", health);
         Assert.Contains("'Prepared', 'RollbackIntent', 'RolledBack'", health);
         Assert.Contains(

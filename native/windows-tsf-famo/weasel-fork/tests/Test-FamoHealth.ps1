@@ -426,8 +426,6 @@ function Get-ActiveTransactionJournal {
            [string]$record.PreviousObjectId -ne '')) -or
         (-not [string]::IsNullOrEmpty([string]$record.SeedReceiptHash) -and
           [string]$record.SeedReceiptHash -notmatch '^[0-9A-Fa-f]{64}$') -or
-        ([string]$record.PreviousProfileActive -eq '1' -and
-          [string]$record.PreviousProfileEnabled -ne '1') -or
         (-not $hasPrevious -and
           ([string]$record.PreviousProfileActive -ne '0' -or
            [string]$record.PreviousProfileEnabled -ne '0' -or
@@ -470,6 +468,7 @@ function Test-RecoveryTask {
     $installerHash = [string]$record.ResumeInstallerHash
     $taskName = [string]$record.ResumeTaskName
     $sid = [string]$record.OriginalUserSid
+    $originalUserAccount = [string]$record.OriginalUserAccount
     $expectedTask = "\Famo\Transaction-$id"
     $expectedInstaller = Join-Path $env:ProgramFiles "Famo\pending\$id\Famo-Resume-$id.exe"
     $expectedArguments = "/FamoRecover=$id /FamoManifest=$($record.ManifestHash) /FamoVersion=$($record.Version) /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
@@ -487,47 +486,58 @@ function Test-RecoveryTask {
       param([string] $Name)
       @($taskXml.SelectNodes("//*[local-name()='$Name']"))
     }
-    $userIds = & $nodes 'UserId'
-    $principals = & $nodes 'Principal'
-    $logonTriggers = & $nodes 'LogonTrigger'
-    $actions = & $nodes 'Actions'
-    $execs = & $nodes 'Exec'
-    $commands = & $nodes 'Command'
-    $arguments = & $nodes 'Arguments'
-    $logonTypes = & $nodes 'LogonType'
-    $runLevels = & $nodes 'RunLevel'
-    $securityDescriptors = & $nodes 'SecurityDescriptor'
-    $enabled = & $nodes 'Enabled'
-    $settings = & $nodes 'Settings'
+    $principals = @(& $nodes 'Principal')
+    $logonTriggers = @(& $nodes 'LogonTrigger')
+    $actions = @(& $nodes 'Actions')
+    $execs = @(& $nodes 'Exec')
+    $commands = @(& $nodes 'Command')
+    $arguments = @(& $nodes 'Arguments')
+    $logonTypes = @(& $nodes 'LogonType')
+    $runLevels = @(& $nodes 'RunLevel')
+    $securityDescriptors = @(& $nodes 'SecurityDescriptor')
+    $enabled = @(& $nodes 'Enabled')
+    $settings = @(& $nodes 'Settings')
     $triggerElements = @($taskXml.SelectNodes("//*[local-name()='Triggers']/*"))
     $actionElements = @($taskXml.SelectNodes("//*[local-name()='Actions']/*"))
     $triggerEnabled = @($taskXml.SelectNodes(
       "//*[local-name()='LogonTrigger']/*[local-name()='Enabled']"))
     $settingsEnabled = @($taskXml.SelectNodes(
       "//*[local-name()='Settings']/*[local-name()='Enabled']"))
+    $principalUserIds = @($taskXml.SelectNodes(
+      "//*[local-name()='Principal']/*[local-name()='UserId']"))
+    $triggerUserIds = @($taskXml.SelectNodes(
+      "//*[local-name()='LogonTrigger']/*[local-name()='UserId']"))
     if ($principals.Count -ne 1 -or $logonTriggers.Count -ne 1 -or
         $actions.Count -ne 1 -or $settings.Count -ne 1 -or
         $execs.Count -ne 1 -or
         $commands.Count -ne 1 -or $arguments.Count -ne 1 -or
         $securityDescriptors.Count -ne 1 -or
-        [string]$securityDescriptors[0].'#text' -cne $expectedSddl -or
-        [string]$principals[0].id -cne 'OriginalUser' -or
-        [string]$actions[0].Context -cne 'OriginalUser' -or
+        [string]$securityDescriptors[0].InnerText -cne $expectedSddl -or
+        [string](($principals[0]).GetAttribute('id')) -cne 'OriginalUser' -or
+        [string](($actions[0]).GetAttribute('Context')) -cne 'OriginalUser' -or
         $triggerElements.Count -ne 1 -or
         [string]$triggerElements[0].LocalName -cne 'LogonTrigger' -or
         $actionElements.Count -ne 1 -or
         [string]$actionElements[0].LocalName -cne 'Exec' -or
-        $triggerEnabled.Count -ne 1 -or
-        [string]$triggerEnabled[0].'#text' -cne 'true' -or
-        $settingsEnabled.Count -ne 1 -or
-        [string]$settingsEnabled[0].'#text' -cne 'true' -or
-        $enabled.Count -ne 2 -or
-        @($enabled | Where-Object { [string]$_.'#text' -cne 'true' }).Count -ne 0 -or
-        $userIds.Count -ne 2 -or @($userIds | Where-Object { $_.'#text' -cne $sid }).Count -ne 0 -or
-        $logonTypes.Count -ne 1 -or [string]$logonTypes[0].'#text' -cne 'InteractiveToken' -or
-        $runLevels.Count -ne 1 -or [string]$runLevels[0].'#text' -cne 'HighestAvailable' -or
-        -not (Same-Path ([string]$commands[0].'#text') $installer) -or
-        [string]$arguments[0].'#text' -cne $expectedArguments) {
+        $triggerEnabled.Count -gt 1 -or
+        @($triggerEnabled |
+          Where-Object { [string]$_.InnerText -cne 'true' }).Count -ne 0 -or
+        $settingsEnabled.Count -gt 1 -or
+        @($settingsEnabled |
+          Where-Object { [string]$_.InnerText -cne 'true' }).Count -ne 0 -or
+        @($enabled |
+          Where-Object { [string]$_.InnerText -cne 'true' }).Count -ne 0 -or
+        $principalUserIds.Count -ne 1 -or
+        [string]$principalUserIds[0].InnerText -cne $sid -or
+        $triggerUserIds.Count -ne 1 -or
+        ([string]$triggerUserIds[0].InnerText -cne $sid -and
+         [string]$triggerUserIds[0].InnerText -cne $originalUserAccount) -or
+        $logonTypes.Count -ne 1 -or
+        [string]$logonTypes[0].InnerText -cne 'InteractiveToken' -or
+        $runLevels.Count -ne 1 -or
+        [string]$runLevels[0].InnerText -cne 'HighestAvailable' -or
+        -not (Same-Path ([string]$commands[0].InnerText) $installer) -or
+        [string]$arguments[0].InnerText -cne $expectedArguments) {
       throw 'scheduled task XML identity mismatch'
     }
     return [pscustomobject]@{ pass = $true; detail = "task=$taskName; sid=$sid; installer=$installer" }
@@ -1283,7 +1293,8 @@ $recoveryInventoryOk = if (-not $recoveryTaskInventory.pass) {
 } elseif ($recoveryCleanupDebtPresent -and -not $recoveryCleanupDebtBound) {
   $false
 } elseif (($isPending -or $recoveryDebtPresent) -and $journalInfo.record) {
-  $expectedFolderSddl = 'D:P(A;;FA;;;SY)(A;;FA;;;BA)'
+  $expectedFolderSddl =
+    "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;$($journalInfo.record.OriginalUserSid))"
   $inventoryShapeOk = $recoveryTaskInventory.folderPresent -and
     $recoveryTaskInventory.folderSddl -ceq $expectedFolderSddl -and
     $recoveryTaskInventory.names.Count -eq 1 -and
