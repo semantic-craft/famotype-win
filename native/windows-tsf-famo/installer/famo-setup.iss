@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.4"
+  #define AppVersion  "1.5.5"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -1393,6 +1393,43 @@ begin
   if ChildExists then
   begin
     if ((ChildAttributes and FileAttributeDirectory) = 0) or
+       not TryGetFinalObjectInfo(Child, ChildFinalPath, ChildObjectId) or
+       not PathSame(ExtractFileDir(ChildFinalPath), ParentFinalPath) then
+      Exit;
+  end;
+  Result := True;
+end;
+
+function ValidateProtectedFile(const Parent, ChildName: String): Boolean;
+var
+  NormalizedParent, Child, ParentFinalPath, ParentObjectId,
+    ChildFinalPath, ChildObjectId: String;
+  ParentAttributes, ChildAttributes: Cardinal;
+  ParentExists, ChildExists: Boolean;
+begin
+  Result := False;
+  NormalizedParent := NormalizeDirectoryPath(Parent);
+  Child := NormalizeDirectoryPath(AddBackslash(NormalizedParent) + ChildName);
+  if not PathSame(ExtractFileDir(Child), NormalizedParent) or
+     not TryGetPathAttributes(NormalizedParent, ParentExists,
+       ParentAttributes) or
+     not TryGetPathAttributes(Child, ChildExists, ChildAttributes) or
+     not PathIsNonReparseOrMissing(NormalizedParent) or
+     not PathIsNonReparseOrMissing(Child) then
+    Exit;
+  if not ParentExists then
+  begin
+    Result := not ChildExists;
+    Exit;
+  end;
+  if ((ParentAttributes and FileAttributeDirectory) = 0) or
+     not TryGetFinalObjectInfo(NormalizedParent, ParentFinalPath,
+       ParentObjectId) then
+    Exit;
+  if ChildExists then
+  begin
+    if ((ChildAttributes and
+         (FileAttributeDirectory or FileAttributeReparsePoint)) <> 0) or
        not TryGetFinalObjectInfo(Child, ChildFinalPath, ChildObjectId) or
        not PathSame(ExtractFileDir(ChildFinalPath), ParentFinalPath) then
       Exit;
@@ -4479,7 +4516,7 @@ begin
   if not ValidateProtectedChild(LocalAppData, 'Famo') or
      not ValidateProtectedChild(FamoDirectory, '.transactions') or
      not ValidateProtectedChild(TransactionsDirectory, TransactionId) or
-     not ValidateProtectedChild(TransactionDirectory, 'receipt.json') or
+     not ValidateProtectedFile(TransactionDirectory, 'receipt.json') or
      not TryGetPathAttributes(ReceiptPath, Exists, Attributes) or not Exists or
      ((Attributes and (FileAttributeDirectory or FileAttributeReparsePoint)) <> 0) or
      not TryGetFinalObjectInfo(ReceiptPath, BeforeFinalPath, BeforeObjectId) then
