@@ -233,6 +233,7 @@ var
   UninstallRestartPending: Boolean;
   UninstallDeleteArmed: Boolean;
   UninstallOwner: String;
+  TerminalRecoveryTargetDeleteBlocked: Boolean;
   EarlyTransactionMutex: THandle;
 
 function GetFileAttributesW(FileName: String): Cardinal;
@@ -3008,6 +3009,27 @@ begin
     (CompareText(Journal.ManifestHash, '{#ManifestHash}') = 0);
 end;
 
+function IsVersionOlderThanInstaller(const Value: String): Boolean;
+var
+  CandidateVersion, InstallerVersion: Int64;
+begin
+  Result :=
+    StrToVersion(Value + '.0', CandidateVersion) and
+    StrToVersion('{#AppVersion}.0', InstallerVersion) and
+    (ComparePackedVersion(CandidateVersion, InstallerVersion) < 0);
+end;
+
+function ValidateRecoverableJournalArtifact(
+  const Journal: TTransactionJournal; const ExpectedId: String): Boolean;
+begin
+  Result :=
+    ValidateCurrentJournalArtifact(Journal, ExpectedId) or
+    (ValidateJournalSemantics(Journal, ExpectedId) and
+     IsVersionOlderThanInstaller(Journal.Version) and
+     ((Journal.Phase = PhaseReady) or
+      (Journal.Phase = PhaseRolledBack)));
+end;
+
 function ValidatePreviousV2Transaction(const Id, Target,
   Manifest: String): Boolean;
 var
@@ -3336,6 +3358,11 @@ begin
     Exit;
   end;
   if Journal.Phase <> PhaseRolledBack then Exit;
+  if not ValidateRecoverableJournalArtifact(Journal, ActiveId) then
+  begin
+    Result := False;
+    Exit;
+  end;
   ApplyTransactionJournal(Journal);
   RestorePreviousRegistry;
   CommitRollbackActiveProjection;
@@ -3487,16 +3514,18 @@ begin
   Key := JournalGenerationKey(ExpectedId, Generation);
   if not ReadJournalGeneration(Key, Journal) or
      (Journal.Generation <> GenerationText) or
-     not ValidateCurrentJournalArtifact(Journal, ExpectedId) then Exit;
+     not ValidateRecoverableJournalArtifact(Journal, ExpectedId) then Exit;
   ApplyTransactionJournal(Journal);
   Result := True;
 end;
 
 function ValidateTransactionTarget(const Target, ExpectedId,
-  ProtectedPreviousTarget: String; var NormalizedTarget: String): Boolean;
+  ExpectedVersion, ExpectedManifestHash, ProtectedPreviousTarget: String;
+  var NormalizedTarget: String): Boolean;
 var
   VersionsRoot, ExpectedLeaf, ActiveTarget, VersionsFinalPath,
-    VersionsObjectId, TargetFinalPath, TargetObjectId: String;
+    VersionsObjectId, TargetFinalPath, TargetObjectId,
+    NormalizedVersion: String;
   VersionsAttributes, TargetAttributes: Cardinal;
   VersionsExists, TargetExists: Boolean;
 begin
@@ -3506,10 +3535,15 @@ begin
      ContainsParentTraversal(Target) then
     Exit;
   try
+    if not NormalizeSafeRelativePath(ExpectedVersion, NormalizedVersion) or
+       (Pos('\', NormalizedVersion) > 0) or
+       not IsSha256Hex(ExpectedManifestHash) then
+      Exit;
     VersionsRoot := NormalizeDirectoryPath(
       AddBackslash(FixedInstallRoot) + 'versions');
     NormalizedTarget := NormalizeDirectoryPath(Target);
-    ExpectedLeaf := '{#AppVersion}-{#ManifestPrefix}-' + ExpectedId;
+    ExpectedLeaf := NormalizedVersion + '-' +
+      Copy(ExpectedManifestHash, 1, 12) + '-' + ExpectedId;
     if PathSame(NormalizedTarget, VersionsRoot) or
        not PathSame(ExtractFileDir(NormalizedTarget), VersionsRoot) or
        (CompareText(ExtractFileName(NormalizedTarget), ExpectedLeaf) <> 0) then
@@ -3558,7 +3592,8 @@ begin
   RequireSelectedFixedInstallRoot;
   EnsureTransactionTarget;
   if not ValidateTransactionTarget(TransactionTarget, TransactionId,
-    PreviousTarget, ValidatedTarget) then
+    '{#AppVersion}', '{#ManifestHash}', PreviousTarget,
+    ValidatedTarget) then
     RaiseException('unsafe transaction target refused during prepare');
   TransactionTarget := ValidatedTarget;
   CaptureOriginalUserIdentity;
@@ -4607,6 +4642,8 @@ begin
 end;
 
 function RetryRolledBackCleanupDebt: Boolean; forward;
+function ValidateJournalBoundPartialTargetForCleanup(
+  var NormalizedTarget: String): Boolean; forward;
 
 procedure RollbackTransaction;
 var
@@ -4814,7 +4851,8 @@ begin
      CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
   begin
     if not ValidateTransactionTarget(TransactionTarget, TransactionId,
-      PreviousTarget, ValidatedTarget) then
+      JournalAppVersion, JournalManifestHash, PreviousTarget,
+      ValidatedTarget) then
       RaiseException('unsafe transaction target refused during rollback');
     if not DelTree(ValidatedTarget, True, True, True) then
       RaiseException('transaction target deletion failed during rollback');
@@ -4973,14 +5011,23 @@ begin
   end;
 
   TargetCleanupComplete := not DirExists(TransactionTarget);
-  if DirExists(TransactionTarget) and UserRollbackOk and
-     CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
+  if DirExists(TransactionTarget) and UserRollbackOk then
   begin
-    if not ValidateTransactionTarget(TransactionTarget, TransactionId,
-      PreviousTarget, ValidatedTarget) then
-      RaiseException('unsafe transaction target refused during debt retry');
+    if CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
+    begin
+      if not ValidateTransactionTarget(TransactionTarget, TransactionId,
+        JournalAppVersion, JournalManifestHash, PreviousTarget,
+        ValidatedTarget) then
+        RaiseException('unsafe transaction target refused during debt retry');
+    end
+    else if not ValidateJournalBoundPartialTargetForCleanup(
+      ValidatedTarget) then
+      RaiseException(
+        'unsafe partial transaction target refused during debt retry');
     if DelTree(ValidatedTarget, True, True, True) then
       TargetCleanupComplete := not DirExists(ValidatedTarget);
+    if not TargetCleanupComplete and DirExists(ValidatedTarget) then
+      TerminalRecoveryTargetDeleteBlocked := True;
   end;
   if TargetCleanupComplete then
     ClearTransactionDebt('TargetCleanupDebt', DebtKindTargetCleanup);
@@ -5202,6 +5249,26 @@ begin
   end;
 end;
 
+function ValidateJournalBoundPartialTargetForCleanup(
+  var NormalizedTarget: String): Boolean;
+var
+  TargetFinalPath, TargetObjectId: String;
+begin
+  Result :=
+    (JournalPhase = PhaseRolledBack) and
+    TransactionDebtPresent(
+      'TargetCleanupDebt', DebtKindTargetCleanup) and
+    ValidateTransactionTarget(TransactionTarget, TransactionId,
+      JournalAppVersion, JournalManifestHash, PreviousTarget,
+      NormalizedTarget) and
+    TryGetFinalObjectInfo(NormalizedTarget,
+      TargetFinalPath, TargetObjectId) and
+    FinalObjectsSame(TargetFinalPath, TargetObjectId,
+      JournalPendingFinalTarget, JournalPendingObjectId) and
+    ValidateCleanupTree(NormalizedTarget, TargetFinalPath);
+  if not Result then NormalizedTarget := '';
+end;
+
 function ValidateVersionDirectoryForCleanup(const VersionTarget,
   VersionsFinalPath: String): Boolean;
 var
@@ -5412,7 +5479,8 @@ function ValidatePendingTransaction(const PendingTarget, PendingManifest,
   var NormalizedTarget: String): Boolean;
 begin
   Result := ValidateTransactionTarget(PendingTarget, ExpectedId,
-    ProtectedPreviousTarget, NormalizedTarget) and
+    '{#AppVersion}', '{#ManifestHash}', ProtectedPreviousTarget,
+    NormalizedTarget) and
     (CompareText(PendingManifest,
       AddBackslash(NormalizedTarget) + 'payload-manifest.txt') = 0);
   if not Result then NormalizedTarget := '';
@@ -5424,7 +5492,8 @@ var
 begin
   Result := LoadTransactionJournal(ExpectedId) and
     ValidateTransactionTarget(TransactionTarget, TransactionId,
-      PreviousTarget, NormalizedTarget) and
+      JournalAppVersion, JournalManifestHash, PreviousTarget,
+      NormalizedTarget) and
     (CompareText(NormalizedTarget, TransactionTarget) = 0);
   if not Result then Exit;
   if DirExists(TransactionTarget) then
@@ -5524,14 +5593,19 @@ function AdoptCompleteOrphanGeneration(const Id: String;
   var GenerationText: String): Boolean;
 var
   BestGeneration: Integer;
-  BaseKey, Readback: String;
+  BaseKey, Key, Readback: String;
+  Journal: TTransactionJournal;
 begin
   Result := False;
   if not InspectJournalGenerations(Id, BestGeneration) or
      (BestGeneration <= 0) then Exit;
   BaseKey := TransactionJournalKey(Id);
-  if BestGeneration <= 0 then Exit;
   GenerationText := IntToStr(BestGeneration);
+  Key := JournalGenerationKey(Id, BestGeneration);
+  if not ReadJournalGeneration(Key, Journal) or
+     (Journal.Generation <> GenerationText) or
+     not ValidateRecoverableJournalArtifact(Journal, Id) then
+    Exit;
   RequireJournalWrite(BaseKey, 'ActiveGeneration', GenerationText);
   FlushMachineRegistryKey(BaseKey);
   Result := RegQueryStringValue(HKLM64, BaseKey, 'ActiveGeneration',
@@ -5655,7 +5729,7 @@ begin
     end;
     Key := JournalGenerationKey(Id, Generation);
     if (Generation <= 0) or not ReadJournalGeneration(Key, Journal) or
-       not ValidateJournalSemantics(Journal, Id) then
+       not ValidateRecoverableJournalArtifact(Journal, Id) then
     begin
       Result := False;
       Exit;
@@ -5810,6 +5884,7 @@ var
   HasRecoveryArtifacts, HasRecoveryDebt: Boolean;
 begin
   Result := False;
+  TerminalRecoveryTargetDeleteBlocked := False;
   if not TerminalDebtSetMatchesPhase then Exit;
   HasRecoveryArtifacts :=
     (JournalResumeInstaller <> '') or (JournalTaskName <> '');
@@ -5875,6 +5950,61 @@ begin
       'RecoveryCleanupDebt', DebtKindRecoveryArtifacts) and
     not TransactionDebtPresent(
       'VersionCleanupDebt', DebtKindVersionRetention);
+end;
+
+procedure ResetLoadedTransactionForFreshInstall;
+begin
+  TransactionId := '';
+  TransactionTarget := '';
+  PreviousTarget := '';
+  PreviousManifest := '';
+  PreviousManifestHash := '';
+  PreviousDefault := '';
+  PreviousState := '';
+  PreviousHost := '';
+  PreviousServer := '';
+  PreviousProfileTool := '';
+  PreviousVersion := '';
+  PreviousIdentity := '';
+  PreviousTransactionId := '';
+  PreviousCompatibilityTransactionId := '';
+  PreviousProfileActive := False;
+  PreviousProfileEnabled := False;
+  PreviousInputTipPresent := False;
+  SeedReceiptHash := '';
+  OriginalUserSid := '';
+  OriginalUserAccount := '';
+  OriginalUserSession := '';
+  CurrentOriginalUserSession := '';
+  OriginalUserResumeCapable := False;
+  JournalPhase := '';
+  JournalAppVersion := '';
+  JournalManifestHash := '';
+  JournalPendingFinalTarget := '';
+  JournalPendingObjectId := '';
+  JournalPreviousFinalTarget := '';
+  JournalPreviousObjectId := '';
+  PriorPreviousTarget := '';
+  JournalPriorPreviousFinalTarget := '';
+  JournalPriorPreviousObjectId := '';
+  JournalResumeInstaller := '';
+  JournalResumeInstallerHash := '';
+  JournalTaskName := '';
+  JournalAllowDowngrade := False;
+  JournalGeneration := 0;
+  LoadedHostDetected := False;
+  LoadedHostHash := '';
+  LoadedHostVersion := '';
+  LoadedHostExpectedHash := '';
+  ResumeMode := False;
+  RollbackMode := False;
+  PendingTerminal := False;
+  TransactionPrepared := False;
+  RegistrationSwitched := False;
+  InstallReady := False;
+  RollbackComplete := False;
+  RuntimeStarted := False;
+  TerminalRecoveryTargetDeleteBlocked := False;
 end;
 
 function InitializeSetup: Boolean;
@@ -5953,8 +6083,34 @@ begin
     if (JournalPhase = PhaseReady) or
        (JournalPhase = PhaseRolledBack) then
     begin
-      RecoverTerminalTransaction;
-      Result := False;
+      if not RecoverTerminalTransaction then
+      begin
+        Log('ordinary setup deferred by terminal transaction cleanup');
+        if not WizardSilent then
+        begin
+          if TerminalRecoveryTargetDeleteBlocked then
+            MsgBox(
+              '上次更新的旧输入法文件仍未能清理，通常是文件仍被系统占用。' + #13#10 +
+              '请重新启动 Windows，然后再次运行此安装包。',
+              mbInformation, MB_OK)
+          else
+            MsgBox(
+              '无法完成上次更新的安全恢复，安装未继续。' + #13#10 +
+              '请保留安装日志并联系支持。',
+              mbError, MB_OK);
+        end;
+        Result := False;
+        Exit;
+      end;
+      RequestedId := '';
+      if not FindRecoverableTransaction(RequestedId) or
+         (RequestedId <> '') then
+      begin
+        Result := False;
+        Exit;
+      end;
+      ResetLoadedTransactionForFreshInstall;
+      Result := True;
       Exit;
     end;
     RollbackMode := JournalPhase <> PhasePendingReboot;

@@ -101,7 +101,8 @@ public sealed class InstallerContractTests
 
         int scan = Position(iss, "function FindRecoverableTransaction");
         string scanBody = iss[scan..Position(iss, "procedure CleanupAllValidatedRecoveryArtifacts", scan)];
-        Assert.Contains("ValidateJournalSemantics(Journal, Id)", scanBody);
+        Assert.Contains(
+            "ValidateRecoverableJournalArtifact(Journal, Id)", scanBody);
         Assert.Contains("ValidateCurrentJournalArtifact(Journal, Id)", scanBody);
         Assert.Contains("unfinished transaction requires its retained installer", scanBody);
     }
@@ -892,7 +893,13 @@ public sealed class InstallerContractTests
         Assert.Contains("NormalizedTarget := NormalizeDirectoryPath(Target)", validationHelpers);
         Assert.Contains("if PathSame(NormalizedTarget, VersionsRoot) or", validationHelpers);
         Assert.Contains("PathSame(ExtractFileDir(NormalizedTarget), VersionsRoot)", validationHelpers);
-        Assert.Contains("'{#AppVersion}-{#ManifestPrefix}-' + ExpectedId", validationHelpers);
+        Assert.Contains(
+            "NormalizeSafeRelativePath(ExpectedVersion, NormalizedVersion)",
+            validationHelpers);
+        Assert.Contains("IsSha256Hex(ExpectedManifestHash)", validationHelpers);
+        Assert.Contains(
+            "Copy(ExpectedManifestHash, 1, 12) + '-' + ExpectedId",
+            validationHelpers);
         Assert.Contains("CompareText(ExtractFileName(NormalizedTarget), ExpectedLeaf)", validationHelpers);
         Assert.Contains("ActiveTarget := ReadActiveTarget", validationHelpers);
         Assert.Contains("ProtectedPathIsDifferent(NormalizedTarget, TargetExists,", validationHelpers);
@@ -939,7 +946,10 @@ public sealed class InstallerContractTests
         string rollbackBody = iss[rollback..Position(iss, "procedure VerifyActiveInstall", rollback)];
         int deleteValidation = Position(rollbackBody,
             "ValidateTransactionTarget(TransactionTarget, TransactionId,");
-        Assert.Contains("PreviousTarget, ValidatedTarget", rollbackBody);
+        Assert.Contains(
+            "JournalAppVersion, JournalManifestHash, PreviousTarget,",
+            rollbackBody);
+        Assert.Contains("ValidatedTarget", rollbackBody);
         int deleteTree = Position(
             rollbackBody,
             "if not DelTree(ValidatedTarget, True, True, True) then",
@@ -1169,6 +1179,162 @@ public sealed class InstallerContractTests
             Position(recoverBody, "RetryRolledBackCleanupDebt", capture);
         int deleteTask = Position(recoverBody, "DeleteRecoveryTask", retryCall);
         Assert.True(capture < retryCall && retryCall < deleteTask);
+    }
+
+    [Fact]
+    public void Installer_RecoversOlderTerminalJournalsButNotOlderPendingPayloads()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int older = Position(iss, "function IsVersionOlderThanInstaller");
+        string olderBody = iss[older..Position(
+            iss, "function ValidateRecoverableJournalArtifact", older)];
+        int recoverable = Position(
+            iss, "function ValidateRecoverableJournalArtifact");
+        string recoverableBody = iss[recoverable..Position(
+            iss, "function ValidatePreviousV2Transaction", recoverable)];
+        int load = Position(iss, "function LoadTransactionJournal");
+        string loadBody = iss[load..Position(
+            iss, "function ValidateTransactionTarget", load)];
+        int repair = Position(
+            iss, "function RepairRolledBackActiveProjection");
+        string repairBody = iss[repair..Position(
+            iss, "function InspectJournalGenerations", repair)];
+        int repairRead = Position(repairBody, "ReadActiveJournal");
+        int repairGate = Position(
+            repairBody, "ValidateRecoverableJournalArtifact", repairRead);
+        int repairApply = Position(
+            repairBody, "ApplyTransactionJournal", repairGate);
+        int adopt = Position(
+            iss, "function AdoptCompleteOrphanGeneration");
+        string adoptBody = iss[adopt..Position(
+            iss, "function MergeDebtOwner", adopt)];
+        int adoptRead = Position(
+            adoptBody, "ReadJournalGeneration");
+        int adoptGate = Position(
+            adoptBody, "ValidateRecoverableJournalArtifact", adoptRead);
+        int adoptWrite = Position(
+            adoptBody, "RequireJournalWrite", adoptGate);
+        int find = Position(iss, "function FindRecoverableTransaction");
+        string findBody = iss[find..Position(
+            iss, "procedure CleanupAllValidatedRecoveryArtifacts", find)];
+        int findGate = Position(
+            findBody, "ValidateRecoverableJournalArtifact");
+        int pointerWrite = Position(
+            findBody, "RequireJournalWrite", findGate);
+
+        Assert.Contains(
+            "ValidateCurrentJournalArtifact(Journal, ExpectedId)",
+            recoverableBody);
+        Assert.Contains("ValidateJournalSemantics(Journal, ExpectedId)",
+            recoverableBody);
+        Assert.Contains("Journal.Phase = PhaseReady", recoverableBody);
+        Assert.Contains("Journal.Phase = PhaseRolledBack", recoverableBody);
+        Assert.Contains(
+            "IsVersionOlderThanInstaller(Journal.Version)",
+            recoverableBody);
+        Assert.DoesNotContain("PhasePendingReboot", recoverableBody);
+        Assert.Contains("StrToVersion(Value + '.0', CandidateVersion)",
+            olderBody);
+        Assert.Contains(
+            "StrToVersion('{#AppVersion}.0', InstallerVersion)",
+            olderBody);
+        Assert.Contains(
+            "ComparePackedVersion(CandidateVersion, InstallerVersion) < 0",
+            olderBody);
+        Assert.Contains(
+            "ValidateRecoverableJournalArtifact(Journal, ExpectedId)",
+            loadBody);
+        Assert.True(
+            repairRead < repairGate && repairGate < repairApply);
+        Assert.True(
+            adoptRead < adoptGate && adoptGate < adoptWrite);
+        Assert.True(findGate < pointerWrite);
+        Assert.DoesNotContain(
+            "not ValidateJournalSemantics(Journal, Id)",
+            findBody);
+    }
+
+    [Fact]
+    public void Installer_RetriesJournalBoundPartialTargetCleanup()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int guard = Position(
+            iss, "function ValidateJournalBoundPartialTargetForCleanup");
+        string guardBody = iss[guard..Position(
+            iss, "function ValidateVersionDirectoryForCleanup", guard)];
+        int rollback = Position(iss, "procedure RollbackTransaction");
+        int retry = Position(
+            iss, "function RetryRolledBackCleanupDebt", rollback);
+        string retryBody = iss[retry..Position(
+            iss, "function IsFixedHexText", retry)];
+
+        Assert.Contains("JournalPhase = PhaseRolledBack", guardBody);
+        Assert.Contains(
+            "'TargetCleanupDebt', DebtKindTargetCleanup", guardBody);
+        Assert.Contains("JournalAppVersion, JournalManifestHash", guardBody);
+        Assert.Contains(
+            "JournalPendingFinalTarget, JournalPendingObjectId", guardBody);
+        Assert.Contains("ValidateCleanupTree", guardBody);
+        Assert.Contains(
+            "ValidateJournalBoundPartialTargetForCleanup(", retryBody);
+        Assert.Contains("ValidatedTarget)", retryBody);
+        Assert.Contains(
+            "TerminalRecoveryTargetDeleteBlocked := True", retryBody);
+        Assert.DoesNotContain(
+            "DirExists(TransactionTarget) and UserRollbackOk and\n     CurrentPayloadTrusted",
+            retryBody.Replace("\r\n", "\n", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Installer_ContinuesAfterOrdinaryTerminalRecoveryOrExplainsRestart()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int initialize = Position(iss, "function InitializeSetup");
+        string initializeBody = iss[initialize..Position(
+            iss, "procedure CurStepChanged", initialize)];
+        int discovered = Position(
+            initializeBody, "if not FindRecoverableTransaction(RequestedId)");
+        string discoveredBody = initializeBody[discovered..];
+        int terminal = Position(
+            discoveredBody, "(JournalPhase = PhaseReady)");
+        int recover = Position(
+            discoveredBody, "RecoverTerminalTransaction", terminal);
+        int retryDiscovery = Position(
+            discoveredBody, "FindRecoverableTransaction(RequestedId)", recover);
+        int reset = Position(
+            discoveredBody, "ResetLoadedTransactionForFreshInstall",
+            retryDiscovery);
+        int success = Position(discoveredBody, "Result := True", reset);
+
+        Assert.True(terminal < recover && recover < retryDiscovery &&
+            retryDiscovery < reset && reset < success);
+        Assert.Contains(
+            "上次更新的旧输入法文件仍未能清理", discoveredBody);
+        Assert.Contains(
+            "无法完成上次更新的安全恢复，安装未继续", discoveredBody);
+        Assert.Contains("TerminalRecoveryTargetDeleteBlocked",
+            discoveredBody);
+        Assert.Contains("if not WizardSilent then", discoveredBody);
+
+        int resetDefinition = Position(
+            iss, "procedure ResetLoadedTransactionForFreshInstall");
+        string resetBody = iss[resetDefinition..Position(
+            iss, "function InitializeSetup", resetDefinition)];
+        foreach (string field in new[]
+        {
+            "TransactionId := ''",
+            "TransactionTarget := ''",
+            "JournalPhase := ''",
+            "JournalGeneration := 0",
+            "OriginalUserSid := ''",
+            "OriginalUserAccount := ''",
+            "OriginalUserSession := ''",
+            "CurrentOriginalUserSession := ''",
+            "OriginalUserResumeCapable := False"
+        })
+        {
+            Assert.Contains(field, resetBody);
+        }
     }
 
     [Fact]
