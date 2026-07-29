@@ -32,9 +32,12 @@ If an old TSF DLL is still loaded by a running desktop app, the installer safely
 `PendingReboot` and creates a one-user logon recovery task bound to the exact SID that started the
 install. That task finishes the swap after a restart rather than force-closing your applications.
 
-**Updates:** there is no background auto-update on Windows. The "检查更新" button on the settings
-panel's About page opens this repository's Releases page; downloading and installing over the top
-is your call.
+**Updates:** the settings app checks at most once per day by default. You can turn automatic checks
+off on the About page or check manually at any time. When an update is available, Famo waits for
+your confirmation, downloads it, verifies its EdDSA signature, and launches the transactional
+installer with visible progress. It does not force-close desktop apps or force a restart. Because
+the installer is not yet Authenticode-signed, the UAC prompt still shows an unknown publisher.
+Versions that predate the updater need one final manual upgrade to enter this update channel.
 
 ## Features
 

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using Famo.Settings.Core;
+using Famo.Settings.Core.Updates;
 using Famo.Settings.Theming;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -11,21 +12,23 @@ namespace Famo.Settings.Views;
 /// <summary>关于（关）—— 版本 + 开源许可。</summary>
 public sealed class AboutPage : UserControl
 {
-    private const string ReleasesUrl = "https://github.com/semantic-craft/famotype-win/releases/latest";
-
     public AboutPage()
     {
         var sp = new StackPanel();
         sp.Children.Add(FamoUI.PaneHeader("关于", "法墨输入法 · Windows。面向中文法律写作的本地输入工具。"));
 
-        var status = FamoUI.StatusRow("点「刷新配置」可重建索引；点「检查更新」会打开法墨发布页。");
+        var status = FamoUI.StatusRow("法墨默认每天后台检查一次更新；发现新版后由你确认安装。");
         TextBlock statusText = (TextBlock)(status.Child as StackPanel)!.Children[1];
 
         sp.Children.Add(FamoUI.Card("版本",
             FamoUI.Row("当前版本", null, FamoUI.Value(ReadAppVersion()), divider: false),
             FamoUI.Row("产品身份", "Windows TSF 输入服务 + 设置面板。", FamoUI.Value("Famo Input Method")),
             FamoUI.Row("运行组件", "安装版组件名与系统入口保持法墨命名。", FamoUI.Value("FamoTextService.dll / FamoRuntime.exe")),
-            FamoUI.Row("软件更新", "打开法墨发布页手动检查 Windows 安装包；不声称后台自动更新已接入。",
+            FamoUI.Row("自动检查更新", "默认开启，每天最多检查一次；关闭后保留你的选择。",
+                FamoUI.Pill(
+                    App.Settings.Updates.AutomaticChecksEnabled,
+                    enabled => SetAutomaticUpdateChecks(enabled, statusText))),
+            FamoUI.Row("软件更新", "检查、下载并验证法墨签名；安装前仍由你确认。",
                 FamoUI.ActionButton("检查更新", () => CheckForUpdates(statusText)))));
 
         sp.Children.Add(FamoUI.Card("维护与诊断",
@@ -86,15 +89,24 @@ public sealed class AboutPage : UserControl
 
     private static void CheckForUpdates(TextBlock status)
     {
-        try
+        UpdateActionResult result = App.CheckForUpdates();
+        status.Text = result.Status == UpdateActionStatus.Failed
+            ? "检查更新失败：" + result.Error
+            : "正在检查更新；结果会显示在法墨更新窗口中。";
+    }
+
+    private static void SetAutomaticUpdateChecks(bool enabled, TextBlock status)
+    {
+        UpdateActionResult result = App.SetAutomaticUpdateChecksEnabled(enabled);
+        if (result.Status == UpdateActionStatus.Failed)
         {
-            Process.Start(new ProcessStartInfo { FileName = ReleasesUrl, UseShellExecute = true });
-            status.Text = "已打开法墨发布页，请对照当前版本下载安装包。";
+            status.Text = "自动更新设置失败：" + result.Error;
+            return;
         }
-        catch (Exception ex)
-        {
-            status.Text = "未能打开发布页：" + ex.Message;
-        }
+
+        status.Text = enabled
+            ? "已开启后台更新检查；每天最多检查一次。"
+            : "已关闭后台更新检查；仍可随时手动检查。";
     }
 
     /// <summary>只读路径值，点击在资源管理器中打开（对应 macOS openRimeFolder()）。</summary>
