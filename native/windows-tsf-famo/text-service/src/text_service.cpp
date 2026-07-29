@@ -100,7 +100,7 @@ bool SendTerminalAbandon(
     const runtime::PipeEndpoint &endpoint, std::wstring_view expected_runtime,
     const runtime::Correlation &identity,
     const std::atomic<bool> *cancelled = nullptr) {
-  runtime::PipeRuntimePort port;
+  runtime::PipeRuntimePort port{kBridgeAbiVersion};
   std::string error;
   const runtime::Correlation connection = ConnectionIdentity(identity);
   if (!port.Connect(endpoint, expected_runtime, connection,

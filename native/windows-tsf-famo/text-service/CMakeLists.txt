@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(famo_text_service LANGUAGES CXX)
+project(famo_text_service LANGUAGES CXX RC)
 
 if(NOT WIN32)
   message(FATAL_ERROR "FamoTextService requires the Windows SDK")
@@ -8,6 +8,11 @@ endif()
 set(FAMO_IDENTITY "Development" CACHE STRING
     "Compile-time identity set: Development or Stable")
 set_property(CACHE FAMO_IDENTITY PROPERTY STRINGS Development Stable)
+set(FAMO_BRIDGE_ABI "1" CACHE STRING
+    "Stable in-process TSF Bridge ABI; bump only for a Bridge release")
+if(NOT FAMO_BRIDGE_ABI MATCHES "^[1-9][0-9]*$")
+  message(FATAL_ERROR "FAMO_BRIDGE_ABI must be a positive integer")
+endif()
 if(FAMO_IDENTITY STREQUAL "Stable")
   add_compile_definitions(FAMO_STABLE_IDENTITY=1)
 elseif(NOT FAMO_IDENTITY STREQUAL "Development")
@@ -49,6 +54,10 @@ target_compile_definitions(candidate_ui_selfcheck PRIVATE
 target_link_libraries(candidate_ui_selfcheck PRIVATE
   famo_tsf_host_model oleaut32)
 
+configure_file(
+  src/FamoTextService.rc.in
+  generated/FamoTextService.rc
+  @ONLY)
 add_library(FamoTextService SHARED
   src/candidate_ui_element.cpp
   src/composition_controller.cpp
@@ -58,9 +67,13 @@ add_library(FamoTextService SHARED
   src/text_service.cpp
   src/text_service_key.cpp
   src/text_service_ui.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/FamoTextService.rc
   src/FamoTextService.def)
 target_include_directories(FamoTextService PRIVATE include src)
-target_compile_definitions(FamoTextService PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(FamoTextService PRIVATE
+  NOMINMAX
+  WIN32_LEAN_AND_MEAN
+  FAMO_BRIDGE_ABI_VERSION=${FAMO_BRIDGE_ABI})
 target_link_libraries(FamoTextService PRIVATE
   famo_tsf_host_model famo_runtime_core ole32 oleaut32 advapi32 bcrypt)
 set_target_properties(FamoTextService PROPERTIES PREFIX "")

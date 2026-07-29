@@ -25,6 +25,9 @@ DWORD Remaining(std::chrono::steady_clock::time_point deadline) {
 bool ValidReply(const Frame &request, const Frame &reply) {
   if (reply.flags != kFlagResponse)
     return false;
+  if (request.command != Command::Hello &&
+      reply.wire_version != request.wire_version)
+    return false;
   if (reply.command == request.command &&
       reply.correlation == request.correlation) {
     return true;
@@ -58,8 +61,9 @@ bool PreservesLogicalConnection(Command command) {
 
 } // namespace
 
-PipeRuntimePort::PipeRuntimePort()
+PipeRuntimePort::PipeRuntimePort(uint32_t bridge_abi)
     : retirement_(pipe_io::MakeRetirementGate()),
+      bridge_abi_(bridge_abi),
       ui_retirement_(pipe_io::MakeRetirementGate()) {}
 
 PipeRuntimePort::~PipeRuntimePort() { Stop(); }
@@ -100,7 +104,8 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
                                 std::string *channel_error,
                                 const auto &retirement,
                                 auto connect_deadline,
-                                PipeClientIdentity *server_identity) {
+                                PipeClientIdentity *server_identity,
+                                uint16_t *protocol_version) {
     HANDLE pipe = INVALID_HANDLE_VALUE;
     while (pipe == INVALID_HANDLE_VALUE &&
            std::chrono::steady_clock::now() < connect_deadline &&
@@ -146,6 +151,14 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
         Frame hello;
         hello.command = Command::Hello;
         hello.correlation = connection_identity;
+        if (bridge_abi_ != 0) {
+          const HelloRequest offer{kMinSupportedProtocolVersion,
+                                   kProtocolVersion, bridge_abi_};
+          if (!EncodeHelloRequest(offer, &hello.payload, channel_error)) {
+            release_candidate(true);
+            return INVALID_HANDLE_VALUE;
+          }
+        }
         Frame hello_reply;
         const pipe_io::Result hello_write = pipe_io::WriteFrame(
             candidate, hello, connect_deadline, channel_error, retirement);
@@ -154,12 +167,29 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
                 ? pipe_io::ReadFrame(candidate, &hello_reply, connect_deadline,
                                      channel_error, retirement)
                 : hello_write;
-        if (hello_read == pipe_io::Result::Ok &&
-            ValidReply(hello, hello_reply) &&
-            hello_reply.status == Status::Ok &&
-            (!cancelled || !cancelled->load())) {
+        bool negotiated = hello_read == pipe_io::Result::Ok &&
+                          ValidReply(hello, hello_reply) &&
+                          hello_reply.status == Status::Ok;
+        uint16_t selected_protocol = hello_reply.wire_version;
+        if (negotiated && bridge_abi_ != 0) {
+          HelloResponse response;
+          negotiated =
+              DecodeHelloResponse(hello_reply.payload, &response,
+                                  channel_error) &&
+              response.selected_protocol_version ==
+                  hello_reply.wire_version &&
+              response.selected_protocol_version >=
+                  kMinSupportedProtocolVersion &&
+              response.selected_protocol_version <= kProtocolVersion;
+          selected_protocol = response.selected_protocol_version;
+        } else if (negotiated) {
+          negotiated = hello_reply.payload.empty();
+        }
+        if (negotiated && (!cancelled || !cancelled->load())) {
           if (server_identity)
             *server_identity = candidate_identity;
+          if (protocol_version)
+            *protocol_version = selected_protocol;
           pipe = candidate;
           release_candidate(false);
           break;
@@ -200,8 +230,10 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
   };
 
   PipeClientIdentity primary_server;
+  uint16_t primary_protocol = 0;
   HANDLE pipe =
-      connect_pipe(endpoint, error, retirement_, deadline, &primary_server);
+      connect_pipe(endpoint, error, retirement_, deadline, &primary_server,
+                   &primary_protocol);
   if (pipe == INVALID_HANDLE_VALUE) {
     return false;
   }
@@ -215,9 +247,12 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
                              kOptionalUiConnectBudget);
   const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
   PipeClientIdentity ui_server;
+  uint16_t ui_protocol = 0;
   HANDLE ui_pipe = connect_pipe(ui_endpoint, &ignored_ui_error,
-                                ui_retirement_, ui_deadline, &ui_server);
-  if (ui_pipe != INVALID_HANDLE_VALUE && ui_server != primary_server) {
+                                ui_retirement_, ui_deadline, &ui_server,
+                                &ui_protocol);
+  if (ui_pipe != INVALID_HANDLE_VALUE &&
+      (ui_server != primary_server || ui_protocol != primary_protocol)) {
     CloseHandle(ui_pipe);
     ui_pipe = INVALID_HANDLE_VALUE;
   }
@@ -230,6 +265,7 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
                                 std::memory_order_release);
     server_process_id_.store(primary_server.process_id,
                              std::memory_order_release);
+    protocol_version_.store(primary_protocol, std::memory_order_release);
     connection_identity_.store(std::move(connected_identity));
     state_.store(ChannelState::Ready);
     slot_busy_.store(false);
@@ -253,6 +289,7 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
     state_.store(ChannelState::NotReady);
     server_process_id_.store(0, std::memory_order_release);
     server_creation_time_.store(0, std::memory_order_release);
+    protocol_version_.store(kProtocolVersion, std::memory_order_release);
     connection_identity_.store(nullptr);
     slot_busy_.store(false);
     if (ui_pipe != INVALID_HANDLE_VALUE) {
@@ -336,6 +373,7 @@ void PipeRuntimePort::Stop() noexcept {
     state_.store(ChannelState::NotReady);
     server_process_id_.store(0, std::memory_order_release);
     server_creation_time_.store(0, std::memory_order_release);
+    protocol_version_.store(kProtocolVersion, std::memory_order_release);
     connection_identity_.store(nullptr);
     slot_busy_.store(false);
     stop_ = false;
@@ -429,6 +467,7 @@ CallResult PipeRuntimePort::CallUntil(
         std::chrono::steady_clock::now() - started);
     return immediate;
   }
+  request.wire_version = protocol_version_.load(std::memory_order_acquire);
   work_.request = std::move(request);
   work_.deadline = wait_deadline;
   work_.result = {};
@@ -553,6 +592,7 @@ void PipeRuntimePort::Post(Frame &&request) {
       !ui_ready_.load()) {
     return;
   }
+  request.wire_version = protocol_version_.load(std::memory_order_acquire);
   try {
     auto next = std::make_shared<const Frame>(std::move(request));
     std::shared_ptr<const Frame> pending = posted_request_.load();

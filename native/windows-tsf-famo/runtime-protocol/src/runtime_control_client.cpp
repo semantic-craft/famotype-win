@@ -20,7 +20,9 @@ DWORD Remaining(std::chrono::steady_clock::time_point deadline) {
 }
 
 bool ValidReply(const Frame &request, const Frame &reply) {
-  return reply.flags == kFlagResponse && reply.command == request.command &&
+  return reply.flags == kFlagResponse &&
+         reply.wire_version == request.wire_version &&
+         reply.command == request.command &&
          reply.correlation == request.correlation;
 }
 

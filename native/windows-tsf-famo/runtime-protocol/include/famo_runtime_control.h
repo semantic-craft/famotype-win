@@ -37,6 +37,8 @@ private:
     uint64_t connection_generation = 0;
     uint64_t last_sequence = 0;
     PipeClientIdentity owner;
+    uint16_t protocol_version = 0;
+    uint32_t bridge_abi = 0;
   };
   struct Operation {
     uint64_t id = 0;

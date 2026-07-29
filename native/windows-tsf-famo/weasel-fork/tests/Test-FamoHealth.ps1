@@ -1062,6 +1062,19 @@ $target = if ($isPending -and $journalInfo.record) { [string]$journalInfo.record
 $server = if ($isPending -and $target) { Join-Path $target 'FamoRuntime.exe' } elseif ($brand) { [string]$brand.ServerExecutable } else { '' }
 $profileTool = if ($isPending -and $target) { Join-Path $target 'FamoProfileTool.exe' } elseif ($brand) { [string]$brand.ProfileTool } else { '' }
 $manifest = if ($isPending -and $target) { Join-Path $target 'payload-manifest.txt' } elseif ($brand) { [string]$brand.ActiveManifest } else { '' }
+$stableBridgePath = if ($brand) { [string]$brand.BridgePath } else { '' }
+$isLegacyBridgeProjection =
+  $isLegacyRollbackAnchor -and -not $stableBridgePath
+$bridge = if ($stableBridgePath) {
+  $stableBridgePath
+} elseif ($isLegacyBridgeProjection -and $target) {
+  Join-Path $target 'FamoTextService.dll'
+} else { '' }
+$bridgeHash = if ($brand) { [string]$brand.BridgeHash } else { '' }
+$bridgeAbi = if ($brand) { [string]$brand.BridgeAbi } else { '' }
+$bridgeManifest = if ($bridge) {
+  Join-Path (Split-Path -Parent $bridge) 'bridge-manifest.txt'
+} else { '' }
 $pathsOk = $noActivePayload -or ($target -and
   (Test-Path -LiteralPath $target -PathType Container) -and
   (Same-Path $server (Join-Path $target 'FamoRuntime.exe')) -and
@@ -1105,6 +1118,47 @@ $manifestJournalHashOk = $notInstalled -or $noActivePayload -or
 Add-Check 'H3b' 'S0' ([bool]($manifestResult.pass -and $manifestJournalHashOk)) `
   ("{0}; journal hash match={1}" -f $manifestResult.detail, $manifestJournalHashOk)
 
+$bridgeOk = $noActivePayload -or $isPending
+$bridgeDetail = if ($bridgeOk) {
+  'stable Bridge N/A without an active Ready projection'
+} elseif ($isLegacyBridgeProjection) {
+  try {
+    $actualBridgeHash = (Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash
+    $bridgeOk =
+      (Same-Path $bridge (Join-Path $target 'FamoTextService.dll')) -and
+      [string]::Equals(
+        $actualBridgeHash,
+        [string]$journalInfo.record.LoadedHostExpectedHash,
+        [System.StringComparison]::OrdinalIgnoreCase)
+    "legacy rollback Bridge path=$bridge; hash=$actualBridgeHash"
+  } catch {
+    $bridgeOk = $false
+    "legacy rollback Bridge validation failed: $($_.Exception.Message)"
+  }
+} else {
+  try {
+    $expectedBridge = Join-Path $env:ProgramFiles "Famo\bridge\v$bridgeAbi\FamoTextService.dll"
+    $bridgeItem = Get-Item -LiteralPath $bridge -ErrorAction Stop
+    $actualBridgeHash = (Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash
+    $bridgeManifestLines = @(Get-Content -LiteralPath $bridgeManifest -Encoding UTF8)
+    $bridgeOk =
+      $bridgeAbi -cmatch '^[1-9][0-9]*$' -and
+      $bridgeHash -cmatch '^[0-9A-F]{64}$' -and
+      (Same-Path $bridge $expectedBridge) -and
+      [string]::Equals(
+        $actualBridgeHash,
+        $bridgeHash,
+        [System.StringComparison]::Ordinal) -and
+      $bridgeManifestLines -ccontains "bridge_abi=$bridgeAbi" -and
+      $bridgeManifestLines -ccontains "file=FamoTextService.dll|$($bridgeItem.Length)|$bridgeHash"
+    "path=$bridge; abi=$bridgeAbi; hash=$actualBridgeHash; manifest=$bridgeManifest"
+  } catch {
+    $bridgeOk = $false
+    "stable Bridge validation failed: $($_.Exception.Message)"
+  }
+}
+Add-Check 'H3c' 'S0' ($notInstalled -or [bool]$bridgeOk) $bridgeDetail
+
 $registeredDll = ''
 $threadingModel = ''
 if ($machineComPresent) {
@@ -1120,7 +1174,7 @@ $comOk = if ($noActivePayload) {
 } else {
   $machineComPresent -and
     (-not $exactUserContext -or -not $userComPresent) -and
-    (Same-Path $registeredDll (Join-Path $target 'FamoTextService.dll')) -and
+    (Same-Path $registeredDll $bridge) -and
     $threadingModel -eq 'Apartment'
 }
 Add-Check 'H4' 'S0' ($notInstalled -or [bool]$comOk) `
@@ -1137,7 +1191,7 @@ $profileExit = -1
 $profileCommand = if ($isPending) { 'check-absent' } else { 'check' }
 $payloadExecutionTrusted = -not $notInstalled -and -not $noActivePayload -and
   $exactUserContext -and $pathsOk -and $manifestResult.pass -and
-  $manifestJournalHashOk
+  $manifestJournalHashOk -and $bridgeOk
 if ($payloadExecutionTrusted -and
     (Test-Path -LiteralPath $profileTool -PathType Leaf)) {
   $profileCommand = if ($isPending) { 'check-absent' } else { 'check' }
@@ -1210,7 +1264,7 @@ Add-Check 'H7' 'S0' ($notInstalled -or $isolationProblems.Count -eq 0) `
 $resourceProblems = @()
 if (-not $notInstalled -and -not $noActivePayload) {
   foreach ($relative in @(
-    'FamoTextService.dll', 'FamoRuntime.exe', 'FamoRimeEngine.dll', 'FamoProfileTool.exe', 'rime.dll',
+    'FamoRuntime.exe', 'FamoRimeEngine.dll', 'FamoProfileTool.exe', 'rime.dll',
     'data\default.yaml', 'data\weasel.yaml', 'data\opencc',
     'settings\FamoSettings.exe', 'settings\FamoSettings.pri')) {
     if (-not (Test-Path -LiteralPath (Join-Path $target $relative))) { $resourceProblems += $relative }

@@ -9,7 +9,8 @@
 namespace famo::runtime {
 
 constexpr uint32_t kProtocolMagic = 0x4f4d4146; // "FAMO" little-endian.
-constexpr uint16_t kProtocolVersion = 2;
+constexpr uint16_t kMinSupportedProtocolVersion = 2;
+constexpr uint16_t kProtocolVersion = 3;
 constexpr uint16_t kHeaderSize = 76;
 constexpr uint32_t kMaxCandidateCount = 64;
 constexpr uint32_t kMaxStringBytes = 1024 * 1024;
@@ -141,6 +142,30 @@ struct Frame {
   Status status = Status::Ok;
   Correlation correlation;
   std::vector<uint8_t> payload;
+  uint16_t wire_version = kProtocolVersion;
+};
+
+struct HelloRequest {
+  uint16_t min_protocol_version = kMinSupportedProtocolVersion;
+  uint16_t max_protocol_version = kProtocolVersion;
+  uint32_t bridge_abi = 0;
+
+  bool operator==(const HelloRequest &) const = default;
+};
+
+struct HelloResponse {
+  uint16_t min_protocol_version = kMinSupportedProtocolVersion;
+  uint16_t max_protocol_version = kProtocolVersion;
+  uint16_t selected_protocol_version = kProtocolVersion;
+
+  bool operator==(const HelloResponse &) const = default;
+};
+
+struct NegotiatedHello {
+  uint16_t protocol_version = 0;
+  uint32_t bridge_abi = 0;
+  std::vector<uint8_t> response_payload;
+  bool legacy = false;
 };
 
 struct KeyEvent {
@@ -250,6 +275,20 @@ bool EncodeFrame(const Frame &frame, std::vector<uint8_t> *bytes,
                  std::string *error) noexcept;
 bool DecodeFrame(std::span<const uint8_t> bytes, Frame *frame,
                  std::string *error) noexcept;
+
+bool EncodeHelloRequest(const HelloRequest &hello,
+                        std::vector<uint8_t> *payload,
+                        std::string *error) noexcept;
+bool DecodeHelloRequest(std::span<const uint8_t> payload, HelloRequest *hello,
+                        std::string *error) noexcept;
+bool EncodeHelloResponse(const HelloResponse &hello,
+                         std::vector<uint8_t> *payload,
+                         std::string *error) noexcept;
+bool DecodeHelloResponse(std::span<const uint8_t> payload,
+                         HelloResponse *hello,
+                         std::string *error) noexcept;
+bool NegotiateHello(const Frame &request, NegotiatedHello *negotiated,
+                    std::string *error) noexcept;
 
 bool EncodeOpenSession(std::string_view schema, std::vector<uint8_t> *payload,
                        std::string *error) noexcept;

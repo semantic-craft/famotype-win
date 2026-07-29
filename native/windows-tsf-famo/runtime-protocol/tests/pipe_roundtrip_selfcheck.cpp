@@ -267,6 +267,27 @@ bool NormalRoundtrip() {
   return true;
 }
 
+bool ExtendedHelloRoundtrip() {
+  const std::wstring suffix =
+      L"extended-hello-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+  PROCESS_INFORMATION process{};
+  CHECK(SpawnRuntime(suffix, L"none", &process));
+
+  PipeRuntimePort port(1);
+  constexpr uint64_t generation = 199;
+  CHECK(port.Connect(endpoint, RuntimePath(), Hello(generation).correlation,
+                     std::chrono::seconds(2), &error));
+  Frame open = Request(Command::OpenSession, generation, 1);
+  CHECK(EncodeOpenSession("test", &open.payload, &error));
+  CHECK(port.Call(std::move(open), kSessionOpenDeadline).status == Status::Ok);
+  port.Stop();
+  CHECK(FinishRuntime(&process));
+  return true;
+}
+
 bool AbsolutePreviewSelectionRoundtrip() {
   const std::wstring suffix =
       L"absolute-preview-" + std::to_wstring(GetCurrentProcessId());
@@ -1209,6 +1230,8 @@ bool StopRetiresInFlightOffControlPath() {
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
+  if (argc == 2 && std::wstring_view(argv[1]) == L"--extended-hello")
+    return ExtendedHelloRoundtrip() ? 0 : 1;
   if (argc == 4 &&
       std::wstring_view(argv[1]) == L"--control-intruder") {
     PipeEndpoint endpoint;
@@ -1239,7 +1262,8 @@ int wmain(int argc, wchar_t **argv) {
   }
   if (argc != 1)
     return 2;
-  if (!NormalRoundtrip() || !AbsolutePreviewSelectionRoundtrip() ||
+  if (!ExtendedHelloRoundtrip() || !NormalRoundtrip() ||
+      !AbsolutePreviewSelectionRoundtrip() ||
       !WrongPeerRejected() ||
       !ConnectFailureIsOffHotPath() ||
       !OptionalUiPipeDoesNotDelayPrimaryReadiness() ||
@@ -1254,6 +1278,7 @@ int wmain(int argc, wchar_t **argv) {
       !FaultCheck(L"read-hang", L"no-reply", 510, false) ||
       !FaultCheck(L"engine-hang", L"engine-hang", 520, false) ||
       !FaultCheck(L"malformed", L"malformed", 540, false) ||
+      !FaultCheck(L"wrong-version", L"wrong-version", 545, false) ||
       !FaultCheck(L"disconnect", L"disconnect", 550, false) ||
       !ExecuteDisconnectRecoversExactDelivery(
           L"disconnect-before-execute", L"disconnect-before-execute", 560,

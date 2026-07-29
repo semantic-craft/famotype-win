@@ -180,6 +180,7 @@ Frame RuntimeService::Reply(const Frame &request, Status status) const {
   reply.flags = kFlagResponse;
   reply.status = status;
   reply.correlation = request.correlation;
+  reply.wire_version = request.wire_version;
   return reply;
 }
 

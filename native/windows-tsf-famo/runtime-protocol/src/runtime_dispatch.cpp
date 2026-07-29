@@ -44,8 +44,10 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
       c.connection_generation == 0)
     return Reply(request, Status::InvalidFrame);
   if (request.command == Command::Hello) {
-    if (!request.payload.empty() || c.session_id != 0 ||
-        c.session_generation != 0 || c.sequence != 0)
+    NegotiatedHello negotiated;
+    std::string negotiation_error;
+    if (c.session_id != 0 || c.session_generation != 0 || c.sequence != 0 ||
+        !NegotiateHello(request, &negotiated, &negotiation_error))
       return Reply(request, Status::InvalidFrame);
     CleanupDeadOwnersLocked();
     if (IsAbandonedEpochLocked(c))
@@ -119,18 +121,29 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
           clients_.emplace(
               c.client_id,
               ClientEpoch{c.activation_generation,
-                          c.connection_generation, bound_owner, 0});
+                          c.connection_generation, bound_owner, 0,
+                          negotiated.protocol_version,
+                          negotiated.bridge_abi});
         } catch (...) {
           return Reply(request, Status::Unavailable);
         }
       } else {
         found->second = ClientEpoch{
-            c.activation_generation, c.connection_generation, bound_owner, 0};
+            c.activation_generation, c.connection_generation, bound_owner, 0,
+            negotiated.protocol_version, negotiated.bridge_abi};
       }
     } else if (found != clients_.end() && owner && !found->second.owner) {
       found->second.owner = *owner;
     }
-    return Reply(request, Status::Ok);
+    if (found != clients_.end() &&
+        (found->second.protocol_version != negotiated.protocol_version ||
+         found->second.bridge_abi != negotiated.bridge_abi)) {
+      return Reply(request, Status::StaleRequest);
+    }
+    Frame reply = Reply(request, Status::Ok);
+    reply.wire_version = negotiated.protocol_version;
+    reply.payload = std::move(negotiated.response_payload);
+    return reply;
   }
   if (request.command == Command::OpenSession)
     CleanupDeadOwnersLocked();
@@ -141,6 +154,8 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
       (owner && client->second.owner != *owner)) {
     return Reply(request, Status::StaleRequest);
   }
+  if (request.wire_version != client->second.protocol_version)
+    return Reply(request, Status::InvalidFrame);
   if (c.session_id == 0 || c.session_generation == 0 || c.sequence == 0)
     return Reply(request, Status::InvalidFrame);
 
