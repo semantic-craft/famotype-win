@@ -8,7 +8,7 @@
 param(
   [string] $NativeOutput = '',
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.5.4',
+  [string] $AppVersion = '1.5.5',
   [ValidateSet('Stable')]
   [string] $Identity = 'Stable',
   [string] $Configuration = 'Release',
@@ -42,14 +42,35 @@ function NeedSameFileHash([string] $Expected, [string] $Actual, [string] $Hint) 
   }
 }
 
+function Invoke-NativeProcess {
+  param(
+    [string] $FilePath,
+    [string[]] $Arguments
+  )
+
+  $nativeArgs = @('/d', '/c', 'call', $FilePath) + $Arguments
+  $output = & $env:ComSpec @nativeArgs 2>&1
+  $exitCode = $LASTEXITCODE
+  if ($null -eq $exitCode) {
+    throw '当前宿主未等待 Windows 原生命令；请从 WSL 通过 cmd.exe /d /c "pwsh ..." 运行。'
+  }
+  [pscustomobject]@{
+    ExitCode = $exitCode
+    Output = @($output | ForEach-Object { $_.ToString() })
+  }
+}
+
 function Find-DotNetSdk {
   $candidates = @(
     $(if ($env:DOTNET_ROOT) { Join-Path $env:DOTNET_ROOT 'dotnet.exe' }),
     (Get-Command dotnet.exe -ErrorAction SilentlyContinue).Source
   ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
   foreach ($candidate in $candidates) {
-    $sdks = & $candidate --list-sdks 2>$null
-    if ($LASTEXITCODE -eq 0 -and $sdks) { return $candidate }
+    $probe = Invoke-NativeProcess -FilePath $candidate -Arguments @('--list-sdks')
+    if ($probe.ExitCode -eq 0 -and
+        -not [string]::IsNullOrWhiteSpace(($probe.Output -join [Environment]::NewLine))) {
+      return $candidate
+    }
   }
   throw '未找到包含 SDK 的 dotnet.exe。'
 }
@@ -130,11 +151,21 @@ Copy-Item -LiteralPath (Join-Path $InstallerDir 'start_service.bat') -Destinatio
 Write-Host '== 3) Publish settings ==' -ForegroundColor Cyan
 Need $SettingsProj '设置面板工程缺失。'
 $dotnet = Find-DotNetSdk
-& $dotnet publish $SettingsProj -c $Configuration -r win-x64 --self-contained `
-  -p:WindowsAppSDKSelfContained=true -p:WindowsPackageType=None `
-  -p:Version=$AppVersion -p:InformationalVersion=$AppVersion `
-  -o (Join-Path $PayloadStage 'settings') --nologo
-if ($LASTEXITCODE -ne 0) { throw 'dotnet publish 失败。' }
+$publishArguments = @(
+  'publish', $SettingsProj,
+  '-c', $Configuration,
+  '-r', 'win-x64',
+  '--self-contained',
+  '-p:WindowsAppSDKSelfContained=true',
+  '-p:WindowsPackageType=None',
+  "-p:Version=$AppVersion",
+  "-p:InformationalVersion=$AppVersion",
+  '-o', (Join-Path $PayloadStage 'settings'),
+  '--nologo'
+)
+$publish = Invoke-NativeProcess -FilePath $dotnet -Arguments $publishArguments
+$publish.Output | ForEach-Object { Write-Host $_ }
+if ($publish.ExitCode -ne 0) { throw 'dotnet publish 失败。' }
 
 [xml]$project = Get-Content -LiteralPath $SettingsProj
 $targetFramework = @($project.Project.PropertyGroup | ForEach-Object { $_.TargetFramework } | Where-Object { $_ })[0]
@@ -179,8 +210,16 @@ $iscc = @(
   "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
 ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 if (-not $iscc) { throw '未找到 ISCC.exe。' }
-& $iscc "/DAppVersion=$AppVersion" "/DManifestPrefix=$manifestPrefix" "/DManifestHash=$manifestHash" "/DIdentity=$Identity" $Iss
-if ($LASTEXITCODE -ne 0) { throw 'ISCC 编译失败。' }
+$isccArguments = @(
+  "/DAppVersion=$AppVersion",
+  "/DManifestPrefix=$manifestPrefix",
+  "/DManifestHash=$manifestHash",
+  "/DIdentity=$Identity",
+  $Iss
+)
+$compile = Invoke-NativeProcess -FilePath $iscc -Arguments $isccArguments
+$compile.Output | ForEach-Object { Write-Host $_ }
+if ($compile.ExitCode -ne 0) { throw 'ISCC 编译失败。' }
 
 $exe = Get-ChildItem -LiteralPath (Join-Path $InstallerDir 'dist') -Filter "Famo-Setup-$AppVersion.exe" | Select-Object -First 1
 Need $exe.FullName 'ISCC 未生成预期安装器。'

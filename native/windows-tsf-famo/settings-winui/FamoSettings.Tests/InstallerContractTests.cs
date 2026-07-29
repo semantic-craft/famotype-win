@@ -340,6 +340,33 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void Installer_AcceptsAProtectedSeedReceiptFile()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int guard = Position(iss, "function ValidateProtectedFile");
+        string guardBody = iss[
+            guard..Position(iss, "procedure RequireFixedProtectedInstallRoot", guard)];
+        int receipt = Position(iss, "function ReadPreparedSeedReceiptHash");
+        string receiptBody = iss[
+            receipt..Position(iss, "procedure InstallUserState", receipt)];
+        string compactGuard = string.Concat(
+            guardBody.Where(character => !char.IsWhiteSpace(character)));
+
+        Assert.Contains(
+            "(ChildAttributesand(FileAttributeDirectoryorFileAttributeReparsePoint))<>0",
+            compactGuard);
+        Assert.Contains(
+            "PathSame(ExtractFileDir(ChildFinalPath), ParentFinalPath)",
+            guardBody);
+        Assert.Contains(
+            "ValidateProtectedFile(TransactionDirectory, 'receipt.json')",
+            receiptBody);
+        Assert.DoesNotContain(
+            "ValidateProtectedChild(TransactionDirectory, 'receipt.json')",
+            receiptBody);
+    }
+
+    [Fact]
     public void Installer_RollbackRestoresProfileOnlyAfterMutationIntent()
     {
         string iss = InstallerText("famo-setup.iss");
@@ -687,6 +714,28 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void BuildInstaller_WaitsForGuiSubsystemToolsThroughCmdHost()
+    {
+        string script = InstallerText("build-installer.ps1");
+
+        Assert.Contains("$nativeArgs = @('/d', '/c', 'call', $FilePath) + $Arguments", script);
+        Assert.Contains("& $env:ComSpec @nativeArgs", script);
+        Assert.Contains("$exitCode = $LASTEXITCODE", script);
+        Assert.Contains(
+            "Invoke-NativeProcess -FilePath $candidate -Arguments @('--list-sdks')",
+            script);
+        Assert.Contains(
+            "Invoke-NativeProcess -FilePath $dotnet -Arguments $publishArguments",
+            script);
+        Assert.Contains(
+            "Invoke-NativeProcess -FilePath $iscc -Arguments $isccArguments",
+            script);
+        Assert.DoesNotContain("[Diagnostics.ProcessStartInfo]::new()", script);
+        Assert.DoesNotContain("& $dotnet publish", script);
+        Assert.DoesNotContain("& $iscc", script);
+    }
+
+    [Fact]
     public void Installer_BindsTheCompleteManifestHashAndDeclaredFileSizes()
     {
         string iss = InstallerText("famo-setup.iss");
@@ -796,7 +845,7 @@ public sealed class InstallerContractTests
         }
         Assert.Contains("-p:Version=$AppVersion", script);
         Assert.Contains("-p:InformationalVersion=$AppVersion", script);
-        Assert.Contains("if ($LASTEXITCODE -ne 0) { throw 'ISCC 编译失败。' }", script);
+        Assert.Contains("if ($compile.ExitCode -ne 0) { throw 'ISCC 编译失败。' }", script);
     }
 
     [Fact]
