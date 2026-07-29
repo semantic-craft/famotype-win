@@ -254,9 +254,9 @@ public sealed class InstallerContractTests
 
         int registerTarget = Position(iss, "function RegisterTarget");
         string registerBody = iss[registerTarget..Position(iss, "function UnregisterTarget", registerTarget)];
-        Assert.Contains("'register-machine'", registerBody);
+        Assert.Contains("'register-machine-at '", registerBody);
         Assert.Contains("'check-machine'", registerBody);
-        Assert.DoesNotContain("'register'", registerBody);
+        Assert.DoesNotContain("'register-machine'", registerBody);
 
         int unregisterPrevious = Position(
             iss, "function UnregisterPreviousRegistration");
@@ -266,13 +266,13 @@ public sealed class InstallerContractTests
         string registerPreviousBody = iss[registerPrevious..Position(
             iss, "function DetectLoadedPreviousHost", registerPrevious)];
         Assert.Contains(
-            "if RunAndRequire(PreviousProfileTool, 'unregister-machine', False) then",
+            "'unregister-machine-at ' + AddQuotes(PreviousHost)",
             unregisterPreviousBody);
         Assert.Contains(
             "Result := RunRegSvr32(PreviousHost, True)",
             unregisterPreviousBody);
         Assert.Contains(
-            "if RunAndRequire(PreviousProfileTool, 'register-machine', False) then",
+            "'register-machine-at ' + AddQuotes(PreviousHost)",
             registerPreviousBody);
         Assert.Contains(
             "Result := RunRegSvr32(PreviousHost, False)",
@@ -711,7 +711,7 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
-    public void BuildInstaller_ConsumesOneStableNativeOutput()
+    public void BuildInstaller_ConsumesStableRuntimeAndBridgeArtifacts()
     {
         string script = InstallerText("build-installer.ps1");
 
@@ -722,6 +722,7 @@ public sealed class InstallerContractTests
         {
             Assert.Contains(file, script);
         }
+        Assert.Contains("$BridgeArtifact", script);
 
         foreach (string forbidden in new[] { "$WeaselOutput", "$EngineDll", "weaselx64.dll", "WeaselServer.exe", "WeaselDeployer.exe", "FamoDeploy.exe" })
         {

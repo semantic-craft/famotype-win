@@ -41,11 +41,34 @@ int main() {
   CHECK(DecodeFrame(bytes, &parsed, &error));
   CHECK(parsed.command == source.command);
   CHECK(parsed.correlation == source.correlation);
-  CHECK(kProtocolVersion == 2);
-  auto v1 = bytes;
-  v1[4] = 1;
-  v1[5] = 0;
-  CHECK(!DecodeFrame(v1, &parsed, &error));
+  CHECK(kProtocolVersion == 3);
+  CHECK(kMinSupportedProtocolVersion == 2);
+  auto previous_version = bytes;
+  previous_version[4] = 2;
+  previous_version[5] = 0;
+  CHECK(DecodeFrame(previous_version, &parsed, &error));
+  CHECK(parsed.wire_version == 2);
+  auto unsupported_version = bytes;
+  unsupported_version[4] = 1;
+  unsupported_version[5] = 0;
+  CHECK(!DecodeFrame(unsupported_version, &parsed, &error));
+
+  const HelloRequest hello_request{
+      kMinSupportedProtocolVersion, kProtocolVersion, 1};
+  CHECK(EncodeHelloRequest(hello_request, &payload, &error));
+  payload.push_back(0xaa);
+  HelloRequest decoded_hello_request;
+  CHECK(DecodeHelloRequest(payload, &decoded_hello_request, &error));
+  CHECK(decoded_hello_request == hello_request);
+
+  const HelloResponse hello_response{kMinSupportedProtocolVersion,
+                                     kProtocolVersion,
+                                     kMinSupportedProtocolVersion};
+  CHECK(EncodeHelloResponse(hello_response, &payload, &error));
+  payload.push_back(0x55);
+  HelloResponse decoded_hello_response;
+  CHECK(DecodeHelloResponse(payload, &decoded_hello_response, &error));
+  CHECK(decoded_hello_response == hello_response);
   std::string schema;
   CHECK(DecodeOpenSession(parsed.payload, &schema, &error));
   CHECK(schema == "test");

@@ -44,6 +44,7 @@ enum class ServerFault {
   NoRead,
   NoReply,
   MalformedReply,
+  WrongVersionReply,
   Disconnect,
   EngineHang,
   OpenSessionDelay,
@@ -67,7 +68,7 @@ struct DeliveryResult {
 
 class PipeRuntimePort {
 public:
-  PipeRuntimePort();
+  explicit PipeRuntimePort(uint32_t bridge_abi = 0);
   ~PipeRuntimePort();
   PipeRuntimePort(const PipeRuntimePort &) = delete;
   PipeRuntimePort &operator=(const PipeRuntimePort &) = delete;
@@ -147,12 +148,14 @@ private:
   std::atomic<uint64_t> connection_generation_{0};
   std::atomic<uint64_t> server_creation_time_{0};
   std::atomic<uint32_t> server_process_id_{0};
+  std::atomic<uint16_t> protocol_version_{kProtocolVersion};
   std::atomic<std::shared_ptr<const Correlation>> connection_identity_;
   std::atomic<bool> slot_busy_{false};
   std::shared_ptr<pipe_io::RetirementGate> retirement_;
   bool stop_ = false;
   bool queued_ = false;
   bool in_flight_ = false;
+  const uint32_t bridge_abi_ = 0;
 
   std::mutex ui_mutex_;
   std::thread ui_worker_;

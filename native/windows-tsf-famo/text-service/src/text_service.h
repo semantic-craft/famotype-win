@@ -17,6 +17,7 @@
 #include "candidate_ui_element.h"
 #include "com_ptr.h"
 #include "composition_controller.h"
+#include "famo_bridge_abi.h"
 #include "famo_runtime_pipe.h"
 #include "famo_tsf_host_model.h"
 
@@ -219,7 +220,7 @@ private:
   ComPtr<ITfThreadMgr> thread_manager_;
   ComPtr<ITfKeystrokeMgr> keystroke_manager_;
   ComPtr<ITfUIElementMgr> ui_manager_;
-  runtime::PipeRuntimePort runtime_port_;
+  runtime::PipeRuntimePort runtime_port_{kBridgeAbiVersion};
   std::wstring runtime_endpoint_suffix_;
   std::wstring runtime_executable_name_;
   std::string schema_id_;

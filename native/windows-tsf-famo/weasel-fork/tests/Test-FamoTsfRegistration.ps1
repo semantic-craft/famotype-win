@@ -108,6 +108,19 @@ $installState = if ($brand) { [string]$brand.InstallState } else { 'NotInstalled
 $isPending = $installState -eq 'PendingReboot'
 $target = if ($isPending) { [string]$brand.PendingTarget } elseif ($brand) { [string]$brand.InstallDir } else { '' }
 $profileTool = if ($isPending -and $target) { Join-Path $target 'FamoProfileTool.exe' } elseif ($brand) { [string]$brand.ProfileTool } else { '' }
+$stableBridgePath = if ($brand) { [string]$brand.BridgePath } else { '' }
+$legacyReadyProjection =
+  -not $isPending -and $target -and -not $stableBridgePath
+$bridge = if ($stableBridgePath) {
+  $stableBridgePath
+} elseif ($legacyReadyProjection) {
+  Join-Path $target 'FamoTextService.dll'
+} else { '' }
+$bridgeHash = if ($brand) { [string]$brand.BridgeHash } else { '' }
+$bridgeAbi = if ($brand) { [string]$brand.BridgeAbi } else { '' }
+$bridgeManifest = if ($bridge) {
+  Join-Path (Split-Path -Parent $bridge) 'bridge-manifest.txt'
+} else { '' }
 
 $inprocDll = ''
 $threadingModel = ''
@@ -116,7 +129,7 @@ if ($machineComPresent) {
   $inprocDll = [string]$com.GetValue('')
   $threadingModel = [string]$com.GetValue('ThreadingModel')
 }
-$expectedDll = if ($target) { Join-Path $target 'FamoTextService.dll' } else { '' }
+$expectedDll = if ($isPending) { '' } else { $bridge }
 $comOk = if ($isPending) {
   -not $machineComPresent -and -not $userComPresent
 } else {
@@ -126,6 +139,39 @@ Add-Audit 'TSF-COM' 'HKLM COM registration; per-user COM override absent' ($notI
   'The machine COM registration must point to the active transaction and no legacy HKCU key may shadow it.' `
   $(if ($isPending) { 'HKLM/HKCU COM registration absent' } else { "HKLM COM=$expectedDll; ThreadingModel=Apartment; HKCU override absent" }) `
   $(if ($notInstalled) { 'absent with clean uninstall' } else { "COM=$inprocDll; ThreadingModel=$threadingModel; userOverride=$userComPresent" })
+
+$bridgeOk = $notInstalled -or $isPending
+$bridgeActual = if ($bridgeOk) {
+  'N/A without an active Ready Bridge'
+} elseif ($legacyReadyProjection) {
+  $bridgeOk = Test-Path -LiteralPath $bridge -PathType Leaf
+  "legacy rollback Bridge path=$bridge; present=$bridgeOk"
+} else {
+  try {
+    $expectedBridge = Join-Path $env:ProgramFiles "Famo\bridge\v$bridgeAbi\FamoTextService.dll"
+    $bridgeItem = Get-Item -LiteralPath $bridge -ErrorAction Stop
+    $actualHash = (Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash
+    $manifestLines = @(Get-Content -LiteralPath $bridgeManifest -Encoding UTF8)
+    $bridgeOk =
+      $bridgeAbi -cmatch '^[1-9][0-9]*$' -and
+      $bridgeHash -cmatch '^[0-9A-F]{64}$' -and
+      (Same-Path $bridge $expectedBridge) -and
+      [string]::Equals(
+        $actualHash,
+        $bridgeHash,
+        [System.StringComparison]::Ordinal) -and
+      $manifestLines -ccontains "bridge_abi=$bridgeAbi" -and
+      $manifestLines -ccontains "file=FamoTextService.dll|$($bridgeItem.Length)|$bridgeHash"
+    "path=$bridge; abi=$bridgeAbi; hash=$actualHash; manifest=$bridgeManifest"
+  } catch {
+    $bridgeOk = $false
+    "stable Bridge validation failed: $($_.Exception.Message)"
+  }
+}
+Add-Audit 'TSF-BRIDGE' 'stable Bridge artifact' ([bool]$bridgeOk) `
+  'Ready installs use the immutable ABI-addressed Bridge path and exact manifest hash.' `
+  '%ProgramFiles%\Famo\bridge\v<abi>\FamoTextService.dll with matching manifest' `
+  $bridgeActual
 
 $profileOutput = ''
 $profileExit = -1

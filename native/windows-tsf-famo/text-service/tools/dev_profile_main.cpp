@@ -1492,8 +1492,29 @@ HRESULT ClearCurrentUserComShadow(std::wstring_view expected_sid) {
 
 using RegistrationEntry = HRESULT(STDAPICALLTYPE *)();
 
-HRESULT InvokeRegistration(const char *export_name) {
-  const std::wstring dll = ModuleDirectory() + L"\\FamoTextService.dll";
+HRESULT InvokeRegistrationAt(const std::wstring &dll,
+                             const char *export_name) {
+  const bool drive_absolute =
+      dll.size() >= 3 &&
+      ((dll[0] >= L'A' && dll[0] <= L'Z') ||
+       (dll[0] >= L'a' && dll[0] <= L'z')) &&
+      dll[1] == L':' && (dll[2] == L'\\' || dll[2] == L'/');
+  const bool unc_absolute =
+      dll.size() >= 3 &&
+      ((dll[0] == L'\\' && dll[1] == L'\\') ||
+       (dll[0] == L'/' && dll[1] == L'/'));
+  if ((!drive_absolute && !unc_absolute) ||
+      !ExecutableLeafMatches(dll, L"FamoTextService.dll"))
+    return E_INVALIDARG;
+  std::wstring canonical(32768, L'\0');
+  const DWORD canonical_length = GetFullPathNameW(
+      dll.c_str(), static_cast<DWORD>(canonical.size()), canonical.data(),
+      nullptr);
+  if (canonical_length == 0 || canonical_length >= canonical.size())
+    return HRESULT_FROM_WIN32(GetLastError());
+  canonical.resize(canonical_length);
+  if (_wcsicmp(canonical.c_str(), dll.c_str()) != 0)
+    return HRESULT_FROM_WIN32(ERROR_BAD_PATHNAME);
   HMODULE module = LoadLibraryW(dll.c_str());
   if (!module)
     return HRESULT_FROM_WIN32(GetLastError());
@@ -1502,6 +1523,11 @@ HRESULT InvokeRegistration(const char *export_name) {
   const HRESULT result = entry ? entry() : HRESULT_FROM_WIN32(GetLastError());
   FreeLibrary(module);
   return result;
+}
+
+HRESULT InvokeRegistration(const char *export_name) {
+  return InvokeRegistrationAt(
+      ModuleDirectory() + L"\\FamoTextService.dll", export_name);
 }
 
 bool RegistryPresentAt(HKEY root) {
@@ -1988,6 +2014,36 @@ int wmain(int argc, wchar_t **argv) {
     std::wprintf(L"current_user_com_shadow=absent\n");
     return 0;
   }
+  if (argc == 3 &&
+      (std::wstring_view(argv[1]) == L"register-machine-at" ||
+       std::wstring_view(argv[1]) == L"unregister-machine-at")) {
+    const bool registering =
+        std::wstring_view(argv[1]) == L"register-machine-at";
+    const HRESULT result = InvokeRegistrationAt(
+        argv[2],
+        registering ? "DllRegisterMachine" : "DllUnregisterMachine");
+    if (FAILED(result)) {
+      std::fwprintf(
+          stderr, L"explicit Bridge registration failed: 0x%08lx\n",
+          static_cast<unsigned long>(result));
+      return 1;
+    }
+    if (registering)
+      WaitForMachineRegistrationVisibility();
+    else
+      WaitForMachineRegistrationRemoval();
+    const bool machine_registry =
+        RegistryPresentAt(HKEY_LOCAL_MACHINE);
+    const bool profile = ProfileRegistered();
+    const bool category = KeyboardCategoryRegistered();
+    std::wprintf(L"machine_registry=%ls profile=%ls category=%ls\n",
+                 machine_registry ? L"present" : L"absent",
+                 profile ? L"present" : L"absent",
+                 category ? L"present" : L"absent");
+    return registering
+               ? (machine_registry && profile && category ? 0 : 1)
+               : (!machine_registry && !profile && !category ? 0 : 1);
+  }
   if (argc == 3 && std::wstring_view(argv[1]) == L"cleanup-user-for") {
     const HRESULT result = CleanupDesktopUser(argv[2]);
     if (FAILED(result)) {
@@ -2023,7 +2079,7 @@ int wmain(int argc, wchar_t **argv) {
   if (argc != 2) {
     std::fwprintf(
         stderr,
-        L"usage: FamoProfileTool register|register-machine|register-disabled|enable|disable|activate|check|check-machine|check-disabled|check-absent|is-active|is-enabled|switch-away|start-runtime|start-runtime-for <sid>|stop-runtime-for <sid> <executable>|desktop-run-for <sid> wait|nowait <kind> <operation> <executable>|cleanup-user|cleanup-user-for <sid>|delete-user-data-for <sid>|delete-user-data-current <sid>|clear-user-com-shadow <sid>|unregister|unregister-machine|unregister-machine-direct|loaded <dll>|capture-original-user <pipe-id> <challenge> <record>|capture-original-user-for <sid> <pipe-id> <challenge> <record>|prove-current-token <pipe-id> <challenge>|prove-shell-token <pipe-id> <challenge>|prove-shell-token-for <sid> <pipe-id> <challenge>\n");
+        L"usage: FamoProfileTool register|register-machine|register-machine-at <dll>|register-disabled|enable|disable|activate|check|check-machine|check-disabled|check-absent|is-active|is-enabled|switch-away|start-runtime|start-runtime-for <sid>|stop-runtime-for <sid> <executable>|desktop-run-for <sid> wait|nowait <kind> <operation> <executable>|cleanup-user|cleanup-user-for <sid>|delete-user-data-for <sid>|delete-user-data-current <sid>|clear-user-com-shadow <sid>|unregister|unregister-machine|unregister-machine-at <dll>|unregister-machine-direct|loaded <dll>|capture-original-user <pipe-id> <challenge> <record>|capture-original-user-for <sid> <pipe-id> <challenge> <record>|prove-current-token <pipe-id> <challenge>|prove-shell-token <pipe-id> <challenge>|prove-shell-token-for <sid> <pipe-id> <challenge>\n");
     return 2;
   }
   const std::wstring_view command(argv[1]);
