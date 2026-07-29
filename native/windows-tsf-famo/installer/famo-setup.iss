@@ -492,7 +492,7 @@ begin
     Kind := 'runtime';
     if Parameters = '' then Operation := 'start'
     else if Parameters = '--control shutdown' then Operation := 'shutdown'
-    else if Parameters = '/quit' then Operation := 'quit'
+    else if Parameters = '/q' then Operation := 'quit'
     else if Parameters = '--control deploy' then Operation := 'deploy'
     else if Parameters = '--control reload-options' then
       Operation := 'reload-options';
@@ -3078,14 +3078,14 @@ begin
     (CompareText(Journal.ManifestHash, '{#ManifestHash}') = 0);
 end;
 
-function IsVersionOlderThanInstaller(const Value: String): Boolean;
+function IsVersionNotNewerThanInstaller(const Value: String): Boolean;
 var
   CandidateVersion, InstallerVersion: Int64;
 begin
   Result :=
     StrToVersion(Value + '.0', CandidateVersion) and
     StrToVersion('{#AppVersion}.0', InstallerVersion) and
-    (ComparePackedVersion(CandidateVersion, InstallerVersion) < 0);
+    (ComparePackedVersion(CandidateVersion, InstallerVersion) <= 0);
 end;
 
 function ValidateRecoverableJournalArtifact(
@@ -3094,7 +3094,7 @@ begin
   Result :=
     ValidateCurrentJournalArtifact(Journal, ExpectedId) or
     (ValidateJournalSemantics(Journal, ExpectedId) and
-     IsVersionOlderThanInstaller(Journal.Version) and
+     IsVersionNotNewerThanInstaller(Journal.Version) and
      ((Journal.Phase = PhaseReady) or
       (Journal.Phase = PhaseRolledBack)));
 end;
@@ -4560,15 +4560,51 @@ end;
 procedure StartRuntimeAsOriginalUser;
 var
   ResultCode: Integer;
-  Broker: String;
+  Broker, ActiveState, ActiveTarget, ActiveVersion, ActiveServer: String;
 begin
   Broker := ProfileTool(TransactionTarget);
+  FlushMachineRegistryKey(BrandKey);
+  if not RegQueryStringValue(HKLM64, BrandKey, 'InstallState',
+       ActiveState) or
+     not RegQueryStringValue(HKLM64, BrandKey, 'InstallDir',
+       ActiveTarget) or
+     not RegQueryStringValue(HKLM64, BrandKey, 'ActiveVersion',
+       ActiveVersion) or
+     not RegQueryStringValue(HKLM64, BrandKey, 'ServerExecutable',
+       ActiveServer) or
+     (ActiveState <> 'Activating') or
+     (CompareText(ActiveTarget, TransactionTarget) <> 0) or
+     (CompareText(ActiveVersion, JournalAppVersion) <> 0) or
+     (CompareText(ActiveServer,
+       AddBackslash(TransactionTarget) + 'FamoRuntime.exe') <> 0) then
+  begin
+    Log('runtime activation projection mismatch: state=' + ActiveState +
+      '; target=' + ActiveTarget + '; version=' + ActiveVersion +
+      '; server=' + ActiveServer);
+    RaiseException('runtime activation projection readback failed');
+  end;
   if not ValidateCurrentPayloadForExecution or
     not Exec(Broker, 'start-runtime-for ' + OriginalUserSid, '', SW_HIDE,
     ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
     RaiseException('runtime start failed');
   RuntimeStarted := True;
   Sleep(750);
+end;
+
+function StopRuntimeAsOriginalUser(const RuntimePath: String): Boolean;
+var
+  Parameters: String;
+begin
+  Result := RuntimePath = '';
+  if Result then Exit;
+  Parameters := 'stop-runtime-for ' + OriginalUserSid + ' ' +
+    AddQuotes(RuntimePath);
+  Result := RunAndRequire(
+    ProfileTool(TransactionTarget), Parameters, False);
+  if Result then
+    Log('previous runtime stop readback succeeded: ' + RuntimePath)
+  else
+    Log('previous runtime stop readback failed: ' + RuntimePath);
 end;
 
 procedure CapturePreviousUserState;
@@ -4636,7 +4672,7 @@ end;
 procedure InstallUserState;
 var
   SeedArguments, Settings: String;
-  DeployAttempt: Integer;
+  DeployAttempt, DeployExit: Integer;
   DeployOk: Boolean;
 begin
   TransitionTransactionPhase(PhaseUserStateIntent);
@@ -4665,14 +4701,24 @@ begin
     One shot here killed a real 1.4.9 install; the control client is
     idempotent, so retry briefly instead. }
   DeployOk := False;
-  for DeployAttempt := 1 to 5 do
+  for DeployAttempt := 1 to 15 do
   begin
-    if RunAndRequire(AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
-      '--control deploy', True) then
+    DeployExit := RunBoundDesktopExitCode(
+      AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
+      '--control deploy', True);
+    Log('runtime deploy attempt ' + IntToStr(DeployAttempt) +
+      ' exit=' + IntToStr(DeployExit));
+    if DeployExit = 0 then
     begin
       DeployOk := True;
       Break;
     end;
+    { A just-stopped predecessor can briefly retain the per-session singleton.
+      In that case the first new process exits cleanly and no server remains.
+      Restart before retrying the control pipe instead of polling an absent
+      process forever. }
+    if DeployAttempt < 15 then
+      StartRuntimeAsOriginalUser;
     Sleep(2000);
   end;
   if not DeployOk then
@@ -5971,6 +6017,19 @@ begin
   begin
     RestorePreviousRegistry;
     CommitRollbackActiveProjection;
+    { A terminal rollback must not keep replaying an obsolete installer at
+      every logon. Retire its exact authenticated task before attempting to
+      delete a TSF DLL that may remain loaded until the next reboot. }
+    if HasRecoveryDebt then
+    begin
+      try
+        DeleteRecoveryTask;
+      except
+        Log('deferred terminal recovery artifact cleanup: ' +
+          GetExceptionMessage);
+        Exit;
+      end;
+    end;
     if TransactionDebtPresent(
          'UserRollbackDebt', DebtKindUserRollback) then
       CaptureOriginalUserIdentity;
@@ -5986,7 +6045,7 @@ begin
   else
     Exit;
 
-  if HasRecoveryDebt then
+  if (JournalPhase = PhaseReady) and HasRecoveryDebt then
   begin
     try
       DeleteRecoveryTask;
@@ -6145,6 +6204,11 @@ begin
   end;
   if not FindRecoverableTransaction(RequestedId) then
   begin
+    Log('setup blocked because the retained transaction set failed validation');
+    SuppressibleMsgBox(
+      '检测到无法安全识别的历史安装记录，安装未继续。' + #13#10 +
+      '请保留安装日志并联系支持。',
+      mbError, MB_OK, IDOK);
     Result := False;
     Exit;
   end;
@@ -6208,9 +6272,8 @@ begin
       begin
         if not ValidatePreviousPayloadForExecution then
           RaiseException('previous payload identity mismatch before runtime shutdown');
-        if not RunAndRequire(PreviousServer, '--control shutdown', True) then
-          RunAndRequire(PreviousServer, '/quit', True);
-        Sleep(750);
+        if not StopRuntimeAsOriginalUser(PreviousServer) then
+          RaiseException('previous runtime did not exit after shutdown');
       end;
       if JournalPhase = PhasePrepared then
         TransitionTransactionPhase(PhasePayloadVerified);
@@ -6278,7 +6341,20 @@ begin
       Log('installation failed before rollback: ' + Failure);
       if (JournalPhase <> PhaseReady) and
          (JournalPhase <> PhaseRolledBack) then
-        RollbackTransaction;
+      begin
+        try
+          RollbackTransaction;
+        except
+          Log('rollback compensation failed: ' + GetExceptionMessage);
+        end;
+      end;
+      if JournalPhase = PhaseRolledBack then
+        InstallReady := True;
+      if WizardSilent then
+      begin
+        Log('silent setup aborted after durable rollback');
+        Abort;
+      end;
       RaiseException(Failure);
     end;
   end;

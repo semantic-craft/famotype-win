@@ -421,6 +421,41 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void SilentRecovery_AbortsWithoutBlockingAfterDurableRollback()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int changed = Position(iss, "procedure CurStepChanged");
+        string changedBody = iss[
+            changed..Position(iss, "function NeedRestart", changed)];
+
+        int rollbackTry = Position(changedBody, "try", Position(
+            changedBody, "installation failed before rollback"));
+        int rollback = Position(changedBody, "RollbackTransaction", rollbackTry);
+        int compensationLog = Position(
+            changedBody, "rollback compensation failed", rollback);
+        int ready = Position(changedBody, "InstallReady := True", compensationLog);
+        int silent = Position(changedBody, "if WizardSilent then", ready);
+        int silentLog = Position(
+            changedBody, "silent setup aborted after durable rollback", silent);
+        int abort = Position(changedBody, "Abort;", silentLog);
+        int raise = Position(changedBody, "RaiseException(Failure);", abort);
+
+        Assert.True(
+            rollbackTry < rollback &&
+            rollback < compensationLog &&
+            compensationLog < ready &&
+            ready < silent &&
+            silent < silentLog &&
+            silentLog < abort &&
+            abort < raise);
+        Assert.Equal(
+            raise,
+            changedBody.LastIndexOf(
+                "RaiseException(Failure);",
+                StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void Installer_RejectsDirOverridesAndReparseProtectedRootsBeforeCapture()
     {
         string iss = InstallerText("famo-setup.iss");
@@ -1050,10 +1085,13 @@ public sealed class InstallerContractTests
         Assert.True(prepare < apply && apply < start && start < deploy);
         Assert.Contains("is-active", iss);
         Assert.DoesNotContain("new profile activation failed", iss);
-        int shutdown = Position(iss, "'--control shutdown', True)");
-        int legacyQuit = Position(iss, "'/quit', True", shutdown);
-        int settle = Position(iss, "Sleep(750)", legacyQuit);
-        Assert.True(shutdown < legacyQuit && legacyQuit < settle);
+        int shutdown = Position(iss, "StopRuntimeAsOriginalUser(PreviousServer)");
+        int switchRegistration = Position(iss, "SwitchRegistration;", shutdown);
+        Assert.True(shutdown < switchRegistration);
+        Assert.DoesNotContain("'/quit'", iss);
+        Assert.Contains("else if Parameters = '/q' then Operation := 'quit'", iss);
+        Assert.Contains("runtime deploy attempt ", installBody);
+        Assert.Contains("StartRuntimeAsOriginalUser;", installBody[start..]);
         Assert.DoesNotContain("--control status", iss);
         Assert.DoesNotContain("FamoDeploy.exe", iss, StringComparison.OrdinalIgnoreCase);
     }
@@ -1067,11 +1105,44 @@ public sealed class InstallerContractTests
         string startBody = iss[start..seed];
 
         Assert.Contains("Broker := ProfileTool(TransactionTarget)", startBody);
+        Assert.Contains("FlushMachineRegistryKey(BrandKey)", startBody);
+        Assert.Contains("'InstallState'", startBody);
+        Assert.Contains("'InstallDir'", startBody);
+        Assert.Contains("'ActiveVersion'", startBody);
+        Assert.Contains("'ServerExecutable'", startBody);
+        Assert.Contains("runtime activation projection readback failed", startBody);
         Assert.Contains("ValidateCurrentPayloadForExecution", startBody);
         Assert.Contains("'start-runtime-for ' + OriginalUserSid", startBody);
         Assert.Contains("ewWaitUntilTerminated", startBody);
         Assert.DoesNotContain("Shell.Application", startBody);
         Assert.DoesNotContain("FindWindowSW", startBody);
+    }
+
+    [Fact]
+    public void RuntimeUpgrade_WaitsForExactPredecessorExitBeforeStartingReplacement()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        string tool = RepoText(
+            "native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
+
+        int stop = Position(tool, "HRESULT StopRuntimeAsDesktopUser");
+        int resolve = Position(tool, "bool ResolveDesktopOperation", stop);
+        string stopBody = tool[stop..resolve];
+        Assert.Contains("RunAsDesktopUser(runtime, L\"--control shutdown\"", stopBody);
+        Assert.Contains("WaitForExecutableExit(runtime)", stopBody);
+        Assert.Contains("RunAsDesktopUser(runtime, L\"/q\"", stopBody);
+        Assert.Contains("ForceStopExactRuntime(runtime, expected_sid)", stopBody);
+        Assert.Contains("RmShutdown(session, RmForceShutdown", tool);
+        Assert.Contains("QueryFullProcessImageNameW", tool);
+        Assert.Contains("TokenMatchesSid(token, expected_sid)", tool);
+        Assert.Contains("stop-runtime-for", tool);
+
+        int postInstall = Position(iss, "if CurStep = ssPostInstall then");
+        int stopCall = Position(
+            iss, "StopRuntimeAsOriginalUser(PreviousServer)", postInstall);
+        int detectLoaded = Position(
+            iss, "LoadedHostDetected := DetectLoadedPreviousHost", stopCall);
+        Assert.True(stopCall < detectLoaded);
     }
 
     [Fact]
@@ -1213,20 +1284,25 @@ public sealed class InstallerContractTests
         int recover = Position(iss, "function RecoverTerminalTransaction");
         string recoverBody =
             iss[recover..Position(iss, "function InitializeSetup", recover)];
-        int capture = Position(recoverBody, "CaptureOriginalUserIdentity");
+        int rolledBack = Position(
+            recoverBody, "if JournalPhase = PhaseRolledBack then");
+        int deleteTask =
+            Position(recoverBody, "DeleteRecoveryTask", rolledBack);
+        int capture =
+            Position(recoverBody, "CaptureOriginalUserIdentity", deleteTask);
         int retryCall =
             Position(recoverBody, "RetryRolledBackCleanupDebt", capture);
-        int deleteTask = Position(recoverBody, "DeleteRecoveryTask", retryCall);
-        Assert.True(capture < retryCall && retryCall < deleteTask);
+        Assert.True(deleteTask < capture && capture < retryCall);
     }
 
     [Fact]
-    public void Installer_RecoversOlderTerminalJournalsButNotOlderPendingPayloads()
+    public void Installer_RecoversNotNewerTerminalJournalsButNotPendingPayloads()
     {
         string iss = InstallerText("famo-setup.iss");
-        int older = Position(iss, "function IsVersionOlderThanInstaller");
-        string olderBody = iss[older..Position(
-            iss, "function ValidateRecoverableJournalArtifact", older)];
+        int notNewer =
+            Position(iss, "function IsVersionNotNewerThanInstaller");
+        string notNewerBody = iss[notNewer..Position(
+            iss, "function ValidateRecoverableJournalArtifact", notNewer)];
         int recoverable = Position(
             iss, "function ValidateRecoverableJournalArtifact");
         string recoverableBody = iss[recoverable..Position(
@@ -1269,17 +1345,17 @@ public sealed class InstallerContractTests
         Assert.Contains("Journal.Phase = PhaseReady", recoverableBody);
         Assert.Contains("Journal.Phase = PhaseRolledBack", recoverableBody);
         Assert.Contains(
-            "IsVersionOlderThanInstaller(Journal.Version)",
+            "IsVersionNotNewerThanInstaller(Journal.Version)",
             recoverableBody);
         Assert.DoesNotContain("PhasePendingReboot", recoverableBody);
         Assert.Contains("StrToVersion(Value + '.0', CandidateVersion)",
-            olderBody);
+            notNewerBody);
         Assert.Contains(
             "StrToVersion('{#AppVersion}.0', InstallerVersion)",
-            olderBody);
+            notNewerBody);
         Assert.Contains(
-            "ComparePackedVersion(CandidateVersion, InstallerVersion) < 0",
-            olderBody);
+            "ComparePackedVersion(CandidateVersion, InstallerVersion) <= 0",
+            notNewerBody);
         Assert.Contains(
             "ValidateRecoverableJournalArtifact(Journal, ExpectedId)",
             loadBody);

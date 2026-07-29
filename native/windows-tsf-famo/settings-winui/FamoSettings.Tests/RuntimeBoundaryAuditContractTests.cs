@@ -119,6 +119,22 @@ public sealed class RuntimeBoundaryAuditContractTests
 
         Assert.Contains("ProductionInstallAllowed(ModuleDirectory())", tsf);
         Assert.Contains("ProductionInstallAllowed(ModuleDirectory(), true)", runtime);
+        Assert.Contains("famo-runtime-startup.log", runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"install-state\", 3",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"singleton\", 3)",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"candidate-window\", 3)",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"engine\", 4, error)",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"control-pipe\", 5)",
+            runtime);
     }
 
     private static string RepoFile(string relativePath)
