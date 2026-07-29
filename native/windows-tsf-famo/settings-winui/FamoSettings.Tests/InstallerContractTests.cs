@@ -1126,7 +1126,8 @@ public sealed class InstallerContractTests
         int runBound = Position(iss, "function RunBoundDesktopExitCode");
         string runBoundBody =
             iss[runBound..Position(iss, "function RunAndRequire", runBound)];
-        Assert.Contains("ValidateCurrentPayloadForExecution", runBoundBody);
+        Assert.DoesNotContain(
+            "if not ValidateCurrentPayloadForExecution", runBoundBody);
         Assert.Contains(
             "ValidateManagedExecutableForExecution(FileName)", runBoundBody);
 
@@ -1146,6 +1147,44 @@ public sealed class InstallerContractTests
         Assert.True(validate < execute);
         Assert.Contains("FamoEmbeddedManifest.txt", cleanupBody);
         Assert.Contains("'unregister-machine-direct'", cleanupBody);
+    }
+
+    [Fact]
+    public void InnoSetup_MakesPendingRebootAndRecoveryVisibleAndLogged()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        string appcast = InstallerText("make-appcast.ps1");
+        string appcastSelfTest = InstallerText("make-appcast-selftest.ps1");
+        int arguments = Position(iss, "function ExpectedRecoveryArguments");
+        string argumentsBody = iss[arguments..Position(
+            iss, "function EnsureRecoveryTaskFolderByCom", arguments)];
+        int cached = Position(
+            iss, "function CachedCurrentPayloadExecutionProofMatches");
+        string cachedBody = iss[cached..Position(
+            iss, "function ValidateCurrentPayloadForExecution", cached)];
+        int validate = Position(
+            iss, "function ValidateCurrentPayloadForExecution", cached);
+        string validateBody = iss[validate..Position(
+            iss, "function RunRegSvr32", validate)];
+
+        Assert.Contains("SetupLogging=yes", iss);
+        Assert.Contains("FinishedRestartLabel=", iss);
+        Assert.Contains("必须重新启动电脑才能完成切换并显示新输入法", iss);
+        Assert.Contains("' /SILENT /SP- /NORESTART'", argumentsBody);
+        Assert.DoesNotContain("/VERYSILENT", argumentsBody);
+        Assert.DoesNotContain("/SUPPRESSMSGBOXES", argumentsBody);
+        Assert.Contains("Result := PendingTerminal", iss);
+        Assert.Contains(
+            "sparkle:installerArguments=\"/SILENT /SP- /NOICONS\"",
+            appcast);
+        Assert.DoesNotContain(
+            "sparkle:installerArguments=\"/SILENT /SP- /NOICONS /NORESTART\"",
+            appcast);
+        Assert.Contains("'/SILENT /SP- /NOICONS'", appcastSelfTest);
+        Assert.Contains(
+            "CachedCurrentPayloadExecutionProofMatches", validateBody);
+        Assert.Contains("FinalObjectsSame", cachedBody);
+        Assert.Contains("GetSHA256OfFile(Manifest)", cachedBody);
     }
 
     [Fact]
@@ -1314,7 +1353,8 @@ public sealed class InstallerContractTests
             "无法完成上次更新的安全恢复，安装未继续", discoveredBody);
         Assert.Contains("TerminalRecoveryTargetDeleteBlocked",
             discoveredBody);
-        Assert.Contains("if not WizardSilent then", discoveredBody);
+        Assert.Contains("SuppressibleMsgBox(", discoveredBody);
+        Assert.DoesNotContain("if not WizardSilent then", discoveredBody);
 
         int resetDefinition = Position(
             iss, "procedure ResetLoadedTransactionForFreshInstall");

@@ -56,7 +56,7 @@ public sealed class FamoLogTests
         string iml = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/settings-winui/FamoSettings.Core/InputMethodList.cs"));
         Assert.DoesNotContain("catch { return false; }", iml);
-        Assert.Contains(@"FamoLog.Append($""InstallLayoutOrTip(install) failed", iml);
+        Assert.Contains("InstallLayoutOrTip(install) failed after retry", iml);
         Assert.Contains(@"FamoLog.Append($""InstallLayoutOrTip(uninstall) failed", iml);
 
         string program = File.ReadAllText(RepoFile(
@@ -65,6 +65,7 @@ public sealed class FamoLogTests
         int log = program.IndexOf(@"FamoLog.Append($""--seed-only failed", StringComparison.Ordinal);
         Assert.True(seed >= 0 && log > seed,
             "RunSeedOnly catch must log the failure (Inno [Run] ignores exit codes; without a log line first-launch failure is invisible)");
+        Assert.Contains("--apply-seed-transaction failed", program);
     }
 
     private static string RepoFile(string relativePath)

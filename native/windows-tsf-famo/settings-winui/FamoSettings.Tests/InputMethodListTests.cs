@@ -93,6 +93,74 @@ public sealed class InputMethodListTests
         Assert.DoesNotContain("ValueContainsTip", probe);
     }
 
+    [Fact]
+    public void UserListInstall_RetriesTransientLogonFailure()
+    {
+        int attempts = 0;
+        List<int> delays = [];
+
+        bool result = InputMethodList.RetryEnsureFamoInUserList(
+            install: () =>
+            {
+                attempts++;
+                return attempts >= 3;
+            },
+            isAlreadyPresent: () => attempts >= 3,
+            delay: delays.Add,
+            maxAttempts: 5,
+            delayMilliseconds: 500);
+
+        Assert.True(result);
+        Assert.Equal(3, attempts);
+        Assert.Equal([500, 500], delays);
+    }
+
+    [Fact]
+    public void UserListInstall_AcceptsVerifiedPresenceAfterFalseNativeResult()
+    {
+        int attempts = 0;
+        int delays = 0;
+
+        bool result = InputMethodList.RetryEnsureFamoInUserList(
+            install: () =>
+            {
+                attempts++;
+                return false;
+            },
+            isAlreadyPresent: () => true,
+            delay: _ => delays++,
+            maxAttempts: 5,
+            delayMilliseconds: 500);
+
+        Assert.True(result);
+        Assert.Equal(1, attempts);
+        Assert.Equal(0, delays);
+    }
+
+    [Fact]
+    public void UserListInstall_WaitsForReadbackAfterTrueNativeResult()
+    {
+        int attempts = 0;
+        int probes = 0;
+        List<int> delays = [];
+
+        bool result = InputMethodList.RetryEnsureFamoInUserList(
+            install: () =>
+            {
+                attempts++;
+                return true;
+            },
+            isAlreadyPresent: () => ++probes >= 3,
+            delay: delays.Add,
+            maxAttempts: 5,
+            delayMilliseconds: 500);
+
+        Assert.True(result);
+        Assert.Equal(3, attempts);
+        Assert.Equal(3, probes);
+        Assert.Equal([500, 500], delays);
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;
