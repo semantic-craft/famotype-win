@@ -49,17 +49,18 @@ public sealed class AboutPageParityContractTests
     }
 
     [Fact]
-    public void AboutPage_ExposesHonestManualUpdateCheck()
+    public void AboutPage_ExposesAutomaticAndManualSignedUpdateChecks()
     {
         string page = File.ReadAllText(RepoFile("native/windows-tsf-famo/settings-winui/FamoSettings/Views/AboutPage.cs"));
         string menuTest = File.ReadAllText(RepoFile("native/windows-tsf-famo/weasel-fork/tests/Test-FamoMenuParity.ps1"));
 
         Assert.Contains("软件更新", page);
+        Assert.Contains("自动检查更新", page);
         Assert.Contains("检查更新", page);
-        Assert.Contains("ReleasesUrl", page);
-        Assert.Contains("semantic-craft/famotype-win/releases/latest", page);
-        Assert.Contains("已打开法墨发布页", page);
-        Assert.DoesNotContain("已是最新版本", page);
+        Assert.Contains("App.Settings.Updates.AutomaticChecksEnabled", page);
+        Assert.Contains("App.SetAutomaticUpdateChecksEnabled", page);
+        Assert.Contains("App.CheckForUpdates", page);
+        Assert.DoesNotContain("Process.Start(new ProcessStartInfo { FileName = ReleasesUrl", page);
         Assert.Contains("tray menu must keep update checks in the About page", menuTest);
     }
 

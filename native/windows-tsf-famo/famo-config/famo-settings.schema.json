@@ -13,6 +13,19 @@
       "const": 4
     },
 
+    "updates": {
+      "description": "软件更新策略；默认后台检查，用户可明确关闭。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automaticChecksEnabled"],
+      "properties": {
+        "automaticChecksEnabled": {
+          "description": "启动设置程序后按 WinSparkle 周期后台检查；发现新版仍需用户确认安装。",
+          "type": "boolean"
+        }
+      }
+    },
+
     "appearance": {
       "description": "即时桶(instant)。改动写 famo-style.yaml，触发 FamoRuntime 候选窗轻量 reload，不走 RIME 重部署。",
       "type": "object",

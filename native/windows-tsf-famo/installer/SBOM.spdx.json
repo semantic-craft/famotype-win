@@ -138,6 +138,16 @@
       "licenseConcluded": "MIT",
       "licenseDeclared": "MIT",
       "copyrightText": "Copyright Microsoft Corporation"
+    },
+    {
+      "name": "WinSparkle",
+      "SPDXID": "SPDXRef-Package-WinSparkle",
+      "versionInfo": "0.9.3",
+      "downloadLocation": "https://github.com/vslavik/winsparkle",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "copyrightText": "Copyright Vaclav Slavik"
     }
   ],
   "relationships": [
@@ -170,6 +180,11 @@
       "spdxElementId": "SPDXRef-Package-Famo-Windows",
       "relationshipType": "CONTAINS",
       "relatedSpdxElement": "SPDXRef-Package-Windows-App-SDK"
+    },
+    {
+      "spdxElementId": "SPDXRef-Package-Famo-Windows",
+      "relationshipType": "CONTAINS",
+      "relatedSpdxElement": "SPDXRef-Package-WinSparkle"
     },
     {
       "spdxElementId": "SPDXRef-Package-librime",

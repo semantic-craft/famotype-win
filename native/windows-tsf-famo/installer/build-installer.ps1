@@ -147,9 +147,11 @@ foreach ($name in @('FamoSettings.pri', 'App.xbf', 'MainWindow.xbf')) {
 Need (Join-Path $resourceDir 'Theming') 'WinUI publish 缺少 Theming 资源。'
 New-Item -ItemType Directory -Path (Join-Path $settingsStage 'Theming') -Force | Out-Null
 Copy-Item -Path (Join-Path $resourceDir 'Theming\*.xbf') -Destination (Join-Path $settingsStage 'Theming') -Force
+Need (Join-Path $settingsStage 'WinSparkle.dll') 'WinUI publish 缺少自动更新运行库。'
 
 Copy-Item -LiteralPath (Join-Path $InstallerDir 'LICENSE') -Destination (Join-Path $PayloadStage 'licenses\LICENSE') -Force
 Copy-Item -LiteralPath (Join-Path $InstallerDir 'THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $PayloadStage 'licenses\THIRD-PARTY-NOTICES.txt') -Force
+Copy-Item -LiteralPath (Join-Path $InstallerDir 'WinSparkle-LICENSE.txt') -Destination (Join-Path $PayloadStage 'licenses\WinSparkle-LICENSE.txt') -Force
 Need $Sbom 'SPDX SBOM 缺失。'
 Copy-Item -LiteralPath $Sbom -Destination (Join-Path $PayloadStage 'licenses\SBOM.spdx.json') -Force
 
