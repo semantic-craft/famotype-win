@@ -67,7 +67,7 @@ Windows EdDSA 私钥只放在发布机的密钥存储中，不入仓库。脚本
 ```powershell
 $env:FAMO_UPDATE_PRIVATE_KEY = '<仓库外私钥路径>'
 .\make-appcast-selftest.ps1
-.\make-appcast.ps1 -AppVersion 1.5.3
+.\make-appcast.ps1 -AppVersion 1.5.4
 ```
 
 若从 WSL 调用 Windows PowerShell，须用 Windows `cmd.exe` 作为宿主，避免 WSL
