@@ -1,10 +1,12 @@
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
+using System.Reflection;
 using Famo.Settings.Core;
 using Famo.Settings.Core.Ai;
 using Famo.Settings.Core.Insertion;
 using Famo.Settings.Core.QuickPhrases;
 using Famo.Settings.Core.Selection;
+using Famo.Settings.Core.Updates;
 using Famo.Settings.Interop;
 using Famo.Settings.Theming;
 using Famo.Settings.Views;
@@ -43,6 +45,9 @@ public partial class App : Application
 
     /// <summary>UI 线程派发器（单实例重定向回调在后台线程，须切回 UI 线程操作窗口）。</summary>
     private static DispatcherQueue? _uiQueue;
+
+    private static readonly UpdateCoordinator Updates = new(
+        new WinSparkleUpdateBackend(ReadAppVersion(), RequestUpdateShutdown));
 
     private static string? _pendingPromptContent;
     private static string? _pendingPromptStatus;
@@ -368,6 +373,10 @@ public partial class App : Application
 
         // 捕获 UI 线程派发器，供单实例重定向回调切回。
         _uiQueue = DispatcherQueue.GetForCurrentThread();
+        if (!_uiQueue.TryEnqueue(DispatcherQueuePriority.Low, StartUpdates))
+        {
+            FamoLog.Append("Automatic update startup was not queued");
+        }
 
         // --page <id> 深链：从托盘/悬浮面板拉起时直达指定页；emoji 为特例 → 表情浮窗，不开设置主窗。
         string? startPage = GetArgValue(argv, "--page");
@@ -409,6 +418,54 @@ public partial class App : Application
         }
 
         OpenMainWindow(startPage);
+    }
+
+    private static string ReadAppVersion()
+    {
+        string? version = typeof(App).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+            ?.InformationalVersion;
+        return string.IsNullOrWhiteSpace(version)
+            ? typeof(App).Assembly.GetName().Version?.ToString() ?? "dev"
+            : version;
+    }
+
+    private static void StartUpdates()
+    {
+        UpdateActionResult result = Updates.Start(
+            Settings.Updates.AutomaticChecksEnabled);
+        if (result.Status == UpdateActionStatus.Failed)
+        {
+            FamoLog.Append($"Automatic update startup failed: {result.Error}");
+        }
+    }
+
+    public static UpdateActionResult CheckForUpdates() => Updates.CheckNow();
+
+    public static UpdateActionResult SetAutomaticUpdateChecksEnabled(bool enabled)
+    {
+        try
+        {
+            Settings.Updates.AutomaticChecksEnabled = enabled;
+            Store.Save(Settings);
+        }
+        catch (Exception ex)
+        {
+            return new UpdateActionResult(UpdateActionStatus.Failed, ex.Message);
+        }
+
+        return Updates.SetAutomaticChecksEnabled(enabled);
+    }
+
+    internal static void StopUpdates() => Updates.Stop();
+
+    private static void RequestUpdateShutdown()
+    {
+        DispatcherQueue? queue = _uiQueue;
+        if (queue is null || !queue.TryEnqueue(() => Application.Current.Exit()))
+        {
+            FamoLog.Append("Updater requested shutdown but UI dispatch was unavailable");
+        }
     }
 
     private static bool HasFlag(string[] argv, string flag) =>

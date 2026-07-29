@@ -12,6 +12,7 @@ public sealed class FamoSettings
     public const int CurrentVersion = 4;
 
     public int Version { get; set; } = CurrentVersion;
+    public UpdateSettings Updates { get; set; } = new();
     public AppearanceSettings Appearance { get; set; } = new();
     public EngineSettings Engine { get; set; } = new();
     public SwitchSettings Switches { get; set; } = new();
@@ -20,6 +21,12 @@ public sealed class FamoSettings
     public ClipboardSettings Clipboard { get; set; } = new();
     public AiSettings Ai { get; set; } = new();
     public HotKeySettings HotKeys { get; set; } = new();
+}
+
+/// <summary>应用更新策略。默认后台检查；用户关闭后持久保留明确选择。</summary>
+public sealed class UpdateSettings
+{
+    public bool AutomaticChecksEnabled { get; set; } = true;
 }
 
 /// <summary>显式功能召唤热键。空串表示未设置；仅接受至少两个 Ctrl/Alt/Shift 修饰键 + A-Z。</summary>

@@ -491,10 +491,11 @@ public sealed class InstallerContractTests
             Assert.Contains(file, script);
         }
 
-        foreach (string forbidden in new[] { "$WeaselOutput", "$EngineDll", "weaselx64.dll", "WeaselServer.exe", "WeaselDeployer.exe", "FamoDeploy.exe", "WinSparkle.dll" })
+        foreach (string forbidden in new[] { "$WeaselOutput", "$EngineDll", "weaselx64.dll", "WeaselServer.exe", "WeaselDeployer.exe", "FamoDeploy.exe" })
         {
             Assert.DoesNotContain(forbidden, script, StringComparison.OrdinalIgnoreCase);
         }
+        Assert.Contains("Need (Join-Path $settingsStage 'WinSparkle.dll')", script);
     }
 
     [Fact]

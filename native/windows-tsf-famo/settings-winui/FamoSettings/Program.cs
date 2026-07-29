@@ -85,6 +85,7 @@ public static class Program
             SynchronizationContext.SetSynchronizationContext(ctx);
             _ = new App();
         });
+        App.StopUpdates();
         return 0;
     }
 

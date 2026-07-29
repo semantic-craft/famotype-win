@@ -47,6 +47,44 @@ public class SettingsStoreTests : IDisposable
     }
 
     [Fact]
+    public void CreateDefault_EnablesAutomaticUpdateChecks()
+    {
+        FamoSettings settings = SettingsStore.CreateDefault();
+
+        Assert.True(settings.Updates.AutomaticChecksEnabled);
+    }
+
+    [Fact]
+    public void SaveThenLoad_PreservesAutomaticUpdateOptOut()
+    {
+        var store = new SettingsStore(_file);
+        FamoSettings settings = store.Load();
+        settings.Updates.AutomaticChecksEnabled = false;
+
+        store.Save(settings);
+        FamoSettings reloaded = new SettingsStore(_file).Load();
+
+        Assert.False(reloaded.Updates.AutomaticChecksEnabled);
+    }
+
+    [Fact]
+    public void Load_OldSettingsFileMissingUpdates_DefaultsAutomaticChecksOn()
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(_file, """
+        {
+          "version": 4,
+          "appearance": { "skin": "wuda" }
+        }
+        """);
+
+        FamoSettings settings = new SettingsStore(_file).Load();
+
+        Assert.True(settings.Updates.AutomaticChecksEnabled);
+        Assert.Equal("wuda", settings.Appearance.Skin);
+    }
+
+    [Fact]
     public void SaveThenLoad_RoundTrips()
     {
         var store = new SettingsStore(_file);
