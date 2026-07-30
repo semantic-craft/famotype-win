@@ -81,7 +81,7 @@ public sealed class UpdateIntegrationContractTests
     }
 
     [Fact]
-    public void ReleaseMetadataIsPreparedFor156()
+    public void ReleaseMetadataIsPreparedFor157()
     {
         string build = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/installer/build-installer.ps1"));
@@ -92,10 +92,10 @@ public sealed class UpdateIntegrationContractTests
         string sbom = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/installer/SBOM.spdx.json"));
 
-        Assert.Contains("[string] $AppVersion = '1.5.6'", build);
-        Assert.Contains("[string] $AppVersion = '1.5.6'", appcast);
-        Assert.Contains("#define AppVersion  \"1.5.6\"", installer);
-        Assert.Contains("\"versionInfo\": \"1.5.6\"", sbom);
+        Assert.Contains("[string] $AppVersion = '1.5.7'", build);
+        Assert.Contains("[string] $AppVersion = '1.5.7'", appcast);
+        Assert.Contains("#define AppVersion  \"1.5.7\"", installer);
+        Assert.Contains("\"versionInfo\": \"1.5.7\"", sbom);
     }
 
     private static string RepoFile(string relativePath)

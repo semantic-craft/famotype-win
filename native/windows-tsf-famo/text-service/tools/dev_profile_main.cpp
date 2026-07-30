@@ -601,11 +601,12 @@ HRESULT RunAsDesktopUser(const std::wstring &executable,
     CloseHandle(shell_process);
     return HRESULT_FROM_WIN32(ERROR_ELEVATION_REQUIRED);
   }
-
   STARTUPINFOW startup{};
+  wchar_t interactive_desktop[] = L"winsta0\\default";
   startup.cb = sizeof(startup);
   startup.dwFlags = STARTF_USESHOWWINDOW;
   startup.wShowWindow = SW_HIDE;
+  startup.lpDesktop = interactive_desktop;
   PROCESS_INFORMATION process{};
   std::wstring command_line = L"\"" + executable + L"\"";
   if (!arguments.empty())

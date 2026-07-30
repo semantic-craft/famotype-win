@@ -85,7 +85,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $bridgeBefore = if ($RequireRuntimeOnly) { Get-BridgeSnapshot } else { $null }
 $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-')
-$install = Start-Process -FilePath $Installer -ArgumentList $arguments -Wait -PassThru
+$install = Start-Process -FilePath $Installer -ArgumentList $arguments -PassThru
+$install.WaitForExit()
 if ($install.ExitCode -ne 0) {
   throw "本地安装/修复失败，退出码 $($install.ExitCode)。"
 }

@@ -698,11 +698,10 @@ bool TextService::ConnectRuntime(const runtime::Correlation &identity,
   if (!runtime::BuildCurrentPipeEndpoint(runtime_endpoint_suffix_, &endpoint,
                                          &error))
     return false;
-  const std::wstring expected =
-      ModuleDirectory() + L"\\" + runtime_executable_name_;
+  std::wstring expected;
   std::chrono::milliseconds deadline{500};
   if (runtime_executable_name_ == L"FamoRuntime.exe") {
-    if (!runtime::ProductionInstallAllowed(ModuleDirectory()))
+    if (!runtime::ResolveProductionRuntime(&expected))
       return false;
     if (!WaitNamedPipeW(endpoint.name.c_str(), 0) &&
         GetLastError() == ERROR_FILE_NOT_FOUND) {
@@ -718,6 +717,8 @@ bool TextService::ConnectRuntime(const runtime::Correlation &identity,
       }
     }
     deadline = std::chrono::seconds(2);
+  } else {
+    expected = ModuleDirectory() + L"\\" + runtime_executable_name_;
   }
   if (retry_terminal_debt) {
     RetryTerminalAbandonDebts(

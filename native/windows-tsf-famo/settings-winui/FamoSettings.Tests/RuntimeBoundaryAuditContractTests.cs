@@ -110,14 +110,25 @@ public sealed class RuntimeBoundaryAuditContractTests
     }
 
     [Fact]
-    public void ProductionTsfAndRuntimeRejectInactiveInstallTargets()
+    public void StableBridgeResolvesTheVersionedRuntimeProjection()
     {
         string tsf = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/text-service/src/text_service.cpp"));
         string runtime = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
 
-        Assert.Contains("ProductionInstallAllowed(ModuleDirectory())", tsf);
+        Assert.Contains("ResolveProductionRuntime(&expected)", tsf);
+        Assert.DoesNotContain(
+            "ProductionInstallAllowed(ModuleDirectory())",
+            tsf);
+        Assert.Contains(
+            "if (runtime_executable_name_ == L\"FamoRuntime.exe\") {\n"
+            + "    if (!runtime::ResolveProductionRuntime(&expected))",
+            tsf);
+        Assert.Contains(
+            "} else {\n"
+            + "    expected = ModuleDirectory() + L\"\\\\\" + runtime_executable_name_;",
+            tsf);
         Assert.Contains("ProductionInstallAllowed(ModuleDirectory(), true)", runtime);
         Assert.Contains("famo-runtime-startup.log", runtime);
         Assert.Contains(
