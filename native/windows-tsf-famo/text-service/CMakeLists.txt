@@ -104,7 +104,7 @@ target_include_directories(${FAMO_PROFILE_TOOL} PRIVATE
   src ${CMAKE_CURRENT_SOURCE_DIR}/../runtime-protocol/include)
 target_compile_definitions(${FAMO_PROFILE_TOOL} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(${FAMO_PROFILE_TOOL} PRIVATE
-  ole32 advapi32 Rstrtmgr shell32 ntdll)
+  ole32 oleaut32 advapi32 Rstrtmgr shell32 taskschd ntdll)
 add_dependencies(${FAMO_PROFILE_TOOL} FamoTextService)
 add_custom_command(TARGET ${FAMO_PROFILE_TOOL} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
