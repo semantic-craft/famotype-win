@@ -11,7 +11,7 @@ public sealed class AiPage : UserControl
 {
     private static readonly AiProviderPreset[] Presets =
     {
-        new("阿里云百炼", "阿里云百炼", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen3.6-flash"),
+        new("阿里云百炼", "阿里云百炼", "", "qwen3.6-flash", RequiresWorkspaceId: true),
         new("火山引擎 · 豆包 Seed", "火山引擎 · 豆包 Seed", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-seed-2-1-turbo-260628"),
         new("小米 MiMo", "小米 MiMo", "https://api.xiaomimimo.com/v1/chat/completions", "mimo-v2.5"),
         new("DeepSeek", "DeepSeek", "https://api.deepseek.com/v1/chat/completions", "deepseek-v4-flash"),
@@ -28,6 +28,8 @@ public sealed class AiPage : UserControl
     private TextBlock _status = null!;
     private ComboBox _preset = null!;
     private TextBox _displayName = null!;
+    private TextBox _workspaceId = null!;
+    private FrameworkElement _workspaceIdRow = null!;
     private TextBox _endpoint = null!;
     private TextBox _model = null!;
     private PasswordBox _apiKey = null!;
@@ -37,6 +39,7 @@ public sealed class AiPage : UserControl
     private PasswordBox _searchKey = null!;
     private TextBlock _searchKeyState = null!;
     private TextBlock _searchHint = null!;
+    private FrameworkElement _searchCredentialDetails = null!;
     private FrameworkElement _searchDetails = null!;
 
     public AiPage()
@@ -63,7 +66,13 @@ public sealed class AiPage : UserControl
 
         _preset = BuildPresetCombo();
         _displayName = new TextBox { PlaceholderText = "供应商名称", MinWidth = 260 };
-        _endpoint = new TextBox { PlaceholderText = "https://.../chat/completions", MinWidth = 360 };
+        _workspaceId = new TextBox
+        {
+            PlaceholderText = "从百炼业务空间详情复制",
+            MinWidth = 300,
+        };
+        _endpoint = new TextBox { PlaceholderText = "https://...", MinWidth = 360 };
+        _workspaceId.TextChanged += (_, _) => UpdateQwenEndpointPreview();
         _model = new TextBox { PlaceholderText = "模型 ID", MinWidth = 260 };
         _apiKey = new PasswordBox { PlaceholderText = "API Key", MinWidth = 260 };
         _deepSeekModelRow = FamoUI.Row("DeepSeek 模型", "Chat · V4 Flash 更快；Reasoner · V4 Pro 更适合复杂推理。",
@@ -71,11 +80,16 @@ public sealed class AiPage : UserControl
             {
                 _model.Text = idx == 0 ? "deepseek-v4-flash" : "deepseek-v4-pro";
             }));
+        _workspaceIdRow = FamoUI.Row(
+            "Workspace ID",
+            "必填；程序据此生成 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses，不内置项目方 ID。",
+            _workspaceId);
 
         sp.Children.Add(FamoUI.Card("供应商（配一个就行）",
             FamoUI.Row("预设", "可直接填充 OpenAI-compatible endpoint 与模型。", _preset, divider: false),
             _deepSeekModelRow,
             FamoUI.Row("名称", "显示在 AI 对话和菜单状态里。", _displayName),
+            _workspaceIdRow,
             FamoUI.Row("Endpoint", "必须是 HTTPS，或本机 HTTP 调试地址。", _endpoint),
             FamoUI.Row("模型", "必填；按供应商文档填写模型 ID。", _model),
             FamoUI.Row("API Key", "保存到 Windows Credential Manager；不会写入 JSON。", _apiKey),
@@ -132,14 +146,17 @@ public sealed class AiPage : UserControl
         var details = new StackPanel();
         details.Children.Add(FamoUI.Row(
             "搜索服务",
-            "搜索与作答模型解耦；豆包搜索默认，更适合中文站点。",
+            "百炼内置搜索复用默认千问配置；豆包与 Perplexity 仍使用独立搜索密钥。",
             _searchBackend,
             divider: false));
-        details.Children.Add(FamoUI.Row(
+        var credentialDetails = new StackPanel();
+        credentialDetails.Children.Add(FamoUI.Row(
             "搜索服务 API Key",
             "独立于上面的模型密钥，保存到 Windows Credential Manager。",
             _searchKey));
-        details.Children.Add(FamoUI.RowFull(BuildSearchKeyActions(), divider: true));
+        credentialDetails.Children.Add(FamoUI.RowFull(BuildSearchKeyActions(), divider: true));
+        _searchCredentialDetails = credentialDetails;
+        details.Children.Add(_searchCredentialDetails);
         details.Children.Add(FamoUI.RowFull(_searchHint));
         _searchDetails = details;
 
@@ -158,7 +175,7 @@ public sealed class AiPage : UserControl
             "任意提问 · 联网搜索",
             FamoUI.Row(
                 "联网搜索",
-                "开启后先检索网页，再交给当前默认供应商作答；只作用于任意提问，不影响划词技能与输入候选。",
+                "开启后按所选搜索服务联网作答；只作用于任意提问，不影响划词技能与输入候选。",
                 enabled,
                 divider: false),
             FamoUI.RowFull(_searchDetails, divider: true));
@@ -240,6 +257,20 @@ public sealed class AiPage : UserControl
     private void UpdateSearchBackendUi()
     {
         string backend = SelectedSearchBackend();
+        bool usesProviderCredential = WebSearchBackends.UsesProviderCredential(backend);
+        _searchCredentialDetails.Visibility = usesProviderCredential
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+        if (usesProviderCredential)
+        {
+            _searchKeyState.Text = "";
+            _searchHint.Text =
+                $"{WebSearchBackends.KeyHint(backend)}\n" +
+                "联网时按百炼 Responses API 发送 tools:[{\"type\":\"web_search\"}]；" +
+                "默认供应商不是阿里云百炼时会直接提示，不会退回错误的搜索链路。";
+            return;
+        }
+
         bool configured;
         try
         {
@@ -291,8 +322,13 @@ public sealed class AiPage : UserControl
     private void FillPreset(AiProviderPreset preset)
     {
         _displayName.Text = preset.DisplayName;
+        _workspaceId.Text = "";
         _endpoint.Text = preset.Endpoint;
         _model.Text = preset.Model;
+        _workspaceIdRow.Visibility = preset.RequiresWorkspaceId
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        _endpoint.IsReadOnly = preset.RequiresWorkspaceId;
         _deepSeekModelRow.Visibility = preset.DisplayName == "DeepSeek" ? Visibility.Visible : Visibility.Collapsed;
         SetStatus("已填充 " + preset.Label + " 预设，请输入 API Key 后保存。");
     }
@@ -301,10 +337,13 @@ public sealed class AiPage : UserControl
     {
         try
         {
+            string endpoint = IsQwenPresetSelected()
+                ? QwenResponsesApi.BuildBeijingEndpoint(_workspaceId.Text)
+                : _endpoint.Text;
             AiProviderProfile profile = _providerService.AddProfile(new AiProviderProfileDraft
             {
                 DisplayName = _displayName.Text,
-                Endpoint = _endpoint.Text,
+                Endpoint = endpoint,
                 Model = _model.Text,
                 ApiKey = _apiKey.Password,
                 MakeDefault = true,
@@ -455,6 +494,7 @@ public sealed class AiPage : UserControl
     private void ClearProviderForm()
     {
         _displayName.Text = "";
+        _workspaceId.Text = "";
         _endpoint.Text = "";
         _model.Text = "";
         _apiKey.Password = "";
@@ -466,5 +506,28 @@ public sealed class AiPage : UserControl
         if (_status != null) _status.Text = text;
     }
 
-    private sealed record AiProviderPreset(string Label, string DisplayName, string Endpoint, string Model);
+    private bool IsQwenPresetSelected() =>
+        _preset.SelectedIndex >= 0
+        && Presets[_preset.SelectedIndex].RequiresWorkspaceId;
+
+    private void UpdateQwenEndpointPreview()
+    {
+        if (_endpoint is null || !IsQwenPresetSelected()) return;
+
+        try
+        {
+            _endpoint.Text = QwenResponsesApi.BuildBeijingEndpoint(_workspaceId.Text);
+        }
+        catch (InvalidDataException)
+        {
+            _endpoint.Text = "";
+        }
+    }
+
+    private sealed record AiProviderPreset(
+        string Label,
+        string DisplayName,
+        string Endpoint,
+        string Model,
+        bool RequiresWorkspaceId = false);
 }
