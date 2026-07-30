@@ -45,7 +45,7 @@ public sealed class AiSettings
     /// <summary>任意提问的联网搜索总开关；默认关闭，不影响划词技能或输入候选。</summary>
     public bool AskWebSearchEnabled { get; set; }
 
-    /// <summary>独立搜索服务：doubao（默认）/ perplexity。</summary>
+    /// <summary>搜索服务：qwen（默认千问供应商内置）/ doubao（默认）/ perplexity。</summary>
     public string WebSearchBackend { get; set; } = "doubao";
 
     /// <summary>划词菜单总开关：关闭后任意技能菜单项点击都提示「划词菜单已关闭」，不再逐个检查具体技能开关。</summary>
