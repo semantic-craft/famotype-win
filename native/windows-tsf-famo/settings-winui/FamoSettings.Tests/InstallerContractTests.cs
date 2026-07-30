@@ -401,6 +401,46 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void Installer_DoesNotArmUserRollbackWhenSeedPrepareProducedNoReceipt()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int rollback = Position(iss, "procedure RollbackTransaction");
+        string rollbackBody = iss[
+            rollback..Position(
+                iss, "function RetryRolledBackCleanupDebt", rollback)];
+        int derive = Position(rollbackBody, "HadUserStateIntent :=");
+        string derivation = rollbackBody[
+            derive..Position(rollbackBody, "HadProfileMutationIntent :=", derive)];
+
+        Assert.Contains("(SeedReceiptHash <> '')", derivation);
+        Assert.DoesNotContain(
+            "(JournalPhase = PhaseUserStateIntent)", derivation);
+        Assert.Contains(
+            "(JournalPhase = PhaseUserStatePrepared)", derivation);
+    }
+
+    [Fact]
+    public void Installer_ReceiptlessRollbackDebtOnlyDiscardsPrepareAndRestartsRuntime()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int retry = Position(iss, "function RetryRolledBackCleanupDebt");
+        string retryBody = iss[
+            retry..Position(
+                iss, "procedure CleanupObsoleteVersions", retry)];
+        int receiptless = Position(
+            retryBody, "if HasUserDebt and (SeedReceiptHash = '') then");
+        string receiptlessBody = retryBody[
+            receiptless..Position(
+                retryBody, "else if HasUserDebt then", receiptless)];
+
+        Assert.Contains("--discard-seed-transaction", receiptlessBody);
+        Assert.Contains(
+            "RunBoundDesktopExitCode(PreviousServer", receiptlessBody);
+        Assert.DoesNotContain("--remove-input-tip", receiptlessBody);
+        Assert.DoesNotContain("cleanup-user-state", receiptlessBody);
+    }
+
+    [Fact]
     public void Installer_LogsTheOriginalFailureBeforeRollbackCompensation()
     {
         string iss = InstallerText("famo-setup.iss");
@@ -745,6 +785,27 @@ public sealed class InstallerContractTests
         Assert.All(
             bridgeEntries,
             entry => Assert.Contains("onlyifdoesntexist", entry));
+    }
+
+    [Fact]
+    public void Installer_RejectsAConflictingFrozenBridgeBeforePreparingTheTransaction()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int preflight = Position(iss, "procedure VerifyFrozenBridgePreflight");
+        string preflightBody = iss[preflight..Position(
+            iss, "function TransactionChangedBridge", preflight)];
+
+        Assert.Contains("FileExists(FixedBridgeDll)", preflightBody);
+        Assert.Contains("GetSHA256OfFile(FixedBridgeDll)", preflightBody);
+        Assert.Contains("'{#BridgeHash}'", preflightBody);
+        Assert.Contains("frozen Bridge conflict", preflightBody);
+
+        int install = Position(iss, "if CurStep = ssInstall then");
+        string installBody = iss[install..Position(
+            iss, "if CurStep = ssPostInstall then", install)];
+        Assert.True(
+            Position(installBody, "VerifyFrozenBridgePreflight") <
+            Position(installBody, "PrepareTransaction"));
     }
 
     [Fact]
@@ -1301,6 +1362,28 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void ReadyCommit_RequiresStableUserProfileAndInputTipReadback()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int ensure = Position(iss, "procedure EnsureStableUserProfileState");
+        string ensureBody = iss[ensure..Position(
+            iss, "procedure VerifyActiveInstall", ensure)];
+
+        Assert.Contains("'check'", ensureBody);
+        Assert.Contains("'--is-input-tip'", ensureBody);
+        Assert.Contains("'enable'", ensureBody);
+        Assert.Contains("'--add-input-tip'", ensureBody);
+        Assert.Contains("StableReadbacks := StableReadbacks + 1", ensureBody);
+        Assert.Contains("StableReadbacks >= 2", ensureBody);
+        Assert.Contains("Sleep(2000)", ensureBody);
+
+        int verify = Position(iss, "procedure VerifyActiveInstall");
+        string verifyBody = iss[verify..Position(
+            iss, "procedure CompletePendingTransaction", verify)];
+        Assert.Contains("EnsureStableUserProfileState", verifyBody);
+    }
+
+    [Fact]
     public void InnoSetup_PinsTheRunningSetupObjectAcrossRecoveryCopy()
     {
         string iss = InstallerText("famo-setup.iss");
@@ -1448,6 +1531,35 @@ public sealed class InstallerContractTests
         int retryCall =
             Position(recoverBody, "RetryRolledBackCleanupDebt", capture);
         Assert.True(deleteTask < capture && capture < retryCall);
+    }
+
+    [Fact]
+    public void ReadyTerminalRecovery_DoesNotRearmAnAlreadyCommittedSeedReceipt()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int recover = Position(iss, "function RecoverTerminalTransaction");
+        string recoverBody =
+            iss[recover..Position(iss, "procedure ResetLoadedTransactionForFreshInstall", recover)];
+        int ready = Position(
+            recoverBody, "else if JournalPhase = PhaseReady then");
+        string readyBody = recoverBody[ready..Position(
+            recoverBody,
+            "if (JournalPhase = PhaseReady) and HasRecoveryDebt",
+            ready)];
+
+        int debtThen = Position(
+            readyBody, "'UserCleanupDebt', DebtKindSeedCommit) then");
+        int branchBegin = Position(readyBody, "begin", debtThen);
+        int capture = Position(
+            readyBody, "CaptureOriginalUserIdentity", debtThen);
+        int commit = Position(
+            readyBody, "CommitSeedReceiptAfterReady", capture);
+        int branchEnd = Position(readyBody, "end;", commit);
+        Assert.True(
+            debtThen < branchBegin &&
+            branchBegin < capture &&
+            capture < commit &&
+            commit < branchEnd);
     }
 
     [Fact]
@@ -1853,6 +1965,41 @@ public sealed class InstallerContractTests
 
         Assert.True(startup < desktop && desktop < create);
         Assert.Contains("L\"winsta0\\\\default\"", body);
+        Assert.Contains("STARTUPINFOW", body);
+    }
+
+    [Fact]
+    public void NativeProfileTool_BreaksPackagedInstallerContextThroughValidatedRelay()
+    {
+        string tool = RepoText(
+            "native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
+        int direct = Position(
+            tool, "int RunBoundDesktopOperationCurrent");
+        string directBody = tool[
+            direct..Position(tool, "int RunBoundDesktopOperation(", direct)];
+        int outer = Position(tool, "int RunBoundDesktopOperation(", direct);
+        string outerBody = tool[
+            outer..Position(tool, "std::wstring TextServiceGuidText", outer)];
+
+        Assert.Contains("CurrentProcessTokenMatchesSid(sid)", directBody);
+        Assert.Contains("TokenIsMediumIntegrityDesktop", directBody);
+        Assert.Contains("ResolveDesktopOperation", directBody);
+        Assert.Contains("CreateProcessW", directBody);
+        Assert.Contains("desktop-relay-for", outerBody);
+        Assert.Contains("RunAsScheduledDesktopUser(", outerBody);
+        Assert.Contains("ModulePath()", outerBody);
+        Assert.Contains("RunBoundDesktopOperationCurrent(", tool);
+        Assert.Contains(
+            "argv[2], argv[3], argv[4], argv[5], argv[6]", tool);
+        Assert.Contains("ITaskService", tool);
+        Assert.Contains("TASK_LOGON_INTERACTIVE_TOKEN", tool);
+        Assert.Contains("TASK_RUNLEVEL_LUA", tool);
+        Assert.Contains("DeleteTask", tool);
+
+        string cmake = RepoText(
+            "native/windows-tsf-famo/text-service/CMakeLists.txt");
+        Assert.Contains("taskschd", cmake, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("oleaut32", cmake, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

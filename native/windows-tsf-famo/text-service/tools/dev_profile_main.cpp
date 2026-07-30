@@ -8,7 +8,9 @@
 #include <restartmanager.h>
 #include <sddl.h>
 #include <shlobj.h>
+#include <taskschd.h>
 #include <winternl.h>
+#include <wrl/client.h>
 
 #include "famo_guids.h"
 
@@ -892,7 +894,331 @@ bool ResolveDesktopOperation(std::wstring_view kind,
   return false;
 }
 
-int RunBoundDesktopOperation(std::wstring_view sid, std::wstring_view wait_mode,
+int RunBoundDesktopOperationCurrent(
+    std::wstring_view sid, std::wstring_view wait_mode,
+    std::wstring_view kind, std::wstring_view operation,
+    const std::wstring &executable) {
+  constexpr DWORD kChildTimeoutMs = 120000;
+  const bool wait = wait_mode == L"wait";
+  if ((!wait && wait_mode != L"nowait") ||
+      (operation != L"start" && !wait))
+    return 2;
+  if (!CurrentProcessTokenMatchesSid(sid))
+    return 1;
+  HANDLE current_token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &current_token))
+    return 1;
+  const bool valid_current =
+      TokenIsMediumIntegrityDesktop(current_token) &&
+      TokenMatchesSid(current_token, sid);
+  CloseHandle(current_token);
+  if (!valid_current)
+    return 1;
+
+  std::wstring arguments;
+  if (!ResolveDesktopOperation(kind, operation, sid, executable, &arguments))
+    return 2;
+
+  const size_t separator = executable.find_last_of(L"\\/");
+  if (separator == std::wstring::npos)
+    return 2;
+  const std::wstring directory = executable.substr(0, separator);
+  std::wstring command_line = L"\"" + executable + L"\"";
+  if (!arguments.empty())
+    command_line += L" " + arguments;
+  STARTUPINFOW startup{};
+  wchar_t interactive_desktop[] = L"winsta0\\default";
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESHOWWINDOW;
+  startup.wShowWindow = SW_HIDE;
+  startup.lpDesktop = interactive_desktop;
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(executable.c_str(), command_line.data(), nullptr,
+                      nullptr, FALSE, CREATE_SUSPENDED, nullptr,
+                      directory.c_str(), &startup, &process)) {
+    std::fwprintf(stderr, L"relay process creation failed: %lu\n",
+                  static_cast<unsigned long>(GetLastError()));
+    return 1;
+  }
+
+  int result = 1;
+  bool resumed = false;
+  HANDLE child_token = nullptr;
+  if (OpenProcessToken(process.hProcess, TOKEN_QUERY, &child_token)) {
+    const bool valid_child =
+        TokenIsMediumIntegrityDesktop(child_token) &&
+        TokenMatchesSid(child_token, sid);
+    CloseHandle(child_token);
+    if (valid_child &&
+        ResumeThread(process.hThread) != static_cast<DWORD>(-1)) {
+      resumed = true;
+      if (!wait) {
+        result = 0;
+      } else {
+        const DWORD waited =
+            WaitForSingleObject(process.hProcess, kChildTimeoutMs);
+        DWORD exit_code = 1;
+        if (waited == WAIT_OBJECT_0 &&
+            GetExitCodeProcess(process.hProcess, &exit_code)) {
+          result = static_cast<int>(exit_code);
+        } else {
+          const DWORD failure =
+              waited == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+          TerminateProcess(process.hProcess, failure);
+          WaitForSingleObject(process.hProcess, 5000);
+        }
+      }
+    }
+  }
+  if (!resumed) {
+    TerminateProcess(process.hProcess, ERROR_ACCESS_DENIED);
+    WaitForSingleObject(process.hProcess, 5000);
+  }
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return result;
+}
+
+HRESULT RunAsScheduledDesktopUser(
+    std::wstring_view sid, const std::wstring &executable,
+    const std::wstring &arguments, DWORD *child_exit_code) {
+  using Microsoft::WRL::ComPtr;
+  constexpr DWORD kTaskTimeoutMs = 150000;
+  if (child_exit_code)
+    *child_exit_code = STILL_ACTIVE;
+  if (sid.empty() || executable.empty())
+    return E_INVALIDARG;
+
+  const HRESULT initialized =
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (FAILED(initialized) && initialized != RPC_E_CHANGED_MODE)
+    return initialized;
+  const bool uninitialize = SUCCEEDED(initialized);
+  HRESULT result = E_FAIL;
+  {
+    ComPtr<ITaskService> service;
+    ComPtr<ITaskFolder> root;
+    ComPtr<ITaskDefinition> definition;
+    ComPtr<IPrincipal> principal;
+    ComPtr<ITaskSettings> settings;
+    ComPtr<IActionCollection> actions;
+    ComPtr<IAction> action;
+    ComPtr<IExecAction> exec;
+    ComPtr<IRegisteredTask> registered;
+    ComPtr<IRunningTask> running;
+    std::wstring task_name;
+    bool task_registered = false;
+
+    do {
+      result = CoCreateInstance(
+          CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
+          IID_PPV_ARGS(&service));
+      if (FAILED(result))
+        break;
+      VARIANT empty{};
+      VariantInit(&empty);
+      result = service->Connect(empty, empty, empty, empty);
+      if (FAILED(result))
+        break;
+
+      BSTR root_path = SysAllocString(L"\\");
+      if (!root_path) {
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      result = service->GetFolder(root_path, &root);
+      SysFreeString(root_path);
+      if (FAILED(result))
+        break;
+      result = service->NewTask(0, &definition);
+      if (FAILED(result))
+        break;
+
+      result = definition->get_Principal(&principal);
+      if (FAILED(result))
+        break;
+      BSTR user_id = SysAllocStringLen(
+          sid.data(), static_cast<UINT>(sid.size()));
+      if (!user_id) {
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      result = principal->put_UserId(user_id);
+      SysFreeString(user_id);
+      if (FAILED(result))
+        break;
+      result = principal->put_LogonType(TASK_LOGON_INTERACTIVE_TOKEN);
+      if (FAILED(result))
+        break;
+      result = principal->put_RunLevel(TASK_RUNLEVEL_LUA);
+      if (FAILED(result))
+        break;
+
+      result = definition->get_Settings(&settings);
+      if (FAILED(result))
+        break;
+      if (FAILED(result = settings->put_Enabled(VARIANT_TRUE)) ||
+          FAILED(result = settings->put_AllowDemandStart(VARIANT_TRUE)) ||
+          FAILED(result = settings->put_StartWhenAvailable(VARIANT_TRUE)) ||
+          FAILED(result =
+                     settings->put_DisallowStartIfOnBatteries(VARIANT_FALSE)) ||
+          FAILED(result =
+                     settings->put_StopIfGoingOnBatteries(VARIANT_FALSE))) {
+        break;
+      }
+      BSTR execution_limit = SysAllocString(L"PT3M");
+      if (!execution_limit) {
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      result = settings->put_ExecutionTimeLimit(execution_limit);
+      SysFreeString(execution_limit);
+      if (FAILED(result))
+        break;
+
+      result = definition->get_Actions(&actions);
+      if (FAILED(result))
+        break;
+      result = actions->Create(TASK_ACTION_EXEC, &action);
+      if (FAILED(result))
+        break;
+      result = action.As(&exec);
+      if (FAILED(result))
+        break;
+      BSTR action_path = SysAllocString(executable.c_str());
+      if (!action_path) {
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      result = exec->put_Path(action_path);
+      SysFreeString(action_path);
+      if (FAILED(result))
+        break;
+      BSTR action_arguments = SysAllocString(arguments.c_str());
+      if (!action_arguments) {
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      result = exec->put_Arguments(action_arguments);
+      SysFreeString(action_arguments);
+      if (FAILED(result))
+        break;
+      const size_t separator = executable.find_last_of(L"\\/");
+      if (separator == std::wstring::npos) {
+        result = E_INVALIDARG;
+        break;
+      }
+      const std::wstring working_directory =
+          executable.substr(0, separator);
+      BSTR action_directory =
+          SysAllocString(working_directory.c_str());
+      if (!action_directory) {
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      result = exec->put_WorkingDirectory(action_directory);
+      SysFreeString(action_directory);
+      if (FAILED(result))
+        break;
+
+      GUID nonce{};
+      if (FAILED(result = CoCreateGuid(&nonce)))
+        break;
+      wchar_t guid[40]{};
+      if (StringFromGUID2(nonce, guid, static_cast<int>(std::size(guid))) <= 0) {
+        result = E_FAIL;
+        break;
+      }
+      task_name = L"Famo-DesktopOp-";
+      for (const wchar_t character : std::wstring_view(guid)) {
+        if (iswalnum(character))
+          task_name.push_back(character);
+      }
+      if (task_name.size() <= std::wstring_view(L"Famo-DesktopOp-").size()) {
+        result = E_FAIL;
+        break;
+      }
+
+      VARIANT task_user{};
+      VariantInit(&task_user);
+      task_user.vt = VT_BSTR;
+      task_user.bstrVal = SysAllocStringLen(
+          sid.data(), static_cast<UINT>(sid.size()));
+      if (!task_user.bstrVal) {
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      const std::wstring security_descriptor =
+          L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;" +
+          std::wstring(sid) + L")";
+      VARIANT task_security{};
+      VariantInit(&task_security);
+      task_security.vt = VT_BSTR;
+      task_security.bstrVal =
+          SysAllocString(security_descriptor.c_str());
+      BSTR registered_name = SysAllocString(task_name.c_str());
+      if (!task_security.bstrVal || !registered_name) {
+        SysFreeString(task_user.bstrVal);
+        SysFreeString(task_security.bstrVal);
+        SysFreeString(registered_name);
+        result = E_OUTOFMEMORY;
+        break;
+      }
+      result = root->RegisterTaskDefinition(
+          registered_name, definition.Get(), TASK_CREATE, task_user, empty,
+          TASK_LOGON_INTERACTIVE_TOKEN, task_security, &registered);
+      SysFreeString(task_user.bstrVal);
+      SysFreeString(task_security.bstrVal);
+      SysFreeString(registered_name);
+      if (FAILED(result))
+        break;
+      task_registered = true;
+
+      result = registered->Run(empty, &running);
+      if (FAILED(result))
+        break;
+      const ULONGLONG deadline = GetTickCount64() + kTaskTimeoutMs;
+      for (;;) {
+        TASK_STATE state = TASK_STATE_UNKNOWN;
+        LONG last_result = SCHED_S_TASK_HAS_NOT_RUN;
+        const HRESULT state_result = registered->get_State(&state);
+        const HRESULT last_result_read =
+            registered->get_LastTaskResult(&last_result);
+        if (SUCCEEDED(state_result) && SUCCEEDED(last_result_read) &&
+            state != TASK_STATE_QUEUED && state != TASK_STATE_RUNNING &&
+            last_result != SCHED_S_TASK_HAS_NOT_RUN) {
+          if (child_exit_code)
+            *child_exit_code = static_cast<DWORD>(last_result);
+          result = S_OK;
+          break;
+        }
+        if (GetTickCount64() >= deadline) {
+          running->Stop();
+          result = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+          break;
+        }
+        Sleep(50);
+      }
+    } while (false);
+
+    if (task_registered) {
+      BSTR registered_name = SysAllocString(task_name.c_str());
+      const HRESULT deleted =
+          registered_name
+              ? root->DeleteTask(registered_name, 0)
+              : E_OUTOFMEMORY;
+      SysFreeString(registered_name);
+      if (SUCCEEDED(result) && FAILED(deleted))
+        result = deleted;
+    }
+  }
+  if (uninitialize)
+    CoUninitialize();
+  return result;
+}
+
+int RunBoundDesktopOperation(std::wstring_view sid,
+                             std::wstring_view wait_mode,
                              std::wstring_view kind,
                              std::wstring_view operation,
                              const std::wstring &executable) {
@@ -900,16 +1226,21 @@ int RunBoundDesktopOperation(std::wstring_view sid, std::wstring_view wait_mode,
   if ((!wait && wait_mode != L"nowait") ||
       (operation != L"start" && !wait))
     return 2;
-  std::wstring arguments;
-  if (!ResolveDesktopOperation(kind, operation, sid, executable, &arguments))
+  std::wstring validated_arguments;
+  if (!ResolveDesktopOperation(kind, operation, sid, executable,
+                               &validated_arguments))
     return 2;
-  DWORD child_exit_code = STILL_ACTIVE;
-  const HRESULT result =
-      RunAsDesktopUser(executable, arguments, wait, sid, &child_exit_code);
-  if (wait && child_exit_code != STILL_ACTIVE)
-    return static_cast<int>(child_exit_code);
+  const std::wstring relay_arguments =
+      L"desktop-relay-for " + std::wstring(sid) + L" " +
+      std::wstring(wait_mode) + L" " + std::wstring(kind) + L" " +
+      std::wstring(operation) + L" \"" + executable + L"\"";
+  DWORD relay_exit_code = STILL_ACTIVE;
+  const HRESULT result = RunAsScheduledDesktopUser(
+      sid, ModulePath(), relay_arguments, &relay_exit_code);
+  if (relay_exit_code != STILL_ACTIVE)
+    return static_cast<int>(relay_exit_code);
   if (FAILED(result)) {
-    std::fwprintf(stderr, L"bound desktop operation failed: 0x%08lx\n",
+    std::fwprintf(stderr, L"bound desktop relay failed: 0x%08lx\n",
                   static_cast<unsigned long>(result));
     return 1;
   }
@@ -1966,6 +2297,11 @@ int wmain(int argc, wchar_t **argv) {
       return 1;
     }
     return 0;
+  }
+  if (argc == 7 &&
+      std::wstring_view(argv[1]) == L"desktop-relay-for") {
+    return RunBoundDesktopOperationCurrent(
+        argv[2], argv[3], argv[4], argv[5], argv[6]);
   }
   if (argc == 7 &&
       std::wstring_view(argv[1]) == L"desktop-run-for") {

@@ -778,6 +778,21 @@ begin
   Result := AddBackslash(FixedBridgeDirectory) + 'FamoTextService.dll';
 end;
 
+procedure VerifyFrozenBridgePreflight;
+var
+  ExistingHash: String;
+begin
+  if not FileExists(FixedBridgeDll) then Exit;
+  ExistingHash := Uppercase(GetSHA256OfFile(FixedBridgeDll));
+  if CompareText(ExistingHash, '{#BridgeHash}') <> 0 then
+  begin
+    Log('frozen Bridge conflict: path=' + FixedBridgeDll +
+      '; expectedHash={#BridgeHash}; actualHash=' + ExistingHash);
+    RaiseException(
+      'frozen Bridge v{#BridgeAbi} already exists with a different hash');
+  end;
+end;
+
 function TransactionChangedBridge: Boolean;
 begin
   Result :=
@@ -4957,7 +4972,6 @@ begin
   end;
   HadUserStateIntent :=
     (SeedReceiptHash <> '') or
-    (JournalPhase = PhaseUserStateIntent) or
     (JournalPhase = PhaseUserStatePrepared) or
     (JournalPhase = PhaseUserStateApplied) or
     (JournalPhase = PhaseVerifyIntent);
@@ -5195,7 +5209,40 @@ begin
   CommitRollbackActiveProjection;
   CurrentPayloadTrusted := ValidateCurrentPayloadForExecution;
   UserRollbackOk := not HasUserDebt;
-  if HasUserDebt then
+  if HasUserDebt and (SeedReceiptHash = '') then
+  begin
+    UserRollbackOk := CurrentPayloadTrusted;
+    RestoreSettings := AddBackslash(TransactionTarget) +
+      'settings\FamoSettings.exe';
+    if UserRollbackOk and
+       (not ValidateCurrentPayloadForExecution or
+        not RunAndRequire(RestoreSettings,
+          '--discard-seed-transaction ' + TransactionId, True)) then
+      UserRollbackOk := False;
+    if UserRollbackOk and (PreviousServer <> '') and
+       FileExists(PreviousServer) then
+    begin
+      if not ValidatePreviousPayloadForExecution then
+        UserRollbackOk := False;
+      if UserRollbackOk then
+      begin
+        ResultCode := RunBoundDesktopExitCode(PreviousServer, '', False);
+        if ResultCode <> 0 then
+          UserRollbackOk := False;
+        if UserRollbackOk then
+        begin
+          Sleep(750);
+          if not ValidatePreviousPayloadForExecution or
+             not RunAndRequire(PreviousServer,
+               '--control reload-options', True) then
+            UserRollbackOk := False;
+        end;
+      end;
+    end;
+    if UserRollbackOk then
+      ClearTransactionDebt('UserRollbackDebt', DebtKindUserRollback);
+  end
+  else if HasUserDebt then
   begin
     UserRollbackOk := CurrentPayloadTrusted;
     RestoreSettings := AddBackslash(TransactionTarget) +
@@ -5290,16 +5337,10 @@ begin
     begin
       RestoreSettings := AddBackslash(TransactionTarget) +
         'settings\FamoSettings.exe';
-      if (SeedReceiptHash <> '') and
-         (not ValidateCurrentPayloadForExecution or
-          not RunAndRequire(RestoreSettings,
-            '--rollback-seed-transaction ' + TransactionId + ' ' +
-            SeedReceiptHash, True)) then
-        UserRollbackOk := False
-      else if (SeedReceiptHash = '') and
-              (not ValidateCurrentPayloadForExecution or
-               not RunAndRequire(RestoreSettings,
-                 '--discard-seed-transaction ' + TransactionId, True)) then
+      if not ValidateCurrentPayloadForExecution or
+         not RunAndRequire(RestoreSettings,
+           '--rollback-seed-transaction ' + TransactionId + ' ' +
+           SeedReceiptHash, True) then
         UserRollbackOk := False;
     end;
     if UserRollbackOk then
@@ -5699,6 +5740,43 @@ begin
   end;
 end;
 
+procedure EnsureStableUserProfileState;
+var
+  Attempt, StableReadbacks, TipExit: Integer;
+  Settings: String;
+  ProfileHealthy, EnableOk, AddOk: Boolean;
+begin
+  Settings := AddBackslash(TransactionTarget) +
+    'settings\FamoSettings.exe';
+  StableReadbacks := 0;
+  for Attempt := 1 to 6 do
+  begin
+    ProfileHealthy := RunAndRequire(
+      ProfileTool(TransactionTarget), 'check', True);
+    TipExit := RunAsOriginalUserExitCode(Settings, '--is-input-tip');
+    if ProfileHealthy and (TipExit = 0) then
+    begin
+      StableReadbacks := StableReadbacks + 1;
+      if StableReadbacks >= 2 then Exit;
+    end
+    else
+    begin
+      StableReadbacks := 0;
+      EnableOk := RunAndRequire(
+        ProfileTool(TransactionTarget), 'enable', True);
+      AddOk := RunAndRequire(Settings, '--add-input-tip', True);
+      Log('user profile persistence repair attempt ' +
+        IntToStr(Attempt) + ': profileHealthy=' +
+        IntToStr(Ord(ProfileHealthy)) + '; tipExit=' +
+        IntToStr(TipExit) + '; enableOk=' +
+        IntToStr(Ord(EnableOk)) + '; addOk=' +
+        IntToStr(Ord(AddOk)));
+    end;
+    Sleep(2000);
+  end;
+  RaiseException('user profile state did not remain stable');
+end;
+
 procedure VerifyActiveInstall;
 var
   RegisteredDll: String;
@@ -5716,8 +5794,7 @@ begin
     RaiseException('active stable Bridge hash mismatch');
   if not RunAndRequire(ProfileTool(TransactionTarget), 'check-machine', False) then
     RaiseException('machine profile health readback failed');
-  if not RunAndRequire(ProfileTool(TransactionTarget), 'check', True) then
-    RaiseException('profile health readback failed');
+  EnsureStableUserProfileState;
 end;
 
 procedure CompletePendingTransaction;
@@ -6256,8 +6333,10 @@ begin
   begin
     if TransactionDebtPresent(
          'UserCleanupDebt', DebtKindSeedCommit) then
+    begin
       CaptureOriginalUserIdentity;
-    if not CommitSeedReceiptAfterReady then Exit;
+      if not CommitSeedReceiptAfterReady then Exit;
+    end;
   end
   else
     Exit;
@@ -6474,7 +6553,11 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   Failure: String;
 begin
-  if CurStep = ssInstall then PrepareTransaction;
+  if CurStep = ssInstall then
+  begin
+    VerifyFrozenBridgePreflight;
+    PrepareTransaction;
+  end;
   if CurStep = ssPostInstall then
   begin
     if RollbackMode then
