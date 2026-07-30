@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.6"
+  #define AppVersion  "1.5.7"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -15,7 +15,7 @@
   #define Identity "Stable"
 #endif
 #ifndef BridgeAbi
-  #define BridgeAbi "1"
+  #define BridgeAbi "2"
 #endif
 #ifndef BridgeHash
   #define BridgeHash "0000000000000000000000000000000000000000000000000000000000000000"
@@ -72,8 +72,8 @@ Source: "{#StagingDir}\payload\FamoProfileTool.exe"; Flags: dontcopy noencryptio
 Source: "{#StagingDir}\payload\payload-manifest.txt"; Flags: dontcopy noencryption; DestName: "FamoEmbeddedManifest.txt"
 ; The TSF DLL is an independent, frozen artifact. Routine Runtime upgrades
 ; leave this path and its bytes untouched.
-Source: "{#StagingDir}\bridge\FamoTextService.dll"; DestDir: "{code:GetBridgeDirectory}"; Flags: ignoreversion uninsrestartdelete; Check: ShouldInstallBridge
-Source: "{#StagingDir}\bridge\bridge-manifest.txt"; DestDir: "{code:GetBridgeDirectory}"; Flags: ignoreversion; Check: ShouldInstallBridge
+Source: "{#StagingDir}\bridge\FamoTextService.dll"; DestDir: "{code:GetBridgeDirectory}"; Flags: ignoreversion onlyifdoesntexist uninsrestartdelete; Check: ShouldInstallBridge
+Source: "{#StagingDir}\bridge\bridge-manifest.txt"; DestDir: "{code:GetBridgeDirectory}"; Flags: ignoreversion onlyifdoesntexist; Check: ShouldInstallBridge
 
 [Icons]
 Name: "{autoprograms}\法墨设置"; Filename: "{code:GetActiveSettings}"; IconFilename: "{code:GetActiveSettings}"; Check: ShouldInstallPayload
@@ -1335,10 +1335,10 @@ begin
   Manifest := AddBackslash(EnsureTransactionTarget) + 'payload-manifest.txt';
   if not FileExists(Manifest) then RaiseException('payload manifest missing');
   ActualHash := Uppercase(GetSHA256OfFile(Manifest));
-  if (CompareText(ActualHash, '{#ManifestHash}') <> 0) or
-     (CompareText(ActualHash, JournalManifestHash) <> 0) then
+  if CompareText(ActualHash, JournalManifestHash) <> 0 then
     RaiseException('payload manifest full hash mismatch');
-  if CompareText(Copy(ActualHash, 1, 12), '{#ManifestPrefix}') <> 0 then
+  if CompareText(Copy(ActualHash, 1, 12),
+       Copy(JournalManifestHash, 1, 12)) <> 0 then
     RaiseException('payload manifest identity mismatch');
   if not LoadStringsFromFile(Manifest, Lines) then RaiseException('payload manifest unreadable');
 
@@ -1370,7 +1370,8 @@ begin
     begin
       HasFormat := HasFormat or (Lines[I] = 'format=1');
       HasProduct := HasProduct or (Lines[I] = 'product=Famo');
-      HasVersion := HasVersion or (Lines[I] = 'version={#AppVersion}');
+      HasVersion := HasVersion or
+        (Lines[I] = 'version=' + JournalAppVersion);
       HasProtocol := HasProtocol or (Lines[I] = 'protocol=1');
       HasArch := HasArch or (Lines[I] = 'architecture=x64');
       HasIdentity := HasIdentity or (Lines[I] = 'identity={#Identity}');
@@ -3756,6 +3757,7 @@ end;
 
 function ValidateTransactionTarget(const Target, ExpectedId,
   ExpectedVersion, ExpectedManifestHash, ProtectedPreviousTarget: String;
+  AllowCurrentActiveTarget: Boolean;
   var NormalizedTarget: String): Boolean;
 var
   VersionsRoot, ExpectedLeaf, ActiveTarget, VersionsFinalPath,
@@ -3808,8 +3810,9 @@ begin
         Exit;
     end;
     ActiveTarget := ReadActiveTarget;
-    if not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
-       TargetFinalPath, TargetObjectId, ActiveTarget) or
+    if ((not AllowCurrentActiveTarget) and
+        not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
+          TargetFinalPath, TargetObjectId, ActiveTarget)) or
        not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
        TargetFinalPath, TargetObjectId, ProtectedPreviousTarget) then
       Exit;
@@ -3828,7 +3831,7 @@ begin
   EnsureTransactionTarget;
   if not ValidateTransactionTarget(TransactionTarget, TransactionId,
     '{#AppVersion}', '{#ManifestHash}', PreviousTarget,
-    ValidatedTarget) then
+    False, ValidatedTarget) then
     RaiseException('unsafe transaction target refused during prepare');
   TransactionTarget := ValidatedTarget;
   CaptureOriginalUserIdentity;
@@ -4867,6 +4870,7 @@ begin
   if not RunAndRequire(Settings, SeedArguments, True) then
     RaiseException('user seed transaction apply failed');
   TransitionTransactionPhase(PhaseUserStateApplied);
+  WriteActiveRegistry(TransactionTarget, 'Activating');
   StartRuntimeAsOriginalUser;
   { First launch of freshly written binaries is slow (Defender scans them on
     execute), so the runtime's control pipe may not be up 750ms after start.
@@ -5142,7 +5146,7 @@ begin
   begin
     if not ValidateTransactionTarget(TransactionTarget, TransactionId,
       JournalAppVersion, JournalManifestHash, PreviousTarget,
-      ValidatedTarget) then
+      False, ValidatedTarget) then
       RaiseException('unsafe transaction target refused during rollback');
     CurrentPayloadProofValid := False;
     if not DelTree(ValidatedTarget, True, True, True) then
@@ -5309,7 +5313,7 @@ begin
     begin
       if not ValidateTransactionTarget(TransactionTarget, TransactionId,
         JournalAppVersion, JournalManifestHash, PreviousTarget,
-        ValidatedTarget) then
+        False, ValidatedTarget) then
         RaiseException('unsafe transaction target refused during debt retry');
     end
     else if not ValidateJournalBoundPartialTargetForCleanup(
@@ -5553,7 +5557,7 @@ begin
       'TargetCleanupDebt', DebtKindTargetCleanup) and
     ValidateTransactionTarget(TransactionTarget, TransactionId,
       JournalAppVersion, JournalManifestHash, PreviousTarget,
-      NormalizedTarget) and
+      False, NormalizedTarget) and
     TryGetFinalObjectInfo(NormalizedTarget,
       TargetFinalPath, TargetObjectId) and
     FinalObjectsSame(TargetFinalPath, TargetObjectId,
@@ -5721,6 +5725,18 @@ var
   RegisterAttempt: Integer;
   RegisterOk: Boolean;
 begin
+  { The predecessor can race back during logon even though the pending phase
+    removed its Run entry before reboot. Retire that exact binary again before
+    the replacement claims the per-session Runtime singleton. }
+  if (PreviousServer <> '') and FileExists(PreviousServer) then
+  begin
+    if not ValidatePreviousPayloadForExecution then
+      RaiseException(
+        'previous payload identity mismatch before pending activation');
+    if not StopRuntimeAsOriginalUser(PreviousServer) then
+      RaiseException(
+        'previous runtime did not exit before pending activation');
+  end;
   TransitionTransactionPhase(PhaseActivateIntent);
   { The exact-SID logon task can run early in logon, before the CTF/TSF
     services are ready. Registration is idempotent, so retry briefly instead
@@ -5776,7 +5792,7 @@ function ValidatePendingTransaction(const PendingTarget, PendingManifest,
 begin
   Result := ValidateTransactionTarget(PendingTarget, ExpectedId,
     '{#AppVersion}', '{#ManifestHash}', ProtectedPreviousTarget,
-    NormalizedTarget) and
+    False, NormalizedTarget) and
     (CompareText(PendingManifest,
       AddBackslash(NormalizedTarget) + 'payload-manifest.txt') = 0);
   if not Result then NormalizedTarget := '';
@@ -5786,24 +5802,38 @@ function LoadPendingState(const ExpectedId: String): Boolean;
 var
   NormalizedTarget, FinalTarget, ObjectId, ExpectedRecovery: String;
 begin
-  Result := LoadTransactionJournal(ExpectedId) and
-    ValidateTransactionTarget(TransactionTarget, TransactionId,
-      JournalAppVersion, JournalManifestHash, PreviousTarget,
-      NormalizedTarget) and
-    (CompareText(NormalizedTarget, TransactionTarget) = 0);
-  if not Result then Exit;
+  Result := False;
+  if not LoadTransactionJournal(ExpectedId) then
+  begin
+    Log('pending state load rejected: journal');
+    Exit;
+  end;
+  if not ValidateTransactionTarget(TransactionTarget, TransactionId,
+       JournalAppVersion, JournalManifestHash, PreviousTarget,
+       JournalPhase = PhaseReady, NormalizedTarget) or
+     (CompareText(NormalizedTarget, TransactionTarget) <> 0) then
+  begin
+    Log('pending state load rejected: target path');
+    Exit;
+  end;
+  Result := True;
   if DirExists(TransactionTarget) then
   begin
     Result := TryGetFinalObjectInfo(TransactionTarget, FinalTarget, ObjectId) and
       (CompareText(FinalTarget, JournalPendingFinalTarget) = 0) and
       (JournalPendingObjectId <> '') and
       (CompareText(ObjectId, JournalPendingObjectId) = 0);
-    if not Result then Exit;
+    if not Result then
+    begin
+      Log('pending state load rejected: target object');
+      Exit;
+    end;
   end
   else if (JournalPhase <> PhasePrepared) and
           (JournalPhase <> PhaseRollbackIntent) and
           (JournalPhase <> PhaseRolledBack) then
   begin
+    Log('pending state load rejected: target object');
     Result := False;
     Exit;
   end;
@@ -5813,6 +5843,7 @@ begin
       ((JournalPreviousObjectId <> '') and
        (CompareText(ObjectId, JournalPreviousObjectId) <> 0))) then
   begin
+    Log('pending state load rejected: previous target identity');
     Result := False;
     Exit;
   end;
@@ -5828,12 +5859,19 @@ begin
     else
       Result := Result and
         ((JournalPhase = PhaseReady) or (JournalPhase = PhaseRolledBack));
-    if not Result then Exit;
+    if not Result then
+    begin
+      Log('pending state load rejected: recovery installer identity');
+      Exit;
+    end;
   end;
   if (JournalPhase = PhasePendingReboot) and
      ((JournalTaskName = '') or (JournalResumeInstaller = '') or
       not OriginalUserResumeCapable) then
+  begin
+    Log('pending state load rejected: recovery installer identity');
     Result := False;
+  end;
 end;
 
 function InspectJournalGenerations(const Id: String;

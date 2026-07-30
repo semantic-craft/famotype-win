@@ -732,6 +732,114 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void Installer_NeverRewritesAnExistingFrozenBridgeArtifact()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        string[] bridgeEntries = iss
+            .Split('\n')
+            .Where(line =>
+                line.StartsWith(@"Source: ""{#StagingDir}\bridge\", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.Equal(2, bridgeEntries.Length);
+        Assert.All(
+            bridgeEntries,
+            entry => Assert.Contains("onlyifdoesntexist", entry));
+    }
+
+    [Fact]
+    public void TerminalRecovery_ValidatesPayloadAgainstRecoveredJournal()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int verifyPayload = Position(iss, "procedure VerifyPayloadOrFail");
+        string body = iss[verifyPayload..Position(
+            iss,
+            "function CachedCurrentPayloadExecutionProofMatches",
+            verifyPayload)];
+
+        Assert.Contains(
+            "CompareText(ActualHash, JournalManifestHash)",
+            body);
+        Assert.Contains(
+            "Copy(JournalManifestHash, 1, 12)",
+            body);
+        Assert.Contains(
+            "Lines[I] = 'version=' + JournalAppVersion",
+            body);
+        Assert.DoesNotContain(
+            "CompareText(ActualHash, '{#ManifestHash}')",
+            body);
+        Assert.DoesNotContain(
+            "Lines[I] = 'version={#AppVersion}'",
+            body);
+    }
+
+    [Fact]
+    public void TerminalRecovery_LogsTheRejectedPendingStateStage()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int load = Position(iss, "function LoadPendingState");
+        string body = iss[load..Position(
+            iss,
+            "function InspectJournalGenerations",
+            load)];
+
+        Assert.Contains("pending state load rejected: journal", body);
+        Assert.Contains("pending state load rejected: target path", body);
+        Assert.Contains("pending state load rejected: target object", body);
+        Assert.Contains(
+            "pending state load rejected: previous target identity",
+            body);
+        Assert.Contains(
+            "pending state load rejected: recovery installer identity",
+            body);
+    }
+
+    [Fact]
+    public void TerminalRecovery_AllowsOnlyAReadyJournalToReuseTheActiveTarget()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int validate = Position(iss, "function ValidateTransactionTarget");
+        string validateBody = iss[validate..Position(
+            iss,
+            "procedure PrepareTransaction",
+            validate)];
+        int load = Position(iss, "function LoadPendingState");
+        string loadBody = iss[load..Position(
+            iss,
+            "function InspectJournalGenerations",
+            load)];
+        int prepare = Position(iss, "procedure PrepareTransaction");
+        string prepareBody = iss[prepare..Position(
+            iss,
+            "procedure CheckDowngradePolicy",
+            prepare)];
+
+        Assert.Contains("AllowCurrentActiveTarget: Boolean", validateBody);
+        Assert.Contains(
+            "(not AllowCurrentActiveTarget) and",
+            validateBody);
+        Assert.Contains(
+            "JournalPhase = PhaseReady, NormalizedTarget",
+            loadBody);
+        Assert.Contains("False, ValidatedTarget", prepareBody);
+    }
+
+    [Fact]
+    public void RuntimeOnlySmoke_WaitsForTheInstallerButNotItsRuntimeDescendant()
+    {
+        string smoke = InstallerText("smoke-harness.ps1");
+        int arguments = Position(smoke, "$arguments = @(");
+        string install = smoke[arguments..Position(
+            smoke,
+            "if ($RequireRuntimeOnly)",
+            arguments)];
+
+        Assert.Contains("$install.WaitForExit()", install);
+        Assert.DoesNotContain("-Wait -PassThru", install);
+    }
+
+    [Fact]
     public void BuildInstaller_EmitsAndChecksOnePayloadManifest()
     {
         string script = InstallerText("build-installer.ps1");
@@ -779,8 +887,8 @@ public sealed class InstallerContractTests
         int verify = Position(iss, "procedure VerifyPayloadOrFail");
         string body = iss[verify..Position(iss, "function RunRegSvr32", verify)];
 
-        Assert.Contains("CompareText(ActualHash, '{#ManifestHash}')", body);
         Assert.Contains("CompareText(ActualHash, JournalManifestHash)", body);
+        Assert.DoesNotContain("CompareText(ActualHash, '{#ManifestHash}')", body);
         Assert.Contains("payload manifest full hash mismatch", body);
         Assert.Contains("ParseFileEntryDetailed", body);
         Assert.Contains("TryGetFileSize64", body);
@@ -1120,6 +1228,31 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void InnoSetup_ReprojectsActivatingStateAfterDurableUserStateBeforeRuntimeStart()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int install = Position(iss, "procedure InstallUserState");
+        string installBody =
+            iss[install..Position(iss, "procedure PersistUserCleanupDebtBeforeReady", install)];
+
+        int durableUserState = Position(
+            installBody,
+            "TransitionTransactionPhase(PhaseUserStateApplied);");
+        int activatingProjection = Position(
+            installBody,
+            "WriteActiveRegistry(TransactionTarget, 'Activating');",
+            durableUserState);
+        int startRuntime = Position(
+            installBody,
+            "StartRuntimeAsOriginalUser;",
+            activatingProjection);
+
+        Assert.True(
+            durableUserState < activatingProjection &&
+            activatingProjection < startRuntime);
+    }
+
+    [Fact]
     public void RuntimeUpgrade_WaitsForExactPredecessorExitBeforeStartingReplacement()
     {
         string iss = InstallerText("famo-setup.iss");
@@ -1144,6 +1277,27 @@ public sealed class InstallerContractTests
         int detectLoaded = Position(
             iss, "LoadedHostDetected := DetectLoadedPreviousHost", stopCall);
         Assert.True(stopCall < detectLoaded);
+    }
+
+    [Fact]
+    public void RebootResume_StopsLoginRacePredecessorBeforeStartingReplacement()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int complete = Position(iss, "procedure CompletePendingTransaction");
+        string body = iss[complete..Position(
+            iss, "function ValidatePendingTransaction", complete)];
+
+        int validate = Position(
+            body, "ValidatePreviousPayloadForExecution");
+        int stop = Position(
+            body, "StopRuntimeAsOriginalUser(PreviousServer)", validate);
+        int activate = Position(
+            body, "TransitionTransactionPhase(PhaseActivateIntent)", stop);
+
+        Assert.True(validate < stop && stop < activate);
+        Assert.Contains(
+            "previous runtime did not exit before pending activation",
+            body);
     }
 
     [Fact]
@@ -1681,6 +1835,24 @@ public sealed class InstallerContractTests
         Assert.Contains("loaded", selfcheck);
         Assert.Contains("if (!ProfileActive())", tool);
         Assert.Contains("return S_OK;", tool);
+    }
+
+    [Fact]
+    public void NativeProfileTool_BindsExactUserWorkToTheInteractiveDesktop()
+    {
+        string tool = RepoText(
+            "native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
+        int runAsDesktopUser = Position(tool, "HRESULT RunAsDesktopUser");
+        string body = tool[runAsDesktopUser..Position(
+            tool, "HRESULT StartRuntimeAsDesktopUser", runAsDesktopUser)];
+
+        int startup = Position(body, "STARTUPINFOW startup");
+        int desktop = Position(
+            body, "startup.lpDesktop = interactive_desktop", startup);
+        int create = Position(body, "CreateProcessWithTokenW", desktop);
+
+        Assert.True(startup < desktop && desktop < create);
+        Assert.Contains("L\"winsta0\\\\default\"", body);
     }
 
     [Fact]

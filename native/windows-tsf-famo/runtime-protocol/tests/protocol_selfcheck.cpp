@@ -24,6 +24,21 @@ int main() {
   CHECK(!InstallTargetAllowed(L"PendingReboot", L"C:\\Famo\\v2", L"C:\\Famo\\v2",
                               true));
   CHECK(!InstallTargetAllowed(L"Ready", L"C:\\Famo\\v1", L"C:\\Famo\\v2"));
+  CHECK(ActiveRuntimeProjectionAllowed(
+      L"Ready", L"C:\\Program Files\\Famo\\versions\\v2\\",
+      L"c:\\program files\\famo\\versions\\v2\\FamoRuntime.exe"));
+  CHECK(ActiveRuntimeProjectionAllowed(
+      L"Activating", L"C:\\Famo\\versions\\v3",
+      L"C:\\Famo\\versions\\v3\\FamoRuntime.exe", true));
+  CHECK(!ActiveRuntimeProjectionAllowed(
+      L"Activating", L"C:\\Famo\\versions\\v3",
+      L"C:\\Famo\\versions\\v3\\FamoRuntime.exe"));
+  CHECK(!ActiveRuntimeProjectionAllowed(
+      L"Ready", L"C:\\Famo\\versions\\v3",
+      L"C:\\Famo\\bridge\\v2\\FamoRuntime.exe"));
+  CHECK(!ActiveRuntimeProjectionAllowed(
+      L"Ready", L"C:\\Famo\\versions\\v3",
+      L"C:\\Famo\\versions\\v3\\OtherRuntime.exe"));
 
   std::string error;
   std::vector<uint8_t> payload;

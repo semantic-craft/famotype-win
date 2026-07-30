@@ -17,6 +17,13 @@ public sealed class StableBridgeArchitectureContractTests
         Assert.Contains("'protocol_max'", script);
         Assert.Contains("/DBridgeAbi=$bridgeAbi", script);
         Assert.Contains("/DBridgeHash=$bridgeHash", script);
+        Assert.Contains(
+            "text-service\\build-bridge-v2-artifact",
+            script);
+
+        string installer = RepoText(
+            "native/windows-tsf-famo/installer/famo-setup.iss");
+        Assert.Contains("#define BridgeAbi \"2\"", installer);
 
         int runtimeFiles = Position(script, "$runtimeFiles = @(");
         int runtimeFilesEnd = Position(script, ")", runtimeFiles);
