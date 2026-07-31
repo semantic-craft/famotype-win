@@ -64,9 +64,13 @@ public sealed class AiChatClient
             throw new InvalidOperationException("选中文本过长，已取消任意提问。");
         }
         _client.EnsureReady();
+        string searchBackend = WebSearchBackends.Normalize(_settings.Ai.WebSearchBackend);
+        bool useQwenNativeSearch = _settings.Ai.AskWebSearchEnabled
+            && searchBackend == WebSearchBackends.Qwen;
         WebSearchGrounding? grounding = _settings.Ai.AskWebSearchEnabled
+            && !useQwenNativeSearch
             ? await _webSearch.SearchAsync(
-                _settings.Ai.WebSearchBackend, prompt, cancellationToken)
+                searchBackend, prompt, cancellationToken)
             : null;
 
         var messages = new List<AiProviderChatMessage>
@@ -92,8 +96,16 @@ public sealed class AiChatClient
         }
         messages.Add(new AiProviderChatMessage("user", prompt.Trim()));
 
-        AiProviderChatCompletionResult response = await _client.SendAsync(messages, cancellationToken);
+        AiProviderChatCompletionResult response = await _client.SendAsync(
+            messages,
+            cancellationToken,
+            useNativeWebSearch: useQwenNativeSearch);
         return new AiChatResult(
-            response.Text, response.ProviderId, response.Model, grounding?.Provider);
+            response.Text,
+            response.ProviderId,
+            response.Model,
+            useQwenNativeSearch
+                ? WebSearchBackends.DisplayName(WebSearchBackends.Qwen)
+                : grounding?.Provider);
     }
 }

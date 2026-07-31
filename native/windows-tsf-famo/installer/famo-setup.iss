@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.4"
+  #define AppVersion  "1.5.9"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -13,6 +13,18 @@
 #endif
 #ifndef Identity
   #define Identity "Stable"
+#endif
+#ifndef BridgeAbi
+  #define BridgeAbi "3"
+#endif
+#ifndef BridgeHash
+  #define BridgeHash "0000000000000000000000000000000000000000000000000000000000000000"
+#endif
+#ifndef BridgeProtocolMin
+  #define BridgeProtocolMin "2"
+#endif
+#ifndef BridgeProtocolMax
+  #define BridgeProtocolMax "2"
 #endif
 #define AppPublisher  "Famo"
 #define StagingDir    "staging"
@@ -37,6 +49,7 @@ PrivilegesRequired=admin
 SetupMutex=FamoInstallerTransactionV2,Global\FamoInstallerTransactionV2
 CloseApplications=no
 RestartApplications=no
+SetupLogging=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 LicenseFile={#StagingDir}\payload\licenses\LICENSE
@@ -46,6 +59,10 @@ UninstallDisplayIcon={code:GetActiveSettings}
 [Languages]
 Name: "zh"; MessagesFile: "compiler:Default.isl"
 
+[Messages]
+FinishedRestartLabel=法墨的新版本文件已经安装，但旧输入法模块仍被 Windows 占用。必须重新启动电脑才能完成切换并显示新输入法。是否现在重启？
+FinishedRestartMessage=法墨的新版本文件已经安装，但旧输入法模块仍被 Windows 占用。必须重新启动电脑才能完成切换并显示新输入法。%n%n是否现在重启？
+
 [Files]
 ; Every repair extracts a complete payload to a fresh immutable transaction target.
 Source: "{#StagingDir}\payload\*"; DestDir: "{code:GetTransactionTarget}"; Flags: recursesubdirs createallsubdirs ignoreversion uninsrestartdelete; Check: ShouldInstallPayload
@@ -53,6 +70,10 @@ Source: "{#StagingDir}\payload\*"; DestDir: "{code:GetTransactionTarget}"; Flags
 ; authenticate to the elevated transaction coordinator.
 Source: "{#StagingDir}\payload\FamoProfileTool.exe"; Flags: dontcopy noencryption; DestName: "FamoIdentityBroker.exe"
 Source: "{#StagingDir}\payload\payload-manifest.txt"; Flags: dontcopy noencryption; DestName: "FamoEmbeddedManifest.txt"
+; The TSF DLL is an independent, frozen artifact. Routine Runtime upgrades
+; leave this path and its bytes untouched.
+Source: "{#StagingDir}\bridge\FamoTextService.dll"; DestDir: "{code:GetBridgeDirectory}"; Flags: ignoreversion onlyifdoesntexist uninsrestartdelete; Check: ShouldInstallBridge
+Source: "{#StagingDir}\bridge\bridge-manifest.txt"; DestDir: "{code:GetBridgeDirectory}"; Flags: ignoreversion onlyifdoesntexist; Check: ShouldInstallBridge
 
 [Icons]
 Name: "{autoprograms}\法墨设置"; Filename: "{code:GetActiveSettings}"; IconFilename: "{code:GetActiveSettings}"; Check: ShouldInstallPayload
@@ -182,6 +203,9 @@ var
   PreviousDefault: String;
   PreviousState: String;
   PreviousHost: String;
+  PreviousBridgePath: String;
+  PreviousBridgeHash: String;
+  PreviousBridgeAbi: String;
   PreviousServer: String;
   PreviousProfileTool: String;
   PreviousVersion: String;
@@ -220,6 +244,12 @@ var
   LoadedHostHash: String;
   LoadedHostVersion: String;
   LoadedHostExpectedHash: String;
+  CurrentPayloadProofValid: Boolean;
+  CurrentPayloadProofFinalTarget: String;
+  CurrentPayloadProofObjectId: String;
+  CurrentPayloadProofManifestFinalPath: String;
+  CurrentPayloadProofManifestObjectId: String;
+  CurrentPayloadProofManifestHash: String;
   ResumeMode: Boolean;
   RollbackMode: Boolean;
   PendingTerminal: Boolean;
@@ -233,6 +263,7 @@ var
   UninstallRestartPending: Boolean;
   UninstallDeleteArmed: Boolean;
   UninstallOwner: String;
+  TerminalRecoveryTargetDeleteBlocked: Boolean;
   EarlyTransactionMutex: THandle;
 
 function GetFileAttributesW(FileName: String): Cardinal;
@@ -347,6 +378,12 @@ begin
 end;
 
 function FixedInstallRoot: String; forward;
+function FixedBridgeDirectory: String; forward;
+function FixedBridgeDll: String; forward;
+function TransactionChangedBridge: Boolean; forward;
+function PathIsNonReparseOrMissing(const Path: String): Boolean; forward;
+function TryParseManagedStableBridgePath(
+  const Path: String; var BridgeAbi: Integer): Boolean; forward;
 
 function EnsureTransactionTarget: String;
 begin
@@ -366,6 +403,16 @@ end;
 function ShouldInstallPayload: Boolean;
 begin
   Result := not RollbackMode;
+end;
+
+function GetBridgeDirectory(Param: String): String;
+begin
+  Result := FixedBridgeDirectory;
+end;
+
+function ShouldInstallBridge: Boolean;
+begin
+  Result := not RollbackMode and TransactionChangedBridge;
 end;
 
 function ReadActiveTarget: String;
@@ -480,7 +527,7 @@ begin
     Kind := 'runtime';
     if Parameters = '' then Operation := 'start'
     else if Parameters = '--control shutdown' then Operation := 'shutdown'
-    else if Parameters = '/quit' then Operation := 'quit'
+    else if Parameters = '/q' then Operation := 'quit'
     else if Parameters = '--control deploy' then Operation := 'deploy'
     else if Parameters = '--control reload-options' then
       Operation := 'reload-options';
@@ -498,8 +545,10 @@ var
   Broker, BrokerParameters: String;
 begin
   Result := -1;
-  if not ValidateCurrentPayloadForExecution or
-     not ValidateManagedExecutableForExecution(FileName) then
+  { ValidateManagedExecutableForExecution proves the complete current payload
+    for every supported desktop executable, including the embedded broker.
+    Calling the full proof separately here doubled every 641-file scan. }
+  if not ValidateManagedExecutableForExecution(FileName) then
     Exit;
   if not BuildBoundDesktopParameters(FileName, Parameters, WaitForExit,
        Broker, BrokerParameters) then
@@ -554,7 +603,10 @@ end;
 
 function RegisterTarget(const Target: String): Boolean;
 begin
-  Result := RunAndRequire(ProfileTool(Target), 'register-machine', False) and
+  Result := FileExists(FixedBridgeDll) and
+    (CompareText(GetSHA256OfFile(FixedBridgeDll), '{#BridgeHash}') = 0) and
+    RunAndRequire(ProfileTool(Target),
+      'register-machine-at ' + AddQuotes(FixedBridgeDll), False) and
     RunAndRequire(ProfileTool(Target), 'check-machine', False);
 end;
 
@@ -565,8 +617,7 @@ begin
   Result := RegQueryStringValue(HKLM64,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '',
     RegisteredDll) and
-    (CompareText(RegisteredDll,
-      AddBackslash(Target) + 'FamoTextService.dll') = 0);
+    (CompareText(RegisteredDll, FixedBridgeDll) = 0);
 end;
 
 function UnregisterTarget(const Target: String): Boolean;
@@ -577,7 +628,8 @@ begin
     Exit;
   end;
   Result := FileExists(ProfileTool(Target)) and
-    RunAndRequire(ProfileTool(Target), 'unregister-machine', False) and
+    RunAndRequire(ProfileTool(Target),
+      'unregister-machine-at ' + AddQuotes(FixedBridgeDll), False) and
     not MachineComPointsToTarget(Target);
 end;
 
@@ -585,7 +637,8 @@ function UnregisterMachineTarget(const Target: String): Boolean;
 begin
   Result := True;
   if FileExists(ProfileTool(Target)) then
-    Result := RunAndRequire(ProfileTool(Target), 'unregister-machine', False);
+    Result := RunAndRequire(ProfileTool(Target),
+      'unregister-machine-at ' + AddQuotes(FixedBridgeDll), False);
 end;
 
 procedure WriteOrDelete(const Name, Value: String);
@@ -622,6 +675,13 @@ begin
   RegWriteStringValue(HKLM64, BrandKey, 'ServerExecutable', AddBackslash(Target) + 'FamoRuntime.exe');
   RegWriteStringValue(HKLM64, BrandKey, 'ProfileTool', ProfileTool(Target));
   RegWriteStringValue(HKLM64, BrandKey, 'ActiveManifest', AddBackslash(Target) + 'payload-manifest.txt');
+  RegWriteStringValue(HKLM64, BrandKey, 'BridgePath', FixedBridgeDll);
+  RegWriteStringValue(HKLM64, BrandKey, 'BridgeHash', '{#BridgeHash}');
+  RegWriteStringValue(HKLM64, BrandKey, 'BridgeAbi', '{#BridgeAbi}');
+  RegWriteStringValue(HKLM64, BrandKey, 'BridgeProtocolMin',
+    '{#BridgeProtocolMin}');
+  RegWriteStringValue(HKLM64, BrandKey, 'BridgeProtocolMax',
+    '{#BridgeProtocolMax}');
   RegWriteStringValue(HKLM64, BrandKey, 'ActiveVersion', '{#AppVersion}');
   RegWriteStringValue(HKLM64, BrandKey, 'Identity', '{#Identity}');
   RegWriteStringValue(HKLM64, BrandKey, 'TransactionId', TransactionId);
@@ -632,6 +692,8 @@ begin
 end;
 
 procedure RestorePreviousRegistry;
+var
+  PreviousManagedBridgeAbi: Integer;
 begin
   if PreviousTarget <> '' then
   begin
@@ -663,6 +725,33 @@ begin
     WriteOrDelete('PreviousTarget', PriorPreviousTarget);
     RegWriteStringValue(HKLM64, BrandKey, 'PreviousDefault', PreviousDefault);
   end;
+  if TryParseManagedStableBridgePath(
+       PreviousHost, PreviousManagedBridgeAbi) then
+  begin
+    RegWriteStringValue(HKLM64, BrandKey, 'BridgePath', PreviousHost);
+    RegWriteStringValue(HKLM64, BrandKey, 'BridgeHash',
+      LoadedHostExpectedHash);
+    RegWriteStringValue(HKLM64, BrandKey, 'BridgeAbi',
+      IntToStr(PreviousManagedBridgeAbi));
+  end
+  else
+  begin
+    RegDeleteValue(HKLM64, BrandKey, 'BridgePath');
+    RegDeleteValue(HKLM64, BrandKey, 'BridgeHash');
+    RegDeleteValue(HKLM64, BrandKey, 'BridgeAbi');
+  end;
+  if CompareText(PreviousHost, FixedBridgeDll) = 0 then
+  begin
+    RegWriteStringValue(HKLM64, BrandKey, 'BridgeProtocolMin',
+      '{#BridgeProtocolMin}');
+    RegWriteStringValue(HKLM64, BrandKey, 'BridgeProtocolMax',
+      '{#BridgeProtocolMax}');
+  end
+  else
+  begin
+    RegDeleteValue(HKLM64, BrandKey, 'BridgeProtocolMin');
+    RegDeleteValue(HKLM64, BrandKey, 'BridgeProtocolMax');
+  end;
   if (PreviousDefault <> '') and (OriginalUserSid <> '') then
     RegWriteStringValue(HKU, OriginalUserSid + '\Keyboard Layout\Preload',
       '1', PreviousDefault);
@@ -677,6 +766,38 @@ end;
 function FixedInstallRoot: String;
 begin
   Result := NormalizeDirectoryPath(ExpandConstant('{autopf}\Famo'));
+end;
+
+function FixedBridgeDirectory: String;
+begin
+  Result := AddBackslash(FixedInstallRoot) + 'bridge\v{#BridgeAbi}';
+end;
+
+function FixedBridgeDll: String;
+begin
+  Result := AddBackslash(FixedBridgeDirectory) + 'FamoTextService.dll';
+end;
+
+procedure VerifyFrozenBridgePreflight;
+var
+  ExistingHash: String;
+begin
+  if not FileExists(FixedBridgeDll) then Exit;
+  ExistingHash := Uppercase(GetSHA256OfFile(FixedBridgeDll));
+  if CompareText(ExistingHash, '{#BridgeHash}') <> 0 then
+  begin
+    Log('frozen Bridge conflict: path=' + FixedBridgeDll +
+      '; expectedHash={#BridgeHash}; actualHash=' + ExistingHash);
+    RaiseException(
+      'frozen Bridge v{#BridgeAbi} already exists with a different hash');
+  end;
+end;
+
+function TransactionChangedBridge: Boolean;
+begin
+  Result :=
+    (CompareText(PreviousHost, FixedBridgeDll) <> 0) or
+    (CompareText(LoadedHostHash, '{#BridgeHash}') <> 0);
 end;
 
 function TryGetPathAttributes(const Path: String; var Exists: Boolean;
@@ -886,10 +1007,49 @@ begin
   end;
 end;
 
+function TryParseManagedStableBridgePath(
+  const Path: String; var BridgeAbi: Integer): Boolean;
+var
+  BridgeRoot, BridgeDirectory, AbiLeaf, AbiText,
+    RootFinalPath, RootObjectId, DirectoryFinalPath, DirectoryObjectId,
+    HostFinalPath, HostObjectId: String;
+begin
+  Result := False;
+  BridgeAbi := 0;
+  if (Path = '') or
+     (CompareText(ExtractFileName(Path), 'FamoTextService.dll') <> 0) then
+    Exit;
+  BridgeRoot :=
+    NormalizeDirectoryPath(AddBackslash(FixedInstallRoot) + 'bridge');
+  BridgeDirectory := NormalizeDirectoryPath(ExtractFileDir(Path));
+  AbiLeaf := ExtractFileName(BridgeDirectory);
+  if (Length(AbiLeaf) < 2) or
+     ((AbiLeaf[1] <> 'v') and (AbiLeaf[1] <> 'V')) then
+    Exit;
+  AbiText := Copy(AbiLeaf, 2, Length(AbiLeaf));
+  BridgeAbi := StrToIntDef(AbiText, 0);
+  if (BridgeAbi <= 0) or (AbiText <> IntToStr(BridgeAbi)) or
+     not PathSame(ExtractFileDir(BridgeDirectory), BridgeRoot) or
+     not PathIsNonReparseOrMissing(BridgeRoot) or
+     not PathIsNonReparseOrMissing(BridgeDirectory) or
+     not PathIsNonReparseOrMissing(Path) or
+     not TryGetFinalObjectInfo(BridgeRoot, RootFinalPath, RootObjectId) or
+     not TryGetFinalObjectInfo(
+       BridgeDirectory, DirectoryFinalPath, DirectoryObjectId) or
+     not TryGetFinalObjectInfo(Path, HostFinalPath, HostObjectId) or
+     not PathSame(ExtractFileDir(DirectoryFinalPath), RootFinalPath) or
+     not PathSame(ExtractFileDir(HostFinalPath), DirectoryFinalPath) then
+  begin
+    BridgeAbi := 0;
+    Exit;
+  end;
+  Result := True;
+end;
+
 procedure ReadPreviousHostMetadata;
 var
   Lines: TArrayOfString;
-  I: Integer;
+  I, ManagedBridgeAbi: Integer;
   RelativePath, ExpectedHash: String;
 begin
   LoadedHostHash := '';
@@ -905,13 +1065,23 @@ begin
   if (PreviousManifest <> '') and FileExists(PreviousManifest) then
   begin
     PreviousManifestHash := Uppercase(GetSHA256OfFile(PreviousManifest));
+    ManagedBridgeAbi := 0;
+    if CompareText(PreviousHost, FixedBridgeDll) = 0 then
+      LoadedHostExpectedHash := Uppercase('{#BridgeHash}')
+    else if TryParseManagedStableBridgePath(
+              PreviousHost, ManagedBridgeAbi) and
+            (CompareText(PreviousBridgePath, PreviousHost) = 0) and
+            (PreviousBridgeAbi = IntToStr(ManagedBridgeAbi)) and
+            IsSha256Hex(PreviousBridgeHash) then
+      LoadedHostExpectedHash := Uppercase(PreviousBridgeHash);
     if not LoadStringsFromFile(PreviousManifest, Lines) then
       RaiseException('previous payload manifest unreadable');
     for I := 0 to GetArrayLength(Lines) - 1 do
     begin
       if (PreviousVersion = '') and (Pos('version=', Lines[I]) = 1) then
         PreviousVersion := Copy(Lines[I], 9, Length(Lines[I]));
-      if (Pos('file=', Lines[I]) = 1) and
+      if (LoadedHostExpectedHash = '') and
+         (Pos('file=', Lines[I]) = 1) and
          ParseFileEntry(Lines[I], RelativePath, ExpectedHash) and
          (CompareText(RelativePath, 'FamoTextService.dll') = 0) then
         LoadedHostExpectedHash := Uppercase(ExpectedHash);
@@ -920,6 +1090,23 @@ begin
        (CompareText(LoadedHostHash, LoadedHostExpectedHash) <> 0) then
       RaiseException('previous loaded-host path/hash/version does not match its manifest');
   end;
+end;
+
+function PreviousBridgeSnapshotValid: Boolean;
+var
+  ManagedBridgeAbi: Integer;
+begin
+  Result :=
+    (PreviousHost <> '') and
+    FileExists(PreviousHost) and
+    IsSha256Hex(LoadedHostHash) and
+    IsSha256Hex(LoadedHostExpectedHash) and
+    (CompareText(LoadedHostHash, LoadedHostExpectedHash) = 0) and
+    (TryParseManagedStableBridgePath(
+        PreviousHost, ManagedBridgeAbi) or
+     ((CompareText(PreviousHost,
+        AddBackslash(PreviousTarget) + 'FamoTextService.dll') = 0) and
+      (CompareText(PreviousHost, FixedBridgeDll) <> 0)));
 end;
 
 function ValidatePreviousV2Transaction(const Id, Target,
@@ -961,14 +1148,13 @@ begin
     (PreviousState = StateReady) and
     (CompareText(PreviousManifest,
       AddBackslash(PreviousTarget) + 'payload-manifest.txt') = 0) and
-    (CompareText(PreviousHost,
-      AddBackslash(PreviousTarget) + 'FamoTextService.dll') = 0) and
+    PreviousBridgeSnapshotValid and
     (CompareText(PreviousProfileTool,
       AddBackslash(PreviousTarget) + 'FamoProfileTool.exe') = 0) and
     (CompareText(PreviousServer,
       AddBackslash(PreviousTarget) + 'FamoRuntime.exe') = 0) and
     IsSha256Hex(PreviousManifestHash) and
-    FileExists(PreviousManifest) and FileExists(PreviousHost) and
+    FileExists(PreviousManifest) and
     FileExists(PreviousProfileTool) and FileExists(PreviousServer) and
     TryGetFinalObjectInfo(VersionsRoot, VersionsFinalPath,
       VersionsObjectId) and
@@ -996,6 +1182,9 @@ begin
   PreviousDefault := '';
   PreviousState := '';
   PreviousHost := '';
+  PreviousBridgePath := '';
+  PreviousBridgeHash := '';
+  PreviousBridgeAbi := '';
   PreviousServer := '';
   PreviousProfileTool := '';
   PreviousVersion := '';
@@ -1017,6 +1206,9 @@ begin
     PreviousCompatibilityTransactionId);
   RegQueryStringValue(HKLM64, BrandKey, 'ServerExecutable', PreviousServer);
   RegQueryStringValue(HKLM64, BrandKey, 'ProfileTool', PreviousProfileTool);
+  RegQueryStringValue(HKLM64, BrandKey, 'BridgePath', PreviousBridgePath);
+  RegQueryStringValue(HKLM64, BrandKey, 'BridgeHash', PreviousBridgeHash);
+  RegQueryStringValue(HKLM64, BrandKey, 'BridgeAbi', PreviousBridgeAbi);
   RegQueryStringValue(HKLM64, BrandKey, 'ActiveVersion', PreviousVersion);
   RegQueryStringValue(HKLM64, BrandKey, 'Identity', PreviousIdentity);
   { Elevated lifecycle code must only consume machine-scoped registration.
@@ -1158,10 +1350,10 @@ begin
   Manifest := AddBackslash(EnsureTransactionTarget) + 'payload-manifest.txt';
   if not FileExists(Manifest) then RaiseException('payload manifest missing');
   ActualHash := Uppercase(GetSHA256OfFile(Manifest));
-  if (CompareText(ActualHash, '{#ManifestHash}') <> 0) or
-     (CompareText(ActualHash, JournalManifestHash) <> 0) then
+  if CompareText(ActualHash, JournalManifestHash) <> 0 then
     RaiseException('payload manifest full hash mismatch');
-  if CompareText(Copy(ActualHash, 1, 12), '{#ManifestPrefix}') <> 0 then
+  if CompareText(Copy(ActualHash, 1, 12),
+       Copy(JournalManifestHash, 1, 12)) <> 0 then
     RaiseException('payload manifest identity mismatch');
   if not LoadStringsFromFile(Manifest, Lines) then RaiseException('payload manifest unreadable');
 
@@ -1193,7 +1385,8 @@ begin
     begin
       HasFormat := HasFormat or (Lines[I] = 'format=1');
       HasProduct := HasProduct or (Lines[I] = 'product=Famo');
-      HasVersion := HasVersion or (Lines[I] = 'version={#AppVersion}');
+      HasVersion := HasVersion or
+        (Lines[I] = 'version=' + JournalAppVersion);
       HasProtocol := HasProtocol or (Lines[I] = 'protocol=1');
       HasArch := HasArch or (Lines[I] = 'architecture=x64');
       HasIdentity := HasIdentity or (Lines[I] = 'identity={#Identity}');
@@ -1246,19 +1439,75 @@ begin
   end;
 end;
 
+function CachedCurrentPayloadExecutionProofMatches: Boolean;
+var
+  TargetFinalPath, TargetObjectId, Manifest, ManifestFinalPath,
+    ManifestObjectId: String;
+begin
+  { Cache only within this elevated Setup process. The target inherits the
+    Program Files ACL, while every desktop child runs with the original
+    non-elevated token. Re-pin the target and manifest objects on every use,
+    and invalidate the cache before any target deletion. }
+  Result := False;
+  Manifest := AddBackslash(TransactionTarget) + 'payload-manifest.txt';
+  if not CurrentPayloadProofValid or
+     (CompareText(CurrentPayloadProofManifestHash,
+       JournalManifestHash) <> 0) or
+     not FinalObjectsSame(CurrentPayloadProofFinalTarget,
+       CurrentPayloadProofObjectId, JournalPendingFinalTarget,
+       JournalPendingObjectId) or
+     not TryGetFinalObjectInfo(TransactionTarget, TargetFinalPath,
+       TargetObjectId) or
+     not TryGetFinalObjectInfo(Manifest, ManifestFinalPath,
+       ManifestObjectId) then
+    Exit;
+  Result :=
+    FinalObjectsSame(TargetFinalPath, TargetObjectId,
+      CurrentPayloadProofFinalTarget, CurrentPayloadProofObjectId) and
+    FinalObjectsSame(ManifestFinalPath, ManifestObjectId,
+      CurrentPayloadProofManifestFinalPath,
+      CurrentPayloadProofManifestObjectId) and
+    PathSame(ExtractFileDir(ManifestFinalPath), TargetFinalPath) and
+    (CompareText(GetSHA256OfFile(Manifest), JournalManifestHash) = 0);
+end;
+
 function ValidateCurrentPayloadForExecution: Boolean;
 var
-  PinnedFinalTarget, PinnedObjectId: String;
+  PinnedFinalTarget, PinnedObjectId, Manifest, ManifestFinalPath,
+    ManifestObjectId: String;
 begin
   Result := False;
   PinnedFinalTarget := JournalPendingFinalTarget;
   PinnedObjectId := JournalPendingObjectId;
   if (PinnedFinalTarget = '') or (PinnedObjectId = '') then Exit;
+  if CachedCurrentPayloadExecutionProofMatches then
+  begin
+    Result := True;
+    Exit;
+  end;
+  CurrentPayloadProofValid := False;
   try
     try
       VerifyPayloadOrFail;
       Result := FinalObjectsSame(JournalPendingFinalTarget,
         JournalPendingObjectId, PinnedFinalTarget, PinnedObjectId);
+      Manifest := AddBackslash(TransactionTarget) +
+        'payload-manifest.txt';
+      if Result and
+         TryGetFinalObjectInfo(Manifest, ManifestFinalPath,
+           ManifestObjectId) and
+         PathSame(ExtractFileDir(ManifestFinalPath),
+           JournalPendingFinalTarget) then
+      begin
+        CurrentPayloadProofFinalTarget := PinnedFinalTarget;
+        CurrentPayloadProofObjectId := PinnedObjectId;
+        CurrentPayloadProofManifestFinalPath := ManifestFinalPath;
+        CurrentPayloadProofManifestObjectId := ManifestObjectId;
+        CurrentPayloadProofManifestHash := JournalManifestHash;
+        CurrentPayloadProofValid := True;
+      end
+      else
+        Result := False;
     except
       Log('current payload execution proof failed: ' + GetExceptionMessage);
       Result := False;
@@ -1301,8 +1550,9 @@ begin
     Result := False;
     Exit;
   end;
-  if (PreviousProfileTool <> '') and FileExists(PreviousProfileTool) then
-    if RunAndRequire(PreviousProfileTool, 'unregister-machine', False) then
+  if FileExists(ProfileTool(TransactionTarget)) then
+    if RunAndRequire(ProfileTool(TransactionTarget),
+         'unregister-machine-at ' + AddQuotes(PreviousHost), False) then
     begin
       Result := True;
       Exit;
@@ -1322,8 +1572,9 @@ begin
     Result := False;
     Exit;
   end;
-  if (PreviousProfileTool <> '') and FileExists(PreviousProfileTool) then
-    if RunAndRequire(PreviousProfileTool, 'register-machine', False) then
+  if FileExists(ProfileTool(TransactionTarget)) then
+    if RunAndRequire(ProfileTool(TransactionTarget),
+         'register-machine-at ' + AddQuotes(PreviousHost), False) then
     begin
       Result := True;
       Exit;
@@ -1400,6 +1651,43 @@ begin
   Result := True;
 end;
 
+function ValidateProtectedFile(const Parent, ChildName: String): Boolean;
+var
+  NormalizedParent, Child, ParentFinalPath, ParentObjectId,
+    ChildFinalPath, ChildObjectId: String;
+  ParentAttributes, ChildAttributes: Cardinal;
+  ParentExists, ChildExists: Boolean;
+begin
+  Result := False;
+  NormalizedParent := NormalizeDirectoryPath(Parent);
+  Child := NormalizeDirectoryPath(AddBackslash(NormalizedParent) + ChildName);
+  if not PathSame(ExtractFileDir(Child), NormalizedParent) or
+     not TryGetPathAttributes(NormalizedParent, ParentExists,
+       ParentAttributes) or
+     not TryGetPathAttributes(Child, ChildExists, ChildAttributes) or
+     not PathIsNonReparseOrMissing(NormalizedParent) or
+     not PathIsNonReparseOrMissing(Child) then
+    Exit;
+  if not ParentExists then
+  begin
+    Result := not ChildExists;
+    Exit;
+  end;
+  if ((ParentAttributes and FileAttributeDirectory) = 0) or
+     not TryGetFinalObjectInfo(NormalizedParent, ParentFinalPath,
+       ParentObjectId) then
+    Exit;
+  if ChildExists then
+  begin
+    if ((ChildAttributes and
+         (FileAttributeDirectory or FileAttributeReparsePoint)) <> 0) or
+       not TryGetFinalObjectInfo(Child, ChildFinalPath, ChildObjectId) or
+       not PathSame(ExtractFileDir(ChildFinalPath), ParentFinalPath) then
+      Exit;
+  end;
+  Result := True;
+end;
+
 procedure RequireFixedProtectedInstallRoot;
 var
   AppRoot, ProgramFilesRoot, DriveRoot, ProgramFilesFinalPath,
@@ -1426,7 +1714,10 @@ begin
       not PathSame(ExtractFileDir(AppFinalPath), ProgramFilesFinalPath)) then
     RaiseException('protected install root identity mismatch');
   if not ValidateProtectedChild(AppRoot, 'pending') or
-     not ValidateProtectedChild(AppRoot, 'versions') then
+     not ValidateProtectedChild(AppRoot, 'versions') or
+     not ValidateProtectedChild(AppRoot, 'bridge') or
+     not ValidateProtectedChild(AddBackslash(AppRoot) + 'bridge',
+       'v{#BridgeAbi}') then
     RaiseException('protected transaction roots are unsafe');
 end;
 
@@ -2971,6 +3262,27 @@ begin
     (CompareText(Journal.ManifestHash, '{#ManifestHash}') = 0);
 end;
 
+function IsVersionNotNewerThanInstaller(const Value: String): Boolean;
+var
+  CandidateVersion, InstallerVersion: Int64;
+begin
+  Result :=
+    StrToVersion(Value + '.0', CandidateVersion) and
+    StrToVersion('{#AppVersion}.0', InstallerVersion) and
+    (ComparePackedVersion(CandidateVersion, InstallerVersion) <= 0);
+end;
+
+function ValidateRecoverableJournalArtifact(
+  const Journal: TTransactionJournal; const ExpectedId: String): Boolean;
+begin
+  Result :=
+    ValidateCurrentJournalArtifact(Journal, ExpectedId) or
+    (ValidateJournalSemantics(Journal, ExpectedId) and
+     IsVersionNotNewerThanInstaller(Journal.Version) and
+     ((Journal.Phase = PhaseReady) or
+      (Journal.Phase = PhaseRolledBack)));
+end;
+
 function ValidatePreviousV2Transaction(const Id, Target,
   Manifest: String): Boolean;
 var
@@ -3023,14 +3335,13 @@ begin
     (PreviousState = StateReady) and
     (CompareText(PreviousManifest,
       AddBackslash(PreviousTarget) + 'payload-manifest.txt') = 0) and
-    (CompareText(PreviousHost,
-      AddBackslash(PreviousTarget) + 'FamoTextService.dll') = 0) and
+    PreviousBridgeSnapshotValid and
     (CompareText(PreviousProfileTool,
       AddBackslash(PreviousTarget) + 'FamoProfileTool.exe') = 0) and
     (CompareText(PreviousServer,
       AddBackslash(PreviousTarget) + 'FamoRuntime.exe') = 0) and
     IsSha256Hex(PreviousManifestHash) and
-    FileExists(PreviousManifest) and FileExists(PreviousHost) and
+    FileExists(PreviousManifest) and
     FileExists(PreviousProfileTool) and FileExists(PreviousServer) and
     TryGetFinalObjectInfo(PreviousTarget, TargetFinalPath,
       TargetObjectId) and
@@ -3128,13 +3439,12 @@ begin
     (CompareText(RegisteredDll, PreviousHost) = 0) and
     (CompareText(PreviousManifest,
       AddBackslash(PreviousTarget) + 'payload-manifest.txt') = 0) and
-    (CompareText(PreviousHost,
-      AddBackslash(PreviousTarget) + 'FamoTextService.dll') = 0) and
+    PreviousBridgeSnapshotValid and
     (CompareText(PreviousProfileTool,
       AddBackslash(PreviousTarget) + 'FamoProfileTool.exe') = 0) and
     (CompareText(PreviousServer,
       AddBackslash(PreviousTarget) + 'FamoRuntime.exe') = 0) and
-    FileExists(PreviousManifest) and FileExists(PreviousHost) and
+    FileExists(PreviousManifest) and
     FileExists(PreviousProfileTool) and FileExists(PreviousServer) and
     TryGetFinalObjectInfo(PreviousTarget, TargetFinalPath,
       TargetObjectId) and
@@ -3299,6 +3609,11 @@ begin
     Exit;
   end;
   if Journal.Phase <> PhaseRolledBack then Exit;
+  if not ValidateRecoverableJournalArtifact(Journal, ActiveId) then
+  begin
+    Result := False;
+    Exit;
+  end;
   ApplyTransactionJournal(Journal);
   RestorePreviousRegistry;
   CommitRollbackActiveProjection;
@@ -3450,16 +3765,19 @@ begin
   Key := JournalGenerationKey(ExpectedId, Generation);
   if not ReadJournalGeneration(Key, Journal) or
      (Journal.Generation <> GenerationText) or
-     not ValidateCurrentJournalArtifact(Journal, ExpectedId) then Exit;
+     not ValidateRecoverableJournalArtifact(Journal, ExpectedId) then Exit;
   ApplyTransactionJournal(Journal);
   Result := True;
 end;
 
 function ValidateTransactionTarget(const Target, ExpectedId,
-  ProtectedPreviousTarget: String; var NormalizedTarget: String): Boolean;
+  ExpectedVersion, ExpectedManifestHash, ProtectedPreviousTarget: String;
+  AllowCurrentActiveTarget: Boolean;
+  var NormalizedTarget: String): Boolean;
 var
   VersionsRoot, ExpectedLeaf, ActiveTarget, VersionsFinalPath,
-    VersionsObjectId, TargetFinalPath, TargetObjectId: String;
+    VersionsObjectId, TargetFinalPath, TargetObjectId,
+    NormalizedVersion: String;
   VersionsAttributes, TargetAttributes: Cardinal;
   VersionsExists, TargetExists: Boolean;
 begin
@@ -3469,10 +3787,15 @@ begin
      ContainsParentTraversal(Target) then
     Exit;
   try
+    if not NormalizeSafeRelativePath(ExpectedVersion, NormalizedVersion) or
+       (Pos('\', NormalizedVersion) > 0) or
+       not IsSha256Hex(ExpectedManifestHash) then
+      Exit;
     VersionsRoot := NormalizeDirectoryPath(
       AddBackslash(FixedInstallRoot) + 'versions');
     NormalizedTarget := NormalizeDirectoryPath(Target);
-    ExpectedLeaf := '{#AppVersion}-{#ManifestPrefix}-' + ExpectedId;
+    ExpectedLeaf := NormalizedVersion + '-' +
+      Copy(ExpectedManifestHash, 1, 12) + '-' + ExpectedId;
     if PathSame(NormalizedTarget, VersionsRoot) or
        not PathSame(ExtractFileDir(NormalizedTarget), VersionsRoot) or
        (CompareText(ExtractFileName(NormalizedTarget), ExpectedLeaf) <> 0) then
@@ -3502,8 +3825,9 @@ begin
         Exit;
     end;
     ActiveTarget := ReadActiveTarget;
-    if not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
-       TargetFinalPath, TargetObjectId, ActiveTarget) or
+    if ((not AllowCurrentActiveTarget) and
+        not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
+          TargetFinalPath, TargetObjectId, ActiveTarget)) or
        not ProtectedPathIsDifferent(NormalizedTarget, TargetExists,
        TargetFinalPath, TargetObjectId, ProtectedPreviousTarget) then
       Exit;
@@ -3521,7 +3845,8 @@ begin
   RequireSelectedFixedInstallRoot;
   EnsureTransactionTarget;
   if not ValidateTransactionTarget(TransactionTarget, TransactionId,
-    PreviousTarget, ValidatedTarget) then
+    '{#AppVersion}', '{#ManifestHash}', PreviousTarget,
+    False, ValidatedTarget) then
     RaiseException('unsafe transaction target refused during prepare');
   TransactionTarget := ValidatedTarget;
   CaptureOriginalUserIdentity;
@@ -3596,15 +3921,21 @@ end;
 procedure SwitchRegistration;
 begin
   TransitionTransactionPhase(PhaseActivateIntent);
-  if PreviousHost <> '' then
+  if TransactionChangedBridge and (PreviousHost <> '') then
   begin
     if not RunAndRequire(ProfileTool(TransactionTarget), 'switch-away', True) then
       RaiseException('previous profile switch-away failed');
     if not UnregisterPreviousRegistration then
       RaiseException('previous profile unregister failed');
   end;
-  if not RegisterTarget(TransactionTarget) then RaiseException('new profile registration failed');
-  RegistrationSwitched := True;
+  if TransactionChangedBridge then
+  begin
+    if not RegisterTarget(TransactionTarget) then
+      RaiseException('new profile registration failed');
+    RegistrationSwitched := True;
+  end
+  else
+    Log('stable Bridge unchanged; skipped TSF detach and registration');
   WriteActiveRegistry(TransactionTarget, 'Activating');
   TransitionTransactionPhase(PhaseMachineRegistered);
 end;
@@ -3760,7 +4091,7 @@ begin
   Result := '/FamoRecover=' + Id +
     ' /FamoManifest=' + JournalManifestHash +
     ' /FamoVersion=' + JournalAppVersion +
-    ' /VERYSILENT /SUPPRESSMSGBOXES /NORESTART';
+    ' /SILENT /SP- /NORESTART';
 end;
 
 function EnsureRecoveryTaskFolderByCom: Boolean;
@@ -4419,15 +4750,51 @@ end;
 procedure StartRuntimeAsOriginalUser;
 var
   ResultCode: Integer;
-  Broker: String;
+  Broker, ActiveState, ActiveTarget, ActiveVersion, ActiveServer: String;
 begin
   Broker := ProfileTool(TransactionTarget);
+  FlushMachineRegistryKey(BrandKey);
+  if not RegQueryStringValue(HKLM64, BrandKey, 'InstallState',
+       ActiveState) or
+     not RegQueryStringValue(HKLM64, BrandKey, 'InstallDir',
+       ActiveTarget) or
+     not RegQueryStringValue(HKLM64, BrandKey, 'ActiveVersion',
+       ActiveVersion) or
+     not RegQueryStringValue(HKLM64, BrandKey, 'ServerExecutable',
+       ActiveServer) or
+     (ActiveState <> 'Activating') or
+     (CompareText(ActiveTarget, TransactionTarget) <> 0) or
+     (CompareText(ActiveVersion, JournalAppVersion) <> 0) or
+     (CompareText(ActiveServer,
+       AddBackslash(TransactionTarget) + 'FamoRuntime.exe') <> 0) then
+  begin
+    Log('runtime activation projection mismatch: state=' + ActiveState +
+      '; target=' + ActiveTarget + '; version=' + ActiveVersion +
+      '; server=' + ActiveServer);
+    RaiseException('runtime activation projection readback failed');
+  end;
   if not ValidateCurrentPayloadForExecution or
     not Exec(Broker, 'start-runtime-for ' + OriginalUserSid, '', SW_HIDE,
     ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
     RaiseException('runtime start failed');
   RuntimeStarted := True;
   Sleep(750);
+end;
+
+function StopRuntimeAsOriginalUser(const RuntimePath: String): Boolean;
+var
+  Parameters: String;
+begin
+  Result := RuntimePath = '';
+  if Result then Exit;
+  Parameters := 'stop-runtime-for ' + OriginalUserSid + ' ' +
+    AddQuotes(RuntimePath);
+  Result := RunAndRequire(
+    ProfileTool(TransactionTarget), Parameters, False);
+  if Result then
+    Log('previous runtime stop readback succeeded: ' + RuntimePath)
+  else
+    Log('previous runtime stop readback failed: ' + RuntimePath);
 end;
 
 procedure CapturePreviousUserState;
@@ -4479,7 +4846,7 @@ begin
   if not ValidateProtectedChild(LocalAppData, 'Famo') or
      not ValidateProtectedChild(FamoDirectory, '.transactions') or
      not ValidateProtectedChild(TransactionsDirectory, TransactionId) or
-     not ValidateProtectedChild(TransactionDirectory, 'receipt.json') or
+     not ValidateProtectedFile(TransactionDirectory, 'receipt.json') or
      not TryGetPathAttributes(ReceiptPath, Exists, Attributes) or not Exists or
      ((Attributes and (FileAttributeDirectory or FileAttributeReparsePoint)) <> 0) or
      not TryGetFinalObjectInfo(ReceiptPath, BeforeFinalPath, BeforeObjectId) then
@@ -4495,7 +4862,7 @@ end;
 procedure InstallUserState;
 var
   SeedArguments, Settings: String;
-  DeployAttempt: Integer;
+  DeployAttempt, DeployExit: Integer;
   DeployOk: Boolean;
 begin
   TransitionTransactionPhase(PhaseUserStateIntent);
@@ -4518,20 +4885,31 @@ begin
   if not RunAndRequire(Settings, SeedArguments, True) then
     RaiseException('user seed transaction apply failed');
   TransitionTransactionPhase(PhaseUserStateApplied);
+  WriteActiveRegistry(TransactionTarget, 'Activating');
   StartRuntimeAsOriginalUser;
   { First launch of freshly written binaries is slow (Defender scans them on
     execute), so the runtime's control pipe may not be up 750ms after start.
     One shot here killed a real 1.4.9 install; the control client is
     idempotent, so retry briefly instead. }
   DeployOk := False;
-  for DeployAttempt := 1 to 5 do
+  for DeployAttempt := 1 to 15 do
   begin
-    if RunAndRequire(AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
-      '--control deploy', True) then
+    DeployExit := RunBoundDesktopExitCode(
+      AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
+      '--control deploy', True);
+    Log('runtime deploy attempt ' + IntToStr(DeployAttempt) +
+      ' exit=' + IntToStr(DeployExit));
+    if DeployExit = 0 then
     begin
       DeployOk := True;
       Break;
     end;
+    { A just-stopped predecessor can briefly retain the per-session singleton.
+      In that case the first new process exits cleanly and no server remains.
+      Restart before retrying the control pipe instead of polling an absent
+      process forever. }
+    if DeployAttempt < 15 then
+      StartRuntimeAsOriginalUser;
     Sleep(2000);
   end;
   if not DeployOk then
@@ -4570,6 +4948,8 @@ begin
 end;
 
 function RetryRolledBackCleanupDebt: Boolean; forward;
+function ValidateJournalBoundPartialTargetForCleanup(
+  var NormalizedTarget: String): Boolean; forward;
 
 procedure RollbackTransaction;
 var
@@ -4592,7 +4972,6 @@ begin
   end;
   HadUserStateIntent :=
     (SeedReceiptHash <> '') or
-    (JournalPhase = PhaseUserStateIntent) or
     (JournalPhase = PhaseUserStatePrepared) or
     (JournalPhase = PhaseUserStateApplied) or
     (JournalPhase = PhaseVerifyIntent);
@@ -4648,7 +5027,8 @@ begin
          'cleanup-user-state', True) then
       UserRollbackOk := False;
   end;
-  if MachineComPointsToTarget(TransactionTarget) then
+  if TransactionChangedBridge and
+     MachineComPointsToTarget(TransactionTarget) then
   begin
     if CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
     begin
@@ -4658,7 +5038,8 @@ begin
     else if not RunTrustedDirectMachineUnregister then
       RaiseException('trusted direct machine registration rollback failed');
   end;
-  if MachineComPointsToTarget(TransactionTarget) then
+  if TransactionChangedBridge and
+     MachineComPointsToTarget(TransactionTarget) then
     RaiseException('new machine COM registration remains after rollback');
   if (PriorPreviousTarget <> '') and
      (not TryGetFinalObjectInfo(PriorPreviousTarget, PriorFinalPath,
@@ -4672,7 +5053,8 @@ begin
   RestorePreviousRegistry;
   if PreviousHost <> '' then
   begin
-    if not RegisterPreviousRegistration then
+    if TransactionChangedBridge and
+       not RegisterPreviousRegistration then
       RaiseException('previous profile rollback failed');
     if HadProfileMutationIntent then
     begin
@@ -4777,8 +5159,10 @@ begin
      CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
   begin
     if not ValidateTransactionTarget(TransactionTarget, TransactionId,
-      PreviousTarget, ValidatedTarget) then
+      JournalAppVersion, JournalManifestHash, PreviousTarget,
+      False, ValidatedTarget) then
       RaiseException('unsafe transaction target refused during rollback');
+    CurrentPayloadProofValid := False;
     if not DelTree(ValidatedTarget, True, True, True) then
       RaiseException('transaction target deletion failed during rollback');
     TargetCleanupComplete := not DirExists(ValidatedTarget);
@@ -4825,7 +5209,40 @@ begin
   CommitRollbackActiveProjection;
   CurrentPayloadTrusted := ValidateCurrentPayloadForExecution;
   UserRollbackOk := not HasUserDebt;
-  if HasUserDebt then
+  if HasUserDebt and (SeedReceiptHash = '') then
+  begin
+    UserRollbackOk := CurrentPayloadTrusted;
+    RestoreSettings := AddBackslash(TransactionTarget) +
+      'settings\FamoSettings.exe';
+    if UserRollbackOk and
+       (not ValidateCurrentPayloadForExecution or
+        not RunAndRequire(RestoreSettings,
+          '--discard-seed-transaction ' + TransactionId, True)) then
+      UserRollbackOk := False;
+    if UserRollbackOk and (PreviousServer <> '') and
+       FileExists(PreviousServer) then
+    begin
+      if not ValidatePreviousPayloadForExecution then
+        UserRollbackOk := False;
+      if UserRollbackOk then
+      begin
+        ResultCode := RunBoundDesktopExitCode(PreviousServer, '', False);
+        if ResultCode <> 0 then
+          UserRollbackOk := False;
+        if UserRollbackOk then
+        begin
+          Sleep(750);
+          if not ValidatePreviousPayloadForExecution or
+             not RunAndRequire(PreviousServer,
+               '--control reload-options', True) then
+            UserRollbackOk := False;
+        end;
+      end;
+    end;
+    if UserRollbackOk then
+      ClearTransactionDebt('UserRollbackDebt', DebtKindUserRollback);
+  end
+  else if HasUserDebt then
   begin
     UserRollbackOk := CurrentPayloadTrusted;
     RestoreSettings := AddBackslash(TransactionTarget) +
@@ -4843,7 +5260,8 @@ begin
     if UserRollbackOk and (PreviousHost <> '') then
     begin
       if not ValidatePreviousPayloadForExecution or
-         not RegisterPreviousRegistration then
+         (TransactionChangedBridge and
+          not RegisterPreviousRegistration) then
         UserRollbackOk := False;
       if PreviousProfileEnabled then
       begin
@@ -4919,16 +5337,10 @@ begin
     begin
       RestoreSettings := AddBackslash(TransactionTarget) +
         'settings\FamoSettings.exe';
-      if (SeedReceiptHash <> '') and
-         (not ValidateCurrentPayloadForExecution or
-          not RunAndRequire(RestoreSettings,
-            '--rollback-seed-transaction ' + TransactionId + ' ' +
-            SeedReceiptHash, True)) then
-        UserRollbackOk := False
-      else if (SeedReceiptHash = '') and
-              (not ValidateCurrentPayloadForExecution or
-               not RunAndRequire(RestoreSettings,
-                 '--discard-seed-transaction ' + TransactionId, True)) then
+      if not ValidateCurrentPayloadForExecution or
+         not RunAndRequire(RestoreSettings,
+           '--rollback-seed-transaction ' + TransactionId + ' ' +
+           SeedReceiptHash, True) then
         UserRollbackOk := False;
     end;
     if UserRollbackOk then
@@ -4936,14 +5348,24 @@ begin
   end;
 
   TargetCleanupComplete := not DirExists(TransactionTarget);
-  if DirExists(TransactionTarget) and UserRollbackOk and
-     CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
+  if DirExists(TransactionTarget) and UserRollbackOk then
   begin
-    if not ValidateTransactionTarget(TransactionTarget, TransactionId,
-      PreviousTarget, ValidatedTarget) then
-      RaiseException('unsafe transaction target refused during debt retry');
+    if CurrentPayloadTrusted and ValidateCurrentPayloadForExecution then
+    begin
+      if not ValidateTransactionTarget(TransactionTarget, TransactionId,
+        JournalAppVersion, JournalManifestHash, PreviousTarget,
+        False, ValidatedTarget) then
+        RaiseException('unsafe transaction target refused during debt retry');
+    end
+    else if not ValidateJournalBoundPartialTargetForCleanup(
+      ValidatedTarget) then
+      RaiseException(
+        'unsafe partial transaction target refused during debt retry');
+    CurrentPayloadProofValid := False;
     if DelTree(ValidatedTarget, True, True, True) then
       TargetCleanupComplete := not DirExists(ValidatedTarget);
+    if not TargetCleanupComplete and DirExists(ValidatedTarget) then
+      TerminalRecoveryTargetDeleteBlocked := True;
   end;
   if TargetCleanupComplete then
     ClearTransactionDebt('TargetCleanupDebt', DebtKindTargetCleanup);
@@ -5165,6 +5587,26 @@ begin
   end;
 end;
 
+function ValidateJournalBoundPartialTargetForCleanup(
+  var NormalizedTarget: String): Boolean;
+var
+  TargetFinalPath, TargetObjectId: String;
+begin
+  Result :=
+    (JournalPhase = PhaseRolledBack) and
+    TransactionDebtPresent(
+      'TargetCleanupDebt', DebtKindTargetCleanup) and
+    ValidateTransactionTarget(TransactionTarget, TransactionId,
+      JournalAppVersion, JournalManifestHash, PreviousTarget,
+      False, NormalizedTarget) and
+    TryGetFinalObjectInfo(NormalizedTarget,
+      TargetFinalPath, TargetObjectId) and
+    FinalObjectsSame(TargetFinalPath, TargetObjectId,
+      JournalPendingFinalTarget, JournalPendingObjectId) and
+    ValidateCleanupTree(NormalizedTarget, TargetFinalPath);
+  if not Result then NormalizedTarget := '';
+end;
+
 function ValidateVersionDirectoryForCleanup(const VersionTarget,
   VersionsFinalPath: String): Boolean;
 var
@@ -5298,6 +5740,43 @@ begin
   end;
 end;
 
+procedure EnsureStableUserProfileState;
+var
+  Attempt, StableReadbacks, TipExit: Integer;
+  Settings: String;
+  ProfileHealthy, EnableOk, AddOk: Boolean;
+begin
+  Settings := AddBackslash(TransactionTarget) +
+    'settings\FamoSettings.exe';
+  StableReadbacks := 0;
+  for Attempt := 1 to 6 do
+  begin
+    ProfileHealthy := RunAndRequire(
+      ProfileTool(TransactionTarget), 'check', True);
+    TipExit := RunAsOriginalUserExitCode(Settings, '--is-input-tip');
+    if ProfileHealthy and (TipExit = 0) then
+    begin
+      StableReadbacks := StableReadbacks + 1;
+      if StableReadbacks >= 2 then Exit;
+    end
+    else
+    begin
+      StableReadbacks := 0;
+      EnableOk := RunAndRequire(
+        ProfileTool(TransactionTarget), 'enable', True);
+      AddOk := RunAndRequire(Settings, '--add-input-tip', True);
+      Log('user profile persistence repair attempt ' +
+        IntToStr(Attempt) + ': profileHealthy=' +
+        IntToStr(Ord(ProfileHealthy)) + '; tipExit=' +
+        IntToStr(TipExit) + '; enableOk=' +
+        IntToStr(Ord(EnableOk)) + '; addOk=' +
+        IntToStr(Ord(AddOk)));
+    end;
+    Sleep(2000);
+  end;
+  RaiseException('user profile state did not remain stable');
+end;
+
 procedure VerifyActiveInstall;
 var
   RegisteredDll: String;
@@ -5308,12 +5787,14 @@ begin
   if not RegQueryStringValue(HKLM64,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) then
     RaiseException('active COM registration missing');
-  if CompareText(RegisteredDll, AddBackslash(TransactionTarget) + 'FamoTextService.dll') <> 0 then
+  if CompareText(RegisteredDll, FixedBridgeDll) <> 0 then
     RaiseException('active COM registration target mismatch');
+  if not FileExists(FixedBridgeDll) or
+     (CompareText(GetSHA256OfFile(FixedBridgeDll), '{#BridgeHash}') <> 0) then
+    RaiseException('active stable Bridge hash mismatch');
   if not RunAndRequire(ProfileTool(TransactionTarget), 'check-machine', False) then
     RaiseException('machine profile health readback failed');
-  if not RunAndRequire(ProfileTool(TransactionTarget), 'check', True) then
-    RaiseException('profile health readback failed');
+  EnsureStableUserProfileState;
 end;
 
 procedure CompletePendingTransaction;
@@ -5321,6 +5802,18 @@ var
   RegisterAttempt: Integer;
   RegisterOk: Boolean;
 begin
+  { The predecessor can race back during logon even though the pending phase
+    removed its Run entry before reboot. Retire that exact binary again before
+    the replacement claims the per-session Runtime singleton. }
+  if (PreviousServer <> '') and FileExists(PreviousServer) then
+  begin
+    if not ValidatePreviousPayloadForExecution then
+      RaiseException(
+        'previous payload identity mismatch before pending activation');
+    if not StopRuntimeAsOriginalUser(PreviousServer) then
+      RaiseException(
+        'previous runtime did not exit before pending activation');
+  end;
   TransitionTransactionPhase(PhaseActivateIntent);
   { The exact-SID logon task can run early in logon, before the CTF/TSF
     services are ready. Registration is idempotent, so retry briefly instead
@@ -5375,7 +5868,8 @@ function ValidatePendingTransaction(const PendingTarget, PendingManifest,
   var NormalizedTarget: String): Boolean;
 begin
   Result := ValidateTransactionTarget(PendingTarget, ExpectedId,
-    ProtectedPreviousTarget, NormalizedTarget) and
+    '{#AppVersion}', '{#ManifestHash}', ProtectedPreviousTarget,
+    False, NormalizedTarget) and
     (CompareText(PendingManifest,
       AddBackslash(NormalizedTarget) + 'payload-manifest.txt') = 0);
   if not Result then NormalizedTarget := '';
@@ -5385,23 +5879,38 @@ function LoadPendingState(const ExpectedId: String): Boolean;
 var
   NormalizedTarget, FinalTarget, ObjectId, ExpectedRecovery: String;
 begin
-  Result := LoadTransactionJournal(ExpectedId) and
-    ValidateTransactionTarget(TransactionTarget, TransactionId,
-      PreviousTarget, NormalizedTarget) and
-    (CompareText(NormalizedTarget, TransactionTarget) = 0);
-  if not Result then Exit;
+  Result := False;
+  if not LoadTransactionJournal(ExpectedId) then
+  begin
+    Log('pending state load rejected: journal');
+    Exit;
+  end;
+  if not ValidateTransactionTarget(TransactionTarget, TransactionId,
+       JournalAppVersion, JournalManifestHash, PreviousTarget,
+       JournalPhase = PhaseReady, NormalizedTarget) or
+     (CompareText(NormalizedTarget, TransactionTarget) <> 0) then
+  begin
+    Log('pending state load rejected: target path');
+    Exit;
+  end;
+  Result := True;
   if DirExists(TransactionTarget) then
   begin
     Result := TryGetFinalObjectInfo(TransactionTarget, FinalTarget, ObjectId) and
       (CompareText(FinalTarget, JournalPendingFinalTarget) = 0) and
       (JournalPendingObjectId <> '') and
       (CompareText(ObjectId, JournalPendingObjectId) = 0);
-    if not Result then Exit;
+    if not Result then
+    begin
+      Log('pending state load rejected: target object');
+      Exit;
+    end;
   end
   else if (JournalPhase <> PhasePrepared) and
           (JournalPhase <> PhaseRollbackIntent) and
           (JournalPhase <> PhaseRolledBack) then
   begin
+    Log('pending state load rejected: target object');
     Result := False;
     Exit;
   end;
@@ -5411,6 +5920,7 @@ begin
       ((JournalPreviousObjectId <> '') and
        (CompareText(ObjectId, JournalPreviousObjectId) <> 0))) then
   begin
+    Log('pending state load rejected: previous target identity');
     Result := False;
     Exit;
   end;
@@ -5426,12 +5936,19 @@ begin
     else
       Result := Result and
         ((JournalPhase = PhaseReady) or (JournalPhase = PhaseRolledBack));
-    if not Result then Exit;
+    if not Result then
+    begin
+      Log('pending state load rejected: recovery installer identity');
+      Exit;
+    end;
   end;
   if (JournalPhase = PhasePendingReboot) and
      ((JournalTaskName = '') or (JournalResumeInstaller = '') or
       not OriginalUserResumeCapable) then
+  begin
+    Log('pending state load rejected: recovery installer identity');
     Result := False;
+  end;
 end;
 
 function InspectJournalGenerations(const Id: String;
@@ -5487,14 +6004,19 @@ function AdoptCompleteOrphanGeneration(const Id: String;
   var GenerationText: String): Boolean;
 var
   BestGeneration: Integer;
-  BaseKey, Readback: String;
+  BaseKey, Key, Readback: String;
+  Journal: TTransactionJournal;
 begin
   Result := False;
   if not InspectJournalGenerations(Id, BestGeneration) or
      (BestGeneration <= 0) then Exit;
   BaseKey := TransactionJournalKey(Id);
-  if BestGeneration <= 0 then Exit;
   GenerationText := IntToStr(BestGeneration);
+  Key := JournalGenerationKey(Id, BestGeneration);
+  if not ReadJournalGeneration(Key, Journal) or
+     (Journal.Generation <> GenerationText) or
+     not ValidateRecoverableJournalArtifact(Journal, Id) then
+    Exit;
   RequireJournalWrite(BaseKey, 'ActiveGeneration', GenerationText);
   FlushMachineRegistryKey(BaseKey);
   Result := RegQueryStringValue(HKLM64, BaseKey, 'ActiveGeneration',
@@ -5618,7 +6140,7 @@ begin
     end;
     Key := JournalGenerationKey(Id, Generation);
     if (Generation <= 0) or not ReadJournalGeneration(Key, Journal) or
-       not ValidateJournalSemantics(Journal, Id) then
+       not ValidateRecoverableJournalArtifact(Journal, Id) then
     begin
       Result := False;
       Exit;
@@ -5773,6 +6295,7 @@ var
   HasRecoveryArtifacts, HasRecoveryDebt: Boolean;
 begin
   Result := False;
+  TerminalRecoveryTargetDeleteBlocked := False;
   if not TerminalDebtSetMatchesPhase then Exit;
   HasRecoveryArtifacts :=
     (JournalResumeInstaller <> '') or (JournalTaskName <> '');
@@ -5788,6 +6311,19 @@ begin
   begin
     RestorePreviousRegistry;
     CommitRollbackActiveProjection;
+    { A terminal rollback must not keep replaying an obsolete installer at
+      every logon. Retire its exact authenticated task before attempting to
+      delete a TSF DLL that may remain loaded until the next reboot. }
+    if HasRecoveryDebt then
+    begin
+      try
+        DeleteRecoveryTask;
+      except
+        Log('deferred terminal recovery artifact cleanup: ' +
+          GetExceptionMessage);
+        Exit;
+      end;
+    end;
     if TransactionDebtPresent(
          'UserRollbackDebt', DebtKindUserRollback) then
       CaptureOriginalUserIdentity;
@@ -5797,13 +6333,15 @@ begin
   begin
     if TransactionDebtPresent(
          'UserCleanupDebt', DebtKindSeedCommit) then
+    begin
       CaptureOriginalUserIdentity;
-    if not CommitSeedReceiptAfterReady then Exit;
+      if not CommitSeedReceiptAfterReady then Exit;
+    end;
   end
   else
     Exit;
 
-  if HasRecoveryDebt then
+  if (JournalPhase = PhaseReady) and HasRecoveryDebt then
   begin
     try
       DeleteRecoveryTask;
@@ -5838,6 +6376,62 @@ begin
       'RecoveryCleanupDebt', DebtKindRecoveryArtifacts) and
     not TransactionDebtPresent(
       'VersionCleanupDebt', DebtKindVersionRetention);
+end;
+
+procedure ResetLoadedTransactionForFreshInstall;
+begin
+  TransactionId := '';
+  TransactionTarget := '';
+  PreviousTarget := '';
+  PreviousManifest := '';
+  PreviousManifestHash := '';
+  PreviousDefault := '';
+  PreviousState := '';
+  PreviousHost := '';
+  PreviousServer := '';
+  PreviousProfileTool := '';
+  PreviousVersion := '';
+  PreviousIdentity := '';
+  PreviousTransactionId := '';
+  PreviousCompatibilityTransactionId := '';
+  PreviousProfileActive := False;
+  PreviousProfileEnabled := False;
+  PreviousInputTipPresent := False;
+  SeedReceiptHash := '';
+  OriginalUserSid := '';
+  OriginalUserAccount := '';
+  OriginalUserSession := '';
+  CurrentOriginalUserSession := '';
+  OriginalUserResumeCapable := False;
+  JournalPhase := '';
+  JournalAppVersion := '';
+  JournalManifestHash := '';
+  JournalPendingFinalTarget := '';
+  JournalPendingObjectId := '';
+  JournalPreviousFinalTarget := '';
+  JournalPreviousObjectId := '';
+  PriorPreviousTarget := '';
+  JournalPriorPreviousFinalTarget := '';
+  JournalPriorPreviousObjectId := '';
+  JournalResumeInstaller := '';
+  JournalResumeInstallerHash := '';
+  JournalTaskName := '';
+  JournalAllowDowngrade := False;
+  JournalGeneration := 0;
+  LoadedHostDetected := False;
+  LoadedHostHash := '';
+  LoadedHostVersion := '';
+  LoadedHostExpectedHash := '';
+  ResumeMode := False;
+  RollbackMode := False;
+  PendingTerminal := False;
+  TransactionPrepared := False;
+  RegistrationSwitched := False;
+  InstallReady := False;
+  RollbackComplete := False;
+  RuntimeStarted := False;
+  TerminalRecoveryTargetDeleteBlocked := False;
+  CurrentPayloadProofValid := False;
 end;
 
 function InitializeSetup: Boolean;
@@ -5906,6 +6500,11 @@ begin
   end;
   if not FindRecoverableTransaction(RequestedId) then
   begin
+    Log('setup blocked because the retained transaction set failed validation');
+    SuppressibleMsgBox(
+      '检测到无法安全识别的历史安装记录，安装未继续。' + #13#10 +
+      '请保留安装日志并联系支持。',
+      mbError, MB_OK, IDOK);
     Result := False;
     Exit;
   end;
@@ -5916,8 +6515,31 @@ begin
     if (JournalPhase = PhaseReady) or
        (JournalPhase = PhaseRolledBack) then
     begin
-      RecoverTerminalTransaction;
-      Result := False;
+      if not RecoverTerminalTransaction then
+      begin
+        Log('ordinary setup deferred by terminal transaction cleanup');
+        if TerminalRecoveryTargetDeleteBlocked then
+          SuppressibleMsgBox(
+            '上次更新的旧输入法文件仍未能清理，通常是文件仍被系统占用。' + #13#10 +
+            '请重新启动 Windows，然后再次运行此安装包。',
+            mbInformation, MB_OK, IDOK)
+        else
+          SuppressibleMsgBox(
+            '无法完成上次更新的安全恢复，安装未继续。' + #13#10 +
+            '请保留安装日志并联系支持。',
+            mbError, MB_OK, IDOK);
+        Result := False;
+        Exit;
+      end;
+      RequestedId := '';
+      if not FindRecoverableTransaction(RequestedId) or
+         (RequestedId <> '') then
+      begin
+        Result := False;
+        Exit;
+      end;
+      ResetLoadedTransactionForFreshInstall;
+      Result := True;
       Exit;
     end;
     RollbackMode := JournalPhase <> PhasePendingReboot;
@@ -5931,7 +6553,11 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   Failure: String;
 begin
-  if CurStep = ssInstall then PrepareTransaction;
+  if CurStep = ssInstall then
+  begin
+    VerifyFrozenBridgePreflight;
+    PrepareTransaction;
+  end;
   if CurStep = ssPostInstall then
   begin
     if RollbackMode then
@@ -5946,15 +6572,16 @@ begin
       begin
         if not ValidatePreviousPayloadForExecution then
           RaiseException('previous payload identity mismatch before runtime shutdown');
-        if not RunAndRequire(PreviousServer, '--control shutdown', True) then
-          RunAndRequire(PreviousServer, '/quit', True);
-        Sleep(750);
+        if not StopRuntimeAsOriginalUser(PreviousServer) then
+          RaiseException('previous runtime did not exit after shutdown');
       end;
       if JournalPhase = PhasePrepared then
         TransitionTransactionPhase(PhasePayloadVerified);
       CheckDowngradePolicy;
       FailIfRequested('after-verify');
-      LoadedHostDetected := DetectLoadedPreviousHost;
+      LoadedHostDetected := False;
+      if TransactionChangedBridge then
+        LoadedHostDetected := DetectLoadedPreviousHost;
       if ResumeMode and LoadedHostDetected then
       begin
         VerifyPendingInstall;
@@ -6016,7 +6643,20 @@ begin
       Log('installation failed before rollback: ' + Failure);
       if (JournalPhase <> PhaseReady) and
          (JournalPhase <> PhaseRolledBack) then
-        RollbackTransaction;
+      begin
+        try
+          RollbackTransaction;
+        except
+          Log('rollback compensation failed: ' + GetExceptionMessage);
+        end;
+      end;
+      if JournalPhase = PhaseRolledBack then
+        InstallReady := True;
+      if WizardSilent then
+      begin
+        Log('silent setup aborted after durable rollback');
+        Abort;
+      end;
       RaiseException(Failure);
     end;
   end;
@@ -6134,6 +6774,83 @@ begin
       Log('cannot schedule versions directory deletion: ' + GetExceptionMessage);
       Result := False;
     end;
+  end;
+end;
+
+function OnlyLoadedStableBridgeResidue(const BridgeRoot: String): Boolean;
+var
+  FindRec: TFindRec;
+  Path: String;
+begin
+  Result := FileExists(FixedBridgeDll) and
+    (CompareText(GetSHA256OfFile(FixedBridgeDll), '{#BridgeHash}') = 0);
+  if not Result then Exit;
+  if FindFirst(AddBackslash(BridgeRoot) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Path := AddBackslash(BridgeRoot) + FindRec.Name;
+          if ((FindRec.Attributes and FileAttributeDirectory) = 0) or
+             (CompareText(Path, FixedBridgeDirectory) <> 0) then
+          begin
+            Result := False;
+            Exit;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  if FindFirst(AddBackslash(FixedBridgeDirectory) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Path := AddBackslash(FixedBridgeDirectory) + FindRec.Name;
+          if ((FindRec.Attributes and FileAttributeDirectory) <> 0) or
+             (CompareText(Path, FixedBridgeDll) <> 0) then
+          begin
+            Result := False;
+            Exit;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+procedure CleanupStableBridgeForUninstall;
+var
+  BridgeRoot, BridgeManifest, FinalPath, ObjectId: String;
+begin
+  BridgeRoot := AddBackslash(FixedInstallRoot) + 'bridge';
+  if not DirExists(BridgeRoot) then Exit;
+  if not TryGetFinalObjectInfo(BridgeRoot, FinalPath, ObjectId) or
+     not ValidateCleanupTree(BridgeRoot, FinalPath) then
+    RaiseException('unsafe stable Bridge tree refused during uninstall');
+  BridgeManifest :=
+    AddBackslash(FixedBridgeDirectory) + 'bridge-manifest.txt';
+  if FileExists(BridgeManifest) and not DeleteFile(BridgeManifest) then
+    RaiseException('cannot delete stable Bridge manifest');
+  if DelTree(BridgeRoot, True, True, True) then Exit;
+  if not OnlyLoadedStableBridgeResidue(BridgeRoot) then
+    RaiseException('unexpected stable Bridge uninstall residue');
+  try
+    RestartReplace(FixedBridgeDll, '');
+    RestartReplace(FixedBridgeDirectory, '');
+    RestartReplace(BridgeRoot, '');
+    UninstallRestartPending := True;
+    Log('loaded stable Bridge scheduled for restart deletion: ' +
+      FixedBridgeDll);
+  except
+    RaiseException('cannot schedule stable Bridge deletion: ' +
+      GetExceptionMessage);
   end;
 end;
 
@@ -6480,6 +7197,7 @@ begin
          not ScheduleLoadedHostResidueForRestart(VersionsRoot) then
         RaiseException('cannot schedule transaction version cleanup');
     end;
+    CleanupStableBridgeForUninstall;
     PendingRoot := AddBackslash(FixedInstallRoot) + 'pending';
     if DirExists(PendingRoot) then
     begin

@@ -56,6 +56,7 @@ Frame RuntimeControlService::Reply(const Frame &request, Status status) const {
   reply.flags = kFlagResponse;
   reply.status = status;
   reply.correlation = request.correlation;
+  reply.wire_version = request.wire_version;
   return reply;
 }
 
@@ -80,7 +81,10 @@ Frame RuntimeControlService::Dispatch(
 
   std::lock_guard lock(mutex_);
   if (request.command == Command::Hello) {
-    if (!request.payload.empty() || c.sequence != 0)
+    NegotiatedHello negotiated;
+    std::string negotiation_error;
+    if (c.sequence != 0 ||
+        !NegotiateHello(request, &negotiated, &negotiation_error))
       return Reply(request, Status::InvalidFrame);
     const auto found = clients_.find(c.client_id);
     if (found != clients_.end() && owner && found->second.owner &&
@@ -94,14 +98,25 @@ Frame RuntimeControlService::Dispatch(
       return Reply(request, Status::StaleRequest);
     if (found != clients_.end() &&
         c.activation_generation == found->second.activation_generation &&
-        c.connection_generation == found->second.connection_generation)
-      return Reply(request, Status::Ok);
+        c.connection_generation == found->second.connection_generation) {
+      if (found->second.protocol_version != negotiated.protocol_version ||
+          found->second.bridge_abi != negotiated.bridge_abi)
+        return Reply(request, Status::StaleRequest);
+      Frame reply = Reply(request, Status::Ok);
+      reply.wire_version = negotiated.protocol_version;
+      reply.payload = std::move(negotiated.response_payload);
+      return reply;
+    }
     if (found == clients_.end() && clients_.size() >= kMaxClients)
       return Reply(request, Status::Unavailable);
     clients_[c.client_id] =
         ClientState{c.activation_generation, c.connection_generation, 0,
-                    owner};
-    return Reply(request, Status::Ok);
+                    owner, negotiated.protocol_version,
+                    negotiated.bridge_abi};
+    Frame reply = Reply(request, Status::Ok);
+    reply.wire_version = negotiated.protocol_version;
+    reply.payload = std::move(negotiated.response_payload);
+    return reply;
   }
 
   const auto client = clients_.find(c.client_id);
@@ -111,6 +126,8 @@ Frame RuntimeControlService::Dispatch(
       (owner && client->second.owner != owner) ||
       c.sequence == 0 || c.sequence <= client->second.last_sequence)
     return Reply(request, Status::StaleRequest);
+  if (request.wire_version != client->second.protocol_version)
+    return Reply(request, Status::InvalidFrame);
   client->second.last_sequence = c.sequence;
 
   if (request.command == Command::ControlStatus) {

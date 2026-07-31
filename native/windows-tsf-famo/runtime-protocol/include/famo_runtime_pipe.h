@@ -44,6 +44,7 @@ enum class ServerFault {
   NoRead,
   NoReply,
   MalformedReply,
+  WrongVersionReply,
   Disconnect,
   EngineHang,
   OpenSessionDelay,
@@ -67,7 +68,7 @@ struct DeliveryResult {
 
 class PipeRuntimePort {
 public:
-  PipeRuntimePort();
+  explicit PipeRuntimePort(uint32_t bridge_abi = 0);
   ~PipeRuntimePort();
   PipeRuntimePort(const PipeRuntimePort &) = delete;
   PipeRuntimePort &operator=(const PipeRuntimePort &) = delete;
@@ -127,6 +128,17 @@ private:
 
   void WorkerMain() noexcept;
   void UiWorkerMain() noexcept;
+  HANDLE ConnectPipeChannel(
+      const PipeEndpoint &endpoint, std::wstring_view expected_server,
+      const Correlation &connection_identity,
+      std::chrono::steady_clock::time_point deadline, std::string *error,
+      const std::shared_ptr<pipe_io::RetirementGate> &retirement,
+      std::mutex &connect_mutex, HANDLE *connecting_pipe,
+      const std::atomic<bool> *cancelled,
+      PipeClientIdentity *server_identity,
+      uint16_t *protocol_version);
+  void QueueUiRequest(std::shared_ptr<const Frame> request) noexcept;
+  void RequeueUiRequest(std::shared_ptr<const Frame> request) noexcept;
   void OpenCircuit(bool preserve_connection_generation = false);
   CallResult CallUntil(Frame &&request,
                        std::chrono::steady_clock::time_point absolute_deadline);
@@ -147,19 +159,26 @@ private:
   std::atomic<uint64_t> connection_generation_{0};
   std::atomic<uint64_t> server_creation_time_{0};
   std::atomic<uint32_t> server_process_id_{0};
+  std::atomic<uint16_t> protocol_version_{kProtocolVersion};
   std::atomic<std::shared_ptr<const Correlation>> connection_identity_;
   std::atomic<bool> slot_busy_{false};
   std::shared_ptr<pipe_io::RetirementGate> retirement_;
   bool stop_ = false;
   bool queued_ = false;
   bool in_flight_ = false;
+  const uint32_t bridge_abi_ = 0;
 
   std::mutex ui_mutex_;
   std::thread ui_worker_;
   HANDLE ui_pipe_ = INVALID_HANDLE_VALUE;
+  HANDLE ui_connecting_pipe_ = INVALID_HANDLE_VALUE;
   std::shared_ptr<pipe_io::RetirementGate> ui_retirement_;
+  PipeEndpoint ui_endpoint_;
+  std::wstring ui_expected_server_;
+  Correlation ui_connection_identity_;
+  PipeClientIdentity ui_expected_identity_;
+  uint16_t ui_expected_protocol_ = kProtocolVersion;
   std::atomic<bool> ui_stop_{false};
-  std::atomic<bool> ui_ready_{false};
   std::atomic<uint64_t> ui_wake_epoch_{0};
   std::atomic<std::shared_ptr<const Frame>> posted_request_;
 };

@@ -12,6 +12,8 @@ namespace {
 // adding it after the deadline on the TSF host thread.
 constexpr std::chrono::milliseconds kWaitSchedulingReserve{16};
 constexpr std::chrono::milliseconds kOptionalUiConnectBudget{25};
+constexpr std::chrono::milliseconds kUiReconnectInitialBackoff{10};
+constexpr std::chrono::milliseconds kUiReconnectMaximumBackoff{1000};
 
 DWORD Remaining(std::chrono::steady_clock::time_point deadline) {
   const auto now = std::chrono::steady_clock::now();
@@ -24,6 +26,9 @@ DWORD Remaining(std::chrono::steady_clock::time_point deadline) {
 
 bool ValidReply(const Frame &request, const Frame &reply) {
   if (reply.flags != kFlagResponse)
+    return false;
+  if (request.command != Command::Hello &&
+      reply.wire_version != request.wire_version)
     return false;
   if (reply.command == request.command &&
       reply.correlation == request.correlation) {
@@ -58,11 +63,139 @@ bool PreservesLogicalConnection(Command command) {
 
 } // namespace
 
-PipeRuntimePort::PipeRuntimePort()
+PipeRuntimePort::PipeRuntimePort(uint32_t bridge_abi)
     : retirement_(pipe_io::MakeRetirementGate()),
+      bridge_abi_(bridge_abi),
       ui_retirement_(pipe_io::MakeRetirementGate()) {}
 
 PipeRuntimePort::~PipeRuntimePort() { Stop(); }
+
+HANDLE PipeRuntimePort::ConnectPipeChannel(
+    const PipeEndpoint &endpoint, std::wstring_view expected_server,
+    const Correlation &connection_identity,
+    std::chrono::steady_clock::time_point deadline, std::string *error,
+    const std::shared_ptr<pipe_io::RetirementGate> &retirement,
+    std::mutex &connect_mutex, HANDLE *connecting_pipe,
+    const std::atomic<bool> *cancelled, PipeClientIdentity *server_identity,
+    uint16_t *protocol_version) {
+  HANDLE pipe = INVALID_HANDLE_VALUE;
+  while (pipe == INVALID_HANDLE_VALUE &&
+         std::chrono::steady_clock::now() < deadline &&
+         (!cancelled || !cancelled->load())) {
+    HANDLE candidate =
+        CreateFileW(endpoint.name.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                    nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (candidate != INVALID_HANDLE_VALUE) {
+      {
+        std::lock_guard lock(connect_mutex);
+        *connecting_pipe = candidate;
+      }
+      const auto release_candidate = [&](bool close) {
+        {
+          std::lock_guard lock(connect_mutex);
+          if (*connecting_pipe == candidate)
+            *connecting_pipe = INVALID_HANDLE_VALUE;
+        }
+        if (close)
+          CloseHandle(candidate);
+      };
+      if (cancelled && cancelled->load()) {
+        release_candidate(true);
+        break;
+      }
+      PipeClientIdentity candidate_identity;
+      if (!VerifyPipeServer(candidate, endpoint, expected_server, error,
+                            &candidate_identity)) {
+        release_candidate(true);
+        return INVALID_HANDLE_VALUE;
+      }
+      DWORD mode = PIPE_READMODE_BYTE;
+      if (!SetNamedPipeHandleState(candidate, &mode, nullptr, nullptr)) {
+        if (error) {
+          *error = "SetNamedPipeHandleState failed: " +
+                   std::to_string(GetLastError());
+        }
+        release_candidate(true);
+        return INVALID_HANDLE_VALUE;
+      }
+
+      Frame hello;
+      hello.command = Command::Hello;
+      hello.correlation = connection_identity;
+      if (bridge_abi_ != 0) {
+        const HelloRequest offer{kMinSupportedProtocolVersion, kProtocolVersion,
+                                 bridge_abi_};
+        if (!EncodeHelloRequest(offer, &hello.payload, error)) {
+          release_candidate(true);
+          return INVALID_HANDLE_VALUE;
+        }
+      }
+      Frame hello_reply;
+      const pipe_io::Result hello_write = pipe_io::WriteFrame(
+          candidate, hello, deadline, error, retirement);
+      const pipe_io::Result hello_read =
+          hello_write == pipe_io::Result::Ok
+              ? pipe_io::ReadFrame(candidate, &hello_reply, deadline, error,
+                                   retirement)
+              : hello_write;
+      bool negotiated =
+          hello_read == pipe_io::Result::Ok && ValidReply(hello, hello_reply) &&
+          hello_reply.status == Status::Ok;
+      uint16_t selected_protocol = hello_reply.wire_version;
+      if (negotiated && bridge_abi_ != 0) {
+        HelloResponse response;
+        negotiated =
+            DecodeHelloResponse(hello_reply.payload, &response, error) &&
+            response.selected_protocol_version == hello_reply.wire_version &&
+            response.selected_protocol_version >=
+                kMinSupportedProtocolVersion &&
+            response.selected_protocol_version <= kProtocolVersion;
+        selected_protocol = response.selected_protocol_version;
+      } else if (negotiated) {
+        negotiated = hello_reply.payload.empty();
+      }
+      if (negotiated && (!cancelled || !cancelled->load())) {
+        if (server_identity)
+          *server_identity = candidate_identity;
+        if (protocol_version)
+          *protocol_version = selected_protocol;
+        pipe = candidate;
+        release_candidate(false);
+        break;
+      }
+      const bool retryable =
+          hello_read == pipe_io::Result::Ok && ValidReply(hello, hello_reply) &&
+          hello_reply.status == Status::Unavailable;
+      release_candidate(true);
+      if (cancelled && cancelled->load())
+        break;
+      if (!retryable) {
+        if (error && error->empty())
+          *error = "pipe Hello handshake failed";
+        return INVALID_HANDLE_VALUE;
+      }
+      if (error)
+        error->clear();
+      Sleep(std::min<DWORD>(2, Remaining(deadline)));
+      continue;
+    }
+    const DWORD open_error = GetLastError();
+    if (open_error == ERROR_PIPE_BUSY) {
+      WaitNamedPipeW(endpoint.name.c_str(),
+                     std::min<DWORD>(10, Remaining(deadline)));
+    } else if (open_error == ERROR_FILE_NOT_FOUND) {
+      Sleep(std::min<DWORD>(2, Remaining(deadline)));
+    } else {
+      if (error) {
+        *error = "CreateFile(pipe) failed: " + std::to_string(open_error);
+      }
+      return INVALID_HANDLE_VALUE;
+    }
+  }
+  if (pipe == INVALID_HANDLE_VALUE && error)
+    *error = "pipe connect deadline elapsed";
+  return pipe;
+}
 
 bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
                               std::wstring_view expected_server,
@@ -95,129 +228,43 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
       *error = "connection identity allocation failed";
     return false;
   }
+  PipeEndpoint ui_endpoint;
+  std::wstring ui_expected_server;
+  std::shared_ptr<pipe_io::RetirementGate> next_ui_retirement;
+  try {
+    ui_endpoint = BuildUiPipeEndpoint(endpoint);
+    ui_expected_server.assign(expected_server);
+    next_ui_retirement = pipe_io::MakeRetirementGate();
+  } catch (...) {
+    if (error)
+      *error = "UI recovery state allocation failed";
+    return false;
+  }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
-  const auto connect_pipe = [&](const PipeEndpoint &channel_endpoint,
-                                std::string *channel_error,
-                                const auto &retirement,
-                                auto connect_deadline,
-                                PipeClientIdentity *server_identity) {
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    while (pipe == INVALID_HANDLE_VALUE &&
-           std::chrono::steady_clock::now() < connect_deadline &&
-           (!cancelled || !cancelled->load())) {
-      HANDLE candidate =
-          CreateFileW(channel_endpoint.name.c_str(),
-                      GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                      FILE_FLAG_OVERLAPPED, nullptr);
-      if (candidate != INVALID_HANDLE_VALUE) {
-        {
-          std::lock_guard lock(connect_mutex_);
-          connecting_pipe_ = candidate;
-        }
-        const auto release_candidate = [&](bool close) {
-          {
-            std::lock_guard lock(connect_mutex_);
-            if (connecting_pipe_ == candidate)
-              connecting_pipe_ = INVALID_HANDLE_VALUE;
-          }
-          if (close)
-            CloseHandle(candidate);
-        };
-        if (cancelled && cancelled->load()) {
-          release_candidate(true);
-          break;
-        }
-        PipeClientIdentity candidate_identity;
-        if (!VerifyPipeServer(candidate, channel_endpoint, expected_server,
-                              channel_error, &candidate_identity)) {
-          release_candidate(true);
-          return INVALID_HANDLE_VALUE;
-        }
-        DWORD mode = PIPE_READMODE_BYTE;
-        if (!SetNamedPipeHandleState(candidate, &mode, nullptr, nullptr)) {
-          if (channel_error) {
-            *channel_error = "SetNamedPipeHandleState failed: " +
-                             std::to_string(GetLastError());
-          }
-          release_candidate(true);
-          return INVALID_HANDLE_VALUE;
-        }
-
-        Frame hello;
-        hello.command = Command::Hello;
-        hello.correlation = connection_identity;
-        Frame hello_reply;
-        const pipe_io::Result hello_write = pipe_io::WriteFrame(
-            candidate, hello, connect_deadline, channel_error, retirement);
-        const pipe_io::Result hello_read =
-            hello_write == pipe_io::Result::Ok
-                ? pipe_io::ReadFrame(candidate, &hello_reply, connect_deadline,
-                                     channel_error, retirement)
-                : hello_write;
-        if (hello_read == pipe_io::Result::Ok &&
-            ValidReply(hello, hello_reply) &&
-            hello_reply.status == Status::Ok &&
-            (!cancelled || !cancelled->load())) {
-          if (server_identity)
-            *server_identity = candidate_identity;
-          pipe = candidate;
-          release_candidate(false);
-          break;
-        }
-        const bool retryable = hello_read == pipe_io::Result::Ok &&
-                               ValidReply(hello, hello_reply) &&
-                               hello_reply.status == Status::Unavailable;
-        release_candidate(true);
-        if (cancelled && cancelled->load())
-          break;
-        if (!retryable) {
-          if (channel_error && channel_error->empty())
-            *channel_error = "pipe Hello handshake failed";
-          return INVALID_HANDLE_VALUE;
-        }
-        if (channel_error)
-          channel_error->clear();
-        Sleep(std::min<DWORD>(2, Remaining(connect_deadline)));
-        continue;
-      }
-      const DWORD open_error = GetLastError();
-      if (open_error == ERROR_PIPE_BUSY) {
-        WaitNamedPipeW(channel_endpoint.name.c_str(),
-                       std::min<DWORD>(10, Remaining(connect_deadline)));
-      } else if (open_error == ERROR_FILE_NOT_FOUND) {
-        Sleep(std::min<DWORD>(2, Remaining(connect_deadline)));
-      } else {
-        if (channel_error) {
-          *channel_error =
-              "CreateFile(pipe) failed: " + std::to_string(open_error);
-        }
-        return INVALID_HANDLE_VALUE;
-      }
-    }
-    if (pipe == INVALID_HANDLE_VALUE && channel_error)
-      *channel_error = "pipe connect deadline elapsed";
-    return pipe;
-  };
-
   PipeClientIdentity primary_server;
-  HANDLE pipe =
-      connect_pipe(endpoint, error, retirement_, deadline, &primary_server);
+  uint16_t primary_protocol = 0;
+  HANDLE pipe = ConnectPipeChannel(
+      endpoint, expected_server, connection_identity, deadline, error,
+      retirement_, connect_mutex_, &connecting_pipe_, cancelled,
+      &primary_server, &primary_protocol);
   if (pipe == INVALID_HANDLE_VALUE) {
     return false;
   }
   // A cancelled best-effort transfer may still be retiring on its old gate.
   // The reaper retains that gate, so a reconnect can start a fresh optional UI
   // lane without weakening the primary lane's fail-closed retirement rule.
-  ui_retirement_ = pipe_io::MakeRetirementGate();
   std::string ignored_ui_error;
   const auto ui_deadline =
       std::min(deadline, std::chrono::steady_clock::now() +
                              kOptionalUiConnectBudget);
-  const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
   PipeClientIdentity ui_server;
-  HANDLE ui_pipe = connect_pipe(ui_endpoint, &ignored_ui_error,
-                                ui_retirement_, ui_deadline, &ui_server);
-  if (ui_pipe != INVALID_HANDLE_VALUE && ui_server != primary_server) {
+  uint16_t ui_protocol = 0;
+  HANDLE ui_pipe = ConnectPipeChannel(
+      ui_endpoint, expected_server, connection_identity, ui_deadline,
+      &ignored_ui_error, next_ui_retirement, connect_mutex_,
+      &connecting_pipe_, cancelled, &ui_server, &ui_protocol);
+  if (ui_pipe != INVALID_HANDLE_VALUE &&
+      (ui_server != primary_server || ui_protocol != primary_protocol)) {
     CloseHandle(ui_pipe);
     ui_pipe = INVALID_HANDLE_VALUE;
   }
@@ -230,6 +277,7 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
                                 std::memory_order_release);
     server_process_id_.store(primary_server.process_id,
                              std::memory_order_release);
+    protocol_version_.store(primary_protocol, std::memory_order_release);
     connection_identity_.store(std::move(connected_identity));
     state_.store(ChannelState::Ready);
     slot_busy_.store(false);
@@ -240,8 +288,14 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
   {
     std::lock_guard lock(ui_mutex_);
     ui_pipe_ = ui_pipe;
+    ui_connecting_pipe_ = INVALID_HANDLE_VALUE;
+    ui_retirement_ = std::move(next_ui_retirement);
+    ui_endpoint_ = std::move(ui_endpoint);
+    ui_expected_server_ = std::move(ui_expected_server);
+    ui_connection_identity_ = connection_identity;
+    ui_expected_identity_ = primary_server;
+    ui_expected_protocol_ = primary_protocol;
     ui_stop_ = false;
-    ui_ready_ = ui_pipe != INVALID_HANDLE_VALUE;
     posted_request_.store(nullptr);
   }
   try {
@@ -253,26 +307,25 @@ bool PipeRuntimePort::Connect(const PipeEndpoint &endpoint,
     state_.store(ChannelState::NotReady);
     server_process_id_.store(0, std::memory_order_release);
     server_creation_time_.store(0, std::memory_order_release);
+    protocol_version_.store(kProtocolVersion, std::memory_order_release);
     connection_identity_.store(nullptr);
     slot_busy_.store(false);
     if (ui_pipe != INVALID_HANDLE_VALUE) {
       CloseHandle(ui_pipe);
       std::lock_guard ui_lock(ui_mutex_);
       ui_pipe_ = INVALID_HANDLE_VALUE;
-      ui_ready_ = false;
     }
     if (error)
       *error = "pipe worker creation failed";
     return false;
   }
-  if (ui_pipe != INVALID_HANDLE_VALUE) {
-    try {
-      ui_worker_ = std::thread(&PipeRuntimePort::UiWorkerMain, this);
-    } catch (...) {
-      std::lock_guard lock(ui_mutex_);
+  try {
+    ui_worker_ = std::thread(&PipeRuntimePort::UiWorkerMain, this);
+  } catch (...) {
+    std::lock_guard lock(ui_mutex_);
+    if (ui_pipe_ != INVALID_HANDLE_VALUE) {
       CloseHandle(ui_pipe_);
       ui_pipe_ = INVALID_HANDLE_VALUE;
-      ui_ready_ = false;
     }
   }
   if (error)
@@ -296,7 +349,6 @@ void PipeRuntimePort::CancelCall(bool preserve_connection_generation) {
 void PipeRuntimePort::Stop() noexcept {
   try {
   HANDLE pipe = INVALID_HANDLE_VALUE;
-  HANDLE ui_pipe = INVALID_HANDLE_VALUE;
   {
     std::lock_guard lock(mutex_);
     stop_ = true;
@@ -305,15 +357,16 @@ void PipeRuntimePort::Stop() noexcept {
   {
     std::lock_guard lock(ui_mutex_);
     ui_stop_ = true;
-    ui_pipe = ui_pipe_;
+    if (ui_pipe_ != INVALID_HANDLE_VALUE)
+      CancelIoEx(ui_pipe_, nullptr);
+    if (ui_connecting_pipe_ != INVALID_HANDLE_VALUE)
+      CancelIoEx(ui_connecting_pipe_, nullptr);
   }
   available_.notify_all();
   ui_wake_epoch_.fetch_add(1);
   ui_wake_epoch_.notify_all();
   if (pipe != INVALID_HANDLE_VALUE)
     CancelIoEx(pipe, nullptr);
-  if (ui_pipe != INVALID_HANDLE_VALUE)
-    CancelIoEx(ui_pipe, nullptr);
   if (worker_.joinable())
     worker_.join();
   if (ui_worker_.joinable())
@@ -336,6 +389,7 @@ void PipeRuntimePort::Stop() noexcept {
     state_.store(ChannelState::NotReady);
     server_process_id_.store(0, std::memory_order_release);
     server_creation_time_.store(0, std::memory_order_release);
+    protocol_version_.store(kProtocolVersion, std::memory_order_release);
     connection_identity_.store(nullptr);
     slot_busy_.store(false);
     stop_ = false;
@@ -347,8 +401,8 @@ void PipeRuntimePort::Stop() noexcept {
     if (ui_pipe_ != INVALID_HANDLE_VALUE)
       CloseHandle(ui_pipe_);
     ui_pipe_ = INVALID_HANDLE_VALUE;
+    ui_connecting_pipe_ = INVALID_HANDLE_VALUE;
     ui_stop_ = false;
-    ui_ready_ = false;
   }
   } catch (...) {
     try {
@@ -362,7 +416,6 @@ void PipeRuntimePort::Stop() noexcept {
     server_process_id_.store(0, std::memory_order_release);
     server_creation_time_.store(0, std::memory_order_release);
     slot_busy_.store(false);
-    ui_ready_.store(false);
   }
 }
 
@@ -429,6 +482,7 @@ CallResult PipeRuntimePort::CallUntil(
         std::chrono::steady_clock::now() - started);
     return immediate;
   }
+  request.wire_version = protocol_version_.load(std::memory_order_acquire);
   work_.request = std::move(request);
   work_.deadline = wait_deadline;
   work_.result = {};
@@ -545,28 +599,47 @@ CallResult PipeRuntimePort::AbandonSession(
   return CallUntil(std::move(request), absolute_deadline);
 }
 
+void PipeRuntimePort::QueueUiRequest(
+    std::shared_ptr<const Frame> request) noexcept {
+  if (!request)
+    return;
+  std::shared_ptr<const Frame> pending = posted_request_.load();
+  for (;;) {
+    if (pending &&
+        SameSession(pending->correlation, request->correlation) &&
+        request->correlation.sequence <= pending->correlation.sequence) {
+      return;
+    }
+    if (posted_request_.compare_exchange_weak(pending, request)) {
+      ui_wake_epoch_.fetch_add(1);
+      ui_wake_epoch_.notify_one();
+      return;
+    }
+  }
+}
+
+void PipeRuntimePort::RequeueUiRequest(
+    std::shared_ptr<const Frame> request) noexcept {
+  if (!request)
+    return;
+  std::shared_ptr<const Frame> empty;
+  if (posted_request_.compare_exchange_strong(empty, std::move(request))) {
+    ui_wake_epoch_.fetch_add(1);
+    ui_wake_epoch_.notify_one();
+  }
+}
+
 void PipeRuntimePort::Post(Frame &&request) {
   if (state_.load() != ChannelState::Ready ||
       request.command != Command::UpdateUiState ||
       request.correlation.connection_generation !=
-          connection_generation_.load() || ui_stop_.load() ||
-      !ui_ready_.load()) {
+          connection_generation_.load() ||
+      ui_stop_.load()) {
     return;
   }
+  request.wire_version = protocol_version_.load(std::memory_order_acquire);
   try {
-    auto next = std::make_shared<const Frame>(std::move(request));
-    std::shared_ptr<const Frame> pending = posted_request_.load();
-    for (;;) {
-      if (pending && SameSession(pending->correlation, next->correlation) &&
-          next->correlation.sequence <= pending->correlation.sequence) {
-        return;
-      }
-      if (posted_request_.compare_exchange_weak(pending, next)) {
-        ui_wake_epoch_.fetch_add(1);
-        ui_wake_epoch_.notify_one();
-        return;
-      }
-    }
+    QueueUiRequest(std::make_shared<const Frame>(std::move(request)));
   } catch (...) {
     // UiState is best-effort; allocation failure must not escape into TSF.
   }
@@ -663,14 +736,10 @@ void PipeRuntimePort::WorkerMain() noexcept {
 
 void PipeRuntimePort::UiWorkerMain() noexcept {
   try {
-  HANDLE pipe = INVALID_HANDLE_VALUE;
-  {
-    std::lock_guard lock(ui_mutex_);
-    pipe = ui_pipe_;
-  }
   uint64_t observed_epoch = ui_wake_epoch_.load();
+  size_t reconnect_failures = 0;
   for (;;) {
-    if (ui_stop_.load() || !ui_ready_.load())
+    if (ui_stop_.load() || state_.load() != ChannelState::Ready)
       break;
     std::shared_ptr<const Frame> request = posted_request_.exchange(nullptr);
     if (!request) {
@@ -678,16 +747,75 @@ void PipeRuntimePort::UiWorkerMain() noexcept {
       observed_epoch = ui_wake_epoch_.load();
       continue;
     }
+
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    std::shared_ptr<pipe_io::RetirementGate> retirement;
+    {
+      std::lock_guard lock(ui_mutex_);
+      pipe = ui_pipe_;
+      retirement = ui_retirement_;
+    }
+    if (pipe == INVALID_HANDLE_VALUE) {
+      auto candidate_retirement = pipe_io::MakeRetirementGate();
+      PipeClientIdentity server_identity;
+      uint16_t protocol_version = 0;
+      std::string ignored_error;
+      HANDLE candidate = ConnectPipeChannel(
+          ui_endpoint_, ui_expected_server_, ui_connection_identity_,
+          std::chrono::steady_clock::now() + kOptionalUiConnectBudget,
+          &ignored_error, candidate_retirement, ui_mutex_,
+          &ui_connecting_pipe_, &ui_stop_, &server_identity,
+          &protocol_version);
+      const bool authenticated =
+          candidate != INVALID_HANDLE_VALUE &&
+          server_identity == ui_expected_identity_ &&
+          protocol_version == ui_expected_protocol_ &&
+          state_.load() == ChannelState::Ready && !ui_stop_.load();
+      {
+        std::lock_guard lock(ui_mutex_);
+        if (authenticated && !ui_stop_.load() &&
+            state_.load() == ChannelState::Ready) {
+          ui_pipe_ = candidate;
+          ui_retirement_ = std::move(candidate_retirement);
+          reconnect_failures = 0;
+          pipe = candidate;
+          retirement = ui_retirement_;
+        } else {
+          if (candidate != INVALID_HANDLE_VALUE)
+            CloseHandle(candidate);
+        }
+      }
+      if (pipe == INVALID_HANDLE_VALUE) {
+        RequeueUiRequest(std::move(request));
+        ++reconnect_failures;
+        if (ui_stop_.load() || state_.load() != ChannelState::Ready)
+          break;
+        const size_t shift = std::min<size_t>(reconnect_failures - 1, 7);
+        const auto backoff = std::min(
+            kUiReconnectInitialBackoff * (1 << shift),
+            kUiReconnectMaximumBackoff);
+        auto remaining = backoff;
+        while (remaining.count() > 0 && !ui_stop_.load() &&
+               state_.load() == ChannelState::Ready) {
+          const auto slice =
+              std::min(remaining, std::chrono::milliseconds(10));
+          Sleep(static_cast<DWORD>(slice.count()));
+          remaining -= slice;
+        }
+        continue;
+      }
+    }
+
     const auto deadline =
         std::chrono::steady_clock::now() + kHardCallDeadline;
 
     std::string ignored_error;
     Frame reply;
     pipe_io::Result io = pipe_io::WriteFrame(
-        pipe, *request, deadline, &ignored_error, ui_retirement_);
+        pipe, *request, deadline, &ignored_error, retirement);
     if (io == pipe_io::Result::Ok) {
       io = pipe_io::ReadFrame(pipe, &reply, deadline, &ignored_error,
-                              ui_retirement_);
+                              retirement);
     }
     const bool valid = io == pipe_io::Result::Ok &&
                        ValidReply(*request, reply) &&
@@ -695,17 +823,24 @@ void PipeRuntimePort::UiWorkerMain() noexcept {
                            connection_generation_.load() &&
                        state_.load() == ChannelState::Ready;
     if (!valid) {
-      ui_ready_ = false;
-      posted_request_.store(nullptr);
-      ui_wake_epoch_.fetch_add(1);
-      ui_wake_epoch_.notify_all();
-      break;
+      RequeueUiRequest(std::move(request));
+      reconnect_failures = 0;
+      {
+        std::lock_guard lock(ui_mutex_);
+        if (ui_pipe_ == pipe) {
+          CloseHandle(ui_pipe_);
+          ui_pipe_ = INVALID_HANDLE_VALUE;
+        }
+      }
+      if (ui_stop_.load() || state_.load() != ChannelState::Ready)
+        break;
+      continue;
     }
+    reconnect_failures = 0;
     // UiState is lossy state. Ok applies it; any valid rejection simply drops
     // this obsolete update while leaving both transport lanes usable.
   }
   } catch (...) {
-    ui_ready_.store(false);
     posted_request_.store(nullptr);
     ui_wake_epoch_.fetch_add(1);
     ui_wake_epoch_.notify_all();
@@ -724,7 +859,6 @@ void PipeRuntimePort::OpenCircuit(bool preserve_connection_generation) {
     server_creation_time_.store(0, std::memory_order_release);
   }
   available_.notify_all();
-  ui_ready_ = false;
   posted_request_.store(nullptr);
   ui_wake_epoch_.fetch_add(1);
   ui_wake_epoch_.notify_all();

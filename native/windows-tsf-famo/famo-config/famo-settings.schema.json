@@ -399,9 +399,9 @@
           "x-famo-target": { "file": "famo-settings.json", "key": "ai/askWebSearchEnabled" }
         },
         "webSearchBackend": {
-          "description": "独立搜索服务。doubao=豆包搜索 Global，perplexity=Perplexity Search。",
+          "description": "搜索服务。qwen=默认千问供应商内置搜索，doubao=豆包搜索 Global，perplexity=Perplexity Search。",
           "type": "string",
-          "enum": ["doubao", "perplexity"],
+          "enum": ["qwen", "doubao", "perplexity"],
           "x-famo-bucket": "local",
           "x-famo-target": { "file": "famo-settings.json", "key": "ai/webSearchBackend" }
         },

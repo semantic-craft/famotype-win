@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>法墨 Windows：稳定 TSF Bridge + 可独立更新 Runtime 方案</title>
+<style>
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1.5rem; line-height: 1.7; color: #1a1a1a; }
+  h1 { font-size: 1.6rem; border-bottom: 2px solid #2b6cb0; padding-bottom: .4rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.2rem; color: #2b6cb0; }
+  h3 { font-size: 1.05rem; margin-top: 1.4rem; }
+  code, pre { font-family: Consolas, "Cascadia Mono", monospace; background: #f4f6f8; border-radius: 4px; }
+  code { padding: .1em .35em; font-size: .92em; }
+  pre { padding: .8rem 1rem; overflow-x: auto; font-size: .88em; line-height: 1.5; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .93em; }
+  th, td { border: 1px solid #cbd5e0; padding: .45rem .7rem; text-align: left; vertical-align: top; }
+  th { background: #edf2f7; }
+  .inv { background: #fffbea; border-left: 4px solid #d69e2e; padding: .6rem 1rem; margin: .8rem 0; }
+  .warn { background: #fff5f5; border-left: 4px solid #c53030; padding: .6rem 1rem; margin: .8rem 0; }
+  .ok { background: #f0fff4; border-left: 4px solid #2f855a; padding: .6rem 1rem; margin: .8rem 0; }
+  .phase { border: 1px solid #cbd5e0; border-radius: 6px; padding: 1rem 1.2rem; margin: 1.2rem 0; }
+  .phase h3 { margin-top: 0; }
+  ul { padding-left: 1.4rem; }
+  li { margin: .25rem 0; }
+</style>
+</head>
+<body>
+
+<h1>稳定 TSF Bridge + 可独立更新 Runtime：免重启常规升级方案</h1>
+<p><b>目标读者</b>：执行本方案的 AI 代理（Codex）。<br>
+<b>仓库</b>：<code>famotype-win</code>，全部路径相对 <code>native/windows-tsf-famo/</code>。<br>
+<b>日期</b>：2026-07-30。</p>
+
+<h2>0. 一句话</h2>
+<p>进程架构已经是三段式，不需要重新设计。要做的是：<b>把 <code>FamoTextService.dll</code>（Bridge）从版本目录里拆出来放到稳定路径、只在 Bridge 自身变化时才替换它，并让 IPC 协议支持「旧 Bridge × 新 Runtime」的版本协商</b>。这样常规升级只换 Runtime 侧文件，宿主进程里加载的 DLL 不动，不再触发 <code>PendingReboot</code>。</p>
+
+<h2>1. 现状与根因</h2>
+<h3>1.1 现有架构（勿改）</h3>
+<pre>
+宿主进程 (Explorer / 浏览器 / 终端…)
+  └─ FamoTextService.dll        ← 进程内 TSF TIP，不加载引擎（已验证：text-service/src 无 LoadLibrary/引擎依赖）
+       │  命名管道 runtime-v2 / control-v2（endpoint 名稳定，不含版本目录路径）
+       ▼
+FamoRuntime.exe                  ← 独立进程，可随意杀/重启
+  ├─ FamoRimeEngine.dll / rime.dll   ← 引擎，仅 Runtime 进程加载
+  └─ 候选窗/状态栏渲染 (runtime-protocol/src/candidate_window.cpp)
+</pre>
+
+<h3>1.2 为什么现在升级要重启</h3>
+<ul>
+  <li>安装器每次升级提取到新的不可变目录 <code>{app}\versions\&lt;version&gt;-&lt;manifest-prefix&gt;-&lt;txid&gt;</code>，<b>五个二进制全部在内</b>，包括 <code>FamoTextService.dll</code>。</li>
+  <li>COM <code>InprocServer32</code> / TSF profile 每次升级重指到新版本目录里的新 DLL。</li>
+  <li>宿主进程锁着旧 DLL → 安装器（正确地）拒绝形成新旧混用的 <code>Ready</code>，切离注册后进 <code>PendingReboot</code>（见 <code>installer/README.md</code> 事务顺序一节）。</li>
+  <li>协议层无兼容窗口：<code>runtime-protocol/src/protocol.cpp:115</code> 对帧头 version 做<b>严格相等</b>校验（<code>version != kProtocolVersion</code> → <code>InvalidFrame</code>），所以即使保留旧 DLL，也只有协议版本恰好没变才能工作。</li>
+</ul>
+<p>结论：重启是<b>安装策略 + 协议无协商</b>造成的，不是进程架构问题。</p>
+
+<h2>2. 不变式（验收的最高标准）</h2>
+<div class="inv"><b>I1 — 常规升级不碰 Bridge。</b>只要新旧安装包的 Bridge 载荷（<code>FamoTextService.dll</code>）SHA-256 一致，升级事务不得替换、移动、反注册该 DLL，不得改动 COM/profile 注册，不得进入 <code>PendingReboot</code>。</div>
+<div class="inv"><b>I2 — Bridge 变更是显式例外。</b>Bridge 载荷变化时，走<b>现有</b>的完整事务（重注册 + 被锁则 <code>PendingReboot</code>），机制原样保留，只是从每次升级的必经路变成罕见路径。</div>
+<div class="inv"><b>I3 — 旧 Bridge × 新 Runtime 必须可用。</b>Runtime 必须接受协议版本在兼容窗口内（至少 [N-1, N]）的 Bridge；新增宿主行为一律走 capability/state_flags 位，旧 Bridge 不认识的位表现为功能缺失（优雅降级），不是断连。</div>
+<div class="inv"><b>I4 — Runtime 重启 = 会话重建。</b>换 Runtime 期间打字线程有界失败开放（已有 bounded IPC），Bridge 自动重连新 Runtime 并重建会话；进行中的组字被清除，不残留候选窗。此行为已有基础（smoke RECOV 行），升级路径复用它。</div>
+<div class="warn"><b>非目标</b>：不做 DLL 热卸载/热替换（TSF 进程内 DLL 无法安全卸载）；不做双 Bridge 并存注册；不引入 shim/detour 链；不把 TSF profile 所有权移出 Bridge（RUNTIME-BOUNDARY-AUDIT.md 既有非目标继续有效）。</div>
+
+<h2>3. 目标布局与注册</h2>
+<table>
+<tr><th></th><th>现状</th><th>目标</th></tr>
+<tr><td>Bridge DLL</td><td><code>{app}\versions\&lt;ver&gt;-…\FamoTextService.dll</code>，每次升级换路径</td><td><code>{app}\bridge\v&lt;bridge-abi&gt;\FamoTextService.dll</code>，路径只随 bridge-abi 号变化</td></tr>
+<tr><td>COM InprocServer32 / profile</td><td>每次升级重指</td><td>指向 bridge 稳定路径，仅 bridge-abi 变化时重指</td></tr>
+<tr><td>Runtime/引擎/配置/工具</td><td colspan="2">继续用 <code>{app}\versions\&lt;ver&gt;-…</code> 不可变目录（不变）</td></tr>
+<tr><td>payload-manifest</td><td>单一 manifest 五个二进制</td><td>拆两段：<code>bridge</code> 段（DLL + bridge-abi 号）与 <code>runtime</code> 段（其余四个 + payload）；两段各自带 SHA-256 清单</td></tr>
+<tr><td>管道 endpoint</td><td colspan="2"><code>runtime-v2/control-v2</code> 名字稳定（不变，这正是 Bridge 不需要知道 Runtime 路径的原因）</td></tr>
+</table>
+<p><code>bridge-abi</code> 是一个手工递增的整数（起始 <code>1</code>），存在 bridge 段 manifest 里，也编进 DLL 的文件版本资源。它<b>不是</b>产品版本号：产品 1.5.x → 1.9.x 期间它可以一直是 1。</p>
+
+<h2>4. 协议兼容策略</h2>
+<ul>
+  <li><b>帧头校验放宽</b>：<code>protocol.cpp</code> 解析端把 <code>version != kProtocolVersion</code> 改为 <code>version &lt; kMinSupportedProtocolVersion || version &gt; kProtocolVersion</code>。新增 <code>kMinSupportedProtocolVersion</code>（当前 = 2）。写端继续写自己的 <code>kProtocolVersion</code>。</li>
+  <li><b>Hello 协商</b>：Hello 请求带 Bridge 的协议版本与 bridge-abi；Hello 响应带 Runtime 的协议版本。双方取 <code>min(bridgeVer, runtimeVer)</code> 作为会话协议版本，之后按该版本编解码。字段追加到 Hello 载荷尾部，旧解析器忽略多余字节即可兼容（若现有解码是严格长度校验，则允许尾部多余字节仅对 Hello 放宽）。</li>
+  <li><b>兼容窗口政策</b>：Runtime 必须支持 [N-1, N]；发版时若要抬 <code>kMinSupportedProtocolVersion</code>，必须先发一个 bridge-abi bump（走 I2 例外流程），不允许在 runtime-only 升级里抬门槛。</li>
+  <li><b>新功能路由</b>：一切新宿主行为优先做成 Runtime 侧逻辑；确需 Bridge 配合的，走 <code>Composition::state_flags</code> 高位 capability bit（现有 <code>kHostInlinePreedit</code> 等即此模式），旧 Bridge 对未知位的行为必须是忽略。</li>
+  <li><b>失败开放</b>：版本协商失败（窗口外）时 Bridge 按现有 <code>Unavailable</code> 路径处理——按键透传、不阻塞打字线程，健康探针报 <code>Degraded</code>。</li>
+</ul>
+
+<h2>5. 分阶段实施</h2>
+
+<div class="phase">
+<h3>Phase 1 — 协议兼容窗口（先做，纯 runtime-protocol 侧）</h3>
+<p><b>改动</b>：</p>
+<ul>
+  <li><code>runtime-protocol/include/famo_runtime_protocol.h</code>：加 <code>kMinSupportedProtocolVersion</code>；Hello 载荷追加 <code>bridge_protocol_version</code>、<code>bridge_abi</code> 字段（尾部追加）。</li>
+  <li><code>runtime-protocol/src/protocol.cpp</code>：解析端版本区间校验；Hello 编解码更新；会话协议版本落到连接状态（<code>runtime_server.cpp</code> / 客户端侧连接对象）。</li>
+  <li><code>runtime-protocol/tests/protocol_selfcheck.cpp</code> 与相关合同测试：新增「version = N-1 的帧被接受」「窗口外被拒且 Status 语义不变」「Hello 尾部多余字节被旧解析器忽略」用例。</li>
+</ul>
+<p><b>验收</b>：自检/合同测试通过；现网协议 v2 帧 100% 不受影响（回归现有全部 runtime-protocol 测试）。</p>
+</div>
+
+<div class="phase">
+<h3>Phase 2 — 安装器：runtime-only 快速升级路径</h3>
+<p><b>改动</b>（<code>installer/famo-setup.iss</code> + <code>build-installer.ps1</code> + manifest 生成）：</p>
+<ul>
+  <li>manifest 拆 bridge/runtime 两段（§3）。</li>
+  <li>升级事务开头新增判定：读当前 <code>Ready</code> generation 的 bridge 段 SHA-256，与新包 bridge 段比对。<b>一致</b> → 走新的 runtime-only 事务：提取新版本目录（不含 Bridge DLL 或含但不注册，取实现简单者，推荐不含）、停旧 Runtime、启新 Runtime、<code>--control deploy</code>、回读校验、写 <code>Ready</code>；全程不触碰 COM/profile 注册与旧 Bridge DLL。<b>不一致</b> → 走现有完整事务（I2）。</li>
+  <li>runtime-only 事务的回滚 = 停新 Runtime、重启旧版本目录的 Runtime；不涉及注册恢复，比现有回滚短。</li>
+  <li>旧版本目录清理：runtime-only 升级成功后，旧版本目录里没有被宿主锁定的文件（Bridge 不在其中），可按现有清理规则直接删。</li>
+</ul>
+<p><b>过渡处理</b>：从「Bridge 还在版本目录里」的旧版（≤1.5.6）升上来的第一次，Bridge 路径必然变化 → 必然走一次完整事务（可能 <code>PendingReboot</code>）。这是<b>最后一次</b>强制重启，README 与升级提示里明说。</p>
+<p><b>验收</b>：<code>settings-winui/FamoSettings.Tests/InstallerContractTests.cs</code> 新增合同用例——bridge 段一致时事务日志不得出现反注册/重注册步骤、终态不得为 <code>PendingReboot</code>；<code>smoke-harness.ps1</code> 增加一行「宿主开着记事本组字中 → 覆盖安装新 runtime-only 包 → 不重启、打字恢复、版本号变新」。</p>
+</div>
+
+<div class="phase">
+<h3>Phase 3 — Bridge 稳定目录迁移</h3>
+<p><b>改动</b>：</p>
+<ul>
+  <li>安装器把 Bridge 装到 <code>{app}\bridge\v&lt;bridge-abi&gt;\</code>，COM/profile 指向它；版本目录不再含 Bridge。</li>
+  <li><code>Test-FamoHealth.ps1</code> / <code>Test-FamoTsfRegistration.ps1</code>：注册路径校验从「当前版本目录」改为「当前 bridge-abi 目录」，并校验 bridge 段 manifest hash。</li>
+  <li>卸载：bridge 目录纳入现有「被锁则登记重启删除」逻辑（复用现状语义）。</li>
+</ul>
+<p><b>验收</b>：连续两次 runtime-only 升级后，<code>{app}\bridge\v1\FamoTextService.dll</code> 的 NTFS 对象 ID/时间戳不变；健康与注册探针全绿。</p>
+</div>
+
+<div class="phase">
+<h3>Phase 4 — Bridge 变更节流制度（流程，不是代码)</h3>
+<ul>
+  <li>仓库加一页 <code>design/BRIDGE-FREEZE.md</code>：列 Bridge 的职责白名单（TSF 编排、edit session、UIElement facade、管道客户端、失败开放），任何 PR 想改 <code>text-service/</code> 必须回答「为什么不能放 Runtime 侧」。</li>
+  <li>CI/合同测试断言：bridge-abi 未 bump 时 <code>FamoTextService.dll</code> 导出表与协议引用面不变（最低限度：bridge 段 hash 变化 ⇒ 要求 commit message/manifest 同时 bump bridge-abi，安装器构建脚本硬校验）。</li>
+</ul>
+</div>
+
+<h2>6. 测试矩阵（最终必须全绿）</h2>
+<table>
+<tr><th>#</th><th>场景</th><th>期望</th></tr>
+<tr><td>T1</td><td>协议 v2 Bridge × v3 Runtime（模拟）</td><td>Hello 协商到 v2，打字/候选/提交全通</td></tr>
+<tr><td>T2</td><td>窗口外版本</td><td>拒连，Bridge 失败开放透传按键，健康报 Degraded</td></tr>
+<tr><td>T3</td><td>runtime-only 升级，宿主组字中</td><td>组字被清除、无残留候选窗、重连后可继续打字、无重启提示</td></tr>
+<tr><td>T4</td><td>runtime-only 升级中途失败</td><td>回滚重启旧 Runtime，注册未被触碰，终态非 PendingReboot</td></tr>
+<tr><td>T5</td><td>bridge-abi bump 升级，DLL 被锁</td><td>行为与今天完全一致：PendingReboot + 恢复任务（现有测试继续覆盖）</td></tr>
+<tr><td>T6</td><td>从 ≤1.5.6 旧布局首次升级</td><td>走完整事务，之后进入新布局；再下一次升级走 T3 路径</td></tr>
+<tr><td>T7</td><td>卸载（Bridge 被锁）</td><td>现状语义：撤销注册 + 登记重启删除</td></tr>
+</table>
+
+<h2>7. 执行顺序与边界</h2>
+<ul>
+  <li>顺序：Phase 1 → 2 → 3 → 4，每个 Phase 独立可发版、独立回归。Phase 1 不依赖安装器改动，先合。</li>
+  <li>只允许触碰：<code>runtime-protocol/</code>、<code>installer/</code>、<code>settings-winui/FamoSettings.Tests/</code>、健康/注册探针脚本、<code>design/</code>。<b>不动</b> <code>text-service/</code> 热路径（除非 Phase 1 的 Hello 字段要求 Bridge 侧编码器同步，那也仅限编解码调用点）。</li>
+  <li>本仓有多个 AI 会话并行开发：动手前 <code>git status</code> + 看近期 log；当前工作区已有 <code>famo-setup.iss</code>、<code>InstallerContractTests.cs</code>、<code>dev_profile_main.cpp</code> 的未提交改动，先确认归属再开工。</li>
+  <li>每个 Phase 宣称完成前：跑该模块既有测试 + 本文对应验收行，带输出证据。</li>
+</ul>
+
+</body>
+</html>

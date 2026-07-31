@@ -110,15 +110,43 @@ public sealed class RuntimeBoundaryAuditContractTests
     }
 
     [Fact]
-    public void ProductionTsfAndRuntimeRejectInactiveInstallTargets()
+    public void StableBridgeResolvesTheVersionedRuntimeProjection()
     {
         string tsf = File.ReadAllText(RepoFile(
-            "native/windows-tsf-famo/text-service/src/text_service.cpp"));
+            "native/windows-tsf-famo/text-service/src/text_service.cpp"))
+            .ReplaceLineEndings("\n");
         string runtime = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
 
-        Assert.Contains("ProductionInstallAllowed(ModuleDirectory())", tsf);
+        Assert.Contains("ResolveProductionRuntime(&expected)", tsf);
+        Assert.DoesNotContain(
+            "ProductionInstallAllowed(ModuleDirectory())",
+            tsf);
+        Assert.Contains(
+            "if (runtime_executable_name_ == L\"FamoRuntime.exe\") {\n"
+            + "    if (!runtime::ResolveProductionRuntime(&expected))",
+            tsf);
+        Assert.Contains(
+            "} else {\n"
+            + "    expected = ModuleDirectory() + L\"\\\\\" + runtime_executable_name_;",
+            tsf);
         Assert.Contains("ProductionInstallAllowed(ModuleDirectory(), true)", runtime);
+        Assert.Contains("famo-runtime-startup.log", runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"install-state\", 3",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"singleton\", 3)",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"candidate-window\", 3)",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"engine\", 4, error)",
+            runtime);
+        Assert.Contains(
+            "AppendStartupDiagnostic(data_root, \"control-pipe\", 5)",
+            runtime);
     }
 
     private static string RepoFile(string relativePath)

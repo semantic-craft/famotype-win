@@ -1,0 +1,34 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @FAMO_BRIDGE_ABI@,0,0,0
+ PRODUCTVERSION @FAMO_BRIDGE_ABI@,0,0,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_DLL
+ FILESUBTYPE 0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "Famo\0"
+      VALUE "FileDescription", "Famo Stable TSF Bridge\0"
+      VALUE "FileVersion", "@FAMO_BRIDGE_ABI@.0.0.0\0"
+      VALUE "InternalName", "FamoTextService.dll\0"
+      VALUE "OriginalFilename", "FamoTextService.dll\0"
+      VALUE "ProductName", "Famo Stable TSF Bridge\0"
+      VALUE "ProductVersion", "@FAMO_BRIDGE_ABI@.0.0.0\0"
+      VALUE "BridgeAbi", "@FAMO_BRIDGE_ABI@\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
