@@ -14,7 +14,7 @@ public sealed class AiPage : UserControl
         new("阿里云百炼", "阿里云百炼", "", "qwen3.6-flash", RequiresWorkspaceId: true),
         new("火山引擎 · 豆包 Seed", "火山引擎 · 豆包 Seed", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-seed-2-1-turbo-260628"),
         new("小米 MiMo", "小米 MiMo", "https://api.xiaomimimo.com/v1/chat/completions", "mimo-v2.5"),
-        new("DeepSeek", "DeepSeek", "https://api.deepseek.com/v1/chat/completions", "deepseek-v4-flash"),
+        new("DeepSeek", "DeepSeek", DeepSeekResponsesApi.Endpoint, DeepSeekResponsesApi.FlashModel),
         new("MiniMax", "MiniMax", "https://api.minimaxi.com/v1/chat/completions", "MiniMax-M2.7-highspeed"),
         new("Google Gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-3.5-flash-lite"),
         new("OpenAI", "OpenAI", "https://api.openai.com/v1/chat/completions", "chat-latest"),
@@ -75,10 +75,13 @@ public sealed class AiPage : UserControl
         _workspaceId.TextChanged += (_, _) => UpdateQwenEndpointPreview();
         _model = new TextBox { PlaceholderText = "模型 ID", MinWidth = 260 };
         _apiKey = new PasswordBox { PlaceholderText = "API Key", MinWidth = 260 };
-        _deepSeekModelRow = FamoUI.Row("DeepSeek 模型", "Chat · V4 Flash 更快；Reasoner · V4 Pro 更适合复杂推理。",
+        _deepSeekModelRow = FamoUI.Row("DeepSeek 模型", "V4 Flash 使用 Responses API；V4 Pro 当前继续使用 Chat Completions。",
             FamoUI.SegBar(new[] { "Chat · V4 Flash", "Reasoner · V4 Pro" }, 0, idx =>
             {
-                _model.Text = idx == 0 ? "deepseek-v4-flash" : "deepseek-v4-pro";
+                _model.Text = idx == 0 ? DeepSeekResponsesApi.FlashModel : "deepseek-v4-pro";
+                _endpoint.Text = idx == 0
+                    ? DeepSeekResponsesApi.Endpoint
+                    : "https://api.deepseek.com/chat/completions";
             }));
         _workspaceIdRow = FamoUI.Row(
             "Workspace ID",
@@ -146,7 +149,7 @@ public sealed class AiPage : UserControl
         var details = new StackPanel();
         details.Children.Add(FamoUI.Row(
             "搜索服务",
-            "百炼内置搜索复用默认千问配置；豆包与 Perplexity 仍使用独立搜索密钥。",
+            "千问或 DeepSeek 内置搜索复用默认供应商配置；豆包与 Perplexity 使用独立搜索密钥。",
             _searchBackend,
             divider: false));
         var credentialDetails = new StackPanel();
@@ -266,8 +269,8 @@ public sealed class AiPage : UserControl
             _searchKeyState.Text = "";
             _searchHint.Text =
                 $"{WebSearchBackends.KeyHint(backend)}\n" +
-                "联网时按百炼 Responses API 发送 tools:[{\"type\":\"web_search\"}]；" +
-                "默认供应商不是阿里云百炼时会直接提示，不会退回错误的搜索链路。";
+                "联网时按供应商 Responses API 发送 tools:[{\"type\":\"web_search\"}]；" +
+                "默认供应商与所选搜索服务不一致时会直接提示。";
             return;
         }
 
