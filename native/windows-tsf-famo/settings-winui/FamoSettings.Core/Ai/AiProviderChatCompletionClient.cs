@@ -36,7 +36,8 @@ internal sealed class AiProviderChatCompletionClient
     public async Task<AiProviderChatCompletionResult> SendAsync(
         IReadOnlyList<AiProviderChatMessage> messages,
         CancellationToken cancellationToken,
-        bool jsonObjectResponse = false)
+        bool jsonObjectResponse = false,
+        bool useNativeWebSearch = false)
     {
         if (messages.Count == 0)
         {
@@ -44,11 +45,18 @@ internal sealed class AiProviderChatCompletionClient
         }
 
         var (profile, apiKey, endpoint) = ResolveDefault();
+        string provider = InferProvider(profile);
+        if (useNativeWebSearch && provider != "qwen")
+        {
+            throw new InvalidOperationException(
+                "阿里云百炼内置搜索要求默认 AI 供应商为阿里云百炼。");
+        }
 
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         ApplyAuth(request, profile, apiKey);
         request.Content = new StringContent(
-            BuildRequestJson(profile, messages, jsonObjectResponse),
+            BuildRequestJson(
+                profile, provider, messages, jsonObjectResponse, useNativeWebSearch),
             Encoding.UTF8,
             "application/json");
 
@@ -60,7 +68,14 @@ internal sealed class AiProviderChatCompletionClient
             throw new InvalidOperationException($"AI 请求失败：HTTP {(int)response.StatusCode} {ExtractErrorMessage(json)}".Trim());
         }
 
-        return new AiProviderChatCompletionResult(ParseAssistantText(json), profile.Id, profile.Model);
+        string text = useNativeWebSearch
+            ? ParseAssistantTextWithSources(json)
+            : ParseAssistantText(json);
+        if (provider == "qwen" && jsonObjectResponse)
+        {
+            EnsureJsonObjectResponse(text);
+        }
+        return new AiProviderChatCompletionResult(text, profile.Id, profile.Model);
     }
 
     private (AiProviderProfile Profile, string ApiKey, Uri Endpoint) ResolveDefault()
@@ -72,7 +87,14 @@ internal sealed class AiProviderChatCompletionClient
         string? apiKey = _secrets.GetSecret(profile.SecretName);
         if (string.IsNullOrWhiteSpace(apiKey))
             throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
-        return (profile, apiKey, ParseEndpoint(profile.Endpoint));
+        Uri endpoint = ParseEndpoint(profile.Endpoint);
+        if (InferProvider(profile) == "qwen"
+            && !QwenResponsesApi.IsResponsesEndpoint(endpoint))
+        {
+            throw new InvalidOperationException(
+                "千问供应商必须使用包含 Workspace ID 的 Responses API 地址；请删除旧配置后重新保存。");
+        }
+        return (profile, apiKey, endpoint);
     }
 
     public async Task<AiProviderChatCompletionResult> SendSourceVerificationAsync(
@@ -99,7 +121,14 @@ internal sealed class AiProviderChatCompletionClient
 
         string apiKey = _secrets.GetSecret(profile.SecretName)
             ?? throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
-        Uri endpoint = SourceVerificationEndpoint(ParseEndpoint(profile.Endpoint), provider);
+        Uri configuredEndpoint = ParseEndpoint(profile.Endpoint);
+        if (provider == "qwen"
+            && !QwenResponsesApi.IsResponsesEndpoint(configuredEndpoint))
+        {
+            throw new InvalidOperationException(
+                "千问供应商必须使用包含 Workspace ID 的 Responses API 地址；请删除旧配置后重新保存。");
+        }
+        Uri endpoint = SourceVerificationEndpoint(configuredEndpoint, provider);
 
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         ApplyAuth(request, profile, apiKey);
@@ -137,16 +166,49 @@ internal sealed class AiProviderChatCompletionClient
 
     private static string BuildRequestJson(
         AiProviderProfile profile,
+        string provider,
         IReadOnlyList<AiProviderChatMessage> messages,
-        bool jsonObjectResponse)
+        bool jsonObjectResponse,
+        bool useNativeWebSearch)
     {
-        var wireMessages = messages
-            .Select(m => new
+        object[] wireMessages = messages
+            .Select(m => (object)new
             {
                 role = m.Role,
                 content = m.Content,
             })
             .ToArray();
+
+        if (provider == "qwen")
+        {
+            object[] responseInput = jsonObjectResponse
+                ?
+                [
+                    new
+                    {
+                        role = "developer",
+                        content =
+                            "Return exactly one valid JSON object and nothing else. "
+                            + "Do not use Markdown or code fences.",
+                    },
+                    .. wireMessages,
+                ]
+                : wireMessages;
+            var responseBody = new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["model"] = profile.Model,
+                ["input"] = responseInput,
+                ["stream"] = false,
+                ["store"] = false,
+                ["reasoning"] = new { effort = "none" },
+            };
+            if (useNativeWebSearch)
+            {
+                responseBody["tools"] = new object[] { new { type = "web_search" } };
+                responseBody["tool_choice"] = "required";
+            }
+            return JsonSerializer.Serialize(responseBody, JsonOptions);
+        }
 
         var body = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
@@ -176,21 +238,15 @@ internal sealed class AiProviderChatCompletionClient
 
         if (provider == "qwen")
         {
-            return JsonSerializer.Serialize(new
+            return JsonSerializer.Serialize(new Dictionary<string, object?>
             {
-                model = "qwen-plus",
-                input = new { messages = wireMessages },
-                parameters = new
-                {
-                    enable_search = true,
-                    search_options = new
-                    {
-                        forced_search = true,
-                        search_strategy = "max",
-                        enable_source = true,
-                    },
-                    result_format = "message",
-                },
+                ["model"] = profile.Model,
+                ["input"] = wireMessages,
+                ["stream"] = false,
+                ["store"] = false,
+                ["reasoning"] = new { effort = "none" },
+                ["tools"] = new object[] { new { type = "web_search" } },
+                ["tool_choice"] = "required",
             }, JsonOptions);
         }
 
@@ -261,7 +317,6 @@ internal sealed class AiProviderChatCompletionClient
         var builder = new UriBuilder(endpoint) { Query = "", Fragment = "" };
         if (provider == "qwen")
         {
-            builder.Path = "/api/v1/services/aigc/text-generation/generation";
             return builder.Uri;
         }
         if (provider is "doubao" or "openai")
@@ -287,8 +342,9 @@ internal sealed class AiProviderChatCompletionClient
 
             if (sources.Count > 0)
             {
-                string sourceLines = string.Join("\n", sources.Take(8).Select(source =>
-                    $"- {(string.IsNullOrWhiteSpace(source.Title) ? source.Url : source.Title)}\n  {source.Url}"));
+                string sourceLines = string.Join(
+                    "\n",
+                    sources.Take(8).Select(FormatSource));
                 string summary = string.IsNullOrWhiteSpace(content)
                     ? "已通过联网检索取得来源 URL，请人工复核来源内容与原文主张是否完全对应。"
                     : content;
@@ -308,49 +364,77 @@ internal sealed class AiProviderChatCompletionClient
 
     private static string FindAssistantContent(JsonElement element)
     {
-        if (element.ValueKind == JsonValueKind.Object)
+        if (element.ValueKind != JsonValueKind.Object)
         {
-            if (element.TryGetProperty("choices", out JsonElement choices)
-                && choices.ValueKind == JsonValueKind.Array
-                && choices.GetArrayLength() > 0
-                && choices[0].TryGetProperty("message", out JsonElement message)
-                && message.TryGetProperty("content", out JsonElement content)
-                && content.ValueKind == JsonValueKind.String)
+            return "";
+        }
+
+        if (element.TryGetProperty("choices", out JsonElement choices)
+            && choices.ValueKind == JsonValueKind.Array
+            && choices.GetArrayLength() > 0
+            && choices[0].TryGetProperty("message", out JsonElement message)
+            && message.TryGetProperty("content", out JsonElement content)
+            && content.ValueKind == JsonValueKind.String)
+        {
+            return content.GetString() ?? "";
+        }
+        if (!element.TryGetProperty("output", out JsonElement output))
+        {
+            return "";
+        }
+
+        if (output.ValueKind == JsonValueKind.Object)
+        {
+            if (output.TryGetProperty("text", out JsonElement text)
+                && text.ValueKind == JsonValueKind.String)
             {
-                return content.GetString() ?? "";
+                return text.GetString() ?? "";
             }
-            if (element.TryGetProperty("output", out JsonElement output))
+            return FindAssistantContent(output);
+        }
+        if (output.ValueKind != JsonValueKind.Array)
+        {
+            return "";
+        }
+
+        var parts = new List<string>();
+        foreach (JsonElement item in output.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object)
             {
-                if (output.ValueKind == JsonValueKind.Object)
-                {
-                    if (output.TryGetProperty("text", out JsonElement text) && text.ValueKind == JsonValueKind.String)
-                    {
-                        return text.GetString() ?? "";
-                    }
-                    string nested = FindAssistantContent(output);
-                    if (nested.Length > 0) return nested;
-                }
-                else if (output.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (JsonElement item in output.EnumerateArray())
-                    {
-                        string nested = FindAssistantContent(item);
-                        if (nested.Length > 0) return nested;
-                    }
-                }
+                continue;
             }
-            if (element.TryGetProperty("content", out JsonElement parts) && parts.ValueKind == JsonValueKind.Array)
+            if (item.TryGetProperty("type", out JsonElement itemType)
+                && itemType.ValueKind == JsonValueKind.String
+                && itemType.GetString() != "message")
             {
-                foreach (JsonElement part in parts.EnumerateArray())
+                continue;
+            }
+            if (!item.TryGetProperty("content", out JsonElement itemContent)
+                || itemContent.ValueKind != JsonValueKind.Array)
+            {
+                continue;
+            }
+            foreach (JsonElement part in itemContent.EnumerateArray())
+            {
+                if (part.ValueKind != JsonValueKind.Object)
                 {
-                    if (part.TryGetProperty("text", out JsonElement text) && text.ValueKind == JsonValueKind.String)
-                    {
-                        return text.GetString() ?? "";
-                    }
+                    continue;
+                }
+                if (part.TryGetProperty("type", out JsonElement partType)
+                    && partType.ValueKind == JsonValueKind.String
+                    && partType.GetString() != "output_text")
+                {
+                    continue;
+                }
+                if (part.TryGetProperty("text", out JsonElement partText)
+                    && partText.ValueKind == JsonValueKind.String)
+                {
+                    parts.Add(partText.GetString() ?? "");
                 }
             }
         }
-        return "";
+        return string.Concat(parts);
     }
 
     private static void CollectSources(
@@ -395,26 +479,20 @@ internal sealed class AiProviderChatCompletionClient
     }
 
     /// <summary>
-    /// 全技能一律关思考的单一策略点。qwen3.6-flash / deepseek 这类混合思考模型默认开思考，
-    /// 短输出前先烧几百上千 reasoning token。此前 Windows 侧完全没有这个开关，所有 AI 技能
-    /// 都带着思考在跑。
+    /// Chat Completions 供应商的关思考策略点。千问已迁移到 Responses API，
+    /// 由其请求体使用官方推荐的 reasoning.effort:none。
     ///
     /// 2026-07-20 实盘 A/B（探针 macOS 主线仓 scripts/Test-FamoAISkills.ps1 ± -ThinkingOff，
     /// 打真实百炼 qwen3.6-flash）：提示词优化 24.4s → 2.5s、任意提问第二轮 9.4s → 1.7s，
     /// 而四要素补齐 / 专名保留 / 多轮承接 / 多版本区分度断言逐条不变——质量零回退。
     ///
-    /// 只发给认得该字段的供应商：别家一个字段都不加，请求体逐字节不变。DashScope 对未知
-    /// 字段是会拒的，所以绝不能无差别下发。
+    /// 只发给认得该字段的供应商：别家一个字段都不加，请求体逐字节不变。
     /// </summary>
     private static void ApplyThinkingOff(IDictionary<string, object?> body, string model)
     {
         if (model.StartsWith("deepseek", StringComparison.OrdinalIgnoreCase))
         {
             body["thinking"] = new { type = "disabled" };
-        }
-        else if (model.StartsWith("qwen", StringComparison.OrdinalIgnoreCase))
-        {
-            body["enable_thinking"] = false;
         }
     }
 
@@ -423,14 +501,8 @@ internal sealed class AiProviderChatCompletionClient
         try
         {
             using JsonDocument doc = JsonDocument.Parse(json);
-            JsonElement first = doc.RootElement.GetProperty("choices")[0];
-            if (first.TryGetProperty("message", out JsonElement message)
-                && message.TryGetProperty("content", out JsonElement content)
-                && content.ValueKind == JsonValueKind.String)
-            {
-                string? text = content.GetString();
-                if (!string.IsNullOrWhiteSpace(text)) return text.Trim();
-            }
+            string text = FindAssistantContent(doc.RootElement);
+            if (!string.IsNullOrWhiteSpace(text)) return text.Trim();
         }
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
         {
@@ -438,6 +510,56 @@ internal sealed class AiProviderChatCompletionClient
         }
 
         throw new InvalidOperationException("AI 响应为空。");
+    }
+
+    private static string ParseAssistantTextWithSources(string json)
+    {
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(json);
+            string text = FindAssistantContent(doc.RootElement).Trim();
+            if (text.Length == 0)
+            {
+                throw new InvalidOperationException("AI 响应为空。");
+            }
+
+            var sources = new List<(string Title, string Url)>();
+            CollectSources(
+                doc.RootElement,
+                sources,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            if (sources.Count == 0) return text;
+
+            string sourceLines = string.Join(
+                "\n",
+                sources.Take(8).Select(FormatSource));
+            return $"{text}\n\n来源：\n{sourceLines}";
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException("AI 响应格式无法解析。", ex);
+        }
+    }
+
+    private static string FormatSource((string Title, string Url) source) =>
+        string.IsNullOrWhiteSpace(source.Title)
+            ? $"- {source.Url}"
+            : $"- {source.Title}\n  {source.Url}";
+
+    private static void EnsureJsonObjectResponse(string text)
+    {
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(text);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidOperationException("千问响应不是 JSON 对象。");
+            }
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException("千问响应不是有效 JSON 对象。", ex);
+        }
     }
 
     private static string ExtractErrorMessage(string json)

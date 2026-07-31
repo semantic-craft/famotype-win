@@ -308,10 +308,56 @@ int main() {
   CHECK(service.readiness() == RuntimeReadiness::Ready);
   CHECK(service.engine_generation() == 2);
 
+  Frame previous_version_hello = Request(Command::Hello, 0);
+  previous_version_hello.correlation.client_id = 10;
+  previous_version_hello.correlation.session_id = 0;
+  previous_version_hello.correlation.session_generation = 0;
+  previous_version_hello.wire_version = kMinSupportedProtocolVersion;
+  const Frame previous_version_hello_reply =
+      service.Dispatch(previous_version_hello);
+  CHECK(previous_version_hello_reply.status == Status::Ok);
+  CHECK(previous_version_hello_reply.wire_version ==
+        kMinSupportedProtocolVersion);
+  Frame previous_version_open = Request(Command::OpenSession, 1);
+  previous_version_open.correlation.client_id =
+      previous_version_hello.correlation.client_id;
+  previous_version_open.wire_version = kMinSupportedProtocolVersion;
+  CHECK(EncodeOpenSession("legacy-v2", &previous_version_open.payload,
+                          &error));
+  const Frame previous_version_open_reply =
+      service.Dispatch(previous_version_open);
+  CHECK(previous_version_open_reply.status == Status::Ok);
+  CHECK(previous_version_open_reply.wire_version ==
+        kMinSupportedProtocolVersion);
+  Frame previous_version_key = Request(Command::ProcessKey, 2);
+  previous_version_key.correlation.client_id =
+      previous_version_hello.correlation.client_id;
+  previous_version_key.wire_version = kMinSupportedProtocolVersion;
+  CHECK(EncodeKeyEvent(
+      {static_cast<uint32_t>('N'), 0, 0, 1, 1},
+      &previous_version_key.payload));
+  const Frame previous_version_key_reply =
+      service.Dispatch(previous_version_key);
+  CHECK(previous_version_key_reply.status == Status::Ok);
+  CHECK(previous_version_key_reply.wire_version ==
+        kMinSupportedProtocolVersion);
+  Composition previous_version_composition;
+  CHECK(DecodeComposition(previous_version_key_reply.payload,
+                          &previous_version_composition, &error));
+  CHECK(previous_version_composition.handled &&
+        previous_version_composition.preedit == "n");
+
   Frame hello = Request(Command::Hello, 0);
   hello.correlation.session_id = 0;
   hello.correlation.session_generation = 0;
-  CHECK(service.Dispatch(hello).status == Status::Ok);
+  const HelloRequest hello_offer{
+      kMinSupportedProtocolVersion, kProtocolVersion, 1};
+  CHECK(EncodeHelloRequest(hello_offer, &hello.payload, &error));
+  const Frame hello_reply = service.Dispatch(hello);
+  CHECK(hello_reply.status == Status::Ok);
+  HelloResponse hello_selection;
+  CHECK(DecodeHelloResponse(hello_reply.payload, &hello_selection, &error));
+  CHECK(hello_selection.selected_protocol_version == kProtocolVersion);
   CHECK(service.Dispatch(hello).status == Status::Ok);
 
   Frame open = Request(Command::OpenSession, 1);
@@ -355,6 +401,29 @@ int main() {
   std::atomic<bool> runtime_running{true};
   RuntimeControlService control(&service, &runtime_running);
   CHECK(control.Start());
+  Frame previous_version_control_hello;
+  previous_version_control_hello.command = Command::Hello;
+  previous_version_control_hello.correlation = {100, 1, 1, 0, 0, 0};
+  previous_version_control_hello.wire_version =
+      kMinSupportedProtocolVersion;
+  const Frame previous_version_control_reply =
+      control.Dispatch(previous_version_control_hello);
+  CHECK(previous_version_control_reply.status == Status::Ok);
+  CHECK(previous_version_control_reply.wire_version ==
+        kMinSupportedProtocolVersion);
+
+  Frame negotiated_control_hello;
+  negotiated_control_hello.command = Command::Hello;
+  negotiated_control_hello.correlation = {102, 1, 1, 0, 0, 0};
+  CHECK(EncodeHelloRequest(hello_offer, &negotiated_control_hello.payload,
+                           &error));
+  const Frame control_hello_reply =
+      control.Dispatch(negotiated_control_hello);
+  CHECK(control_hello_reply.status == Status::Ok);
+  CHECK(DecodeHelloResponse(control_hello_reply.payload, &hello_selection,
+                            &error));
+  CHECK(hello_selection.selected_protocol_version == kProtocolVersion);
+
   Frame control_hello;
   control_hello.command = Command::Hello;
   control_hello.correlation = {101, 1, 1, 0, 0, 0};

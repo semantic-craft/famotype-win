@@ -164,6 +164,8 @@ private:
     uint64_t connection_generation = 0;
     PipeClientIdentity owner;
     uint64_t max_session_id = 0;
+    uint16_t protocol_version = 0;
+    uint32_t bridge_abi = 0;
   };
   struct AbandonedEpoch {
     uint64_t client_id = 0;

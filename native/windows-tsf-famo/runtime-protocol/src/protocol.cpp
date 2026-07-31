@@ -112,7 +112,8 @@ bool PeekFrameSize(std::span<const uint8_t> header, uint32_t *size,
   uint16_t version = 0, header_size = 0;
   if (!reader.U32(&magic) || !reader.U16(&version) ||
       !reader.U16(&header_size) || !reader.U32(&decoded_size) ||
-      magic != kProtocolMagic || version != kProtocolVersion ||
+      magic != kProtocolMagic || version < kMinSupportedProtocolVersion ||
+      version > kProtocolVersion ||
       header_size != kHeaderSize || decoded_size < kHeaderSize ||
       decoded_size > kMaxFrameSize) {
     if (error)
@@ -130,6 +131,8 @@ bool EncodeFrame(const Frame &frame, std::vector<uint8_t> *bytes,
   if (!bytes || !KnownCommand(static_cast<uint16_t>(frame.command)) ||
       !KnownStatus(static_cast<uint32_t>(frame.status)) ||
       (frame.flags & ~(kFlagResponse | kFlagAcknowledgePrevious)) != 0 ||
+      frame.wire_version < kMinSupportedProtocolVersion ||
+      frame.wire_version > kProtocolVersion ||
       frame.payload.size() > kMaxFramePayloadSize) {
     if (error)
       *error = "invalid frame fields";
@@ -137,7 +140,7 @@ bool EncodeFrame(const Frame &frame, std::vector<uint8_t> *bytes,
   }
   Writer writer;
   writer.U32(kProtocolMagic);
-  writer.U16(kProtocolVersion);
+  writer.U16(frame.wire_version);
   writer.U16(kHeaderSize);
   writer.U32(static_cast<uint32_t>(kHeaderSize + frame.payload.size()));
   writer.U16(static_cast<uint16_t>(frame.command));
@@ -209,8 +212,143 @@ bool DecodeFrame(std::span<const uint8_t> bytes, Frame *frame,
   decoded.status = static_cast<Status>(status);
   decoded.correlation = correlation;
   decoded.payload.assign(payload.begin(), payload.end());
+  decoded.wire_version = version;
   *frame = std::move(decoded);
   return true;
+  });
+}
+
+bool EncodeHelloRequest(const HelloRequest &hello,
+                        std::vector<uint8_t> *payload,
+                        std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!payload || hello.min_protocol_version == 0 ||
+        hello.min_protocol_version > hello.max_protocol_version ||
+        hello.bridge_abi == 0) {
+      if (error)
+        *error = "invalid Hello request";
+      return false;
+    }
+    Writer writer;
+    writer.U16(hello.min_protocol_version);
+    writer.U16(hello.max_protocol_version);
+    writer.U32(hello.bridge_abi);
+    *payload = writer.Take();
+    return true;
+  });
+}
+
+bool DecodeHelloRequest(std::span<const uint8_t> payload, HelloRequest *hello,
+                        std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    Reader reader(payload);
+    HelloRequest decoded;
+    if (!hello || !reader.U16(&decoded.min_protocol_version) ||
+        !reader.U16(&decoded.max_protocol_version) ||
+        !reader.U32(&decoded.bridge_abi) ||
+        decoded.min_protocol_version == 0 ||
+        decoded.min_protocol_version > decoded.max_protocol_version ||
+        decoded.bridge_abi == 0) {
+      if (error)
+        *error = "invalid Hello request";
+      return false;
+    }
+    *hello = decoded;
+    return true;
+  });
+}
+
+bool EncodeHelloResponse(const HelloResponse &hello,
+                         std::vector<uint8_t> *payload,
+                         std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!payload || hello.min_protocol_version == 0 ||
+        hello.min_protocol_version > hello.max_protocol_version ||
+        hello.selected_protocol_version < hello.min_protocol_version ||
+        hello.selected_protocol_version > hello.max_protocol_version) {
+      if (error)
+        *error = "invalid Hello response";
+      return false;
+    }
+    Writer writer;
+    writer.U16(hello.min_protocol_version);
+    writer.U16(hello.max_protocol_version);
+    writer.U16(hello.selected_protocol_version);
+    writer.U16(0);
+    *payload = writer.Take();
+    return true;
+  });
+}
+
+bool DecodeHelloResponse(std::span<const uint8_t> payload,
+                         HelloResponse *hello,
+                         std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    Reader reader(payload);
+    HelloResponse decoded;
+    uint16_t reserved = 0;
+    if (!hello || !reader.U16(&decoded.min_protocol_version) ||
+        !reader.U16(&decoded.max_protocol_version) ||
+        !reader.U16(&decoded.selected_protocol_version) ||
+        !reader.U16(&reserved) || reserved != 0 ||
+        decoded.min_protocol_version == 0 ||
+        decoded.min_protocol_version > decoded.max_protocol_version ||
+        decoded.selected_protocol_version < decoded.min_protocol_version ||
+        decoded.selected_protocol_version > decoded.max_protocol_version) {
+      if (error)
+        *error = "invalid Hello response";
+      return false;
+    }
+    *hello = decoded;
+    return true;
+  });
+}
+
+bool NegotiateHello(const Frame &request, NegotiatedHello *negotiated,
+                    std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!negotiated || request.command != Command::Hello ||
+        request.flags != 0 || request.status != Status::Ok) {
+      if (error)
+        *error = "invalid Hello frame";
+      return false;
+    }
+
+    NegotiatedHello result;
+    if (request.payload.empty()) {
+      result.protocol_version = request.wire_version;
+      result.legacy = true;
+      *negotiated = std::move(result);
+      return true;
+    }
+
+    HelloRequest hello;
+    if (!DecodeHelloRequest(request.payload, &hello, error) ||
+        request.wire_version < hello.min_protocol_version ||
+        request.wire_version > hello.max_protocol_version) {
+      if (error && error->empty())
+        *error = "Hello frame version is outside the offered range";
+      return false;
+    }
+    const uint16_t minimum =
+        (std::max)(hello.min_protocol_version,
+                   kMinSupportedProtocolVersion);
+    const uint16_t maximum =
+        (std::min)(hello.max_protocol_version, kProtocolVersion);
+    if (minimum > maximum) {
+      if (error)
+        *error = "Hello protocol ranges do not overlap";
+      return false;
+    }
+
+    result.protocol_version = maximum;
+    result.bridge_abi = hello.bridge_abi;
+    const HelloResponse response{kMinSupportedProtocolVersion,
+                                 kProtocolVersion, maximum};
+    if (!EncodeHelloResponse(response, &result.response_payload, error))
+      return false;
+    *negotiated = std::move(result);
+    return true;
   });
 }
 

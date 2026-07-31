@@ -8,33 +8,50 @@ namespace Famo.Settings.Core.Ai;
 
 public static class WebSearchBackends
 {
+    public const string Qwen = "qwen";
     public const string Doubao = "doubao";
     public const string Perplexity = "perplexity";
 
-    public static readonly string[] All = [Doubao, Perplexity];
+    public static readonly string[] All = [Qwen, Doubao, Perplexity];
 
-    public static string Normalize(string? backend) =>
-        backend == Perplexity ? Perplexity : Doubao;
+    public static string Normalize(string? backend) => backend switch
+    {
+        Qwen => Qwen,
+        Perplexity => Perplexity,
+        _ => Doubao,
+    };
 
-    public static string DisplayName(string backend) =>
-        Normalize(backend) == Perplexity ? "Perplexity" : "豆包搜索";
+    public static string DisplayName(string backend) => Normalize(backend) switch
+    {
+        Qwen => "阿里云百炼（千问内置）",
+        Perplexity => "Perplexity",
+        _ => "豆包搜索",
+    };
+
+    public static bool UsesProviderCredential(string backend) =>
+        Normalize(backend) == Qwen;
 
     public static string SecretName(string backend) =>
         $"famo.websearch.{Normalize(backend)}.apiKey";
 
-    public static string Endpoint(string backend) =>
-        Normalize(backend) == Perplexity
-            ? "https://api.perplexity.ai/search"
-            : "https://open.feedcoopapi.com/search_api/global_search";
+    public static string Endpoint(string backend) => Normalize(backend) switch
+    {
+        Qwen => "默认千问供应商的 Responses API",
+        Perplexity => "https://api.perplexity.ai/search",
+        _ => "https://open.feedcoopapi.com/search_api/global_search",
+    };
 
-    public static string KeyHint(string backend) =>
-        Normalize(backend) == Perplexity
-            ? "在 perplexity.ai 的 API 设置中创建（pplx- 开头）；国内网络可能需要代理。"
-            : "在火山引擎「联网搜索控制台 → API Key 管理 → 按量后付费」单独创建；方舟模型 Key 在这里无效。";
+    public static string KeyHint(string backend) => Normalize(backend) switch
+    {
+        Qwen => "复用默认千问供应商的 Workspace ID 与 API Key，不需要单独保存搜索密钥。",
+        Perplexity => "在 perplexity.ai 的 API 设置中创建（pplx- 开头）；国内网络可能需要代理。",
+        _ => "在火山引擎「联网搜索控制台 → API Key 管理 → 按量后付费」单独创建；方舟模型 Key 在这里无效。",
+    };
 
     internal static IEnumerable<string> Ordered(string preferred)
     {
         string first = Normalize(preferred);
+        if (first == Qwen) yield break;
         yield return first;
         yield return first == Doubao ? Perplexity : Doubao;
     }

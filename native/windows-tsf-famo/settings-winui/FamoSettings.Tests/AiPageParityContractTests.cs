@@ -24,6 +24,9 @@ public sealed class AiPageParityContractTests
         Assert.Contains("Chat · V4 Flash", page);
         Assert.Contains("Reasoner · V4 Pro", page);
         Assert.Contains("任意提问 · 联网搜索", page);
+        Assert.Contains("Workspace ID", page);
+        Assert.Contains("cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses", page);
+        Assert.DoesNotContain("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", page);
 
         // 云端 AI（全局）卡已搬到 SkillsPage.cs（技能平台），AiPage.cs 只剩供应商配置。
         Assert.DoesNotContain("云端 AI（全局）", page);

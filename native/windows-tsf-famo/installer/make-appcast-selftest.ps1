@@ -49,8 +49,8 @@ try {
     throw 'appcast 缺少 windows-x64 平台约束。'
   }
   if ($enclosure.GetAttribute('installerArguments', $sparkleNamespace) -ne
-      '/SILENT /SP- /NOICONS /NORESTART') {
-    throw 'appcast 安装参数不符合非强退/非强制重启策略。'
+      '/SILENT /SP- /NOICONS') {
+    throw 'appcast 安装参数未保留可见进度或重启提示。'
   }
 
   $verifyArgs = @(

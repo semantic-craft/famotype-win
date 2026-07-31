@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -53,6 +54,79 @@ bool Utf8(std::wstring_view source, std::string *target) {
   return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, source.data(),
                              static_cast<int>(source.size()), target->data(),
                              needed, nullptr, nullptr) == needed;
+}
+
+std::string InstallProjectionSummary() {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Famo\\InputMethod", 0,
+                    KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
+    return "registry=unavailable";
+  }
+  wchar_t state[32]{};
+  wchar_t directory[32768]{};
+  DWORD state_bytes = sizeof(state);
+  DWORD directory_bytes = sizeof(directory);
+  const LSTATUS state_result =
+      RegGetValueW(key, nullptr, L"InstallState", RRF_RT_REG_SZ, nullptr,
+                   state, &state_bytes);
+  const LSTATUS directory_result =
+      RegGetValueW(key, nullptr, L"InstallDir", RRF_RT_REG_SZ, nullptr,
+                   directory, &directory_bytes);
+  RegCloseKey(key);
+  std::string state_utf8;
+  std::string directory_utf8;
+  if (state_result != ERROR_SUCCESS || directory_result != ERROR_SUCCESS ||
+      !Utf8(state, &state_utf8) || !Utf8(directory, &directory_utf8)) {
+    return "registry=invalid";
+  }
+  return "state=" + state_utf8 + " install_dir=" + directory_utf8;
+}
+
+void AppendStartupDiagnostic(const std::wstring &data_root,
+                             std::string_view stage, unsigned code,
+                             std::string_view detail = {}) noexcept {
+  try {
+    if (data_root.empty())
+      return;
+    CreateDirectoryW(data_root.c_str(), nullptr);
+    const std::wstring log_directory = data_root + L"\\log";
+    CreateDirectoryW(log_directory.c_str(), nullptr);
+    const std::wstring path =
+        log_directory + L"\\famo-runtime-startup.log";
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+      return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    char prefix[256]{};
+    const int prefix_length = std::snprintf(
+        prefix, sizeof(prefix),
+        "%04u-%02u-%02uT%02u:%02u:%02u.%03u pid=%lu stage=%.*s code=%u",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
+        now.wMilliseconds, static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<int>(stage.size()), stage.data(), code);
+    if (prefix_length > 0) {
+      const size_t safe_length =
+          static_cast<size_t>(prefix_length) < sizeof(prefix)
+              ? static_cast<size_t>(prefix_length)
+              : sizeof(prefix) - 1;
+      std::string line(prefix, safe_length);
+      if (!detail.empty()) {
+        line += " detail=";
+        line.append(detail);
+      }
+      line += "\r\n";
+      DWORD written = 0;
+      WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written,
+                nullptr);
+    }
+    CloseHandle(file);
+  } catch (...) {
+  }
 }
 
 // RuntimeService holds a single sink, so the candidate window and the tray both
@@ -157,6 +231,8 @@ int wmain(int argc, wchar_t **argv) {
   }
   if (endpoint_suffix == kDefaultRuntimeEndpointSuffix &&
       !ProductionInstallAllowed(ModuleDirectory(), true)) {
+    AppendStartupDiagnostic(data_root, "install-state", 3,
+                            InstallProjectionSummary());
     std::fprintf(stderr, "runtime install state is not active\n");
     return 3;
   }
@@ -180,6 +256,7 @@ int wmain(int argc, wchar_t **argv) {
       L"." + endpoint_suffix;
   HANDLE singleton = CreateMutexW(nullptr, TRUE, singleton_name.c_str());
   if (!singleton) {
+    AppendStartupDiagnostic(data_root, "singleton", 3);
     std::fprintf(stderr, "runtime singleton setup failed\n");
     return 3;
   }
@@ -190,6 +267,7 @@ int wmain(int argc, wchar_t **argv) {
 
   CandidateWindow candidate_window;
   if (!candidate_window.Start()) {
+    AppendStartupDiagnostic(data_root, "candidate-window", 3);
     std::fprintf(stderr, "candidate window thread setup failed\n");
     return 3;
   }
@@ -200,6 +278,7 @@ int wmain(int argc, wchar_t **argv) {
   service.SetSnapshotSink(&snapshots);
   const std::wstring engine = ModuleDirectory() + L"\\FamoRimeEngine.dll";
   if (!service.Start(engine.c_str(), data_root_utf8.c_str(), &error)) {
+    AppendStartupDiagnostic(data_root, "engine", 4, error);
     std::fprintf(stderr, "engine setup failed: %s\n", error.c_str());
     service.SetSnapshotSink(nullptr);
     candidate_window.Stop();
@@ -216,6 +295,7 @@ int wmain(int argc, wchar_t **argv) {
 
   RuntimeControlService control_service(&service, &running);
   if (!control_service.Start()) {
+    AppendStartupDiagnostic(data_root, "control-pipe", 5);
     service.SetSnapshotSink(nullptr);
     service.Stop();
     candidate_window.Stop();

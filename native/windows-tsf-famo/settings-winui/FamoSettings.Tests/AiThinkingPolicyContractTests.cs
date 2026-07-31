@@ -34,8 +34,8 @@ public sealed class AiThinkingPolicyContractTests : IDisposable
     [Theory]
     // DeepSeek 系走 thinking:{"type":"disabled"}，且不得带 qwen 的字段。
     [InlineData("deepseek-chat", "\"thinking\":{\"type\":\"disabled\"}", "enable_thinking")]
-    // DashScope（qwen）系走 enable_thinking:false，且不得带 DeepSeek 的字段。
-    [InlineData("qwen3.6-flash", "\"enable_thinking\":false", "\"thinking\"")]
+    // 千问 Responses API 走 reasoning.effort:none，不再使用即将弃用的 enable_thinking。
+    [InlineData("qwen3.6-flash", "\"reasoning\":{\"effort\":\"none\"}", "enable_thinking")]
     public async Task SendAsync_DisablesThinkingForModelsThatSupportIt(
         string model, string expectedFragment, string forbiddenFragment)
     {
@@ -59,12 +59,15 @@ public sealed class AiThinkingPolicyContractTests : IDisposable
     [Fact]
     public async Task SendAsync_KeepsTheExistingWireShapeAlongsideTheThinkingSwitch()
     {
-        // 收拢两条分支后，原有字段必须一个不少（这次改动只加字段、不改形状）。
+        // 千问迁移到 Responses API 后，必须使用官方 input/store 线缆。
         string body = await CaptureRequestBodyAsync("qwen3.6-flash");
 
         Assert.Contains("\"model\":\"qwen3.6-flash\"", body);
         Assert.Contains("\"stream\":false", body);
+        Assert.Contains("\"store\":false", body);
+        Assert.Contains("\"input\":[", body);
         Assert.Contains("\"role\":\"user\"", body);
+        Assert.DoesNotContain("\"messages\":", body);
     }
 
     private async Task<string> CaptureRequestBodyAsync(string model)
@@ -97,7 +100,9 @@ public sealed class AiThinkingPolicyContractTests : IDisposable
         service.AddProfile(new AiProviderProfileDraft
         {
             DisplayName = "Probe",
-            Endpoint = "https://api.deepseek.com/v1/chat/completions",
+            Endpoint = model.StartsWith("qwen", StringComparison.OrdinalIgnoreCase)
+                ? QwenResponsesApi.BuildBeijingEndpoint("llm-thinking-test")
+                : "https://api.deepseek.com/v1/chat/completions",
             Model = model,
             ApiKey = key,
             MakeDefault = true,

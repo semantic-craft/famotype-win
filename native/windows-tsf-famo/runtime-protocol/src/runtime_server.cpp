@@ -286,6 +286,8 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
     }
     if (inject && fault == ServerFault::DisconnectAfterDispatch)
       break;
+    if (inject && fault == ServerFault::WrongVersionReply)
+      reply.wire_version = kMinSupportedProtocolVersion;
     bool hello_accepted = false;
     if (request.command == Command::Hello) {
       hello_accepted =
@@ -423,6 +425,8 @@ bool ParseServerFault(std::string_view value, ServerFault *fault) {
     *fault = ServerFault::NoReply;
   else if (value == "malformed")
     *fault = ServerFault::MalformedReply;
+  else if (value == "wrong-version")
+    *fault = ServerFault::WrongVersionReply;
   else if (value == "disconnect")
     *fault = ServerFault::Disconnect;
   else if (value == "engine-hang")

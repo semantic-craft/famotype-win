@@ -24,6 +24,8 @@ $RegistrationPath = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\$FamoCl
 $BrandPath = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Famo\InputMethod'
 $StagingPayload = [System.IO.Path]::GetFullPath(
   (Join-Path $PSScriptRoot '..\..\installer\staging\payload'))
+$StagingBridge = [System.IO.Path]::GetFullPath(
+  (Join-Path $PSScriptRoot '..\..\installer\staging\bridge'))
 $TipRegistrationPath = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\CTF\TIP\$FamoClsid"
 $TipRegistrationKey = "HKLM\SOFTWARE\Microsoft\CTF\TIP\$FamoClsid"
 
@@ -48,7 +50,9 @@ function Resolve-FamoArtifactPaths {
     [Parameter(Mandatory = $true)][bool] $RegistrationPresent,
     [string] $RegisteredDll,
     [string] $InstallDir,
-    [Parameter(Mandatory = $true)][string] $FallbackPayload
+    [string] $BridgePath,
+    [Parameter(Mandatory = $true)][string] $FallbackPayload,
+    [Parameter(Mandatory = $true)][string] $FallbackBridge
   )
 
   if ($RegistrationPresent) {
@@ -63,16 +67,21 @@ function Resolve-FamoArtifactPaths {
     if ((Split-Path -Leaf $dll) -ine 'FamoTextService.dll') {
       throw "Famo COM registration points to an unsupported text service: $dll"
     }
+    $expectedBridge = if ($BridgePath) {
+      [System.IO.Path]::GetFullPath($BridgePath.Trim('"'))
+    } else {
+      Join-Path $target 'FamoTextService.dll'
+    }
     if (-not [string]::Equals(
-        (Split-Path -Parent $dll).TrimEnd('\'),
-        $target,
+        $dll,
+        $expectedBridge,
         [System.StringComparison]::OrdinalIgnoreCase)) {
-      throw "Famo COM registration does not match InstallDir: $dll <> $target"
+      throw "Famo COM registration does not match Bridge projection: $dll <> $expectedBridge"
     }
     $source = 'RegisteredInstall'
   } else {
     $target = [System.IO.Path]::GetFullPath($FallbackPayload).TrimEnd('\')
-    $dll = Join-Path $target 'FamoTextService.dll'
+    $dll = Join-Path ([System.IO.Path]::GetFullPath($FallbackBridge)) 'FamoTextService.dll'
     $source = 'StagingPayload'
   }
 
@@ -95,9 +104,11 @@ if ($SelfCheck) {
   )
   $fixtureArgs = @{
     RegistrationPresent = $true
-    RegisteredDll = 'C:\Program Files\Famo\versions\1.5.3-fixture\FamoTextService.dll'
+    RegisteredDll = 'C:\Program Files\Famo\bridge\v1\FamoTextService.dll'
     InstallDir = 'C:\Program Files\Famo\versions\1.5.3-fixture'
+    BridgePath = 'C:\Program Files\Famo\bridge\v1\FamoTextService.dll'
     FallbackPayload = 'C:\staging\payload'
+    FallbackBridge = 'C:\staging\bridge'
   }
   $fixture = Resolve-FamoArtifactPaths @fixtureArgs
   $legacyRejected = $false
@@ -106,7 +117,9 @@ if ($SelfCheck) {
       RegistrationPresent = $true
       RegisteredDll = 'C:\Program Files\Famo\FamoTsf.dll'
       InstallDir = 'C:\Program Files\Famo'
+      BridgePath = 'C:\Program Files\Famo\bridge\v1\FamoTextService.dll'
       FallbackPayload = 'C:\staging\payload'
+      FallbackBridge = 'C:\staging\bridge'
     }
     [void](Resolve-FamoArtifactPaths @legacyArgs)
   } catch {
@@ -118,7 +131,9 @@ if ($SelfCheck) {
       RegistrationPresent = $true
       RegisteredDll = ''
       InstallDir = 'C:\Program Files\Famo\versions\1.5.3-fixture'
+      BridgePath = 'C:\Program Files\Famo\bridge\v1\FamoTextService.dll'
       FallbackPayload = 'C:\staging\payload'
+      FallbackBridge = 'C:\staging\bridge'
     }
     [void](Resolve-FamoArtifactPaths @emptyRegistrationArgs)
   } catch {
@@ -151,11 +166,16 @@ $registeredDll = if ($registrationWasPresent) {
 $installDir = if (Test-Path -LiteralPath $BrandPath) {
   [string](Get-ItemPropertyValue -LiteralPath $BrandPath -Name InstallDir -ErrorAction SilentlyContinue)
 } else { '' }
+$bridgePath = if (Test-Path -LiteralPath $BrandPath) {
+  [string](Get-ItemPropertyValue -LiteralPath $BrandPath -Name BridgePath -ErrorAction SilentlyContinue)
+} else { '' }
 $artifactArgs = @{
   RegistrationPresent = $registrationWasPresent
   RegisteredDll = $registeredDll
   InstallDir = $installDir
+  BridgePath = $bridgePath
   FallbackPayload = $StagingPayload
+  FallbackBridge = $StagingBridge
 }
 $artifacts = Resolve-FamoArtifactPaths @artifactArgs
 $FamoDll = $artifacts.dll
