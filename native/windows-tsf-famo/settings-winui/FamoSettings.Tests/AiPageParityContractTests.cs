@@ -23,6 +23,7 @@ public sealed class AiPageParityContractTests
         Assert.Contains("+ 自定义（OpenAI 兼容）", page);
         Assert.Contains("Chat · V4 Flash", page);
         Assert.Contains("Reasoner · V4 Pro", page);
+        Assert.Contains("DeepSeekResponsesApi.Endpoint", page);
         Assert.Contains("任意提问 · 联网搜索", page);
         Assert.Contains("Workspace ID", page);
         Assert.Contains("cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses", page);
@@ -48,6 +49,7 @@ public sealed class AiPageParityContractTests
         Assert.Contains("Windows Credential Manager", page);
         Assert.Contains("https://open.feedcoopapi.com/search_api/global_search", search);
         Assert.Contains("https://api.perplexity.ai/search", search);
+        Assert.Contains("DeepSeek（内置）", search);
         Assert.Contains("famo.websearch.", search);
         Assert.Contains("方舟模型 Key 在这里无效", search);
     }

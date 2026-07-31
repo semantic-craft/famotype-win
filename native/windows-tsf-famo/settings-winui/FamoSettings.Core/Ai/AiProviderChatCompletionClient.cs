@@ -37,7 +37,7 @@ internal sealed class AiProviderChatCompletionClient
         IReadOnlyList<AiProviderChatMessage> messages,
         CancellationToken cancellationToken,
         bool jsonObjectResponse = false,
-        bool useNativeWebSearch = false)
+        string? nativeWebSearchProvider = null)
     {
         if (messages.Count == 0)
         {
@@ -46,17 +46,29 @@ internal sealed class AiProviderChatCompletionClient
 
         var (profile, apiKey, endpoint) = ResolveDefault();
         string provider = InferProvider(profile);
-        if (useNativeWebSearch && provider != "qwen")
+        bool usesResponsesApi = provider == "qwen"
+            || provider == "deepseek" && DeepSeekResponsesApi.IsResponsesEndpoint(endpoint);
+        if (nativeWebSearchProvider is not null && provider != nativeWebSearchProvider)
         {
             throw new InvalidOperationException(
-                "阿里云百炼内置搜索要求默认 AI 供应商为阿里云百炼。");
+                $"{WebSearchBackends.DisplayName(nativeWebSearchProvider)}搜索要求默认 AI 供应商与搜索服务一致。");
+        }
+        if (nativeWebSearchProvider is not null && !usesResponsesApi)
+        {
+            throw new InvalidOperationException(
+                "DeepSeek 内置搜索目前要求 deepseek-v4-flash 与 Responses API。");
         }
 
         using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
         ApplyAuth(request, profile, apiKey);
         request.Content = new StringContent(
             BuildRequestJson(
-                profile, provider, messages, jsonObjectResponse, useNativeWebSearch),
+                profile,
+                provider,
+                messages,
+                jsonObjectResponse,
+                usesResponsesApi,
+                nativeWebSearchProvider is not null),
             Encoding.UTF8,
             "application/json");
 
@@ -68,10 +80,10 @@ internal sealed class AiProviderChatCompletionClient
             throw new InvalidOperationException($"AI 请求失败：HTTP {(int)response.StatusCode} {ExtractErrorMessage(json)}".Trim());
         }
 
-        string text = useNativeWebSearch
+        string text = nativeWebSearchProvider is not null
             ? ParseAssistantTextWithSources(json)
             : ParseAssistantText(json);
-        if (provider == "qwen" && jsonObjectResponse)
+        if ((provider is "qwen" or "deepseek") && jsonObjectResponse)
         {
             EnsureJsonObjectResponse(text);
         }
@@ -88,7 +100,20 @@ internal sealed class AiProviderChatCompletionClient
         if (string.IsNullOrWhiteSpace(apiKey))
             throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
         Uri endpoint = ParseEndpoint(profile.Endpoint);
-        if (InferProvider(profile) == "qwen"
+        string provider = InferProvider(profile);
+        if (provider == "deepseek")
+        {
+            endpoint = DeepSeekResponsesApi.ResolveEndpoint(endpoint, profile.Model);
+            if (DeepSeekResponsesApi.IsResponsesEndpoint(endpoint)
+                && !profile.Model.Equals(
+                    DeepSeekResponsesApi.FlashModel,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "DeepSeek Responses API 目前只支持 deepseek-v4-flash；V4 Pro 请使用 Chat Completions。");
+            }
+        }
+        if (provider == "qwen"
             && !QwenResponsesApi.IsResponsesEndpoint(endpoint))
         {
             throw new InvalidOperationException(
@@ -113,15 +138,28 @@ internal sealed class AiProviderChatCompletionClient
             throw new InvalidOperationException("默认 AI 供应商缺少模型 ID，请先在设置中补全。");
         }
         string provider = InferProvider(profile);
-        if (provider is not ("qwen" or "mimo" or "doubao" or "openai"))
+        if (provider is not ("qwen" or "deepseek" or "mimo" or "doubao" or "openai"))
         {
             throw new InvalidOperationException(
-                "当前默认供应商不支持返回来源的联网核验，请切换到阿里云百炼、小米 MiMo、火山引擎豆包或 OpenAI。");
+                "当前默认供应商不支持返回来源的联网核验，请切换到阿里云百炼、DeepSeek、小米 MiMo、火山引擎豆包或 OpenAI。");
         }
 
+        Uri configuredEndpoint = ParseEndpoint(profile.Endpoint);
+        if (provider == "deepseek")
+        {
+            configuredEndpoint = DeepSeekResponsesApi.ResolveEndpoint(
+                configuredEndpoint, profile.Model);
+            if (!DeepSeekResponsesApi.IsResponsesEndpoint(configuredEndpoint)
+                || !profile.Model.Equals(
+                    DeepSeekResponsesApi.FlashModel,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "DeepSeek 联网核验目前要求 deepseek-v4-flash 与 Responses API。");
+            }
+        }
         string apiKey = _secrets.GetSecret(profile.SecretName)
             ?? throw new InvalidOperationException("默认 AI 供应商缺少 API Key，请先在设置中重新保存。");
-        Uri configuredEndpoint = ParseEndpoint(profile.Endpoint);
         if (provider == "qwen"
             && !QwenResponsesApi.IsResponsesEndpoint(configuredEndpoint))
         {
@@ -169,6 +207,7 @@ internal sealed class AiProviderChatCompletionClient
         string provider,
         IReadOnlyList<AiProviderChatMessage> messages,
         bool jsonObjectResponse,
+        bool usesResponsesApi,
         bool useNativeWebSearch)
     {
         object[] wireMessages = messages
@@ -179,7 +218,7 @@ internal sealed class AiProviderChatCompletionClient
             })
             .ToArray();
 
-        if (provider == "qwen")
+        if (usesResponsesApi)
         {
             object[] responseInput = jsonObjectResponse
                 ?
@@ -199,9 +238,19 @@ internal sealed class AiProviderChatCompletionClient
                 ["model"] = profile.Model,
                 ["input"] = responseInput,
                 ["stream"] = false,
-                ["store"] = false,
                 ["reasoning"] = new { effort = "none" },
             };
+            if (provider == "qwen")
+            {
+                responseBody["store"] = false;
+            }
+            if (provider == "deepseek" && jsonObjectResponse)
+            {
+                responseBody["text"] = new
+                {
+                    format = new { type = "json_object" },
+                };
+            }
             if (useNativeWebSearch)
             {
                 responseBody["tools"] = new object[] { new { type = "web_search" } };
@@ -236,18 +285,22 @@ internal sealed class AiProviderChatCompletionClient
             .Select(m => (object)new { role = m.Role, content = m.Content })
             .ToArray();
 
-        if (provider == "qwen")
+        if (provider is "qwen" or "deepseek")
         {
-            return JsonSerializer.Serialize(new Dictionary<string, object?>
+            var responseBody = new Dictionary<string, object?>
             {
                 ["model"] = profile.Model,
                 ["input"] = wireMessages,
                 ["stream"] = false,
-                ["store"] = false,
                 ["reasoning"] = new { effort = "none" },
                 ["tools"] = new object[] { new { type = "web_search" } },
                 ["tool_choice"] = "required",
-            }, JsonOptions);
+            };
+            if (provider == "qwen")
+            {
+                responseBody["store"] = false;
+            }
+            return JsonSerializer.Serialize(responseBody, JsonOptions);
         }
 
         if (provider == "mimo")
@@ -306,6 +359,7 @@ internal sealed class AiProviderChatCompletionClient
             : "";
         string name = profile.DisplayName.ToLowerInvariant();
         if (host.Contains("dashscope") || host.Contains("aliyuncs") || name.Contains("百炼") || name.Contains("qwen")) return "qwen";
+        if (host == "api.deepseek.com" || name.Contains("deepseek")) return "deepseek";
         if (host.Contains("xiaomimimo") || name.Contains("mimo")) return "mimo";
         if (host.Contains("volces") || host.Contains("volcengine") || name.Contains("豆包")) return "doubao";
         if (host == "api.openai.com" || name.Contains("openai")) return "openai";
@@ -315,7 +369,7 @@ internal sealed class AiProviderChatCompletionClient
     private static Uri SourceVerificationEndpoint(Uri endpoint, string provider)
     {
         var builder = new UriBuilder(endpoint) { Query = "", Fragment = "" };
-        if (provider == "qwen")
+        if (provider is "qwen" or "deepseek")
         {
             return builder.Uri;
         }
@@ -479,8 +533,8 @@ internal sealed class AiProviderChatCompletionClient
     }
 
     /// <summary>
-    /// Chat Completions 供应商的关思考策略点。千问已迁移到 Responses API，
-    /// 由其请求体使用官方推荐的 reasoning.effort:none。
+    /// Chat Completions 供应商的关思考策略点。千问与 DeepSeek V4 Flash 已迁移到
+    /// Responses API，由请求体使用 reasoning.effort:none。
     ///
     /// 2026-07-20 实盘 A/B（探针 macOS 主线仓 scripts/Test-FamoAISkills.ps1 ± -ThinkingOff，
     /// 打真实百炼 qwen3.6-flash）：提示词优化 24.4s → 2.5s、任意提问第二轮 9.4s → 1.7s，
@@ -553,12 +607,12 @@ internal sealed class AiProviderChatCompletionClient
             using JsonDocument document = JsonDocument.Parse(text);
             if (document.RootElement.ValueKind != JsonValueKind.Object)
             {
-                throw new InvalidOperationException("千问响应不是 JSON 对象。");
+                throw new InvalidOperationException("AI 响应不是 JSON 对象。");
             }
         }
         catch (JsonException ex)
         {
-            throw new InvalidOperationException("千问响应不是有效 JSON 对象。", ex);
+            throw new InvalidOperationException("AI 响应不是有效 JSON 对象。", ex);
         }
     }
 
