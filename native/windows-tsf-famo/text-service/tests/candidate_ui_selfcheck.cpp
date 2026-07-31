@@ -42,7 +42,7 @@ public:
     if (!element || !show || !id)
       return E_POINTER;
     ++begins;
-    *show = FALSE;
+    *show = allow_show ? TRUE : FALSE;
     *id = 42;
     element_.reset(element);
     element->AddRef();
@@ -83,11 +83,24 @@ public:
   int updates = 0;
   int ends = 0;
   bool fail_end = false;
+  bool allow_show = false;
 
 private:
   ~FakeUiManager() = default;
   std::atomic<ULONG> references_{1};
   famo::tsf::ComPtr<ITfUIElement> element_;
+};
+
+class FakeCandidateHost final : public famo::tsf::CandidateUiHost {
+public:
+  void OnCandidateVisibilityChanged(
+      famo::tsf::CandidateUiElement *element) override {
+    ++changes;
+    last = element;
+  }
+
+  int changes = 0;
+  famo::tsf::CandidateUiElement *last = nullptr;
 };
 
 famo::runtime::Composition Snapshot() {
@@ -131,7 +144,7 @@ int RunChecks() {
   CHECK(SUCCEEDED(element->Update(Snapshot())) && manager->begins == 2);
   manager->fail_end = true;
   CHECK(SUCCEEDED(element->Update(empty)) && manager->ends == 2);
-  CHECK(!element->begun() && !element->show_allowed());
+  CHECK(!element->begun() && !element->visible());
   BOOL shown = TRUE;
   CHECK(SUCCEEDED(element->IsShown(&shown)) && shown == FALSE);
   manager->fail_end = false;
@@ -140,6 +153,49 @@ int RunChecks() {
 
   element->Release();
   manager->Release();
+
+  // A host that allows the TIP's own UI at BeginUIElement may still take the
+  // drawing over later, by calling ITfUIElement::Show(FALSE). The element must
+  // report the combined status so the runtime window follows the host.
+  auto *host_drawn_manager = new FakeUiManager();
+  host_drawn_manager->allow_show = true;
+  auto *host_drawn =
+      new famo::tsf::CandidateUiElement(host_drawn_manager, nullptr);
+  FakeCandidateHost host;
+  host_drawn->SetHost(&host);
+  BOOL host_allowed = FALSE;
+  CHECK(SUCCEEDED(host_drawn->Update(Snapshot(), &host_allowed)));
+  CHECK(host_allowed == TRUE && host_drawn->visible() == TRUE);
+  CHECK(SUCCEEDED(host_drawn->Show(FALSE)));
+  CHECK(host_drawn->visible() == FALSE);
+  BOOL host_shown = TRUE;
+  CHECK(SUCCEEDED(host_drawn->IsShown(&host_shown)) && host_shown == FALSE);
+  // The host is told once, and told which element changed, so the runtime
+  // window can follow without waiting for the next composition update.
+  CHECK(host.changes == 1 && host.last == host_drawn);
+  // Repeating the same request must not re-notify.
+  CHECK(SUCCEEDED(host_drawn->Show(FALSE)) && host.changes == 1);
+  // Restoring visibility notifies again.
+  CHECK(SUCCEEDED(host_drawn->Show(TRUE)));
+  CHECK(host.changes == 2 && host_drawn->visible() == TRUE);
+  // While hidden, Update() keeps reporting the effective status.
+  CHECK(SUCCEEDED(host_drawn->Show(FALSE)));
+  BOOL while_hidden = TRUE;
+  CHECK(SUCCEEDED(host_drawn->Update(Snapshot(), &while_hidden)));
+  CHECK(while_hidden == FALSE);
+  // A fresh element session clears the previous host's hide.
+  famo::runtime::Composition none;
+  CHECK(SUCCEEDED(host_drawn->Update(none)) && !host_drawn->begun());
+  BOOL reborn = FALSE;
+  CHECK(SUCCEEDED(host_drawn->Update(Snapshot(), &reborn)) && reborn == TRUE);
+  // A detached element must never call back into a released host.
+  const int before_detach = host.changes;
+  host_drawn->SetHost(nullptr);
+  CHECK(SUCCEEDED(host_drawn->Show(FALSE)));
+  CHECK(host.changes == before_detach && host_drawn->visible() == FALSE);
+  host_drawn->Release();
+  host_drawn_manager->Release();
+
   std::printf("candidate_ui_selfcheck: OK\n");
   return 0;
 }

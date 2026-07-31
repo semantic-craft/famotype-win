@@ -64,6 +64,20 @@ HRESULT TextService::OnLayoutChange(ITfContext *context, TfLayoutCode code,
   });
 }
 
+void TextService::OnCandidateVisibilityChanged(CandidateUiElement *element) {
+  // The host called ITfUIElement::Show() to take over or release the drawing
+  // of this element. Republish so the runtime window follows immediately.
+  if (!element || !OnActivationThread())
+    return;
+  for (auto &owned : contexts_) {
+    if (!owned || owned->candidates.get() != element)
+      continue;
+    owned->ui_state.show_allowed = element->visible() != FALSE;
+    PublishUiState(owned.get());
+    return;
+  }
+}
+
 void TextService::RefreshLayout(ContextEntry *entry, ITfContextView *view) {
   if (!entry || !entry->context)
     return;
