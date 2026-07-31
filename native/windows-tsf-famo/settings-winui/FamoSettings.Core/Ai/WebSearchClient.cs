@@ -9,14 +9,16 @@ namespace Famo.Settings.Core.Ai;
 public static class WebSearchBackends
 {
     public const string Qwen = "qwen";
+    public const string DeepSeek = "deepseek";
     public const string Doubao = "doubao";
     public const string Perplexity = "perplexity";
 
-    public static readonly string[] All = [Qwen, Doubao, Perplexity];
+    public static readonly string[] All = [Qwen, DeepSeek, Doubao, Perplexity];
 
     public static string Normalize(string? backend) => backend switch
     {
         Qwen => Qwen,
+        DeepSeek => DeepSeek,
         Perplexity => Perplexity,
         _ => Doubao,
     };
@@ -24,12 +26,13 @@ public static class WebSearchBackends
     public static string DisplayName(string backend) => Normalize(backend) switch
     {
         Qwen => "阿里云百炼（千问内置）",
+        DeepSeek => "DeepSeek（内置）",
         Perplexity => "Perplexity",
         _ => "豆包搜索",
     };
 
     public static bool UsesProviderCredential(string backend) =>
-        Normalize(backend) == Qwen;
+        Normalize(backend) is Qwen or DeepSeek;
 
     public static string SecretName(string backend) =>
         $"famo.websearch.{Normalize(backend)}.apiKey";
@@ -37,6 +40,7 @@ public static class WebSearchBackends
     public static string Endpoint(string backend) => Normalize(backend) switch
     {
         Qwen => "默认千问供应商的 Responses API",
+        DeepSeek => "默认 DeepSeek 供应商的 Responses API",
         Perplexity => "https://api.perplexity.ai/search",
         _ => "https://open.feedcoopapi.com/search_api/global_search",
     };
@@ -44,6 +48,7 @@ public static class WebSearchBackends
     public static string KeyHint(string backend) => Normalize(backend) switch
     {
         Qwen => "复用默认千问供应商的 Workspace ID 与 API Key，不需要单独保存搜索密钥。",
+        DeepSeek => "复用默认 DeepSeek 供应商的 API Key，不需要单独保存搜索密钥。",
         Perplexity => "在 perplexity.ai 的 API 设置中创建（pplx- 开头）；国内网络可能需要代理。",
         _ => "在火山引擎「联网搜索控制台 → API Key 管理 → 按量后付费」单独创建；方舟模型 Key 在这里无效。",
     };
@@ -51,7 +56,7 @@ public static class WebSearchBackends
     internal static IEnumerable<string> Ordered(string preferred)
     {
         string first = Normalize(preferred);
-        if (first == Qwen) yield break;
+        if (UsesProviderCredential(first)) yield break;
         yield return first;
         yield return first == Doubao ? Perplexity : Doubao;
     }

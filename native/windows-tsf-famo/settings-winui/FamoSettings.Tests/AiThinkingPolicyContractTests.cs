@@ -32,8 +32,10 @@ public sealed class AiThinkingPolicyContractTests : IDisposable
     }
 
     [Theory]
-    // DeepSeek 系走 thinking:{"type":"disabled"}，且不得带 qwen 的字段。
+    // DeepSeek Chat Completions 走 thinking:{"type":"disabled"}。
     [InlineData("deepseek-chat", "\"thinking\":{\"type\":\"disabled\"}", "enable_thinking")]
+    // DeepSeek V4 Flash Responses API 走 reasoning.effort:none。
+    [InlineData("deepseek-v4-flash", "\"reasoning\":{\"effort\":\"none\"}", "\"thinking\"")]
     // 千问 Responses API 走 reasoning.effort:none，不再使用即将弃用的 enable_thinking。
     [InlineData("qwen3.6-flash", "\"reasoning\":{\"effort\":\"none\"}", "enable_thinking")]
     public async Task SendAsync_DisablesThinkingForModelsThatSupportIt(
@@ -102,7 +104,9 @@ public sealed class AiThinkingPolicyContractTests : IDisposable
             DisplayName = "Probe",
             Endpoint = model.StartsWith("qwen", StringComparison.OrdinalIgnoreCase)
                 ? QwenResponsesApi.BuildBeijingEndpoint("llm-thinking-test")
-                : "https://api.deepseek.com/v1/chat/completions",
+                : model.Equals(DeepSeekResponsesApi.FlashModel, StringComparison.OrdinalIgnoreCase)
+                    ? DeepSeekResponsesApi.Endpoint
+                    : "https://api.deepseek.com/v1/chat/completions",
             Model = model,
             ApiKey = key,
             MakeDefault = true,

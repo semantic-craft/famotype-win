@@ -65,10 +65,12 @@ public sealed class AiChatClient
         }
         _client.EnsureReady();
         string searchBackend = WebSearchBackends.Normalize(_settings.Ai.WebSearchBackend);
-        bool useQwenNativeSearch = _settings.Ai.AskWebSearchEnabled
-            && searchBackend == WebSearchBackends.Qwen;
+        string? nativeSearchProvider = _settings.Ai.AskWebSearchEnabled
+            && WebSearchBackends.UsesProviderCredential(searchBackend)
+                ? searchBackend
+                : null;
         WebSearchGrounding? grounding = _settings.Ai.AskWebSearchEnabled
-            && !useQwenNativeSearch
+            && nativeSearchProvider is null
             ? await _webSearch.SearchAsync(
                 searchBackend, prompt, cancellationToken)
             : null;
@@ -99,13 +101,13 @@ public sealed class AiChatClient
         AiProviderChatCompletionResult response = await _client.SendAsync(
             messages,
             cancellationToken,
-            useNativeWebSearch: useQwenNativeSearch);
+            nativeWebSearchProvider: nativeSearchProvider);
         return new AiChatResult(
             response.Text,
             response.ProviderId,
             response.Model,
-            useQwenNativeSearch
-                ? WebSearchBackends.DisplayName(WebSearchBackends.Qwen)
+            nativeSearchProvider is not null
+                ? WebSearchBackends.DisplayName(nativeSearchProvider)
                 : grounding?.Provider);
     }
 }

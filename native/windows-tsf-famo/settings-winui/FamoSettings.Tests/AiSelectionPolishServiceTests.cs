@@ -185,6 +185,7 @@ public sealed class AiSelectionPolishServiceTests : IDisposable
 
     [Theory]
     [InlineData("阿里云百炼", "https://llm-source-test.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses", "qwen3.6-flash", "https://llm-source-test.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/responses", "\"tool_choice\":\"required\"", false)]
+    [InlineData("DeepSeek", "https://api.deepseek.com/v1/chat/completions", "deepseek-v4-flash", "https://api.deepseek.com/responses", "\"tool_choice\":\"required\"", false)]
     [InlineData("小米 MiMo", "https://api.xiaomimimo.com/v1/chat/completions", "mimo-v2.5", "https://api.xiaomimimo.com/v1/chat/completions", "\"force_search\":true", true)]
     [InlineData("火山引擎 · 豆包 Seed", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-seed", "https://ark.cn-beijing.volces.com/api/v3/responses", "\"max_tool_calls\":3", false)]
     [InlineData("OpenAI", "https://api.openai.com/v1/chat/completions", "chat-latest", "https://api.openai.com/v1/responses", "\"type\":\"web_search\"", false)]
@@ -228,7 +229,11 @@ public sealed class AiSelectionPolishServiceTests : IDisposable
     {
         FamoSettings settings = SettingsStore.CreateDefault();
         settings.Ai.CloudEnabled = true;
-        AddDefaultProfile("sk-secret");
+        AddDefaultProfile(
+            "sk-secret",
+            "不支持的供应商",
+            "https://example.test/v1/chat/completions",
+            "custom-model");
         var handler = new CaptureHandler(_ => throw new InvalidOperationException("network should not be called"));
         var service = new AiSelectionSkillService(
             settings, new AiProviderProfileStore(_file), _secrets, new HttpClient(handler));
