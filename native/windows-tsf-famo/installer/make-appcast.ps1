@@ -7,7 +7,7 @@
 #>
 param(
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.5.8',
+  [string] $AppVersion = '1.5.9',
   [string] $InstallerPath = '',
   [string] $PrivateKeyPath = $env:FAMO_UPDATE_PRIVATE_KEY,
   [string] $OutputPath = ''
