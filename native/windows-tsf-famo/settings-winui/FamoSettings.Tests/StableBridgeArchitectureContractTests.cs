@@ -18,12 +18,12 @@ public sealed class StableBridgeArchitectureContractTests
         Assert.Contains("/DBridgeAbi=$bridgeAbi", script);
         Assert.Contains("/DBridgeHash=$bridgeHash", script);
         Assert.Contains(
-            "text-service\\build-bridge-v2-artifact",
+            "text-service\\build-bridge-v3-artifact",
             script);
 
         string installer = RepoText(
             "native/windows-tsf-famo/installer/famo-setup.iss");
-        Assert.Contains("#define BridgeAbi \"2\"", installer);
+        Assert.Contains("#define BridgeAbi \"3\"", installer);
 
         int runtimeFiles = Position(script, "$runtimeFiles = @(");
         int runtimeFilesEnd = Position(script, ")", runtimeFiles);
@@ -97,6 +97,7 @@ public sealed class StableBridgeArchitectureContractTests
             "native/windows-tsf-famo/text-service/src/FamoTextService.rc.in");
 
         Assert.Contains("FAMO_BRIDGE_ABI", cmake);
+        Assert.Contains("set(FAMO_BRIDGE_ABI \"3\"", cmake);
         Assert.Contains("FamoTextService.rc.in", cmake);
         Assert.Contains("FILEVERSION @FAMO_BRIDGE_ABI@", resource);
         Assert.Contains("FileMajorPart", artifactBuilder);

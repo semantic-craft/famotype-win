@@ -31,6 +31,14 @@ deployment, rendering, and product features belong in Runtime. Any change that
 can alter `FamoTextService.dll` must explain why it cannot live in Runtime and
 must either reuse the current frozen artifact or explicitly bump the Bridge ABI.
 
+Bridge ABI 3 is an exceptional Bridge release because candidate UI delivery is
+owned by the in-process bounded pipe client. It replaces the one-shot UI
+connection with a reconnecting, latest-state worker while leaving the primary
+key path and Runtime protocol range unchanged. This lifecycle cannot be moved
+to Runtime: after the optional UI pipe misses startup or disconnects, only the
+Bridge still owns the queued TSF state that must be replayed to a replacement
+Runtime.
+
 ## Artifact rules
 
 `installer/build-bridge-artifact.ps1` creates:
