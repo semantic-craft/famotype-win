@@ -113,7 +113,8 @@ public sealed class RuntimeBoundaryAuditContractTests
     public void StableBridgeResolvesTheVersionedRuntimeProjection()
     {
         string tsf = File.ReadAllText(RepoFile(
-            "native/windows-tsf-famo/text-service/src/text_service.cpp"));
+            "native/windows-tsf-famo/text-service/src/text_service.cpp"))
+            .ReplaceLineEndings("\n");
         string runtime = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
 
