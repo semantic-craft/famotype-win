@@ -14,7 +14,6 @@
 #include <windows.h>
 
 #include "famo_runtime_pipe.h"
-#include "famo_runtime_control.h"
 
 using namespace famo::runtime;
 
@@ -119,6 +118,66 @@ Correlation HelloCorrelation(uint64_t connection_generation = 1) {
   return correlation;
 }
 
+bool RunControlProcess(std::wstring_view endpoint_suffix,
+                       std::wstring_view operation,
+                       std::chrono::milliseconds timeout) {
+  std::wstring command = L"\"" + RuntimePath() + L"\" --endpoint-suffix " +
+                         std::wstring(endpoint_suffix) + L" --control " +
+                         std::wstring(operation);
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                      CREATE_NO_WINDOW, nullptr, ModuleDirectory().c_str(),
+                      &startup, &process)) {
+    std::fprintf(stderr, "control process launch failed: %lu\n",
+                 GetLastError());
+    return false;
+  }
+  CloseHandle(process.hThread);
+  const DWORD waited =
+      WaitForSingleObject(process.hProcess, static_cast<DWORD>(timeout.count()));
+  DWORD exit_code = 1;
+  if (waited == WAIT_OBJECT_0)
+    GetExitCodeProcess(process.hProcess, &exit_code);
+  else {
+    TerminateProcess(process.hProcess, 1);
+    WaitForSingleObject(process.hProcess, 1000);
+  }
+  CloseHandle(process.hProcess);
+  if (waited != WAIT_OBJECT_0 || exit_code != 0) {
+    std::fprintf(stderr, "control process failed: wait=%lu exit=%lu\n", waited,
+                 exit_code);
+    return false;
+  }
+  return true;
+}
+
+CallResult DeliveredCall(PipeRuntimePort &port, Frame &&request) {
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = started + kHardCallDeadline;
+  const DeliveryReference reference{request.command, request.correlation};
+  CallResult prepared = port.Prepare(std::move(request), deadline);
+  if (prepared.status != Status::Prepared)
+    return prepared;
+  DeliveryResult delivered = port.ExecutePrepared(reference, deadline);
+  CallResult result;
+  result.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  if (delivered.status != Status::Ok) {
+    result.status = delivered.status;
+    return result;
+  }
+  result.reply = std::move(delivered.final_reply);
+  result.status = result.reply.status;
+  const CallResult acknowledged =
+      port.Ack(reference,
+               std::chrono::steady_clock::now() + kHardCallDeadline);
+  if (acknowledged.status != Status::Ok)
+    result.status = acknowledged.status;
+  return result;
+}
+
 bool DecodeOk(CallResult result, Composition *composition,
               std::string *error) {
   return result.status == Status::Ok &&
@@ -140,11 +199,8 @@ bool Run(std::wstring_view data_root, std::string_view schema,
   const std::wstring suffix =
       L"production-verify-" + std::to_wstring(GetCurrentProcessId());
   PipeEndpoint endpoint;
-  PipeEndpoint control_endpoint;
   std::string error;
   CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
-  CHECK(BuildCurrentPipeEndpoint(suffix + L"-control", &control_endpoint,
-                                 &error));
 
   OwnedRuntimeProcess runtime;
   CHECK(runtime.Start(suffix, data_root));
@@ -160,18 +216,15 @@ bool Run(std::wstring_view data_root, std::string_view schema,
           Status::Ok);
 
     bool control_ok = false;
-    ControlResult deploy_result;
-    std::string control_error;
     std::thread deploy([&] {
-      control_ok = RunControlClient(
-          control_endpoint, RuntimePath(), Command::ControlDeploy,
-          std::chrono::minutes(2), &deploy_result, &control_error);
+      control_ok =
+          RunControlProcess(suffix, L"deploy", std::chrono::minutes(2));
     });
     CallResult failed_open;
     for (uint64_t sequence = 2; sequence < 1002; ++sequence) {
       Frame key = Request(Command::ProcessKey, sequence);
       CHECK(EncodeKeyEvent({'n', 0, 0, 1, sequence}, &key.payload));
-      CallResult call = stress_port.Call(std::move(key), kHardCallDeadline);
+      CallResult call = DeliveredCall(stress_port, std::move(key));
       if (call.status != Status::Ok) {
         failed_open = call;
         break;
@@ -180,13 +233,10 @@ bool Run(std::wstring_view data_root, std::string_view schema,
     }
     deploy.join();
     CHECK(control_ok);
-    CHECK(deploy_result.state == ControlState::Succeeded);
-    CHECK(deploy_result.readiness == RuntimeReadiness::Ready);
     CHECK(failed_open.status == Status::Unavailable);
     CHECK(failed_open.elapsed <= kHardCallDeadline);
-    std::printf("deploy_fail_open_ms=%lld generation=%llu\n",
-                static_cast<long long>(failed_open.elapsed.count()),
-                static_cast<unsigned long long>(deploy_result.engine_generation));
+    std::printf("deploy_fail_open_ms=%lld\n",
+                static_cast<long long>(failed_open.elapsed.count()));
     stress_port.Stop();
     connection_generation = 2;
   }
@@ -217,14 +267,21 @@ bool Run(std::wstring_view data_root, std::string_view schema,
   Composition composition;
   Frame key = request(Command::ProcessKey, 2);
   CHECK(EncodeKeyEvent({'n', 0, 0, 1, 1}, &key.payload));
-  CHECK(DecodeOk(port.Call(std::move(key), kHardCallDeadline), &composition,
-                 &error));
+  const CallResult first_key_result =
+      DeliveredCall(port, std::move(key));
+  if (!DecodeOk(first_key_result, &composition, &error)) {
+    std::fprintf(stderr,
+                 "first ProcessKey failed: status=%u elapsed=%lldms %s\n",
+                 static_cast<unsigned>(first_key_result.status),
+                 static_cast<long long>(first_key_result.elapsed.count()),
+                 error.c_str());
+    return false;
+  }
   CHECK(composition.handled && composition.preedit == "n");
 
   key = request(Command::ProcessKey, 3);
   CHECK(EncodeKeyEvent({'i', 0, 0, 1, 2}, &key.payload));
-  CHECK(DecodeOk(port.Call(std::move(key), kHardCallDeadline), &composition,
-                 &error));
+  CHECK(DecodeOk(DeliveredCall(port, std::move(key)), &composition, &error));
   CHECK(composition.handled && composition.preedit == "ni");
   CHECK(composition.candidates.size() > 1);
   CHECK(HasMultibyteCandidate(composition));
@@ -238,38 +295,33 @@ bool Run(std::wstring_view data_root, std::string_view schema,
 
   Frame highlight = request(Command::HighlightCandidate, 5);
   CHECK(EncodeCandidateIndex(1, &highlight.payload));
-  CHECK(DecodeOk(port.Call(std::move(highlight), kHardCallDeadline),
-                 &composition, &error));
+  CHECK(DecodeOk(DeliveredCall(port, std::move(highlight)), &composition,
+                 &error));
   CHECK(composition.preedit == "ni");
 
   Frame page = request(Command::ChangePage, 6);
   CHECK(EncodePageDirection(false, &page.payload));
-  CHECK(DecodeOk(port.Call(std::move(page), kHardCallDeadline), &composition,
-                 &error));
+  CHECK(DecodeOk(DeliveredCall(port, std::move(page)), &composition, &error));
 
   // X11/Rime BackSpace keysym. This is the value produced by the TSF VK
   // translation boundary, not the raw Windows VK_BACK value.
   key = request(Command::ProcessKey, 7);
   CHECK(EncodeKeyEvent({0xff08, 0, 0, 1, 3}, &key.payload));
-  CHECK(DecodeOk(port.Call(std::move(key), kHardCallDeadline), &composition,
-                 &error));
+  CHECK(DecodeOk(DeliveredCall(port, std::move(key)), &composition, &error));
   CHECK(composition.preedit.size() < 2);
 
   Frame clear = request(Command::ClearComposition, 8);
-  CHECK(DecodeOk(port.Call(std::move(clear), kHardCallDeadline), &composition,
-                 &error));
+  CHECK(DecodeOk(DeliveredCall(port, std::move(clear)), &composition, &error));
   CHECK(composition.preedit.empty());
 
   for (uint64_t sequence = 9; sequence <= 10; ++sequence) {
     key = request(Command::ProcessKey, sequence);
     const uint32_t letter = sequence == 9 ? 'n' : 'i';
     CHECK(EncodeKeyEvent({letter, 0, 0, 1, sequence}, &key.payload));
-    CHECK(DecodeOk(port.Call(std::move(key), kHardCallDeadline), &composition,
-                   &error));
+    CHECK(DecodeOk(DeliveredCall(port, std::move(key)), &composition, &error));
   }
   Frame commit = request(Command::CommitComposition, 11);
-  CHECK(DecodeOk(port.Call(std::move(commit), kHardCallDeadline), &composition,
-                 &error));
+  CHECK(DecodeOk(DeliveredCall(port, std::move(commit)), &composition, &error));
   CHECK(composition.preedit.empty());
   CHECK(!composition.commit.empty());
 
@@ -277,12 +329,11 @@ bool Run(std::wstring_view data_root, std::string_view schema,
     key = request(Command::ProcessKey, sequence);
     const uint32_t letter = sequence == 12 ? 'n' : 'i';
     CHECK(EncodeKeyEvent({letter, 0, 0, 1, sequence}, &key.payload));
-    CHECK(DecodeOk(port.Call(std::move(key), kHardCallDeadline), &composition,
-                   &error));
+    CHECK(DecodeOk(DeliveredCall(port, std::move(key)), &composition, &error));
   }
   Frame select = request(Command::SelectCandidate, 14);
   CHECK(EncodeCandidateIndex(0, &select.payload));
-  CHECK(DecodeOk(port.Call(std::move(select), kHardCallDeadline), &composition,
+  CHECK(DecodeOk(DeliveredCall(port, std::move(select)), &composition,
                  &error));
   CHECK(!composition.commit.empty());
 
@@ -291,11 +342,7 @@ bool Run(std::wstring_view data_root, std::string_view schema,
     CHECK(port.Call(std::move(close), kHardCallDeadline).status == Status::Ok);
     port.Stop();
   }
-  ControlResult shutdown_result;
-  CHECK(RunControlClient(control_endpoint, RuntimePath(),
-                         Command::ControlShutdown, std::chrono::seconds(5),
-                         &shutdown_result, &error));
-  CHECK(shutdown_result.state == ControlState::Succeeded);
+  CHECK(RunControlProcess(suffix, L"shutdown", std::chrono::seconds(5)));
   CHECK(runtime.WaitForExit(std::chrono::seconds(5)));
   port.Stop();
   runtime.Stop();

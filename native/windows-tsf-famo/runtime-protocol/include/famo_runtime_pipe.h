@@ -128,6 +128,17 @@ private:
 
   void WorkerMain() noexcept;
   void UiWorkerMain() noexcept;
+  HANDLE ConnectPipeChannel(
+      const PipeEndpoint &endpoint, std::wstring_view expected_server,
+      const Correlation &connection_identity,
+      std::chrono::steady_clock::time_point deadline, std::string *error,
+      const std::shared_ptr<pipe_io::RetirementGate> &retirement,
+      std::mutex &connect_mutex, HANDLE *connecting_pipe,
+      const std::atomic<bool> *cancelled,
+      PipeClientIdentity *server_identity,
+      uint16_t *protocol_version);
+  void QueueUiRequest(std::shared_ptr<const Frame> request) noexcept;
+  void RequeueUiRequest(std::shared_ptr<const Frame> request) noexcept;
   void OpenCircuit(bool preserve_connection_generation = false);
   CallResult CallUntil(Frame &&request,
                        std::chrono::steady_clock::time_point absolute_deadline);
@@ -160,9 +171,14 @@ private:
   std::mutex ui_mutex_;
   std::thread ui_worker_;
   HANDLE ui_pipe_ = INVALID_HANDLE_VALUE;
+  HANDLE ui_connecting_pipe_ = INVALID_HANDLE_VALUE;
   std::shared_ptr<pipe_io::RetirementGate> ui_retirement_;
+  PipeEndpoint ui_endpoint_;
+  std::wstring ui_expected_server_;
+  Correlation ui_connection_identity_;
+  PipeClientIdentity ui_expected_identity_;
+  uint16_t ui_expected_protocol_ = kProtocolVersion;
   std::atomic<bool> ui_stop_{false};
-  std::atomic<bool> ui_ready_{false};
   std::atomic<uint64_t> ui_wake_epoch_{0};
   std::atomic<std::shared_ptr<const Frame>> posted_request_;
 };

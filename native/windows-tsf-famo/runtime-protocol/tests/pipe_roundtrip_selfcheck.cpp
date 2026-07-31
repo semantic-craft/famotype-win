@@ -187,6 +187,31 @@ private:
   bool entered_value_ = false;
 };
 
+class RecordingSink final : public RuntimeSnapshotSink {
+public:
+  void
+  Publish(std::shared_ptr<const RuntimeSnapshot> snapshot) noexcept override {
+    {
+      std::lock_guard lock(mutex_);
+      latest_ = std::move(snapshot);
+    }
+    changed_.notify_all();
+  }
+
+  bool WaitForUiSequence(uint64_t sequence,
+                         std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, timeout, [&] {
+      return latest_ && latest_->ui_sequence >= sequence;
+    });
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::shared_ptr<const RuntimeSnapshot> latest_;
+};
+
 bool NormalRoundtrip() {
   const std::wstring suffix =
       L"roundtrip-" + std::to_wstring(GetCurrentProcessId());
@@ -425,6 +450,86 @@ bool OptionalUiPipeDoesNotDelayPrimaryReadiness() {
   CHECK(connected);
   CHECK(elapsed < std::chrono::milliseconds(100));
   CHECK(served);
+  return true;
+}
+
+bool OptionalUiPipeRecoversWhenItAppears() {
+  const std::wstring suffix =
+      L"optional-ui-recovery-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+  const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
+  RuntimeService service;
+  RecordingSink sink;
+  service.SetSnapshotSink(&sink);
+  CHECK(service.Start(EnginePath().c_str(), "", &error));
+  CHECK(service.InitializeControlState() == ControlError::None);
+
+  bool primary_served = false;
+  std::string primary_error;
+  std::thread primary([&] {
+    RuntimePipeServer server;
+    primary_served = server.ServeOnce(
+        endpoint, &service, ServerFault::None, std::chrono::seconds(2),
+        &primary_error);
+  });
+  Sleep(25);
+
+  PipeRuntimePort port;
+  constexpr uint64_t generation = 426;
+  const bool connected =
+      port.Connect(endpoint, ModulePath(), Hello(generation).correlation,
+                   std::chrono::seconds(2), &error);
+  bool opened = false;
+  if (connected) {
+    Frame open = Request(Command::OpenSession, generation, 1);
+    opened = EncodeOpenSession("test", &open.payload, &error) &&
+             port.Call(std::move(open), kHardCallDeadline).status == Status::Ok;
+  }
+
+  bool ui_served = false;
+  std::string ui_error;
+  std::thread ui([&] {
+    RuntimePipeServer server;
+    ui_served = server.ServeOnce(
+        ui_endpoint, &service, ServerFault::None, std::chrono::seconds(2),
+        &ui_error, 0, nullptr, true);
+  });
+  Sleep(25);
+
+  bool posted = false;
+  bool recovered = false;
+  if (opened) {
+    Frame update = Request(Command::UpdateUiState, generation, 2);
+    posted =
+        EncodeUiState({{640, 480, 642, 504}, {0, 0, 1920, 1080}, 144, true,
+                       true, true, {1, 2}},
+                      &update.payload, &error);
+    if (posted) {
+      port.Post(std::move(update));
+      recovered =
+          sink.WaitForUiSequence(2, std::chrono::seconds(1));
+    }
+  }
+
+  port.Stop();
+  primary.join();
+  ui.join();
+  service.SetSnapshotSink(nullptr);
+  service.Stop();
+
+  if (!primary_served)
+    std::fprintf(stderr, "primary server failed: %s\n",
+                 primary_error.c_str());
+  if (!ui_served)
+    std::fprintf(stderr, "UI server failed: %s\n", ui_error.c_str());
+  CHECK(connected);
+  CHECK(opened);
+  CHECK(posted);
+  CHECK(recovered);
+  CHECK(primary_served);
+  CHECK(ui_served);
   return true;
 }
 
@@ -797,6 +902,127 @@ bool UiStateFailureDoesNotOccupyOrPoisonProcessKey() {
   CHECK(second_succeeded);
   CHECK(second_stayed_ready);
   CHECK(runtime_finished);
+  return true;
+}
+
+bool UiStateTransportReconnectsAfterTransientFailure() {
+  const std::wstring suffix =
+      L"ui-state-reconnect-" + std::to_wstring(GetCurrentProcessId());
+  PipeEndpoint endpoint;
+  std::string error;
+  CHECK(BuildCurrentPipeEndpoint(suffix, &endpoint, &error));
+  const PipeEndpoint ui_endpoint = BuildUiPipeEndpoint(endpoint);
+
+  RuntimeService service;
+  RecordingSink sink;
+  service.SetSnapshotSink(&sink);
+  CHECK(service.Start(EnginePath().c_str(), "", &error));
+  CHECK(service.InitializeControlState() == ControlError::None);
+
+  std::atomic<bool> primary_served{false};
+  std::atomic<bool> first_ui_served{false};
+  std::atomic<bool> second_ui_served{false};
+  std::string primary_error;
+  std::string first_ui_error;
+  std::string second_ui_error;
+  std::thread primary([&] {
+    RuntimePipeServer server;
+    primary_served.store(server.ServeOnce(
+        endpoint, &service, ServerFault::None, std::chrono::seconds(5),
+        &primary_error));
+  });
+  std::thread first_ui([&] {
+    RuntimePipeServer server;
+    first_ui_served.store(server.ServeOnce(
+        ui_endpoint, &service, ServerFault::UiHang,
+        std::chrono::seconds(5), &first_ui_error, 0, nullptr, true));
+  });
+  Sleep(25);
+
+  PipeRuntimePort port;
+  constexpr uint64_t generation = 491;
+  const bool connected =
+      port.Connect(endpoint, ModulePath(), Hello(generation).correlation,
+                   std::chrono::seconds(2), &error);
+  bool opened = false;
+  bool first_posted = false;
+  bool first_applied = false;
+  if (connected) {
+    Frame open = Request(Command::OpenSession, generation, 1);
+    opened = EncodeOpenSession("test", &open.payload, &error) &&
+             port.Call(std::move(open), kHardCallDeadline).status == Status::Ok;
+  }
+  if (opened) {
+    Frame ui = Request(Command::UpdateUiState, generation, 2);
+    first_posted =
+        EncodeUiState({{640, 480, 642, 504}, {0, 0, 1920, 1080}, 144, true,
+                       true, true, {1, 2}},
+                      &ui.payload, &error);
+    if (first_posted) {
+      port.Post(std::move(ui));
+      first_applied =
+          sink.WaitForUiSequence(2, std::chrono::seconds(1));
+    }
+  }
+  first_ui.join();
+
+  bool second_posted = false;
+  bool latest_posted = false;
+  if (first_applied) {
+    Frame second = Request(Command::UpdateUiState, generation, 3);
+    second_posted =
+        EncodeUiState({{640, 480, 642, 504}, {0, 0, 1920, 1080}, 144, true,
+                       true, true, {1, 3}},
+                      &second.payload, &error);
+    if (second_posted)
+      port.Post(std::move(second));
+
+    Frame latest = Request(Command::UpdateUiState, generation, 4);
+    latest_posted =
+        EncodeUiState({{640, 480, 642, 504}, {0, 0, 1920, 1080}, 144, true,
+                       true, true, {1, 4}},
+                      &latest.payload, &error);
+    if (latest_posted)
+      port.Post(std::move(latest));
+  }
+
+  std::thread second_ui([&] {
+    RuntimePipeServer server;
+    second_ui_served.store(server.ServeOnce(
+        ui_endpoint, &service, ServerFault::None,
+        std::chrono::seconds(2), &second_ui_error, 0, nullptr, true));
+  });
+  Sleep(25);
+
+  bool recovered = false;
+  if (latest_posted)
+    recovered = sink.WaitForUiSequence(4, std::chrono::seconds(2));
+
+  port.Stop();
+  primary.join();
+  second_ui.join();
+  service.SetSnapshotSink(nullptr);
+  service.Stop();
+
+  if (!primary_served.load())
+    std::fprintf(stderr, "primary server failed: %s\n",
+                 primary_error.c_str());
+  if (!first_ui_served.load())
+    std::fprintf(stderr, "first UI server failed: %s\n",
+                 first_ui_error.c_str());
+  if (!second_ui_served.load())
+    std::fprintf(stderr, "second UI server failed: %s\n",
+                 second_ui_error.c_str());
+  CHECK(connected);
+  CHECK(opened);
+  CHECK(first_posted);
+  CHECK(first_applied);
+  CHECK(second_posted);
+  CHECK(latest_posted);
+  CHECK(recovered);
+  CHECK(primary_served.load());
+  CHECK(first_ui_served.load());
+  CHECK(second_ui_served.load());
   return true;
 }
 
@@ -1267,11 +1493,13 @@ int wmain(int argc, wchar_t **argv) {
       !WrongPeerRejected() ||
       !ConnectFailureIsOffHotPath() ||
       !OptionalUiPipeDoesNotDelayPrimaryReadiness() ||
+      !OptionalUiPipeRecoversWhenItAppears() ||
       !UiEndpointRejectsBusinessCommands() || !ConcurrentClients() ||
       !PrimaryCapacityRejectsAtProtocolBoundary() ||
       !ConcurrentRuntimeClients() ||
       !WrongProcessHelloCannotInvalidateOwnerDelivery() ||
       !UiStateFailureDoesNotOccupyOrPoisonProcessKey() ||
+      !UiStateTransportReconnectsAfterTransientFailure() ||
       !TransientBusyKeepsKeyChannelReady() ||
       !UiStateFloodKeepsOneThousandKeysWithinBudget() ||
       !FaultCheck(L"write-hang", L"no-read", 500, true) ||
