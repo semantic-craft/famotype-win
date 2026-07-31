@@ -161,6 +161,38 @@ public sealed class InputMethodListTests
         Assert.Equal([500, 500], delays);
     }
 
+    [Fact]
+    public void UserListRemoval_UsesOfficialLanguageListWhenNativeDisableLeavesTip()
+    {
+        int disableCalls = 0;
+        int languageListCalls = 0;
+        int probes = 0;
+
+        bool result = InputMethodList.TryRemoveFamoFromUserList(
+            disable: () =>
+            {
+                disableCalls++;
+                return true;
+            },
+            removeFromLanguageList: () =>
+            {
+                languageListCalls++;
+                return true;
+            },
+            isStillPresent: () => ++probes == 1);
+
+        Assert.True(result);
+        Assert.Equal(1, disableCalls);
+        Assert.Equal(1, languageListCalls);
+        Assert.Equal(2, probes);
+
+        string source = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings.Core/InputMethodList.cs"));
+        Assert.Contains("Get-WinUserLanguageList", source);
+        Assert.Contains("Set-WinUserLanguageList", source);
+        Assert.Contains("WaitForExit(30_000)", source);
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;

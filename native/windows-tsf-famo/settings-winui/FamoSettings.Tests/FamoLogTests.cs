@@ -57,7 +57,9 @@ public sealed class FamoLogTests
             "native/windows-tsf-famo/settings-winui/FamoSettings.Core/InputMethodList.cs"));
         Assert.DoesNotContain("catch { return false; }", iml);
         Assert.Contains("InstallLayoutOrTip(install) failed after retry", iml);
-        Assert.Contains(@"FamoLog.Append($""InstallLayoutOrTip(uninstall) failed", iml);
+        Assert.Contains(
+            @"$""input TIP removal failed: native={nativeDetail}; language-list={languageListError}""",
+            iml);
 
         string program = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/settings-winui/FamoSettings/Program.cs"));

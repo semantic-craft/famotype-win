@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
@@ -163,13 +164,156 @@ public static class InputMethodList
         }
     }
 
-    /// <summary>从当前用户输入法列表移除（卸载用），只动法墨这一条。失败返回 false，不抛。</summary>
-    public static bool RemoveFamoFromUserList()
+    /// <summary>从当前用户输入法列表移除（卸载用），只动法墨这一条。
+    /// ILOT_UNINSTALL 只禁用 TIP；若它仍在已启用列表中，再通过 Windows
+    /// International 模块更新当前用户语言列表，并以只读探针确认。</summary>
+    public static bool RemoveFamoFromUserList(bool logFailures = true)
     {
-        try { return InstallLayoutOrTip(FamoTip, IlotUninstall); }
+        int lastError = 0;
+        Exception? lastException = null;
+        string languageListError = "";
+        bool result = TryRemoveFamoFromUserList(
+            disable: () =>
+            {
+                try
+                {
+                    bool disabled = InstallLayoutOrTip(FamoTip, IlotUninstall);
+                    if (!disabled)
+                    {
+                        lastError = Marshal.GetLastPInvokeError();
+                    }
+                    return disabled;
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    return false;
+                }
+            },
+            removeFromLanguageList: () =>
+                RemoveFamoWithUserLanguageList(out languageListError),
+            isStillPresent: () =>
+                !TryIsFamoInUserList(out bool present) || present);
+        if (!result && logFailures)
+        {
+            string nativeDetail = lastException is null
+                ? $"Win32={lastError}"
+                : lastException.Message;
+            FamoLog.Append(
+                $"input TIP removal failed: native={nativeDetail}; language-list={languageListError}");
+        }
+        return result;
+    }
+
+    internal static bool TryRemoveFamoFromUserList(
+        Func<bool> disable,
+        Func<bool> removeFromLanguageList,
+        Func<bool> isStillPresent)
+    {
+        _ = disable();
+        if (!isStillPresent())
+        {
+            return true;
+        }
+        _ = removeFromLanguageList();
+        return !isStillPresent();
+    }
+
+    private static bool RemoveFamoWithUserLanguageList(out string error)
+    {
+        error = "";
+        if (!OperatingSystem.IsWindows())
+        {
+            error = "Windows-only International module unavailable";
+            return false;
+        }
+
+        string powershell = Path.Combine(
+            Environment.SystemDirectory,
+            @"WindowsPowerShell\v1.0\powershell.exe");
+        if (!File.Exists(powershell))
+        {
+            error = "Windows PowerShell not found";
+            return false;
+        }
+
+        const string script = """
+            $ErrorActionPreference = 'Stop'
+            $tip = '0804:{54EAD76A-B864-4A6D-9C82-148E3352BEE7}{0158C2BA-4E96-4BA8-B505-E1BBEBB3FA33}'
+            $list = Get-WinUserLanguageList
+            $changed = $false
+            foreach ($language in $list) {
+              for ($index = $language.InputMethodTips.Count - 1; $index -ge 0; $index--) {
+                if ([string]::Equals($language.InputMethodTips[$index], $tip, [StringComparison]::OrdinalIgnoreCase)) {
+                  $language.InputMethodTips.RemoveAt($index)
+                  $changed = $true
+                }
+              }
+            }
+            if ($changed) {
+              Set-WinUserLanguageList -LanguageList $list -Force
+            }
+            foreach ($language in Get-WinUserLanguageList) {
+              foreach ($entry in $language.InputMethodTips) {
+                if ([string]::Equals($entry, $tip, [StringComparison]::OrdinalIgnoreCase)) {
+                  exit 1
+                }
+              }
+            }
+            exit 0
+            """;
+
+        try
+        {
+            ProcessStartInfo startInfo = new()
+            {
+                FileName = powershell,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (string argument in new[]
+            {
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            })
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+
+            using Process process = new() { StartInfo = startInfo };
+            if (!process.Start())
+            {
+                error = "Windows PowerShell did not start";
+                return false;
+            }
+            Task<string> stdout = process.StandardOutput.ReadToEndAsync();
+            Task<string> stderr = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(30_000))
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit();
+                error = "Windows PowerShell timed out";
+                return false;
+            }
+            _ = stdout.GetAwaiter().GetResult();
+            string stderrText = stderr.GetAwaiter().GetResult().Trim();
+            if (process.ExitCode == 0)
+            {
+                return true;
+            }
+            error = string.IsNullOrWhiteSpace(stderrText)
+                ? $"Windows PowerShell exited {process.ExitCode}"
+                : stderrText;
+            return false;
+        }
         catch (Exception ex)
         {
-            FamoLog.Append($"InstallLayoutOrTip(uninstall) failed: {ex.Message}");
+            error = ex.Message;
             return false;
         }
     }
