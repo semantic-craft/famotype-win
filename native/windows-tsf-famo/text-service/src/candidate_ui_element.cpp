@@ -38,7 +38,7 @@ HRESULT CandidateUiElement::Update(const runtime::Composition &composition,
     selection_ = 0;
     End();
     if (show_allowed)
-      *show_allowed = show_allowed_;
+      *show_allowed = visible();
     return S_OK;
   }
 
@@ -56,12 +56,17 @@ HRESULT CandidateUiElement::Update(const runtime::Composition &composition,
     if (SUCCEEDED(result)) {
       begun_ = true;
       show_allowed_ = allowed;
+      // Fresh element session: any hide the host requested for the previous
+      // element does not carry over.
+      shown_ = TRUE;
     }
   } else {
+    // UpdateUIElement carries no pbShow, so the BeginUIElement answer stands
+    // for the life of the element. Show() is how the host changes its mind.
     result = manager_->UpdateUIElement(element_id_);
   }
   if (show_allowed)
-    *show_allowed = show_allowed_;
+    *show_allowed = visible();
   return result;
 }
 
@@ -114,14 +119,23 @@ HRESULT CandidateUiElement::GetGUID(GUID *guid) {
 }
 
 HRESULT CandidateUiElement::Show(BOOL show) {
-  shown_ = show;
+  const BOOL requested = show ? TRUE : FALSE;
+  if (shown_ == requested)
+    return S_OK;
+  shown_ = requested;
+  // UILess contract option 1: move the element to the hide status and keep it
+  // alive so the host can keep drawing from Update notifications. The host is
+  // told so the runtime window follows immediately rather than at the next
+  // composition update.
+  if (host_)
+    host_->OnCandidateVisibilityChanged(this);
   return S_OK;
 }
 
 HRESULT CandidateUiElement::IsShown(BOOL *show) {
   if (!show)
     return E_POINTER;
-  *show = shown_;
+  *show = visible();
   return S_OK;
 }
 

@@ -764,6 +764,7 @@ HRESULT TextService::EnsureContext(ITfContext *context,
                                              owned->document.get()));
     if (!owned->candidates)
       return E_OUTOFMEMORY;
+    owned->candidates->SetHost(this);
     ComPtr<ITfSource> context_source;
     if (FAILED(context->QueryInterface(
             IID_ITfSource,

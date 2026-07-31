@@ -27,7 +27,8 @@ class TextService final : public ITfTextInputProcessorEx,
                           public ITfKeyEventSink,
                           public ITfThreadMgrEventSink,
                           public ITfCompositionSink,
-                          public ITfTextLayoutSink {
+                          public ITfTextLayoutSink,
+                          public CandidateUiHost {
 public:
   TextService();
   explicit TextService(std::wstring runtime_endpoint_suffix);
@@ -73,6 +74,8 @@ public:
                                            TfLayoutCode code,
                                            ITfContextView *view) override;
 
+  void OnCandidateVisibilityChanged(CandidateUiElement *element) override;
+
 private:
   enum class DeliveryWorkKind { Recover, Cancel, Ack };
   enum class DeliveryAttemptState {
@@ -117,6 +120,13 @@ private:
     // Capability is valid only for this exact displayed composition sequence.
     // Zero means the current composition has already consumed its click.
     uint64_t selection_capability_sequence = 0;
+
+    // TSF AddRefs the element in BeginUIElement, so it can outlive this entry.
+    // Detaching here covers every erase/clear site at once.
+    ~ContextEntry() {
+      if (candidates)
+        candidates->SetHost(nullptr);
+    }
   };
 
   enum class SessionWarmupReason { Activation, Focus, Recovery };
