@@ -228,9 +228,62 @@ HWND CreateLayeredWindow(const wchar_t *class_name,
                          notifications);
 }
 
+struct ObservedWindow {
+  bool visible = false;
+  bool has_bounds = false;
+  RECT bounds{};
+};
+
+ObservedWindow ObserveWindow(HWND window) {
+  ObservedWindow observed;
+  observed.visible = IsWindowVisible(window) != FALSE;
+  observed.has_bounds = GetWindowRect(window, &observed.bounds) != FALSE;
+  return observed;
+}
+
+void NotifyCandidateShownOrChanged(HWND window,
+                                   const ObservedWindow &before) {
+  // Observe the HWND after an already-decided presentation. ShouldShow remains
+  // the only visibility policy; this does not create a second state machine.
+  const ObservedWindow after = ObserveWindow(window);
+  if (!after.visible)
+    return;
+  DWORD event = 0;
+  if (!before.visible) {
+    event = EVENT_OBJECT_IME_SHOW;
+  } else if (!before.has_bounds || !after.has_bounds ||
+             !EqualRect(&before.bounds, &after.bounds)) {
+    event = EVENT_OBJECT_IME_CHANGE;
+  }
+  if (event != 0)
+    NotifyWinEvent(event, window, OBJID_CLIENT, CHILDID_SELF);
+}
+
 bool MoveVisible(HWND window, int x, int y) {
-  return SetWindowPos(window, HWND_TOPMOST, x, y, 0, 0,
-                      SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW) != FALSE;
+  const ObservedWindow before = ObserveWindow(window);
+  if (!SetWindowPos(window, HWND_TOPMOST, x, y, 0, 0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+    return false;
+  }
+  NotifyCandidateShownOrChanged(window, before);
+  return true;
+}
+
+bool SubmitCandidateLayered(HWND window, const DibSurface &surface, int x,
+                            int y) {
+  const ObservedWindow before = ObserveWindow(window);
+  if (!SubmitLayered(window, surface, x, y))
+    return false;
+  NotifyCandidateShownOrChanged(window, before);
+  return true;
+}
+
+void HideCandidateWindow(HWND window) {
+  const bool was_visible = IsWindowVisible(window) != FALSE;
+  ShowWindow(window, SW_HIDE);
+  if (was_visible && IsWindowVisible(window) == FALSE) {
+    NotifyWinEvent(EVENT_OBJECT_IME_HIDE, window, OBJID_CLIENT, CHILDID_SELF);
+  }
 }
 
 bool ShouldShow(const RuntimeSnapshot &snapshot) {
@@ -679,6 +732,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       state->fault == Fault::Create
           ? nullptr
           : CreateLayeredWindow(kCandidateWindowClassName, &notifications);
+  // The mode indicator is a short-lived, click-through status toast rather
+  // than a candidate/composition surface, so it does not publish IME
+  // light-dismiss events.
   HWND mode_window =
       state->fault == Fault::Create
           ? nullptr
@@ -754,7 +810,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         continue;
       if (animation.foreground_window &&
           GetForegroundWindow() != animation.foreground_window) {
-        ShowWindow(window, SW_HIDE);
+        HideCandidateWindow(window);
         animation.active = false;
         presented_snapshot.reset();
         continue;
@@ -772,10 +828,11 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         }
         frame = &animation_surface;
       }
-      if (!SubmitLayered(window, *frame,
-                         animation.target_layout.origin_x - animation.margin,
-                         animation.target_layout.origin_y - animation.margin)) {
-        ShowWindow(window, SW_HIDE);
+      if (!SubmitCandidateLayered(
+              window, *frame,
+              animation.target_layout.origin_x - animation.margin,
+              animation.target_layout.origin_y - animation.margin)) {
+        HideCandidateWindow(window);
         animation.active = false;
         presented_snapshot.reset();
         continue;
@@ -799,10 +856,11 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     if (animation.active) {
       animation.active = false;
       notifications.layout = animation.target_layout;
-      if (!SubmitLayered(window, surface,
-                         animation.target_layout.origin_x - animation.margin,
-                         animation.target_layout.origin_y - animation.margin)) {
-        ShowWindow(window, SW_HIDE);
+      if (!SubmitCandidateLayered(
+              window, surface,
+              animation.target_layout.origin_x - animation.margin,
+              animation.target_layout.origin_y - animation.margin)) {
+        HideCandidateWindow(window);
         presented_snapshot.reset();
       }
     }
@@ -919,12 +977,12 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     }
     if (!window || !snapshot || !should_show) {
       if (window)
-        ShowWindow(window, SW_HIDE);
+        HideCandidateWindow(window);
       presented_snapshot.reset();
       continue;
     }
     if (!resources) {
-      ShowWindow(window, SW_HIDE);
+      HideCandidateWindow(window);
       presented_snapshot.reset();
       continue;
     }
@@ -967,7 +1025,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         state->anchor_only_count.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
-      ShowWindow(window, SW_HIDE);
+      HideCandidateWindow(window);
       presented_snapshot.reset();
       continue;
     }
@@ -1022,7 +1080,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       if (state->fault == Fault::Layout ||
           FamoCandidateUiLayout(view.get(), skin, &input, &layout) !=
               FAMO_UI_OK) {
-        ShowWindow(window, SW_HIDE);
+        HideCandidateWindow(window);
         presented_snapshot.reset();
         continue;
       }
@@ -1043,7 +1101,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
          !CopySurface(&previous_surface, surface)))
       animate_scroll = false;
     if (!surface.Ensure(width, height)) {
-      ShowWindow(window, SW_HIDE);
+      HideCandidateWindow(window);
       continue;
     }
     const auto paint = [&]() {
@@ -1067,7 +1125,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       paint_result = paint();
     }
     if (paint_result != FAMO_UI_OK) {
-      ShowWindow(window, SW_HIDE);
+      HideCandidateWindow(window);
       presented_snapshot.reset();
       continue;
     }
@@ -1078,7 +1136,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     HWND frame_foreground =
         reinterpret_cast<HWND>(snapshot->source_window);
     if (frame_foreground && GetForegroundWindow() != frame_foreground) {
-      ShowWindow(window, SW_HIDE);
+      HideCandidateWindow(window);
       presented_snapshot.reset();
       continue;
     }
@@ -1091,13 +1149,14 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         animate_scroll = false;
     }
     if (state->fault == Fault::Submit ||
-        !SubmitLayered(window, *first_frame, layout.origin_x - margin,
-                       layout.origin_y - margin)) {
-      ShowWindow(window, SW_HIDE);
+        !SubmitCandidateLayered(window, *first_frame,
+                                layout.origin_x - margin,
+                                layout.origin_y - margin)) {
+      HideCandidateWindow(window);
       presented_snapshot.reset();
     } else if (frame_foreground &&
                GetForegroundWindow() != frame_foreground) {
-      ShowWindow(window, SW_HIDE);
+      HideCandidateWindow(window);
       notifications.foreground_window = nullptr;
       presented_snapshot.reset();
     } else {
@@ -1131,8 +1190,10 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   }
   if (mode_window)
     DestroyWindow(mode_window);
-  if (window)
+  if (window) {
+    HideCandidateWindow(window);
     DestroyWindow(window);
+  }
   FamoTextResourcesDestroy(resources);
   if (SUCCEEDED(com))
     CoUninitialize();
