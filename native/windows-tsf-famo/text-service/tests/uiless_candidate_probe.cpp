@@ -1,6 +1,6 @@
 // Repeatable UI-less A/B candidate probe (issue #37).
 //
-//   uiless_candidate_probe --mode allow|deny|show-false
+//   uiless_candidate_probe --mode <mode>
 //
 // Hosts a real TSF thread manager, advises its own ITfUIElementSink, loads the
 // shipping FamoTextService.dll in process and drives one composition against the
@@ -34,6 +34,7 @@
 #include <string_view>
 #include <vector>
 
+#include <ctffunc.h>
 #include <msctf.h>
 #include <oleauto.h>
 #include <windows.h>
@@ -58,7 +59,62 @@ constexpr auto kReadyTimeout = std::chrono::seconds(30);
 // draw and still did not.
 constexpr auto kWatchWindow = std::chrono::milliseconds(2000);
 
-enum class Mode { Allow, Deny, ShowFalse };
+enum class Mode {
+  Allow,
+  Deny,
+  ShowFalse,
+  BehaviorSelect,
+  BehaviorFinalize,
+  BehaviorAbort,
+  IntegratableKeys,
+  BehaviorInvalid,
+};
+
+const char *ModeName(Mode mode) {
+  switch (mode) {
+  case Mode::Allow:
+    return "allow";
+  case Mode::Deny:
+    return "deny";
+  case Mode::ShowFalse:
+    return "show-false";
+  case Mode::BehaviorSelect:
+    return "behavior-select";
+  case Mode::BehaviorFinalize:
+    return "behavior-finalize";
+  case Mode::BehaviorAbort:
+    return "behavior-abort";
+  case Mode::IntegratableKeys:
+    return "integratable-keys";
+  case Mode::BehaviorInvalid:
+    return "behavior-invalid";
+  }
+  return "unknown";
+}
+
+bool HostAllowsSelfDraw(Mode mode) {
+  return mode == Mode::Allow || mode == Mode::ShowFalse;
+}
+
+bool ExercisesCandidateControl(Mode mode) {
+  return mode == Mode::BehaviorSelect || mode == Mode::BehaviorFinalize ||
+         mode == Mode::BehaviorAbort || mode == Mode::IntegratableKeys ||
+         mode == Mode::BehaviorInvalid;
+}
+
+int PrimaryIssue(Mode mode) {
+  if (mode == Mode::IntegratableKeys)
+    return 40;
+  return ExercisesCandidateControl(mode) ? 39 : 37;
+}
+
+const char *CoveredIssues(Mode mode) {
+  if (mode == Mode::BehaviorInvalid)
+    return "[39, 40]";
+  if (mode == Mode::IntegratableKeys)
+    return "[40]";
+  return ExercisesCandidateControl(mode) ? "[39]" : "[37]";
+}
 
 struct Failure {
   std::string check;
@@ -87,6 +143,33 @@ struct CandidateList {
   UINT selection = 0;
   std::wstring selected;
   int is_shown = -1;
+};
+
+struct BehaviorObservation {
+  bool available = false;
+  bool set_selection_called = false;
+  HRESULT set_selection_result = E_NOTIMPL;
+  bool finalize_called = false;
+  HRESULT finalize_result = E_NOTIMPL;
+  bool abort_called = false;
+  HRESULT abort_result = E_NOTIMPL;
+};
+
+struct IntegratableObservation {
+  bool available = false;
+  bool distinct_interface_branch = false;
+  bool selection_style_called = false;
+  HRESULT selection_style_result = E_NOTIMPL;
+  TfIntegratableCandidateListSelectionStyle selection_style =
+      STYLE_IMPLIED_SELECTION;
+  bool show_numbers_called = false;
+  HRESULT show_numbers_result = E_NOTIMPL;
+  int show_numbers = -1;
+  bool key_called = false;
+  HRESULT key_result = E_NOTIMPL;
+  int key_eaten = -1;
+  bool finalize_exact_called = false;
+  HRESULT finalize_exact_result = E_NOTIMPL;
 };
 
 std::vector<Failure> g_failures;
@@ -137,6 +220,14 @@ const char *JsonBool(bool value) { return value ? "true" : "false"; }
 // -1 records "not observed" rather than silently reporting a false.
 const char *JsonTriState(int value) {
   return value < 0 ? "null" : (value ? "true" : "false");
+}
+
+std::string JsonHresult(bool called, HRESULT result) {
+  return called ? std::to_string(static_cast<long>(result)) : "null";
+}
+
+std::string JsonNumber(bool observed, long value) {
+  return observed ? std::to_string(value) : "null";
 }
 
 std::string CodePoints(std::wstring_view value) {
@@ -468,29 +559,57 @@ bool SendKey(ITfKeyEventSink *sink, ITfContext *context, WPARAM key) {
 // The UI-less payload a host would render itself. Reading it back through the
 // element manager is what proves the data is still available when the probe has
 // denied the input method its own window.
+CandidateList ReadCandidateList(ITfCandidateListUIElement *candidates);
+
 CandidateList ReadCandidateList(ITfUIElementMgr *manager, DWORD id) {
-  CandidateList list;
   if (!manager || id == TF_INVALID_UIELEMENTID)
-    return list;
+    return {};
   ComPtr<ITfUIElement> element;
   if (FAILED(manager->GetUIElement(id, element.put())) || !element)
-    return list;
+    return {};
   ComPtr<ITfCandidateListUIElement> candidates;
   if (FAILED(element->QueryInterface(
           IID_ITfCandidateListUIElement,
           reinterpret_cast<void **>(candidates.put())))) {
-    return list;
+    return {};
   }
+  return ReadCandidateList(candidates.get());
+}
+
+struct CandidateInterfaces {
+  ComPtr<ITfCandidateListUIElementBehavior> behavior;
+  ComPtr<ITfIntegratableCandidateListUIElement> integratable;
+};
+
+CandidateInterfaces ReadCandidateInterfaces(ITfUIElementMgr *manager,
+                                            DWORD id) {
+  CandidateInterfaces interfaces;
+  if (!manager || id == TF_INVALID_UIELEMENTID)
+    return interfaces;
+  ComPtr<ITfUIElement> element;
+  if (FAILED(manager->GetUIElement(id, element.put())) || !element)
+    return interfaces;
+  element->QueryInterface(IID_ITfCandidateListUIElementBehavior,
+                          reinterpret_cast<void **>(interfaces.behavior.put()));
+  element->QueryInterface(
+      IID_ITfIntegratableCandidateListUIElement,
+      reinterpret_cast<void **>(interfaces.integratable.put()));
+  return interfaces;
+}
+
+CandidateList ReadCandidateList(ITfCandidateListUIElement *candidates) {
+  CandidateList list;
+  if (!candidates)
+    return list;
   list.available = true;
   candidates->GetCount(&list.count);
   candidates->GetSelection(&list.selection);
   BOOL shown = FALSE;
-  if (SUCCEEDED(element->IsShown(&shown)))
+  if (SUCCEEDED(candidates->IsShown(&shown)))
     list.is_shown = shown ? 1 : 0;
   BSTR value = nullptr;
-  if (list.count > 0 && SUCCEEDED(candidates->GetString(list.selection,
-                                                        &value)) &&
-      value) {
+  if (list.count > 0 && list.selection < list.count &&
+      SUCCEEDED(candidates->GetString(list.selection, &value)) && value) {
     list.selected.assign(value, SysStringLen(value));
     SysFreeString(value);
   }
@@ -510,6 +629,11 @@ struct ProbeResult {
   std::vector<Watch> watches;
   std::vector<ElementEvent> events;
   CandidateList candidates;
+  CandidateList candidates_after_action;
+  CandidateList candidates_final;
+  BehaviorObservation behavior;
+  IntegratableObservation integratable;
+  std::wstring document_after_action;
   std::wstring commit;
   std::wstring text_service_source;
   std::wstring runtime_source;
@@ -534,6 +658,116 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
 
   result->watches.push_back(WatchWindow("candidates", runtime_pid));
   result->candidates = ReadCandidateList(manager, sink->element_id());
+
+  if (ExercisesCandidateControl(mode)) {
+    CandidateInterfaces interfaces =
+        ReadCandidateInterfaces(manager, sink->element_id());
+    result->behavior.available = static_cast<bool>(interfaces.behavior);
+    result->integratable.available =
+        static_cast<bool>(interfaces.integratable);
+    result->integratable.distinct_interface_branch =
+        interfaces.behavior && interfaces.integratable &&
+        static_cast<void *>(interfaces.behavior.get()) !=
+            static_cast<void *>(interfaces.integratable.get());
+
+    if (mode == Mode::BehaviorSelect && interfaces.behavior) {
+      result->behavior.set_selection_called = true;
+      result->behavior.set_selection_result =
+          interfaces.behavior->SetSelection(1);
+      PumpMessages();
+      result->candidates_after_action =
+          ReadCandidateList(interfaces.behavior.get());
+      result->candidates_final = result->candidates_after_action;
+      result->document_after_action = store->text();
+      result->watches.push_back(
+          WatchWindow("after_behavior_select", runtime_pid));
+      return;
+    }
+
+    if (mode == Mode::BehaviorFinalize && interfaces.behavior) {
+      result->behavior.set_selection_called = true;
+      result->behavior.set_selection_result =
+          interfaces.behavior->SetSelection(0);
+      PumpMessages();
+      result->candidates_after_action =
+          ReadCandidateList(interfaces.behavior.get());
+      result->behavior.finalize_called = true;
+      result->behavior.finalize_result = interfaces.behavior->Finalize();
+      PumpMessages();
+      result->commit = store->text();
+      result->document_after_action = result->commit;
+      result->candidates_final = ReadCandidateList(interfaces.behavior.get());
+      result->watches.push_back(
+          WatchWindow("after_behavior_finalize", runtime_pid));
+      return;
+    }
+
+    if (mode == Mode::BehaviorAbort && interfaces.behavior) {
+      result->behavior.abort_called = true;
+      result->behavior.abort_result = interfaces.behavior->Abort();
+      PumpMessages();
+      result->document_after_action = store->text();
+      result->candidates_after_action =
+          ReadCandidateList(interfaces.behavior.get());
+      result->candidates_final = result->candidates_after_action;
+      result->watches.push_back(
+          WatchWindow("after_behavior_abort", runtime_pid));
+      return;
+    }
+
+    if (mode == Mode::IntegratableKeys && interfaces.integratable) {
+      result->integratable.selection_style_called = true;
+      result->integratable.selection_style_result =
+          interfaces.integratable->GetSelectionStyle(
+              &result->integratable.selection_style);
+      BOOL show_numbers = FALSE;
+      result->integratable.show_numbers_called = true;
+      result->integratable.show_numbers_result =
+          interfaces.integratable->ShowCandidateNumbers(&show_numbers);
+      result->integratable.show_numbers = show_numbers ? 1 : 0;
+      BOOL eaten = FALSE;
+      result->integratable.key_called = true;
+      result->integratable.key_result =
+          interfaces.integratable->OnKeyDown('1', 0, &eaten);
+      result->integratable.key_eaten = eaten ? 1 : 0;
+      PumpMessages();
+      result->commit = store->text();
+      result->document_after_action = result->commit;
+      result->candidates_after_action =
+          ReadCandidateList(interfaces.behavior.get());
+      result->candidates_final = result->candidates_after_action;
+      result->watches.push_back(
+          WatchWindow("after_integratable_key", runtime_pid));
+      return;
+    }
+
+    if (mode == Mode::BehaviorInvalid && interfaces.behavior) {
+      result->behavior.set_selection_called = true;
+      result->behavior.set_selection_result =
+          interfaces.behavior->SetSelection(result->candidates.count);
+      PumpMessages();
+      result->document_after_action = store->text();
+      result->candidates_after_action =
+          ReadCandidateList(interfaces.behavior.get());
+      if (interfaces.integratable) {
+        result->integratable.finalize_exact_called = true;
+        result->integratable.finalize_exact_result =
+            interfaces.integratable->FinalizeExactCompositionString();
+      }
+      PumpMessages();
+      result->commit = store->text();
+      result->candidates_final = ReadCandidateList(interfaces.behavior.get());
+      result->watches.push_back(
+          WatchWindow("after_invalid_then_exact_finalize", runtime_pid));
+      return;
+    }
+
+    Fail("candidate_control_interface",
+         "the requested candidate-control interface was unavailable");
+    result->watches.push_back(
+        WatchWindow("after_missing_candidate_control", runtime_pid));
+    return;
+  }
 
   if (mode == Mode::ShowFalse) {
     // Issue #38's criterion: a host that starts drawing for itself mid-session
@@ -594,7 +828,7 @@ bool Run(Mode mode, ProbeResult *result) {
     ComPtr<ITfKeyEventSink> keys;
     TfEditCookie edit_cookie = TF_INVALID_COOKIE;
     DWORD sink_cookie = TF_INVALID_COOKIE;
-    UiElementSink *sink = new UiElementSink(mode != Mode::Deny);
+    UiElementSink *sink = new UiElementSink(HostAllowsSelfDraw(mode));
 
     host_ready =
         SUCCEEDED(CoCreateInstance(
@@ -689,8 +923,110 @@ void Check(Mode mode, const ProbeResult &result) {
     return nullptr;
   };
 
-  Expect(result.commit == kExpectedCommit, "commit_text",
-         "the composition did not commit U+4F60 U+597D");
+  if (mode == Mode::BehaviorSelect) {
+    Expect(result.behavior.available, "behavior_available",
+           "the UI element did not expose candidate-list behavior");
+    Expect(result.behavior.set_selection_called &&
+               result.behavior.set_selection_result == S_OK,
+           "behavior_set_selection",
+           "SetSelection(1) did not succeed");
+    Expect(result.candidates_after_action.available &&
+               result.candidates_after_action.count == result.candidates.count &&
+               result.candidates_after_action.selection == 1,
+           "behavior_selection_state",
+           "SetSelection(1) did not retain the candidate list at selection 1");
+    Expect(result.document_after_action.empty(), "behavior_select_no_commit",
+           "SetSelection committed text before Finalize");
+  } else if (mode == Mode::BehaviorFinalize) {
+    Expect(result.behavior.available, "behavior_available",
+           "the UI element did not expose candidate-list behavior");
+    Expect(result.behavior.set_selection_called &&
+               result.behavior.set_selection_result == S_OK &&
+               result.candidates_after_action.available &&
+               result.candidates_after_action.count == result.candidates.count &&
+               result.candidates_after_action.selection == 0,
+           "behavior_finalize_selection",
+           "SetSelection(0) did not leave candidate 0 selected and active");
+    Expect(result.behavior.finalize_called &&
+               result.behavior.finalize_result == S_OK,
+           "behavior_finalize", "Finalize did not succeed");
+    Expect(result.commit == kExpectedCommit, "behavior_finalize_commit",
+           "Finalize did not commit U+4F60 U+597D");
+    Expect(result.candidates_final.available &&
+               result.candidates_final.count == 0,
+           "behavior_finalize_end",
+           "Finalize did not end the candidate composition");
+  } else if (mode == Mode::BehaviorAbort) {
+    Expect(result.behavior.available, "behavior_available",
+           "the UI element did not expose candidate-list behavior");
+    Expect(result.behavior.abort_called && result.behavior.abort_result == S_OK,
+           "behavior_abort", "Abort did not succeed");
+    Expect(result.document_after_action.empty(), "behavior_abort_no_commit",
+           "Abort committed text instead of clearing the composition");
+    Expect(result.candidates_final.available &&
+               result.candidates_final.count == 0,
+           "behavior_abort_end", "Abort left the candidate composition active");
+  } else if (mode == Mode::IntegratableKeys) {
+    Expect(result.behavior.available && result.integratable.available,
+           "integratable_available",
+           "the UI element did not expose both candidate-list interfaces");
+    Expect(result.integratable.distinct_interface_branch,
+           "integratable_distinct_branch",
+           "Behavior and Integratable unexpectedly used the same COM pointer");
+    Expect(result.integratable.selection_style_called &&
+               result.integratable.selection_style_result == S_OK &&
+               result.integratable.selection_style == STYLE_ACTIVE_SELECTION,
+           "integratable_selection_style",
+           "GetSelectionStyle did not report STYLE_ACTIVE_SELECTION");
+    Expect(result.integratable.show_numbers_called &&
+               result.integratable.show_numbers_result == S_OK &&
+               result.integratable.show_numbers == 1,
+           "integratable_candidate_numbers",
+           "ShowCandidateNumbers did not ask the host to draw numbers");
+    Expect(result.integratable.key_called &&
+               result.integratable.key_result == S_OK &&
+               result.integratable.key_eaten == 1,
+           "integratable_key_eaten",
+           "OnKeyDown('1') did not consume the candidate-selection key");
+    Expect(result.commit == kExpectedCommit, "integratable_key_commit",
+           "OnKeyDown('1') did not commit U+4F60 U+597D");
+    Expect(result.candidates_final.available &&
+               result.candidates_final.count == 0,
+           "integratable_key_end",
+           "the integrated selection key did not end the composition");
+  } else if (mode == Mode::BehaviorInvalid) {
+    Expect(result.behavior.available && result.integratable.available,
+           "candidate_control_available",
+           "the UI element did not expose both candidate-list interfaces");
+    Expect(result.behavior.set_selection_called &&
+               result.behavior.set_selection_result == E_INVALIDARG,
+           "behavior_invalid_rejected",
+           "an out-of-range SetSelection did not return E_INVALIDARG");
+    Expect(result.candidates_after_action.available &&
+               result.candidates_after_action.count == result.candidates.count &&
+               result.candidates_after_action.selection ==
+                   result.candidates.selection &&
+               result.candidates_after_action.selected ==
+                   result.candidates.selected,
+           "behavior_invalid_unchanged",
+           "an invalid SetSelection changed the candidate list");
+    Expect(result.document_after_action.empty(), "behavior_invalid_no_commit",
+           "an invalid SetSelection committed text");
+    Expect(result.integratable.finalize_exact_called &&
+               result.integratable.finalize_exact_result == S_OK,
+           "integratable_finalize_exact",
+           "FinalizeExactCompositionString did not succeed after rejection");
+    Expect(result.commit == kExpectedCommit,
+           "integratable_finalize_exact_commit",
+           "FinalizeExactCompositionString did not commit U+4F60 U+597D");
+    Expect(result.candidates_final.available &&
+               result.candidates_final.count == 0,
+           "integratable_finalize_exact_end",
+           "FinalizeExactCompositionString did not end the composition");
+  } else {
+    Expect(result.commit == kExpectedCommit, "commit_text",
+           "the composition did not commit U+4F60 U+597D");
+  }
 
   size_t begins = 0;
   for (const ElementEvent &event : result.events) {
@@ -702,13 +1038,17 @@ void Check(Mode mode, const ProbeResult &result) {
   Expect(result.candidates.available && result.candidates.count > 0,
          "uiless_data",
          "the candidate list was not readable through ITfUIElementMgr");
+  if (ExercisesCandidateControl(mode)) {
+    Expect(result.candidates.count == 2, "deterministic_candidates",
+           "the test engine did not publish the two expected nihao candidates");
+  }
 
   const Watch *candidates = watch("candidates");
   if (!candidates) {
     Fail("candidates_watch", "the candidate stage was never observed");
     return;
   }
-  if (mode == Mode::Deny) {
+  if (!HostAllowsSelfDraw(mode)) {
     Expect(!candidates->ever_visible, "window_denied",
            "the self-drawn candidate window appeared although the host answered "
            "pbShow=FALSE");
@@ -725,19 +1065,30 @@ void Check(Mode mode, const ProbeResult &result) {
            "window");
   }
 
-  const Watch *committed = watch("after_commit");
-  Expect(committed && !committed->final_visible, "window_hidden_after_commit",
-         "the candidate window stayed visible after the composition committed");
+  const char *final_stage = nullptr;
+  if (mode == Mode::BehaviorSelect)
+    final_stage = "after_behavior_select";
+  else if (mode == Mode::BehaviorFinalize)
+    final_stage = "after_behavior_finalize";
+  else if (mode == Mode::BehaviorAbort)
+    final_stage = "after_behavior_abort";
+  else if (mode == Mode::IntegratableKeys)
+    final_stage = "after_integratable_key";
+  else if (mode == Mode::BehaviorInvalid)
+    final_stage = "after_invalid_then_exact_finalize";
+  else
+    final_stage = "after_commit";
+  const Watch *finished = watch(final_stage);
+  Expect(finished && !finished->final_visible, "window_hidden_after_action",
+         "the candidate window was visible after the mode's final action");
 }
 
 void Report(Mode mode, const ProbeResult &result) {
-  const char *mode_name = mode == Mode::Allow  ? "allow"
-                          : mode == Mode::Deny ? "deny"
-                                               : "show-false";
   std::printf("{\n");
   std::printf("  \"probe\": \"uiless_candidate_probe\",\n");
-  std::printf("  \"issue\": 37,\n");
-  std::printf("  \"mode\": \"%s\",\n", mode_name);
+  std::printf("  \"issue\": %d,\n", PrimaryIssue(mode));
+  std::printf("  \"covers_issues\": %s,\n", CoveredIssues(mode));
+  std::printf("  \"mode\": \"%s\",\n", ModeName(mode));
   std::printf("  \"text_service_module\": %s,\n",
               JsonString(result.text_service_source).c_str());
   std::printf("  \"runtime_image\": %s,\n",
@@ -766,6 +1117,61 @@ void Report(Mode mode, const ProbeResult &result) {
               result.candidates.selection,
               JsonString(result.candidates.selected).c_str(),
               JsonTriState(result.candidates.is_shown));
+
+  std::printf(
+      "  \"candidate_list_after_action\": {\"available\": %s, "
+      "\"count\": %u, \"selection\": %u, \"selected\": %s, "
+      "\"is_shown\": %s},\n",
+      JsonBool(result.candidates_after_action.available),
+      result.candidates_after_action.count,
+      result.candidates_after_action.selection,
+      JsonString(result.candidates_after_action.selected).c_str(),
+      JsonTriState(result.candidates_after_action.is_shown));
+  std::printf(
+      "  \"candidate_list_final\": {\"available\": %s, \"count\": %u, "
+      "\"selection\": %u, \"selected\": %s, \"is_shown\": %s},\n",
+      JsonBool(result.candidates_final.available),
+      result.candidates_final.count, result.candidates_final.selection,
+      JsonString(result.candidates_final.selected).c_str(),
+      JsonTriState(result.candidates_final.is_shown));
+  std::printf(
+      "  \"behavior\": {\"available\": %s, \"set_selection_result\": "
+      "%s, \"finalize_result\": %s, \"abort_result\": %s},\n",
+      JsonBool(result.behavior.available),
+      JsonHresult(result.behavior.set_selection_called,
+                  result.behavior.set_selection_result)
+          .c_str(),
+      JsonHresult(result.behavior.finalize_called,
+                  result.behavior.finalize_result)
+          .c_str(),
+      JsonHresult(result.behavior.abort_called, result.behavior.abort_result)
+          .c_str());
+  std::printf(
+      "  \"integratable\": {\"available\": %s, \"distinct_branch\": %s, "
+      "\"selection_style_result\": %s, \"selection_style\": %s, "
+      "\"show_numbers_result\": %s, \"show_numbers\": %s, "
+      "\"key_result\": %s, \"key_eaten\": %s, "
+      "\"finalize_exact_result\": %s},\n",
+      JsonBool(result.integratable.available),
+      JsonBool(result.integratable.distinct_interface_branch),
+      JsonHresult(result.integratable.selection_style_called,
+                  result.integratable.selection_style_result)
+          .c_str(),
+      JsonNumber(result.integratable.selection_style_called,
+                 static_cast<long>(result.integratable.selection_style))
+          .c_str(),
+      JsonHresult(result.integratable.show_numbers_called,
+                  result.integratable.show_numbers_result)
+          .c_str(),
+      JsonTriState(result.integratable.show_numbers),
+      JsonHresult(result.integratable.key_called, result.integratable.key_result)
+          .c_str(),
+      JsonTriState(result.integratable.key_eaten),
+      JsonHresult(result.integratable.finalize_exact_called,
+                  result.integratable.finalize_exact_result)
+          .c_str());
+  std::printf("  \"document_after_action\": %s,\n",
+              JsonString(result.document_after_action).c_str());
 
   std::printf("  \"window\": [\n");
   for (size_t index = 0; index < result.watches.size(); ++index) {
@@ -813,6 +1219,16 @@ int wmain(int argc, wchar_t **argv) {
         mode = Mode::Deny;
       else if (value == L"show-false")
         mode = Mode::ShowFalse;
+      else if (value == L"behavior-select")
+        mode = Mode::BehaviorSelect;
+      else if (value == L"behavior-finalize")
+        mode = Mode::BehaviorFinalize;
+      else if (value == L"behavior-abort")
+        mode = Mode::BehaviorAbort;
+      else if (value == L"integratable-keys")
+        mode = Mode::IntegratableKeys;
+      else if (value == L"behavior-invalid")
+        mode = Mode::BehaviorInvalid;
       else
         mode_set = false;
     } else {
@@ -822,7 +1238,9 @@ int wmain(int argc, wchar_t **argv) {
   }
   if (!mode_set) {
     std::fprintf(stderr,
-                 "usage: uiless_candidate_probe --mode allow|deny|show-false\n");
+                 "usage: uiless_candidate_probe --mode "
+                 "allow|deny|show-false|behavior-select|behavior-finalize|"
+                 "behavior-abort|integratable-keys|behavior-invalid\n");
     return 2;
   }
 
