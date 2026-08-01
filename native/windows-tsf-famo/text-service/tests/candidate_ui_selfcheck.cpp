@@ -99,8 +99,23 @@ public:
     last = element;
   }
 
+  HRESULT OnCandidateBehavior(famo::tsf::CandidateUiElement *element,
+                              famo::tsf::CandidateBehavior behavior,
+                              UINT index) override {
+    ++behaviors;
+    last = element;
+    last_behavior = behavior;
+    last_index = index;
+    return result;
+  }
+
   int changes = 0;
+  int behaviors = 0;
   famo::tsf::CandidateUiElement *last = nullptr;
+  famo::tsf::CandidateBehavior last_behavior =
+      famo::tsf::CandidateBehavior::Select;
+  UINT last_index = 0;
+  HRESULT result = S_OK;
 };
 
 famo::runtime::Composition Snapshot() {
@@ -188,11 +203,47 @@ int RunChecks() {
   CHECK(SUCCEEDED(host_drawn->Update(none)) && !host_drawn->begun());
   BOOL reborn = FALSE;
   CHECK(SUCCEEDED(host_drawn->Update(Snapshot(), &reborn)) && reborn == TRUE);
+
+  // A host that draws the candidates itself drives selection, commit and
+  // cancel through ITfCandidateListUIElementBehavior.
+  famo::tsf::ComPtr<ITfCandidateListUIElementBehavior> behavior;
+  CHECK(SUCCEEDED(host_drawn->QueryInterface(
+      IID_ITfCandidateListUIElementBehavior,
+      reinterpret_cast<void **>(behavior.put()))));
+  CHECK(behavior.get() == static_cast<ITfCandidateListUIElement *>(host_drawn));
+
+  CHECK(behavior->SetSelection(2) == S_OK);
+  CHECK(host.behaviors == 1 && host.last == host_drawn &&
+        host.last_behavior == famo::tsf::CandidateBehavior::Select &&
+        host.last_index == 2);
+  CHECK(behavior->Finalize() == S_OK);
+  CHECK(host.behaviors == 2 &&
+        host.last_behavior == famo::tsf::CandidateBehavior::Finalize);
+  CHECK(behavior->Abort() == S_OK);
+  CHECK(host.behaviors == 3 &&
+        host.last_behavior == famo::tsf::CandidateBehavior::Abort);
+  // The host's verdict is the method's result.
+  host.result = E_FAIL;
+  CHECK(behavior->Finalize() == E_FAIL && host.behaviors == 4);
+  host.result = S_OK;
+  // An index outside the published page never reaches the runtime session.
+  CHECK(behavior->SetSelection(3) == E_INVALIDARG && host.behaviors == 4);
+  // Nor does one against a list the element has already ended.
+  famo::runtime::Composition cleared;
+  CHECK(SUCCEEDED(host_drawn->Update(cleared)) && !host_drawn->begun());
+  CHECK(behavior->SetSelection(0) == E_INVALIDARG && host.behaviors == 4);
+  CHECK(SUCCEEDED(host_drawn->Update(Snapshot())));
+
   // A detached element must never call back into a released host.
   const int before_detach = host.changes;
   host_drawn->SetHost(nullptr);
   CHECK(SUCCEEDED(host_drawn->Show(FALSE)));
   CHECK(host.changes == before_detach && host_drawn->visible() == FALSE);
+  CHECK(behavior->SetSelection(0) == E_FAIL);
+  CHECK(behavior->Finalize() == E_FAIL);
+  CHECK(behavior->Abort() == E_FAIL);
+  CHECK(host.behaviors == 4);
+  behavior.reset();
   host_drawn->Release();
   host_drawn_manager->Release();
 

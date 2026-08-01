@@ -86,9 +86,11 @@ HRESULT CandidateUiElement::QueryInterface(REFIID iid, void **object) {
   if (!object)
     return E_POINTER;
   *object = nullptr;
+  // Single inheritance chain up to IUnknown, so one cast serves every IID.
   if (iid == IID_IUnknown || iid == IID_ITfUIElement ||
-      iid == IID_ITfCandidateListUIElement)
-    *object = static_cast<ITfCandidateListUIElement *>(this);
+      iid == IID_ITfCandidateListUIElement ||
+      iid == IID_ITfCandidateListUIElementBehavior)
+    *object = static_cast<ITfCandidateListUIElementBehavior *>(this);
   if (!*object)
     return E_NOINTERFACE;
   AddRef();
@@ -213,6 +215,36 @@ HRESULT CandidateUiElement::GetCurrentPage(UINT *page) {
     return E_POINTER;
   *page = current_page_;
   return S_OK;
+}
+
+HRESULT CandidateUiElement::SetSelection(UINT index) {
+  return ComBoundary([&] {
+    // The element publishes exactly the engine's current page, so the host's
+    // index is page-relative and has to land inside it.
+    if (index >= candidates_.size())
+      return E_INVALIDARG;
+    return host_
+               ? host_->OnCandidateBehavior(this, CandidateBehavior::Select,
+                                            index)
+               : E_FAIL;
+  });
+}
+
+HRESULT CandidateUiElement::Finalize() {
+  return ComBoundary([&] {
+    // A detached element outlived its session; there is nothing to finalize.
+    return host_ ? host_->OnCandidateBehavior(
+                       this, CandidateBehavior::Finalize, 0)
+                 : E_FAIL;
+  });
+}
+
+HRESULT CandidateUiElement::Abort() {
+  return ComBoundary([&] {
+    return host_
+               ? host_->OnCandidateBehavior(this, CandidateBehavior::Abort, 0)
+               : E_FAIL;
+  });
 }
 
 } // namespace famo::tsf
