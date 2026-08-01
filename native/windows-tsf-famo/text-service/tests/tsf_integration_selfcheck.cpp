@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <functional>
 
+#include <ctffunc.h>
 #include <msctf.h>
 #include <windows.h>
 
@@ -839,8 +840,9 @@ bool HostDrivenCandidateBehaviorMatchesRuntime(TextServiceModule *module,
         CHECK(behavior->SetSelection(count) == E_INVALIDARG);
         CHECK(store->text() == L"ni");
 
-        // SetSelection moves the UI-less host's selection without committing.
-        // Finalize then commits exactly that selected candidate.
+        // SetSelection round-trips through the runtime without committing.
+        // Only the returned composition changes GetSelection; Finalize then
+        // commits the engine's current highlighted candidate.
         CHECK(behavior->SetSelection(1) == S_OK);
         CHECK(store->text() == L"ni");
         UINT selected = 0;
@@ -879,11 +881,61 @@ bool HostDrivenCandidateBehaviorMatchesRuntime(TextServiceModule *module,
         CHECK(behavior->Abort() == S_OK);
         CHECK(store->text() == L"\u5c3c\u4f60");
 
+        // Exact finalization commits the displayed preedit literally. It must
+        // not auto-convert the engine's highlighted candidate.
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(SendKey(key_sink, context, 'H', true));
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(SendKey(key_sink, context, 'O', true));
+        CHECK(store->text() == L"\u5c3c\u4f60nihao");
+        ComPtr<ITfIntegratableCandidateListUIElement> integratable;
+        CHECK(SUCCEEDED(behavior->QueryInterface(
+            IID_ITfIntegratableCandidateListUIElement,
+            reinterpret_cast<void **>(integratable.put()))));
+        CHECK(integratable->FinalizeExactCompositionString() == S_OK);
+        CHECK(store->text() == L"\u5c3c\u4f60nihao");
+        UINT after_exact = 1;
+        CHECK(SUCCEEDED(behavior->GetCount(&after_exact)) && after_exact == 0);
+        CHECK(integratable->FinalizeExactCompositionString() == E_FAIL);
+
         // The ordinary key path still owns the composition afterwards.
         CHECK(SendKey(key_sink, context, 'N', true));
         CHECK(SendKey(key_sink, context, 'I', true));
         CHECK(SendKey(key_sink, context, '2', true));
-        CHECK(store->text() == L"\u5c3c\u4f60\u5c3c");
+        CHECK(store->text() == L"\u5c3c\u4f60nihao\u5c3c");
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool NonEmptyExactClearReplyQuarantines(TextServiceModule *module,
+                                        const wchar_t *runtime_path) {
+  ScopedEnvironment malformed_clear("FAMO_TEST_NONEMPTY_CLEAR_REPLY", "1");
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"ni");
+        ComPtr<ITfCandidateListUIElementBehavior> behavior;
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+        ComPtr<ITfIntegratableCandidateListUIElement> integratable;
+        CHECK(SUCCEEDED(behavior->QueryInterface(
+            IID_ITfIntegratableCandidateListUIElement,
+            reinterpret_cast<void **>(integratable.put()))));
+
+        // The reply is valid wire data but violates ClearComposition's empty
+        // result contract. It must be quarantined before its bogus commit can
+        // reach the document, and the ended element must reject another call.
+        CHECK(integratable->FinalizeExactCompositionString() == S_OK);
+        CHECK(store->text() == L"ni");
+        CHECK(behavior->SetSelection(1) == E_FAIL);
+        CHECK(behavior->Finalize() == E_FAIL);
         return true;
       });
   const bool runtime_finished = runtime.Finish();
@@ -2317,6 +2369,7 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(PreviewSelectionRequiresCapabilityAndAuthenticatedRuntimeWindow(
       &module, runtime_path));
   CHECK(HostDrivenCandidateBehaviorMatchesRuntime(&module, runtime_path));
+  CHECK(NonEmptyExactClearReplyQuarantines(&module, runtime_path));
   CHECK(CandidateBehaviorAfterDeactivationFailsSafely(&module, runtime_path));
   CHECK(FaultFailsOpen(&module, runtime_path, L"engine-hang"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"disconnect"));

@@ -116,6 +116,14 @@ HRESULT TextService::OnCandidateBehavior(CandidateUiElement *element,
   ContextEntry *entry = FindContextByCandidateElement(element);
   if (!entry)
     return E_FAIL;
+  std::string exact_commit;
+  if (behavior == CandidateBehavior::FinalizeExact) {
+    // Copy before reserving a sequence: allocation failure must not strand the
+    // ContextState with a request that was never sent.
+    exact_commit = entry->state.displayed().preedit;
+    if (exact_commit.empty())
+      return E_FAIL;
+  }
   // The click channel's capability token authenticates an unsigned cross
   // process WM_COPYDATA; an in-process COM call on the activation thread does
   // not need it, and consuming it here would disable the runtime's own preview
@@ -128,22 +136,30 @@ HRESULT TextService::OnCandidateBehavior(CandidateUiElement *element,
   runtime::Frame request;
   request.correlation = *correlation;
   switch (behavior) {
-  case CandidateBehavior::Finalize:
-    // SetSelection is local UI-less host state. Finalize submits that
-    // page-relative selection, unlike the click channel's
-    // SelectCandidateAbsolute, whose index space is the preview window of the
-    // *next* page.
-    request.command = runtime::Command::SelectCandidate;
+  case CandidateBehavior::Select:
+    request.command = runtime::Command::HighlightCandidate;
     if (!runtime::EncodeCandidateIndex(index, &request.payload)) {
       entry->state.CompleteUnhandled();
       return E_INVALIDARG;
     }
     break;
+  case CandidateBehavior::Finalize:
+    request.command = runtime::Command::CommitComposition;
+    break;
   case CandidateBehavior::Abort:
     request.command = runtime::Command::ClearComposition;
     break;
+  case CandidateBehavior::FinalizeExact:
+    // Clear the engine through the normal transaction ladder. The successful
+    // empty reply is applied with the captured displayed preedit as a host-only
+    // commit override; no new wire command is needed.
+    request.command = runtime::Command::ClearComposition;
+    break;
   }
-  return DeliverCandidateRequest(entry, std::move(request)) ? S_OK : E_FAIL;
+  return DeliverCandidateRequest(entry, std::move(request),
+                                 std::move(exact_commit))
+             ? S_OK
+             : E_FAIL;
 }
 
 void TextService::RefreshLayout(ContextEntry *entry, ITfContextView *view) {

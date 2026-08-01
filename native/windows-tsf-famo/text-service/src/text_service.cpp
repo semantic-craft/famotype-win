@@ -2256,6 +2256,7 @@ void TextService::ApplyOneDeliveryResult(
     const bool safe_missing =
         result->status == runtime::Status::StaleRequest;
     entry->pending_delivery.reset();
+    entry->exact_candidate_commit.reset();
     if (cancelled || safe_missing) {
       entry->state.CompleteUnhandled();
       if (entry->pending_physical_key) {
@@ -2294,6 +2295,7 @@ void TextService::ApplyOneDeliveryResult(
       !entry->state.AcceptReply(result->final_reply.correlation)) {
     entry->pending_delivery.reset();
     entry->pending_physical_key = false;
+    entry->exact_candidate_commit.reset();
     RecoverConnection();
     return;
   }
@@ -2310,8 +2312,15 @@ void TextService::ApplyOneDeliveryResult(
     QuarantineDelivery(entry);
     return;
   }
+  const std::string *commit_override = nullptr;
+  if (!ResolveCandidateCommitOverride(entry, result->reference, composition,
+                                      &commit_override)) {
+    QuarantineDelivery(entry);
+    return;
+  }
   if (composition.handled) {
-    if (FAILED(ApplyRuntimeComposition(entry, composition))) {
+    if (FAILED(
+            ApplyRuntimeComposition(entry, composition, commit_override))) {
       entry->deferred_delivery_composition = std::move(composition);
       return;
     }
@@ -2322,6 +2331,7 @@ void TextService::ApplyOneDeliveryResult(
     // key, so this late unhandled result cannot be passed through retroactively.
     entry->state.CompleteUnhandled();
   }
+  entry->exact_candidate_commit.reset();
   entry->pending_delivery.reset();
   entry->pending_physical_key = false;
   entry->applied_delivery = result->reference;
@@ -2390,6 +2400,7 @@ void TextService::RetireAbandonedSession(
     entry->pending_delivery.reset();
     entry->applied_delivery.reset();
     entry->deferred_delivery_composition.reset();
+    entry->exact_candidate_commit.reset();
     entry->pending_physical_key = false;
     entry->delivery_work_pending = connection_abandon_pending;
     entry->delivery_quarantined = false;
@@ -2461,13 +2472,22 @@ bool TextService::ApplyDeferredDelivery(ContextEntry *entry) {
     QuarantineDelivery(entry);
     return false;
   }
-  if (FAILED(
-          ApplyRuntimeComposition(entry, *entry->deferred_delivery_composition)))
+  const std::string *commit_override = nullptr;
+  if (!ResolveCandidateCommitOverride(
+          entry, *entry->pending_delivery,
+          *entry->deferred_delivery_composition, &commit_override)) {
+    QuarantineDelivery(entry);
+    return false;
+  }
+  if (FAILED(ApplyRuntimeComposition(entry,
+                                     *entry->deferred_delivery_composition,
+                                     commit_override)))
     return false;
   const runtime::DeliveryReference completed = *entry->pending_delivery;
   entry->state.ApplySucceeded(*entry->deferred_delivery_composition);
   UpdateCandidates(entry, *entry->deferred_delivery_composition);
   entry->deferred_delivery_composition.reset();
+  entry->exact_candidate_commit.reset();
   entry->pending_delivery.reset();
   entry->pending_physical_key = false;
   entry->applied_delivery = completed;
@@ -2482,6 +2502,7 @@ void TextService::QuarantineDelivery(ContextEntry *entry) {
   entry->delivery_quarantined = true;
   entry->delivery_work_pending = false;
   entry->deferred_delivery_composition.reset();
+  entry->exact_candidate_commit.reset();
   entry->pending_physical_key = false;
   if (entry->candidates)
     entry->candidates->End();
