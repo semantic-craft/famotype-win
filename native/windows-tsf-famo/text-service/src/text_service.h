@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -26,6 +27,7 @@ namespace famo::tsf {
 class TextService final : public ITfTextInputProcessorEx,
                           public ITfKeyEventSink,
                           public ITfThreadMgrEventSink,
+                          public ITfCompartmentEventSink,
                           public ITfCompositionSink,
                           public ITfTextLayoutSink,
                           public CandidateUiHost {
@@ -68,6 +70,8 @@ public:
   HRESULT STDMETHODCALLTYPE OnPushContext(ITfContext *context) override;
   HRESULT STDMETHODCALLTYPE OnPopContext(ITfContext *context) override;
 
+  HRESULT STDMETHODCALLTYPE OnChange(REFGUID guid) override;
+
   HRESULT STDMETHODCALLTYPE OnCompositionTerminated(
       TfEditCookie cookie, ITfComposition *composition) override;
   HRESULT STDMETHODCALLTYPE OnLayoutChange(ITfContext *context,
@@ -81,7 +85,8 @@ public:
                              LPARAM key_data, BOOL *eaten) override;
 
 private:
-  enum class DeliveryWorkKind { Recover, Cancel, Ack };
+  enum class DeliveryWorkKind { Recover, Cancel, Ack, Abandon };
+  enum class KeyboardSecurityState { Enabled, Closing, Disabled };
   enum class DeliveryAttemptState {
     Rejected,
     PrepareUnknown,
@@ -104,6 +109,8 @@ private:
     CompositionController composition;
     ComPtr<CandidateUiElement> candidates;
     DWORD layout_sink_cookie = TF_INVALID_COOKIE;
+    ComPtr<ITfSource> keyboard_disabled_source;
+    DWORD keyboard_disabled_sink_cookie = TF_INVALID_COOKIE;
     runtime::UiState ui_state;
     runtime::Correlation pending_session;
     std::string recovery_preedit;
@@ -121,6 +128,10 @@ private:
     bool session_pending = false;
     bool first_key_pending = true;
     bool close_requested = false;
+    KeyboardSecurityState keyboard_security = KeyboardSecurityState::Enabled;
+    bool keyboard_reenable_requested = false;
+    bool composition_cleanup_pending = false;
+    uint8_t keyboard_security_retry_count = 0;
     // Capability is valid only for this exact displayed composition sequence.
     // Zero means the current composition has already consumed its click.
     uint64_t selection_capability_sequence = 0;
@@ -187,7 +198,7 @@ private:
   void ProcessDeliveryWork(
       const std::shared_ptr<const DeliveryWorkRequest> &request);
   void ScheduleSession(ContextEntry *entry, SessionWarmupReason reason);
-  void ScheduleDeliveryWork(ContextEntry *entry, DeliveryWorkKind kind,
+  bool ScheduleDeliveryWork(ContextEntry *entry, DeliveryWorkKind kind,
                             const runtime::DeliveryReference &reference);
   void ApplySessionResult();
   void ApplyDeliveryResult();
@@ -207,7 +218,17 @@ private:
   bool CloseEntry(ContextEntry *entry);
   HRESULT HandleKey(ITfContext *context, WPARAM key, LPARAM key_data,
                     bool down, bool test_only, BOOL *eaten);
-  bool KeyboardDisabled(ContextEntry *entry);
+  bool KeyboardDisabled(ITfContext *context);
+  void ReconcileKeyboardSecurity(ContextEntry *entry, bool disabled);
+  void ContinueKeyboardSecurityClose(ContextEntry *entry);
+  void ScheduleKeyboardSecurityRetry(ContextEntry *entry);
+  void BlockSecurityConnection(uint64_t connection_generation);
+  void ReleaseSecurityConnection(uint64_t connection_generation);
+  void ResetSecurityConnections();
+  bool SecurityConnectionBlockedLocked(
+      uint64_t connection_generation) const noexcept;
+  void CancelPendingSession(ContextEntry *entry);
+  void UnadviseContextSinks(ContextEntry *entry);
   bool HandlePreviewSelection(
       HWND source_window,
       const runtime::PreviewSelectionRequest &request);
@@ -258,10 +279,20 @@ private:
   std::mutex session_publication_mutex_;
   static constexpr size_t kMaxQueuedDeliveryWork = 64;
   std::mutex delivery_queue_mutex_;
+  // Serializes the security boundary with the only recovery operation that
+  // may still execute a prepared engine action.
+  std::mutex delivery_execution_mutex_;
+  std::array<uint64_t, kMaxQueuedDeliveryWork>
+      security_blocked_connections_{};
+  bool security_blocks_all_recovery_ = false;
   std::deque<std::shared_ptr<const DeliveryWorkRequest>>
       delivery_requests_;
   std::deque<std::shared_ptr<const DeliveryWorkResult>>
       delivery_results_;
+  // Security teardown gets one allocation-stable priority slot so it can
+  // overtake an in-flight Recover/Cancel without growing the bounded queue.
+  std::atomic<std::shared_ptr<const DeliveryWorkRequest>>
+      security_abandon_request_;
   // A terminal result is allocated before its destructive runtime abandon and
   // published through this allocation-free slot afterward.
   std::atomic<std::shared_ptr<const DeliveryWorkResult>>
@@ -274,5 +305,9 @@ private:
 
 HRESULT CreateTextServiceInstance(REFIID iid, void **object);
 uint32_t TerminalCleanupConnectAttemptsForTest() noexcept;
+uint32_t RecoveryPreparedClaimsForTest() noexcept;
+uint32_t RecoveryExecuteAttemptsForTest() noexcept;
+uint32_t TerminalPublicationReadyForTest() noexcept;
+uint32_t TerminalRetiredSessionsForTest() noexcept;
 
 } // namespace famo::tsf

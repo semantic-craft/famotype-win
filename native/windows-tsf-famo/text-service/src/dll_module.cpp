@@ -136,3 +136,19 @@ extern "C" uint32_t STDAPICALLTYPE
 FamoGetTerminalCleanupConnectAttemptsForTest() {
   return famo::tsf::TerminalCleanupConnectAttemptsForTest();
 }
+
+extern "C" uint32_t STDAPICALLTYPE FamoGetRecoveryPreparedClaimsForTest() {
+  return famo::tsf::RecoveryPreparedClaimsForTest();
+}
+
+extern "C" uint32_t STDAPICALLTYPE FamoGetRecoveryExecuteAttemptsForTest() {
+  return famo::tsf::RecoveryExecuteAttemptsForTest();
+}
+
+extern "C" uint32_t STDAPICALLTYPE FamoGetTerminalPublicationReadyForTest() {
+  return famo::tsf::TerminalPublicationReadyForTest();
+}
+
+extern "C" uint32_t STDAPICALLTYPE FamoGetTerminalRetiredSessionsForTest() {
+  return famo::tsf::TerminalRetiredSessionsForTest();
+}

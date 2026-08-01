@@ -19,6 +19,9 @@ namespace {
 
 std::atomic<uint64_t> g_activation_generation{0};
 constexpr UINT kRecoveryMessage = WM_APP + 0x46;
+constexpr UINT_PTR kKeyboardSecurityRetryTimer = 0x4641;
+constexpr UINT kKeyboardSecurityRetryDelayMs = 10;
+constexpr uint8_t kMaxKeyboardSecurityRetries = 6;
 constexpr int kSessionOpenAttempts = 3;
 constexpr std::chrono::milliseconds kSessionRetryDelay{20};
 constexpr size_t kMaxTerminalAbandonDebts = 64;
@@ -33,6 +36,10 @@ struct TerminalAbandonDebt {
 std::mutex g_terminal_debt_mutex;
 std::deque<TerminalAbandonDebt> g_terminal_abandon_debts;
 std::atomic<uint32_t> g_terminal_cleanup_connect_attempts{0};
+std::atomic<uint32_t> g_recovery_prepared_claims{0};
+std::atomic<uint32_t> g_recovery_execute_attempts{0};
+std::atomic<uint32_t> g_terminal_publication_ready{0};
+std::atomic<uint32_t> g_terminal_retired_sessions{0};
 
 bool SameConnectionEpoch(const runtime::Correlation &left,
                          const runtime::Correlation &right) {
@@ -181,27 +188,70 @@ bool RefreshSelectionCapability(runtime::UiState *state) {
   return false;
 }
 
-bool CompartmentFlagSet(ITfContext *context, REFGUID compartment) {
+bool KeyboardCompartmentDisabled(ITfContext *context) {
+  // This compartment is the host's security boundary. Only an empty value or
+  // an explicit VT_I4 zero enables the TIP; an unreadable or malformed signal
+  // must fail open to the application instead of reaching the engine.
+  if (!context)
+    return true;
   ComPtr<ITfCompartmentMgr> manager;
   if (FAILED(context->QueryInterface(
           IID_ITfCompartmentMgr, reinterpret_cast<void **>(manager.put()))))
-    return false;
+    return true;
   ComPtr<ITfCompartment> slot;
-  if (FAILED(manager->GetCompartment(compartment, slot.put())))
-    return false;
+  if (FAILED(manager->GetCompartment(GUID_COMPARTMENT_KEYBOARD_DISABLED,
+                                     slot.put())))
+    return true;
   VARIANT value;
   VariantInit(&value);
-  if (FAILED(slot->GetValue(&value)))
-    return false;
-  const bool set = value.vt == VT_I4 && value.lVal != 0;
+  if (FAILED(slot->GetValue(&value))) {
+    VariantClear(&value);
+    return true;
+  }
+  const bool disabled =
+      value.vt != VT_EMPTY && (value.vt != VT_I4 || value.lVal != 0);
   VariantClear(&value);
-  return set;
+  return disabled;
+}
+
+HRESULT GetKeyboardDisabledSource(ITfContext *context, ITfSource **source) {
+  if (!context || !source)
+    return E_INVALIDARG;
+  *source = nullptr;
+  ComPtr<ITfCompartmentMgr> manager;
+  HRESULT result = context->QueryInterface(
+      IID_ITfCompartmentMgr, reinterpret_cast<void **>(manager.put()));
+  if (FAILED(result))
+    return result;
+  ComPtr<ITfCompartment> slot;
+  result = manager->GetCompartment(GUID_COMPARTMENT_KEYBOARD_DISABLED,
+                                   slot.put());
+  if (FAILED(result))
+    return result;
+  return slot->QueryInterface(IID_ITfSource,
+                              reinterpret_cast<void **>(source));
 }
 
 } // namespace
 
 uint32_t TerminalCleanupConnectAttemptsForTest() noexcept {
   return g_terminal_cleanup_connect_attempts.load();
+}
+
+uint32_t RecoveryPreparedClaimsForTest() noexcept {
+  return g_recovery_prepared_claims.load();
+}
+
+uint32_t RecoveryExecuteAttemptsForTest() noexcept {
+  return g_recovery_execute_attempts.load();
+}
+
+uint32_t TerminalPublicationReadyForTest() noexcept {
+  return g_terminal_publication_ready.load();
+}
+
+uint32_t TerminalRetiredSessionsForTest() noexcept {
+  return g_terminal_retired_sessions.load();
 }
 
 TextService::TextService()
@@ -240,6 +290,8 @@ HRESULT TextService::QueryInterface(REFIID iid, void **object) {
     *object = static_cast<ITfKeyEventSink *>(this);
   else if (iid == IID_ITfThreadMgrEventSink)
     *object = static_cast<ITfThreadMgrEventSink *>(this);
+  else if (iid == IID_ITfCompartmentEventSink)
+    *object = static_cast<ITfCompartmentEventSink *>(this);
   else if (iid == IID_ITfCompositionSink)
     *object = static_cast<ITfCompositionSink *>(this);
   else if (iid == IID_ITfTextLayoutSink)
@@ -479,10 +531,16 @@ HRESULT TextService::DeactivateCore() {
 
   for (auto &owned : contexts_) {
     ContextEntry *entry = owned.get();
-    std::string confirmed_preedit = entry->recovery_preedit;
+    const bool security_restricted =
+        entry->keyboard_security != KeyboardSecurityState::Enabled ||
+        KeyboardDisabled(entry->context.get());
+    std::string confirmed_preedit;
     const RecoveryPlan recovery = entry->state.Fail();
-    if (confirmed_preedit.empty() && recovery.commit_preedit)
-      confirmed_preedit = *recovery.commit_preedit;
+    if (!security_restricted) {
+      confirmed_preedit = entry->recovery_preedit;
+      if (confirmed_preedit.empty() && recovery.commit_preedit)
+        confirmed_preedit = *recovery.commit_preedit;
+    }
     if (!confirmed_preedit.empty()) {
       (void)entry->composition.Recover(
           entry->context.get(), client_id_, confirmed_preedit,
@@ -493,15 +551,7 @@ HRESULT TextService::DeactivateCore() {
     entry->composition.ResetBehaviorState();
     entry->ui_state.show_allowed = false;
     SetFocused(entry, false);
-    if (entry->layout_sink_cookie != TF_INVALID_COOKIE) {
-      ComPtr<ITfSource> source;
-      if (SUCCEEDED(entry->context->QueryInterface(
-              IID_ITfSource,
-              reinterpret_cast<void **>(source.put())))) {
-        source->UnadviseSink(entry->layout_sink_cookie);
-      }
-      entry->layout_sink_cookie = TF_INVALID_COOKIE;
-    }
+    UnadviseContextSinks(entry);
     entry->composition.End(entry->context.get(), client_id_);
     entry->state.Close();
   }
@@ -647,16 +697,9 @@ void TextService::ForceDeactivateCleanup() noexcept {
     } catch (...) {
     }
     try {
-      if (entry->layout_sink_cookie != TF_INVALID_COOKIE && entry->context) {
-        ComPtr<ITfSource> source;
-        if (SUCCEEDED(entry->context->QueryInterface(
-                IID_ITfSource, reinterpret_cast<void **>(source.put())))) {
-          source->UnadviseSink(entry->layout_sink_cookie);
-        }
-      }
+      UnadviseContextSinks(entry);
     } catch (...) {
     }
-    entry->layout_sink_cookie = TF_INVALID_COOKIE;
     try {
       entry->state.Close();
     } catch (...) {
@@ -754,24 +797,7 @@ HRESULT TextService::EnsureContext(ITfContext *context,
                                    SessionWarmupReason reason) {
   if (!context || !OnActivationThread())
     return E_INVALIDARG;
-  ApplySessionResult();
   ContextEntry *entry = FindContext(context);
-  if (entry && entry->close_requested)
-    return S_FALSE;
-  if (entry && entry->delivery_quarantined)
-    return S_FALSE;
-  if (entry && !ApplyDeferredDelivery(entry))
-    return S_FALSE;
-  if (entry && entry->recovery_cleanup_required) {
-    ProcessRecoveryWork();
-    if (entry->recovery_cleanup_required)
-      return S_FALSE;
-  }
-  if (entry && entry->state.phase() == ContextPhase::Ready &&
-      entry->state.session_identity().connection_generation ==
-          connection_generation_)
-    return S_OK;
-
   if (!entry) {
     auto owned = std::make_unique<ContextEntry>();
     owned->context = ComPtr<ITfContext>(context);
@@ -782,6 +808,14 @@ HRESULT TextService::EnsureContext(ITfContext *context,
     if (!owned->candidates)
       return E_OUTOFMEMORY;
     owned->candidates->SetHost(this);
+    if (FAILED(GetKeyboardDisabledSource(
+            context, owned->keyboard_disabled_source.put())) ||
+        FAILED(owned->keyboard_disabled_source->AdviseSink(
+            IID_ITfCompartmentEventSink,
+            static_cast<ITfCompartmentEventSink *>(this),
+            &owned->keyboard_disabled_sink_cookie))) {
+      return S_FALSE;
+    }
     ComPtr<ITfSource> context_source;
     if (FAILED(context->QueryInterface(
             IID_ITfSource,
@@ -789,29 +823,301 @@ HRESULT TextService::EnsureContext(ITfContext *context,
         FAILED(context_source->AdviseSink(
             IID_ITfTextLayoutSink, static_cast<ITfTextLayoutSink *>(this),
             &owned->layout_sink_cookie))) {
+      owned->keyboard_disabled_source->UnadviseSink(
+          owned->keyboard_disabled_sink_cookie);
+      owned->keyboard_disabled_sink_cookie = TF_INVALID_COOKIE;
+      owned->keyboard_disabled_source.reset();
       return S_FALSE;
     }
-    contexts_.push_back(std::move(owned));
+    try {
+      if (GetEnvironmentVariableA(
+              "FAMO_TEST_CONTEXT_INSERT_ALLOCATION_FAILURE", nullptr,
+              0) != 0) {
+        throw std::bad_alloc();
+      }
+      contexts_.push_back(std::move(owned));
+    } catch (...) {
+      UnadviseContextSinks(owned.get());
+      throw;
+    }
     entry = contexts_.back().get();
-  } else if (entry->candidates) {
-    entry->candidates->End();
   }
   SetFocused(entry, true);
-  if (KeyboardDisabled(entry))
+  ReconcileKeyboardSecurity(entry, KeyboardDisabled(context));
+  if (entry->keyboard_security != KeyboardSecurityState::Enabled) {
+    if (entry->keyboard_security == KeyboardSecurityState::Closing)
+      PostRecoveryWork();
     return S_FALSE;
+  }
+
+  ApplySessionResult();
+  if (entry->close_requested || entry->delivery_quarantined)
+    return S_FALSE;
+  if (!ApplyDeferredDelivery(entry))
+    return S_FALSE;
+  if (entry->recovery_cleanup_required) {
+    ProcessRecoveryWork();
+    if (entry->recovery_cleanup_required)
+      return S_FALSE;
+  }
+  if (entry->state.phase() == ContextPhase::Ready &&
+      entry->state.session_identity().connection_generation ==
+          connection_generation_)
+    return S_OK;
+  if (entry->candidates)
+    entry->candidates->End();
   if (!entry->session_pending)
     ScheduleSession(entry, reason);
   return S_FALSE;
 }
 
-// Password fields must never reach the engine: no session, no composition, no
-// candidate window. Password hosts disable the keyboard for their TSF context;
-// re-read that context-specific signal for every key so a mid-focus change also
-// fails open to the application.
-bool TextService::KeyboardDisabled(ContextEntry *entry) {
-  return entry && entry->context &&
-         CompartmentFlagSet(entry->context.get(),
-                            GUID_COMPARTMENT_KEYBOARD_DISABLED);
+bool TextService::KeyboardDisabled(ITfContext *context) {
+  return KeyboardCompartmentDisabled(context);
+}
+
+void TextService::CancelPendingSession(ContextEntry *entry) {
+  if (!entry || !entry->session_pending)
+    return;
+  const runtime::Correlation pending = entry->pending_session;
+  {
+    std::lock_guard lock(session_publication_mutex_);
+    const std::shared_ptr<const runtime::Correlation> desired =
+        desired_session_.load();
+    if (desired && *desired == pending)
+      desired_session_.store(nullptr);
+    const std::shared_ptr<const SessionWarmupRequest> request =
+        session_request_.load();
+    if (request && request->identity == pending)
+      session_request_.store(nullptr);
+    const std::shared_ptr<const SessionWarmupResult> result =
+        session_result_.load();
+    if (result && result->identity == pending) {
+      if (result->ready) {
+        entry->state.Open(result->identity);
+        entry->first_key_pending = true;
+      }
+      session_result_.store(nullptr);
+    }
+    entry->session_pending = false;
+    entry->pending_session = {};
+  }
+  session_worker_epoch_.fetch_add(1);
+  session_worker_epoch_.notify_one();
+  session_retry_wake_.notify_all();
+}
+
+bool TextService::SecurityConnectionBlockedLocked(
+    uint64_t connection_generation) const noexcept {
+  return security_blocks_all_recovery_ ||
+         (connection_generation != 0 &&
+          std::find(security_blocked_connections_.begin(),
+                    security_blocked_connections_.end(),
+                    connection_generation) !=
+              security_blocked_connections_.end());
+}
+
+void TextService::BlockSecurityConnection(uint64_t connection_generation) {
+  if (connection_generation == 0)
+    return;
+  std::lock_guard execution_lock(delivery_execution_mutex_);
+  if (SecurityConnectionBlockedLocked(connection_generation))
+    return;
+  const auto empty =
+      std::find(security_blocked_connections_.begin(),
+                security_blocked_connections_.end(), uint64_t{0});
+  if (empty == security_blocked_connections_.end()) {
+    // More concurrent retired epochs than the bounded delivery queue can
+    // represent: fail closed for recovery execution until deactivation.
+    security_blocks_all_recovery_ = true;
+    return;
+  }
+  *empty = connection_generation;
+}
+
+void TextService::ReleaseSecurityConnection(
+    uint64_t connection_generation) {
+  if (connection_generation == 0)
+    return;
+  std::lock_guard execution_lock(delivery_execution_mutex_);
+  for (uint64_t &blocked : security_blocked_connections_) {
+    if (blocked == connection_generation)
+      blocked = 0;
+  }
+}
+
+void TextService::ResetSecurityConnections() {
+  std::lock_guard execution_lock(delivery_execution_mutex_);
+  security_blocked_connections_.fill(0);
+  security_blocks_all_recovery_ = false;
+}
+
+void TextService::ReconcileKeyboardSecurity(ContextEntry *entry,
+                                            bool disabled) {
+  if (!entry)
+    return;
+  if (!disabled) {
+    if (entry->keyboard_security == KeyboardSecurityState::Closing) {
+      if (!entry->keyboard_reenable_requested) {
+        entry->keyboard_reenable_requested = true;
+        // A real compartment transition is a new opportunity to finish a
+        // host-denied composition cleanup. Restart the bounded backoff so an
+        // unlock after the original retry budget still makes progress.
+        entry->keyboard_security_retry_count = 0;
+        PostRecoveryWork();
+      }
+      return;
+    }
+    if (entry->keyboard_security == KeyboardSecurityState::Disabled) {
+      entry->keyboard_security = KeyboardSecurityState::Enabled;
+      entry->keyboard_reenable_requested = false;
+      if (entry->ui_state.focused && !entry->session_pending)
+        ScheduleSession(entry, SessionWarmupReason::Recovery);
+    }
+    return;
+  }
+
+  entry->keyboard_reenable_requested = false;
+  if (entry->keyboard_security != KeyboardSecurityState::Enabled)
+    return;
+  if (entry->pending_delivery) {
+    // Linearize the host security transition against recovery's only
+    // mutation point. An ExecutePrepared already holding this lease finishes
+    // before the boundary; every later one observes the blocked generation.
+    BlockSecurityConnection(
+        entry->pending_delivery->correlation.connection_generation);
+  }
+  entry->keyboard_security = KeyboardSecurityState::Closing;
+  entry->keyboard_security_retry_count = 0;
+  if (entry->candidates)
+    entry->candidates->End();
+  entry->ui_state.show_allowed = false;
+  entry->selection_capability_sequence = 0;
+  entry->composition.ResetBehaviorState();
+  PublishUiState(entry);
+  CancelPendingSession(entry);
+  entry->composition_cleanup_pending =
+      FAILED(entry->composition.End(entry->context.get(), client_id_));
+  PostRecoveryWork();
+}
+
+void TextService::ScheduleKeyboardSecurityRetry(ContextEntry *entry) {
+  // Edit-session denial is normally transient. Bound automatic polling to
+  // 10+20+40+80+160+320 ms; later focus/key/compartment activity can request
+  // another single recovery pass without leaving a 100 Hz timer behind.
+  if (!entry || !recovery_window_ ||
+      entry->keyboard_security_retry_count >=
+          kMaxKeyboardSecurityRetries) {
+    return;
+  }
+  const UINT delay =
+      kKeyboardSecurityRetryDelayMs
+      << entry->keyboard_security_retry_count;
+  if (SetTimer(recovery_window_, kKeyboardSecurityRetryTimer, delay,
+               nullptr) != 0) {
+    ++entry->keyboard_security_retry_count;
+  }
+}
+
+void TextService::ContinueKeyboardSecurityClose(ContextEntry *entry) {
+  if (!entry ||
+      entry->keyboard_security != KeyboardSecurityState::Closing) {
+    return;
+  }
+  CancelPendingSession(entry);
+  if (entry->composition_cleanup_pending) {
+    entry->composition_cleanup_pending =
+        FAILED(entry->composition.End(entry->context.get(), client_id_));
+    if (!entry->composition_cleanup_pending)
+      entry->keyboard_security_retry_count = 0;
+  }
+  if (entry->pending_delivery) {
+    if (!ScheduleDeliveryWork(entry, DeliveryWorkKind::Abandon,
+                              *entry->pending_delivery)) {
+      ScheduleKeyboardSecurityRetry(entry);
+    }
+    return;
+  }
+  if (entry->applied_delivery) {
+    if (!ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
+                              *entry->applied_delivery)) {
+      ScheduleKeyboardSecurityRetry(entry);
+    }
+    return;
+  }
+  if (entry->delivery_work_pending)
+    return;
+
+  if (entry->state.phase() == ContextPhase::Ready) {
+    const auto correlation = entry->state.PlanClose();
+    if (!correlation) {
+      ScheduleKeyboardSecurityRetry(entry);
+      return;
+    }
+    runtime::Frame close;
+    close.command = runtime::Command::CloseSession;
+    close.correlation = *correlation;
+    const runtime::CallResult closed =
+        ConnectRuntime(close.correlation, false)
+            ? runtime_port_.Call(std::move(close), runtime::kHardCallDeadline)
+            : runtime::CallResult{};
+    if (closed.status != runtime::Status::Ok &&
+        closed.status != runtime::Status::StaleRequest) {
+      entry->state.CompleteUnhandled();
+      runtime_port_.Poison();
+      ScheduleKeyboardSecurityRetry(entry);
+      return;
+    }
+    entry->state.Close();
+  } else if (entry->state.phase() != ContextPhase::Closed) {
+    entry->state.Close();
+  }
+
+  if (entry->composition_cleanup_pending) {
+    ScheduleKeyboardSecurityRetry(entry);
+    return;
+  }
+  entry->deferred_delivery_composition.reset();
+  entry->pending_physical_key = false;
+  entry->recovery_cleanup_required = false;
+  entry->recovery_preedit.clear();
+  entry->keyboard_security = KeyboardSecurityState::Disabled;
+  entry->keyboard_security_retry_count = 0;
+  if (entry->keyboard_reenable_requested)
+    ReconcileKeyboardSecurity(entry, false);
+}
+
+void TextService::UnadviseContextSinks(ContextEntry *entry) {
+  if (!entry)
+    return;
+  if (entry->keyboard_disabled_source &&
+      entry->keyboard_disabled_sink_cookie != TF_INVALID_COOKIE) {
+    entry->keyboard_disabled_source->UnadviseSink(
+        entry->keyboard_disabled_sink_cookie);
+  }
+  entry->keyboard_disabled_sink_cookie = TF_INVALID_COOKIE;
+  entry->keyboard_disabled_source.reset();
+  if (entry->layout_sink_cookie != TF_INVALID_COOKIE && entry->context) {
+    ComPtr<ITfSource> source;
+    if (SUCCEEDED(entry->context->QueryInterface(
+            IID_ITfSource, reinterpret_cast<void **>(source.put())))) {
+      source->UnadviseSink(entry->layout_sink_cookie);
+    }
+  }
+  entry->layout_sink_cookie = TF_INVALID_COOKIE;
+}
+
+HRESULT TextService::OnChange(REFGUID guid) {
+  return ComBoundary([&] {
+    if (!OnActivationThread())
+      return RPC_E_WRONG_THREAD;
+    if (guid != GUID_COMPARTMENT_KEYBOARD_DISABLED)
+      return S_OK;
+    for (auto &owned : contexts_)
+      if (owned)
+        ReconcileKeyboardSecurity(
+            owned.get(), KeyboardDisabled(owned->context.get()));
+    return S_OK;
+  });
 }
 
 bool TextService::StartSessionWorker() {
@@ -824,6 +1130,8 @@ bool TextService::StartSessionWorker() {
     delivery_requests_.clear();
     delivery_results_.clear();
   }
+  ResetSecurityConnections();
+  security_abandon_request_.store(nullptr);
   terminal_delivery_result_.store(nullptr);
   desired_session_.store(nullptr);
   try {
@@ -867,6 +1175,8 @@ void TextService::StopSessionWorker() noexcept {
   }
   session_request_.store(nullptr);
   session_result_.store(nullptr);
+  ResetSecurityConnections();
+  security_abandon_request_.store(nullptr);
   terminal_delivery_result_.store(nullptr);
   try {
     std::lock_guard lock(delivery_queue_mutex_);
@@ -901,8 +1211,10 @@ bool TextService::StartRecoveryWindow() {
 
 void TextService::StopRecoveryWindow() {
   recovery_message_posted_ = false;
-  if (recovery_window_)
+  if (recovery_window_) {
+    KillTimer(recovery_window_, kKeyboardSecurityRetryTimer);
     DestroyWindow(recovery_window_);
+  }
   recovery_window_ = nullptr;
 }
 
@@ -918,6 +1230,13 @@ void TextService::ProcessRecoveryWork() {
   ApplyDeliveryResult();
   for (auto &owned : contexts_) {
     ContextEntry *entry = owned.get();
+    ReconcileKeyboardSecurity(entry, KeyboardDisabled(entry->context.get()));
+    if (entry->keyboard_security == KeyboardSecurityState::Closing) {
+      ContinueKeyboardSecurityClose(entry);
+      continue;
+    }
+    if (entry->keyboard_security == KeyboardSecurityState::Disabled)
+      continue;
     if (entry->recovery_cleanup_required &&
         !entry->recovery_preedit.empty()) {
       const HRESULT recovered = entry->composition.Recover(
@@ -964,6 +1283,12 @@ LRESULT CALLBACK TextService::RecoveryWindowProc(HWND window, UINT message,
       service->ProcessRecoveryWork();
       return static_cast<LRESULT>(0);
     }
+    if (message == WM_TIMER &&
+        wparam == kKeyboardSecurityRetryTimer) {
+      KillTimer(window, kKeyboardSecurityRetryTimer);
+      service->ProcessRecoveryWork();
+      return static_cast<LRESULT>(0);
+    }
     if (message == WM_COPYDATA) {
       const auto *copy = reinterpret_cast<const COPYDATASTRUCT *>(lparam);
       if (!copy || copy->dwData != runtime::kPreviewSelectionCopyDataId ||
@@ -988,7 +1313,8 @@ LRESULT CALLBACK TextService::RecoveryWindowProc(HWND window, UINT message,
 
 void TextService::ScheduleSession(ContextEntry *entry,
                                   SessionWarmupReason reason) {
-  if (!entry || entry->session_pending)
+  if (!entry || entry->session_pending ||
+      entry->keyboard_security != KeyboardSecurityState::Enabled)
     return;
   if (!RenewSelectionCapability(entry, 0))
     return;
@@ -1042,34 +1368,113 @@ void TextService::ScheduleSession(ContextEntry *entry,
   }
 }
 
-void TextService::ScheduleDeliveryWork(
+bool TextService::ScheduleDeliveryWork(
     ContextEntry *entry, DeliveryWorkKind kind,
     const runtime::DeliveryReference &reference) {
-  if (!entry || entry->delivery_work_pending || !session_worker_.joinable())
-    return;
-  entry->pending_delivery_work = kind;
+  if (!entry || !session_worker_.joinable())
+    return false;
   try {
+    if (kind == DeliveryWorkKind::Abandon &&
+        GetEnvironmentVariableA(
+            "FAMO_TEST_SECURITY_ABANDON_ALLOCATION_FAILURE_ONCE", nullptr,
+            0) != 0) {
+      SetEnvironmentVariableA(
+          "FAMO_TEST_SECURITY_ABANDON_ALLOCATION_FAILURE_ONCE", nullptr);
+      throw std::bad_alloc();
+    }
     runtime::Correlation identity = reference.correlation;
     identity.sequence = 0;
     auto request = std::make_shared<const DeliveryWorkRequest>(
         DeliveryWorkRequest{identity, reference, kind});
+    std::shared_ptr<const DeliveryWorkRequest> forced_different_priority;
+    if (kind == DeliveryWorkKind::Abandon &&
+        GetEnvironmentVariableA(
+            "FAMO_TEST_FORCE_DIFFERENT_EPOCH_SECURITY_PRIORITY", nullptr,
+            0) != 0) {
+      runtime::Correlation forced_identity = identity;
+      ++forced_identity.connection_generation;
+      runtime::DeliveryReference forced_reference = reference;
+      forced_reference.correlation = forced_identity;
+      forced_different_priority =
+          std::make_shared<const DeliveryWorkRequest>(DeliveryWorkRequest{
+              forced_identity, forced_reference, DeliveryWorkKind::Abandon});
+    }
+    bool wake_worker = false;
     {
       std::lock_guard lock(delivery_queue_mutex_);
-      if (delivery_requests_.size() >= kMaxQueuedDeliveryWork)
-        return;
-      entry->delivery_work_pending = true;
-      try {
+      if (entry->delivery_work_pending) {
+        if (entry->pending_delivery_work == DeliveryWorkKind::Abandon ||
+            kind != DeliveryWorkKind::Abandon) {
+          return true;
+        }
+      }
+
+      if (kind == DeliveryWorkKind::Abandon) {
+        std::shared_ptr<const DeliveryWorkRequest> priority =
+            security_abandon_request_.load();
+        if (!priority && forced_different_priority) {
+          // Deterministically exercise the bounded normal-queue path used
+          // when another connection epoch already owns the priority slot.
+          // The synthetic occupant is local to this scheduling decision and
+          // can never reach the runtime.
+          priority = forced_different_priority;
+        }
+        if (priority &&
+            SameConnectionEpoch(priority->identity, identity)) {
+          entry->pending_delivery_work = kind;
+          entry->delivery_work_pending = true;
+          return true;
+        }
+
+        const auto queued = std::find_if(
+            delivery_requests_.begin(), delivery_requests_.end(),
+            [&](const auto &candidate) {
+              return candidate &&
+                     candidate->kind == DeliveryWorkKind::Abandon &&
+                     SameConnectionEpoch(candidate->identity, identity);
+            });
+        if (queued != delivery_requests_.end()) {
+          if (!priority) {
+            std::shared_ptr<const DeliveryWorkRequest> promoted = *queued;
+            delivery_requests_.erase(queued);
+            entry->pending_delivery_work = kind;
+            entry->delivery_work_pending = true;
+            security_abandon_request_.store(std::move(promoted));
+            wake_worker = true;
+          } else {
+            entry->pending_delivery_work = kind;
+            entry->delivery_work_pending = true;
+          }
+        } else if (!priority) {
+          entry->pending_delivery_work = kind;
+          entry->delivery_work_pending = true;
+          security_abandon_request_.store(std::move(request));
+          wake_worker = true;
+        } else {
+          if (delivery_requests_.size() >= kMaxQueuedDeliveryWork)
+            return false;
+          delivery_requests_.push_front(std::move(request));
+          entry->pending_delivery_work = kind;
+          entry->delivery_work_pending = true;
+          wake_worker = true;
+        }
+      } else {
+        if (delivery_requests_.size() >= kMaxQueuedDeliveryWork)
+          return false;
         delivery_requests_.push_back(std::move(request));
-      } catch (...) {
-        entry->delivery_work_pending = false;
-        throw;
+        entry->pending_delivery_work = kind;
+        entry->delivery_work_pending = true;
+        wake_worker = true;
       }
     }
-    session_worker_epoch_.fetch_add(1);
-    session_worker_epoch_.notify_one();
-    session_retry_wake_.notify_all();
+    if (wake_worker) {
+      session_worker_epoch_.fetch_add(1);
+      session_worker_epoch_.notify_one();
+      session_retry_wake_.notify_all();
+    }
+    return true;
   } catch (...) {
-    entry->delivery_work_pending = false;
+    return false;
   }
 }
 
@@ -1128,8 +1533,9 @@ void TextService::SessionWorkerMain() noexcept {
   try {
   uint64_t observed_epoch = session_worker_epoch_.load();
   while (!session_worker_stop_.load()) {
-    std::shared_ptr<const DeliveryWorkRequest> delivery;
-    {
+    std::shared_ptr<const DeliveryWorkRequest> delivery =
+        security_abandon_request_.exchange(nullptr);
+    if (!delivery) {
       std::lock_guard lock(delivery_queue_mutex_);
       if (!delivery_requests_.empty()) {
         delivery = std::move(delivery_requests_.front());
@@ -1277,6 +1683,30 @@ void TextService::ProcessDeliveryWork(
     const std::shared_ptr<const DeliveryWorkRequest> &request) {
   if (!request || session_worker_stop_.load())
     return;
+  const auto security_boundary_pending = [&]() {
+    if (request->kind == DeliveryWorkKind::Abandon)
+      return false;
+    {
+      std::lock_guard execution_lock(delivery_execution_mutex_);
+      if (SecurityConnectionBlockedLocked(
+              request->identity.connection_generation)) {
+        return true;
+      }
+    }
+    std::lock_guard lock(delivery_queue_mutex_);
+    const std::shared_ptr<const DeliveryWorkRequest> priority =
+        security_abandon_request_.load();
+    if (priority &&
+        SameConnectionEpoch(priority->identity, request->identity)) {
+      return true;
+    }
+    return std::any_of(
+        delivery_requests_.begin(), delivery_requests_.end(),
+        [&](const std::shared_ptr<const DeliveryWorkRequest> &queued) {
+          return queued && queued->kind == DeliveryWorkKind::Abandon &&
+                 SameConnectionEpoch(queued->identity, request->identity);
+        });
+  };
   const auto requeue_without_dropping = [&]() {
     std::unique_lock retry_lock(session_retry_mutex_);
     session_retry_wake_.wait_for(retry_lock, kSessionRetryDelay, [&] {
@@ -1284,6 +1714,24 @@ void TextService::ProcessDeliveryWork(
     });
     retry_lock.unlock();
     while (!session_worker_stop_.load()) {
+      if (request->kind == DeliveryWorkKind::Abandon) {
+        std::shared_ptr<const DeliveryWorkRequest> priority =
+            security_abandon_request_.load();
+        if (priority && SameConnectionEpoch(priority->identity,
+                                            request->identity)) {
+          return;
+        }
+        if (!priority && security_abandon_request_.compare_exchange_strong(
+                             priority, request)) {
+          session_worker_epoch_.fetch_add(1);
+          session_worker_epoch_.notify_one();
+          return;
+        }
+        if (priority && SameConnectionEpoch(priority->identity,
+                                            request->identity)) {
+          return;
+        }
+      }
       try {
         {
           std::lock_guard lock(delivery_queue_mutex_);
@@ -1308,18 +1756,113 @@ void TextService::ProcessDeliveryWork(
          !session_worker_stop_.load()) {
     Sleep(1);
   }
-  if (session_worker_stop_.load())
+  if (session_worker_stop_.load() || security_boundary_pending())
     return;
+
+  if (request->kind == DeliveryWorkKind::Abandon) {
+    std::shared_ptr<DeliveryWorkResult> terminal_result;
+    try {
+      terminal_result = std::make_shared<DeliveryWorkResult>(
+          DeliveryWorkResult{request->identity, request->reference,
+                             request->kind, runtime::Status::Unavailable, {}});
+    } catch (...) {
+      requeue_without_dropping();
+      return;
+    }
+    while (terminal_delivery_result_.load() &&
+           !session_worker_stop_.load()) {
+      std::unique_lock publication_wait(session_retry_mutex_);
+      session_retry_wake_.wait_for(publication_wait, kSessionRetryDelay, [&] {
+        return session_worker_stop_.load() ||
+               !terminal_delivery_result_.load();
+      });
+    }
+    if (session_worker_stop_.load())
+      return;
+
+    runtime::Status status = runtime::Status::Unavailable;
+    if (ConnectRuntime(request->identity) &&
+        !session_worker_stop_.load()) {
+      // A deferred but valid final result cannot be ACKed because the host did
+      // not apply it, while AbandonSession is reserved for terminal-failed
+      // deliveries. Retire the authenticated connection so neither that
+      // result nor any sibling session can survive the security boundary.
+      runtime::Frame abandon;
+      abandon.command = runtime::Command::AbandonConnection;
+      abandon.correlation = ConnectionIdentity(request->identity);
+      status = runtime_port_
+                   .Call(std::move(abandon), runtime::kHardCallDeadline)
+                   .status;
+    }
+    if (status != runtime::Status::Ok &&
+        status != runtime::Status::StaleRequest) {
+      requeue_without_dropping();
+      return;
+    }
+    std::shared_ptr<const DeliveryWorkRequest> queued_security =
+        security_abandon_request_.load();
+    while (queued_security &&
+           SameConnectionEpoch(queued_security->identity,
+                               request->identity) &&
+           !security_abandon_request_.compare_exchange_weak(
+               queued_security, nullptr)) {
+    }
+    {
+      std::lock_guard lock(delivery_queue_mutex_);
+      std::erase_if(
+          delivery_requests_,
+          [&](const std::shared_ptr<const DeliveryWorkRequest> &queued) {
+            return queued &&
+                   SameConnectionEpoch(queued->identity,
+                                       request->identity);
+          });
+      std::erase_if(
+          delivery_results_,
+          [&](const std::shared_ptr<const DeliveryWorkResult> &queued) {
+            return queued &&
+                   SameConnectionEpoch(queued->identity,
+                                       request->identity);
+          });
+    }
+    terminal_result->status = status;
+    terminal_delivery_result_.store(
+        std::shared_ptr<const DeliveryWorkResult>(std::move(terminal_result)));
+    if (recovery_window_)
+      PostMessageW(recovery_window_, kRecoveryMessage, 0, 0);
+    return;
+  }
 
   runtime::Status status = runtime::Status::Unavailable;
   runtime::Frame final_reply;
+  if (security_boundary_pending())
+    return;
   if (ConnectRuntime(request->identity) && !session_worker_stop_.load()) {
+    if (security_boundary_pending())
+      return;
     const auto deadline =
         std::chrono::steady_clock::now() + runtime::kHardCallDeadline;
     if (request->kind == DeliveryWorkKind::Recover) {
       runtime::DeliveryResult result =
           runtime_port_.Claim(request->reference, deadline);
       if (result.status == runtime::Status::Prepared) {
+        g_recovery_prepared_claims.fetch_add(1);
+        while (GetEnvironmentVariableA(
+                   "FAMO_TEST_PAUSE_AFTER_RECOVERY_CLAIM", nullptr, 0) != 0 &&
+               !session_worker_stop_.load()) {
+          Sleep(1);
+        }
+        if (session_worker_stop_.load())
+          return;
+        if (security_boundary_pending())
+          return;
+        // Re-check under the same lease used by OnChange so there is no
+        // check-to-execute window after a keyboard-disabled transition.
+        std::lock_guard execution_lock(delivery_execution_mutex_);
+        if (SecurityConnectionBlockedLocked(
+                request->identity.connection_generation)) {
+          return;
+        }
+        g_recovery_execute_attempts.fetch_add(1);
         result = runtime_port_.ExecutePrepared(
             request->reference,
             std::chrono::steady_clock::now() +
@@ -1379,9 +1922,22 @@ void TextService::ProcessDeliveryWork(
       return;
     }
 
+    g_terminal_publication_ready.fetch_add(1);
+    while (GetEnvironmentVariableA(
+               "FAMO_TEST_PAUSE_BEFORE_TERMINAL_PUBLICATION", nullptr, 0) !=
+               0 &&
+           !session_worker_stop_.load()) {
+      Sleep(1);
+    }
     terminal_delivery_result_.store(std::move(terminal_result));
     if (recovery_window_)
       PostMessageW(recovery_window_, kRecoveryMessage, 0, 0);
+    while (GetEnvironmentVariableA(
+               "FAMO_TEST_PAUSE_AFTER_TERMINAL_PUBLICATION", nullptr, 0) !=
+               0 &&
+           !session_worker_stop_.load()) {
+      Sleep(1);
+    }
     return;
   }
 
@@ -1462,36 +2018,54 @@ void TextService::ReportTiming(const char *operation,
 }
 
 void TextService::ApplySessionResult() {
-  std::unique_lock publication_lock(session_publication_mutex_,
-                                    std::try_to_lock);
-  if (!publication_lock)
-    return;
-  const std::shared_ptr<const SessionWarmupResult> result =
-      session_result_.exchange(nullptr);
-  if (!result || result->identity.activation_generation !=
-                     activation_generation_)
-    return;
-  for (auto &owned : contexts_) {
-    ContextEntry *entry = owned.get();
-    if (!entry->session_pending ||
-        entry->pending_session != result->identity)
-      continue;
-    entry->session_pending = false;
-    entry->pending_session = {};
-    const std::shared_ptr<const runtime::Correlation> desired =
-        desired_session_.load();
-    if (desired && *desired == result->identity)
-      desired_session_.store(nullptr);
-    if (!result->ready || !entry->ui_state.focused ||
-        result->identity.connection_generation != connection_generation_ ||
-        runtime_port_.state() != runtime::ChannelState::Ready) {
+  std::shared_ptr<const SessionWarmupResult> result;
+  ContextEntry *entry = nullptr;
+  {
+    std::unique_lock publication_lock(session_publication_mutex_,
+                                      std::try_to_lock);
+    if (!publication_lock)
+      return;
+    result = session_result_.exchange(nullptr);
+    if (!result || result->identity.activation_generation !=
+                       activation_generation_) {
       return;
     }
-    entry->state.Open(result->identity);
-    entry->first_key_pending = true;
-    RefreshLayout(entry, nullptr);
+    for (auto &owned : contexts_) {
+      ContextEntry *candidate = owned.get();
+      if (!candidate->session_pending ||
+          candidate->pending_session != result->identity) {
+        continue;
+      }
+      entry = candidate;
+      entry->session_pending = false;
+      entry->pending_session = {};
+      const std::shared_ptr<const runtime::Correlation> desired =
+          desired_session_.load();
+      if (desired && *desired == result->identity)
+        desired_session_.store(nullptr);
+      break;
+    }
+  }
+  if (!entry || !result->ready ||
+      result->identity.connection_generation != connection_generation_ ||
+      runtime_port_.state() != runtime::ChannelState::Ready) {
     return;
   }
+
+  const bool disabled = KeyboardDisabled(entry->context.get());
+  ReconcileKeyboardSecurity(entry, disabled);
+  if (disabled ||
+      entry->keyboard_security != KeyboardSecurityState::Enabled) {
+    entry->state.Open(result->identity);
+    entry->first_key_pending = true;
+    PostRecoveryWork();
+    return;
+  }
+  if (!entry->ui_state.focused)
+    return;
+  entry->state.Open(result->identity);
+  entry->first_key_pending = true;
+  RefreshLayout(entry, nullptr);
 }
 
 void TextService::ApplyDeliveryResult() {
@@ -1520,6 +2094,77 @@ void TextService::ApplyOneDeliveryResult(
     RetireAbandonedSession(result->reference);
     return;
   }
+  if (result->kind == DeliveryWorkKind::Abandon) {
+    const runtime::Correlation retired = result->reference.correlation;
+    if (!SameConnectionEpoch(result->identity, retired))
+      return;
+
+    ContextEntry *owner = nullptr;
+    for (auto &owned : contexts_) {
+      ContextEntry *candidate = owned.get();
+      if (SameLogicalSession(candidate->state.session_identity(), retired) ||
+          (candidate->pending_delivery &&
+           *candidate->pending_delivery == result->reference) ||
+          (candidate->applied_delivery &&
+           *candidate->applied_delivery == result->reference)) {
+        owner = candidate;
+        break;
+      }
+    }
+
+    if (result->status != runtime::Status::Ok &&
+        result->status != runtime::Status::StaleRequest) {
+      if (owner) {
+        owner->delivery_work_pending = false;
+        ScheduleDeliveryWork(owner, DeliveryWorkKind::Abandon,
+                             result->reference);
+      }
+      PostRecoveryWork();
+      return;
+    }
+
+    {
+      std::lock_guard lock(delivery_queue_mutex_);
+      std::erase_if(
+          delivery_requests_,
+          [&](const std::shared_ptr<const DeliveryWorkRequest> &work) {
+            return work && SameConnectionEpoch(work->identity, retired);
+          });
+      std::erase_if(
+          delivery_results_,
+          [&](const std::shared_ptr<const DeliveryWorkResult> &work) {
+            return work && SameConnectionEpoch(work->identity, retired);
+          });
+    }
+    for (auto &owned : contexts_) {
+      ContextEntry *affected = owned.get();
+      const bool same_connection =
+          SameConnectionEpoch(affected->state.session_identity(), retired) ||
+          (affected->pending_delivery &&
+           SameConnectionEpoch(
+               affected->pending_delivery->correlation, retired)) ||
+          (affected->applied_delivery &&
+           SameConnectionEpoch(
+               affected->applied_delivery->correlation, retired));
+      if (!same_connection)
+        continue;
+      affected->pending_delivery.reset();
+      affected->applied_delivery.reset();
+      affected->deferred_delivery_composition.reset();
+      affected->pending_physical_key = false;
+      affected->delivery_work_pending = false;
+      affected->delivery_quarantined = false;
+      affected->recover_after_delivery_ack = false;
+    }
+    ReleaseSecurityConnection(retired.connection_generation);
+    // AbandonConnection authenticated and retired this exact old epoch. The
+    // worker may have switched the single runtime port away from a newer
+    // focused session to perform that teardown, so reconcile every context
+    // before scheduling the next fresh generation.
+    RecoverConnection();
+    PostRecoveryWork();
+    return;
+  }
   if (result->identity.connection_generation != connection_generation_)
     return;
 
@@ -1534,7 +2179,38 @@ void TextService::ApplyOneDeliveryResult(
   if (!entry)
     return;
 
+  const bool work_matches =
+      entry->delivery_work_pending &&
+      entry->pending_delivery_work == result->kind &&
+      ((result->kind == DeliveryWorkKind::Ack && entry->applied_delivery &&
+        *entry->applied_delivery == result->reference) ||
+       (result->kind != DeliveryWorkKind::Ack && entry->pending_delivery &&
+        *entry->pending_delivery == result->reference));
+  if (!work_matches)
+    return;
   entry->delivery_work_pending = false;
+
+  ReconcileKeyboardSecurity(entry,
+                            KeyboardDisabled(entry->context.get()));
+  if (entry->keyboard_security != KeyboardSecurityState::Enabled) {
+    if (result->kind == DeliveryWorkKind::Ack) {
+      if (entry->applied_delivery &&
+          *entry->applied_delivery == result->reference &&
+          (result->status == runtime::Status::Ok ||
+           result->status == runtime::Status::StaleRequest)) {
+        entry->applied_delivery.reset();
+      } else {
+        ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
+                             result->reference);
+      }
+      PostRecoveryWork();
+      return;
+    }
+    ScheduleDeliveryWork(entry, DeliveryWorkKind::Abandon,
+                         result->reference);
+    return;
+  }
+
   if (result->kind == DeliveryWorkKind::Ack) {
     if (entry->applied_delivery &&
         *entry->applied_delivery == result->reference &&
@@ -1662,6 +2338,7 @@ void TextService::RetireAbandonedSession(
         delivery_requests_,
         [&](const std::shared_ptr<const DeliveryWorkRequest> &request) {
           return request &&
+                 request->kind != DeliveryWorkKind::Abandon &&
                  SameLogicalSession(request->reference.correlation,
                                     reference.correlation);
         });
@@ -1669,6 +2346,7 @@ void TextService::RetireAbandonedSession(
         delivery_results_,
         [&](const std::shared_ptr<const DeliveryWorkResult> &result) {
           return result &&
+                 result->kind != DeliveryWorkKind::Abandon &&
                  SameLogicalSession(result->reference.correlation,
                                     reference.correlation);
         });
@@ -1690,20 +2368,30 @@ void TextService::RetireAbandonedSession(
       continue;
     }
     retired = entry;
+    ReconcileKeyboardSecurity(entry,
+                              KeyboardDisabled(entry->context.get()));
+    const bool security_close =
+        entry->keyboard_security != KeyboardSecurityState::Enabled;
+    const bool connection_abandon_pending =
+        entry->delivery_work_pending &&
+        entry->pending_delivery_work == DeliveryWorkKind::Abandon;
     if (entry->candidates)
       entry->candidates->End();
     entry->ui_state.show_allowed = false;
     entry->composition.ResetBehaviorState();
     const RecoveryPlan recovery = entry->state.Fail();
-    if (recovery.commit_preedit) {
+    if (!security_close && recovery.commit_preedit) {
       entry->recovery_preedit = *recovery.commit_preedit;
       entry->recovery_cleanup_required = true;
+    } else if (security_close) {
+      entry->recovery_preedit.clear();
+      entry->recovery_cleanup_required = false;
     }
     entry->pending_delivery.reset();
     entry->applied_delivery.reset();
     entry->deferred_delivery_composition.reset();
     entry->pending_physical_key = false;
-    entry->delivery_work_pending = false;
+    entry->delivery_work_pending = connection_abandon_pending;
     entry->delivery_quarantined = false;
     entry->recover_after_delivery_ack = false;
     entry->selection_capability_sequence = 0;
@@ -1726,14 +2414,47 @@ void TextService::RetireAbandonedSession(
   }
   if (!retired)
     return;
+  const bool gate_still_required = std::any_of(
+      contexts_.begin(), contexts_.end(), [&](const auto &owned) {
+        if (!owned ||
+            owned->keyboard_security == KeyboardSecurityState::Enabled) {
+          return false;
+        }
+        const bool same_connection =
+            SameConnectionEpoch(owned->state.session_identity(),
+                                reference.correlation) ||
+            (owned->pending_delivery &&
+             SameConnectionEpoch(
+                 owned->pending_delivery->correlation,
+                 reference.correlation)) ||
+            (owned->applied_delivery &&
+             SameConnectionEpoch(
+                 owned->applied_delivery->correlation,
+                 reference.correlation));
+        if (!same_connection)
+          return false;
+        return owned->pending_delivery ||
+               (owned->delivery_work_pending &&
+                owned->pending_delivery_work ==
+                    DeliveryWorkKind::Abandon);
+      });
+  if (!gate_still_required) {
+    ReleaseSecurityConnection(
+        reference.correlation.connection_generation);
+  }
+  g_terminal_retired_sessions.fetch_add(1);
   PostRecoveryWork();
-  if (retired->ui_state.focused)
+  if (retired->keyboard_security == KeyboardSecurityState::Enabled &&
+      retired->ui_state.focused) {
     ScheduleSession(retired, SessionWarmupReason::Recovery);
+  }
 }
 
 bool TextService::ApplyDeferredDelivery(ContextEntry *entry) {
   if (!entry || !entry->deferred_delivery_composition)
     return true;
+  if (entry->keyboard_security != KeyboardSecurityState::Enabled)
+    return false;
   if (entry->delivery_quarantined || !entry->pending_delivery ||
       !entry->state.AcceptReply(
           entry->pending_delivery->correlation)) {
@@ -1887,13 +2608,7 @@ bool TextService::CloseEntry(ContextEntry *entry) {
   entry->composition.ResetBehaviorState();
   entry->recovery_cleanup_required = false;
   entry->recovery_preedit.clear();
-  if (entry->layout_sink_cookie != TF_INVALID_COOKIE) {
-    ComPtr<ITfSource> source;
-    if (SUCCEEDED(entry->context->QueryInterface(
-            IID_ITfSource, reinterpret_cast<void **>(source.put()))))
-      source->UnadviseSink(entry->layout_sink_cookie);
-    entry->layout_sink_cookie = TF_INVALID_COOKIE;
-  }
+  UnadviseContextSinks(entry);
   entry->composition.End(entry->context.get(), client_id_);
   if (runtime_port_.state() == runtime::ChannelState::Ready) {
     const auto correlation = entry->state.PlanClose();

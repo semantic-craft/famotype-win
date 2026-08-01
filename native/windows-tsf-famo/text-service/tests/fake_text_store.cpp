@@ -94,6 +94,7 @@ HRESULT FakeTextStore::UnadviseSink(IUnknown *unknown) {
 }
 
 HRESULT FakeTextStore::RequestLock(DWORD flags, HRESULT *session_result) {
+  ++lock_request_count_;
   if (!session_result)
     return E_POINTER;
   if (deny_locks_) {

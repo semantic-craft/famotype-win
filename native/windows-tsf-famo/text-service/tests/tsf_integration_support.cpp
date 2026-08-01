@@ -133,11 +133,27 @@ bool TextServiceModule::Load(const wchar_t *path) {
   preview_selection_state_for_test_ =
       reinterpret_cast<PreviewSelectionStateForTestFn>(
           GetProcAddress(module_, "FamoGetPreviewSelectionStateForTest"));
+  recovery_prepared_claims_for_test_ =
+      reinterpret_cast<RecoveryPreparedClaimsForTestFn>(GetProcAddress(
+          module_, "FamoGetRecoveryPreparedClaimsForTest"));
+  recovery_execute_attempts_for_test_ =
+      reinterpret_cast<RecoveryExecuteAttemptsForTestFn>(GetProcAddress(
+          module_, "FamoGetRecoveryExecuteAttemptsForTest"));
+  terminal_publication_ready_for_test_ =
+      reinterpret_cast<TerminalPublicationReadyForTestFn>(GetProcAddress(
+          module_, "FamoGetTerminalPublicationReadyForTest"));
+  terminal_retired_sessions_for_test_ =
+      reinterpret_cast<TerminalRetiredSessionsForTestFn>(GetProcAddress(
+          module_, "FamoGetTerminalRetiredSessionsForTest"));
   terminal_cleanup_connect_attempts_for_test_ =
       reinterpret_cast<TerminalCleanupConnectAttemptsForTestFn>(GetProcAddress(
           module_, "FamoGetTerminalCleanupConnectAttemptsForTest"));
   return can_unload_ && create_for_test_ && reactivate_for_test_ &&
          preview_selection_state_for_test_ &&
+         recovery_prepared_claims_for_test_ &&
+         recovery_execute_attempts_for_test_ &&
+         terminal_publication_ready_for_test_ &&
+         terminal_retired_sessions_for_test_ &&
          terminal_cleanup_connect_attempts_for_test_;
 }
 
@@ -146,6 +162,30 @@ bool TextServiceModule::CanUnload() const { return can_unload_() == S_OK; }
 uint32_t TextServiceModule::TerminalCleanupConnectAttemptsForTest() const {
   return terminal_cleanup_connect_attempts_for_test_
              ? terminal_cleanup_connect_attempts_for_test_()
+             : 0;
+}
+
+uint32_t TextServiceModule::RecoveryPreparedClaimsForTest() const {
+  return recovery_prepared_claims_for_test_
+             ? recovery_prepared_claims_for_test_()
+             : 0;
+}
+
+uint32_t TextServiceModule::RecoveryExecuteAttemptsForTest() const {
+  return recovery_execute_attempts_for_test_
+             ? recovery_execute_attempts_for_test_()
+             : 0;
+}
+
+uint32_t TextServiceModule::TerminalPublicationReadyForTest() const {
+  return terminal_publication_ready_for_test_
+             ? terminal_publication_ready_for_test_()
+             : 0;
+}
+
+uint32_t TextServiceModule::TerminalRetiredSessionsForTest() const {
+  return terminal_retired_sessions_for_test_
+             ? terminal_retired_sessions_for_test_()
              : 0;
 }
 
