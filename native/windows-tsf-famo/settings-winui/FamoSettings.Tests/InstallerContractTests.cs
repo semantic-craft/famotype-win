@@ -341,6 +341,47 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void Installer_CapturesNoPreviousUserStateWhenThereIsNoPreviousInstall()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int capture = Position(iss, "procedure CapturePreviousUserState");
+        string captureBody = iss[
+            capture..Position(iss, "function ReadPreparedSeedReceiptHash", capture)];
+        int semantics = Position(iss, "function ValidateJournalSemantics");
+        string semanticsBody = iss[
+            semantics..Position(
+                iss, "function ValidateCurrentJournalArtifact", semantics)];
+
+        // A first install must short-circuit before the probes: an empty
+        // PreviousTarget has no user state, and the probes run through a
+        // broker that cannot distinguish "no" from "could not tell".
+        int guard = Position(captureBody, "if PreviousTarget = '' then");
+        Assert.True(guard < Position(captureBody, "'is-active'"));
+        Assert.True(guard < Position(captureBody, "'is-enabled'"));
+        Assert.True(guard < Position(captureBody, "'--is-input-tip'"));
+        foreach (string reset in new[]
+        {
+            "PreviousProfileActive := False;",
+            "PreviousProfileEnabled := False;",
+            "PreviousInputTipPresent := False;",
+        })
+        {
+            Assert.True(guard < Position(captureBody, reset));
+        }
+
+        // The journal predicate stays an enforced invariant rather than being
+        // relaxed to tolerate the flags this bug used to record.
+        Assert.Contains(
+            "((Journal.PreviousTarget <> '') or", semanticsBody);
+        Assert.Contains(
+            "((Journal.PreviousProfileActive = '0') and", semanticsBody);
+        Assert.Contains(
+            "(Journal.PreviousProfileEnabled = '0') and", semanticsBody);
+        Assert.Contains(
+            "(Journal.PreviousInputTipPresent = '0')))", semanticsBody);
+    }
+
+    [Fact]
     public void Installer_AcceptsAProtectedSeedReceiptFile()
     {
         string iss = InstallerText("famo-setup.iss");

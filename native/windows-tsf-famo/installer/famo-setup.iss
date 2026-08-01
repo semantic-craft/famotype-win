@@ -4802,6 +4802,19 @@ var
   ProbeExit: Integer;
   Settings: String;
 begin
+  { A first install has no previous user state to capture. Every restore
+    path that reads these flags sits behind PreviousHost <> '', and
+    ValidateJournalSemantics requires all three to stay '0' while
+    PreviousTarget is empty. Probing anyway records a state nothing can
+    consume and fails the journal readback on every first install. }
+  if PreviousTarget = '' then
+  begin
+    PreviousProfileActive := False;
+    PreviousProfileEnabled := False;
+    PreviousInputTipPresent := False;
+    Exit;
+  end;
+
   ProbeExit := RunAsOriginalUserExitCode(
     ProfileTool(TransactionTarget), 'is-active');
   if (ProbeExit <> 0) and (ProbeExit <> 1) then
