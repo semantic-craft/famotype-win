@@ -66,6 +66,8 @@ int wmain(int argc, wchar_t **argv) {
   int fault_after = 0;
   bool parallel = false;
   bool inline_preedit = true;
+  bool candidate_preview = false;
+  bool cjk_english_spacing = false;
   int preview_rows = 0;
   int expected_terminal_abandons = -1;
   int expected_clients = -1;
@@ -89,6 +91,20 @@ int wmain(int argc, wchar_t **argv) {
         return 2;
       }
       inline_preedit = value == L"true";
+    } else if (argument == L"--candidate-preview" && i + 1 < argc) {
+      const std::wstring_view value(argv[++i]);
+      if (value != L"true" && value != L"false") {
+        std::fprintf(stderr, "invalid candidate-preview value\n");
+        return 2;
+      }
+      candidate_preview = value == L"true";
+    } else if (argument == L"--cjk-english-spacing" && i + 1 < argc) {
+      const std::wstring_view value(argv[++i]);
+      if (value != L"true" && value != L"false") {
+        std::fprintf(stderr, "invalid cjk-english-spacing value\n");
+        return 2;
+      }
+      cjk_english_spacing = value == L"true";
     } else if (argument == L"--preview-rows" && i + 1 < argc) {
       preview_rows = _wtoi(argv[++i]);
     } else if (argument == L"--expected-terminal-abandons" &&
@@ -149,6 +165,10 @@ int wmain(int argc, wchar_t **argv) {
     return 3;
   }
   uint32_t behavior_flags = inline_preedit ? kHostInlinePreedit : 0;
+  if (candidate_preview)
+    behavior_flags |= kHostCandidatePreview;
+  if (cjk_english_spacing)
+    behavior_flags |= kHostCjkEnglishSpacing;
   if (preview_rows > 0)
     behavior_flags |= kHostPreviewPages;
   if (preview_rows == 2)
