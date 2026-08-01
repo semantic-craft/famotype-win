@@ -78,19 +78,39 @@ void TextService::OnCandidateVisibilityChanged(CandidateUiElement *element) {
   }
 }
 
+TextService::ContextEntry *
+TextService::FindContextByCandidateElement(CandidateUiElement *element) {
+  if (!element)
+    return nullptr;
+  for (auto &owned : contexts_) {
+    if (owned && !owned->close_requested && owned->candidates.get() == element)
+      return owned.get();
+  }
+  return nullptr;
+}
+
+HRESULT TextService::OnCandidateKeyDown(CandidateUiElement *element, WPARAM key,
+                                        LPARAM key_data, BOOL *eaten) {
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  if (!OnActivationThread())
+    return RPC_E_WRONG_THREAD;
+  ContextEntry *entry = FindContextByCandidateElement(element);
+  if (!entry || !entry->context)
+    return E_FAIL;
+  // The integrated host is routing real input at the candidate list, not
+  // asking for a second keyboard model, so this is the physical key path.
+  return HandleKey(entry->context.get(), key, key_data, /*down=*/true,
+                   /*test_only=*/false, eaten);
+}
+
 HRESULT TextService::OnCandidateBehavior(CandidateUiElement *element,
                                          CandidateBehavior behavior,
                                          UINT index) {
   if (!OnActivationThread())
     return RPC_E_WRONG_THREAD;
-  ContextEntry *entry = nullptr;
-  for (auto &owned : contexts_) {
-    if (owned && !owned->close_requested &&
-        owned->candidates.get() == element) {
-      entry = owned.get();
-      break;
-    }
-  }
+  ContextEntry *entry = FindContextByCandidateElement(element);
   if (!entry)
     return E_FAIL;
   // The click channel's capability token authenticates an unsigned cross

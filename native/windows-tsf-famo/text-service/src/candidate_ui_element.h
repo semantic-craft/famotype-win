@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include <ctffunc.h>
 #include <msctf.h>
 
 #include "com_ptr.h"
@@ -27,12 +28,20 @@ public:
   virtual HRESULT OnCandidateBehavior(class CandidateUiElement *element,
                                       CandidateBehavior behavior,
                                       UINT index) = 0;
+  // An integrated host routed a key at the candidate list instead of letting
+  // it reach the key sink. Goes through the same engine path as real input.
+  virtual HRESULT OnCandidateKeyDown(class CandidateUiElement *element,
+                                     WPARAM key, LPARAM key_data,
+                                     BOOL *eaten) = 0;
 
 protected:
   ~CandidateUiHost() = default;
 };
 
-class CandidateUiElement final : public ITfCandidateListUIElementBehavior {
+// The two bases are separate inheritance branches, each reaching IUnknown on
+// its own, so QueryInterface has to cast per branch rather than once.
+class CandidateUiElement final : public ITfCandidateListUIElementBehavior,
+                                 public ITfIntegratableCandidateListUIElement {
 public:
   CandidateUiElement(ITfUIElementMgr *manager, ITfDocumentMgr *document);
 
@@ -71,6 +80,14 @@ public:
   HRESULT STDMETHODCALLTYPE Finalize() override;
   HRESULT STDMETHODCALLTYPE Abort() override;
 
+  HRESULT STDMETHODCALLTYPE SetIntegrationStyle(GUID style) override;
+  HRESULT STDMETHODCALLTYPE GetSelectionStyle(
+      TfIntegratableCandidateListSelectionStyle *style) override;
+  HRESULT STDMETHODCALLTYPE OnKeyDown(WPARAM key, LPARAM key_data,
+                                      BOOL *eaten) override;
+  HRESULT STDMETHODCALLTYPE ShowCandidateNumbers(BOOL *show) override;
+  HRESULT STDMETHODCALLTYPE FinalizeExactCompositionString() override;
+
 private:
   ~CandidateUiElement();
 
@@ -83,6 +100,7 @@ private:
   UINT current_page_ = 0;
   DWORD element_id_ = TF_INVALID_UIELEMENTID;
   CandidateUiHost *host_ = nullptr;
+  GUID integration_style_ = GUID_NULL;
   BOOL shown_ = TRUE;
   BOOL show_allowed_ = TRUE;
   bool begun_ = false;
