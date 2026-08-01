@@ -314,6 +314,8 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
     return S_OK;
   if (entry->delivery_quarantined)
     return S_OK;
+  if (KeyboardDisabled(entry))
+    return S_OK;
   if (!ApplyDeferredDelivery(entry))
     return S_OK;
   if (entry->recovery_cleanup_required) {
