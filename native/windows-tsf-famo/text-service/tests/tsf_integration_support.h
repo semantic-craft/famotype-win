@@ -24,7 +24,9 @@ public:
              bool inline_preedit = true, uint32_t preview_rows = 0,
              int32_t expected_terminal_abandons = -1,
              int32_t expected_clients = -1,
-             int32_t expected_sessions = -1);
+             int32_t expected_sessions = -1,
+             bool candidate_preview = false,
+             bool cjk_english_spacing = false);
   bool Finish();
   HWND PreviewSourceWindow() const;
 
