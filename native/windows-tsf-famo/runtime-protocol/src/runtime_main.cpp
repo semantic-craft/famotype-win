@@ -129,6 +129,33 @@ void AppendStartupDiagnostic(const std::wstring &data_root,
   }
 }
 
+// #41: bounded exit-code run of the settings companion in headless mode
+// (CLI verbs never enter XAML). Returns -1 on spawn failure or timeout; the
+// child's own retry loops are bounded, so a timed-out child is left to finish
+// rather than killed mid registry write.
+int RunSettingsHeadless(const std::wstring &executable,
+                        const wchar_t *arguments) {
+  std::wstring command = L"\"" + executable + L"\" " + arguments;
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr,
+                      FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                      &process)) {
+    return -1;
+  }
+  CloseHandle(process.hThread);
+  int exit_code = -1;
+  // The add verb is internally bounded (20x500ms retry); leave headroom.
+  if (WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0) {
+    DWORD code = 0;
+    if (GetExitCodeProcess(process.hProcess, &code))
+      exit_code = static_cast<int>(code);
+  }
+  CloseHandle(process.hProcess);
+  return exit_code;
+}
+
 // RuntimeService holds a single sink, so the candidate window and the tray both
 // hang off this. Only Publish and ActivateStyle fan out; PrepareStyle has an
 // out-parameter with a single owner, and the prewarm hook is the renderer's.
@@ -264,6 +291,30 @@ int wmain(int argc, wchar_t **argv) {
     CloseHandle(singleton);
     return 0;
   }
+
+  // #41: bounded TIP self-heal. The installer's Ready path only proves the TIP
+  // was in the user's input list at install time; a later system or user
+  // language-list change can remove it, leaving the candidate UI unreachable.
+  // Ready-only gate -- stricter than the startup gate above, which also admits
+  // Activating -- then probe before repair via the settings companion's
+  // headless verbs (the installer's exact probe/add implementation, no third
+  // copy). Detached thread: startup and typing never block on repair.
+  std::thread([data_root] {
+    if (!ProductionInstallAllowed(ModuleDirectory(), false))
+      return; // PendingReboot/RolledBack/uninstalled expect the TIP absent
+    const std::wstring settings =
+        ModuleDirectory() + L"\\settings\\FamoSettings.exe";
+    const int probe = RunSettingsHeadless(settings, L"--is-input-tip");
+    if (probe == 0)
+      return; // healthy: zero writes, no log churn on every logon
+    const int repair = RunSettingsHeadless(settings, L"--add-input-tip");
+    const int readback = RunSettingsHeadless(settings, L"--is-input-tip");
+    AppendStartupDiagnostic(data_root, "tip-selfheal",
+                            readback == 0 ? 0 : 3,
+                            "probe=" + std::to_string(probe) +
+                                " repair=" + std::to_string(repair) +
+                                " readback=" + std::to_string(readback));
+  }).detach();
 
   CandidateWindow candidate_window;
   if (!candidate_window.Start()) {
