@@ -443,6 +443,7 @@ bool CandidateWindowReportsShowEvent() {
   window.Publish(shown);
   CHECK(WaitForVisibility(true));
   CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
   CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 1);
   CHECK(events.AllAreClientSelf(EVENT_OBJECT_IME_SHOW));
   window.Stop();
