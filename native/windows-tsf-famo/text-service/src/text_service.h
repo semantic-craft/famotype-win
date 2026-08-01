@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -102,6 +103,11 @@ private:
     std::chrono::milliseconds elapsed{0};
   };
 
+  struct ExactCandidateCommit {
+    runtime::Correlation correlation;
+    std::string preedit;
+  };
+
   struct ContextEntry {
     ComPtr<ITfContext> context;
     ComPtr<ITfDocumentMgr> document;
@@ -117,6 +123,7 @@ private:
     std::optional<runtime::DeliveryReference> pending_delivery;
     std::optional<runtime::DeliveryReference> applied_delivery;
     std::optional<runtime::Composition> deferred_delivery_composition;
+    std::optional<ExactCandidateCommit> exact_candidate_commit;
     DeliveryWorkKind pending_delivery_work = DeliveryWorkKind::Recover;
     WPARAM pending_windows_key = 0;
     bool pending_key_down = false;
@@ -232,11 +239,22 @@ private:
   bool HandlePreviewSelection(
       HWND source_window,
       const runtime::PreviewSelectionRequest &request);
-  bool DeliverCandidateRequest(ContextEntry *entry, runtime::Frame &&request);
+  bool DeliverCandidateRequest(ContextEntry *entry, runtime::Frame &&request,
+                               std::string exact_commit = {});
+  bool ResolveCandidateCommitOverride(
+      ContextEntry *entry, const runtime::DeliveryReference &reference,
+      const runtime::Composition &composition,
+      const std::string **commit_override) const;
+  static std::string_view HostInlinePreedit(
+      const runtime::Composition &composition) noexcept;
+  static std::string_view ExactCompositionText(
+      const runtime::Composition &composition) noexcept;
   bool RenewSelectionCapability(ContextEntry *entry,
                                 uint64_t composition_sequence) noexcept;
   HRESULT ApplyRuntimeComposition(ContextEntry *entry,
-                                  const runtime::Composition &composition);
+                                  const runtime::Composition &composition,
+                                  const std::string *commit_override = nullptr)
+      noexcept;
   void RetireAbandonedSession(
       const runtime::DeliveryReference &reference);
   void RecoverConnection();

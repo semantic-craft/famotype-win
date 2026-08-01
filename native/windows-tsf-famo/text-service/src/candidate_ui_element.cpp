@@ -13,13 +13,18 @@ namespace famo::tsf {
 
 CandidateUiElement::CandidateUiElement(ITfUIElementMgr *manager,
                                        ITfDocumentMgr *document)
-    : manager_(manager), document_(document) {
+    : owner_thread_id_(GetCurrentThreadId()), manager_(manager),
+      document_(document) {
   AddModuleObject();
 }
 
 CandidateUiElement::~CandidateUiElement() {
   End();
   RemoveModuleObject();
+}
+
+HRESULT CandidateUiElement::RequireOwnerThread() const noexcept {
+  return GetCurrentThreadId() == owner_thread_id_ ? S_OK : RPC_E_WRONG_THREAD;
 }
 
 HRESULT CandidateUiElement::Update(const runtime::Composition &composition,
@@ -86,9 +91,9 @@ HRESULT CandidateUiElement::QueryInterface(REFIID iid, void **object) {
   if (!object)
     return E_POINTER;
   *object = nullptr;
-  // One chain runs IUnknown -> ITfUIElement -> ITfCandidateListUIElement ->
-  // ...Behavior, so a single cast serves all four. Integratable is a second
-  // branch off IUnknown and needs its own cast to a different address.
+  // Behavior carries the ITfUIElement/ITfCandidateListUIElement chain, so one
+  // cast serves those IIDs. Integratable has a distinct interface-subobject
+  // address and therefore needs its own exact cast.
   if (iid == IID_IUnknown || iid == IID_ITfUIElement ||
       iid == IID_ITfCandidateListUIElement ||
       iid == IID_ITfCandidateListUIElementBehavior)
@@ -223,78 +228,121 @@ HRESULT CandidateUiElement::GetCurrentPage(UINT *page) {
 
 HRESULT CandidateUiElement::SetSelection(UINT index) {
   return ComBoundary([&] {
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
     // The element publishes exactly the engine's current page, so the host's
     // index is page-relative and has to land inside it.
     if (index >= candidates_.size())
       return E_INVALIDARG;
-    return host_
-               ? host_->OnCandidateBehavior(this, CandidateBehavior::Select,
-                                            index)
-               : E_FAIL;
+    if (!host_ || !begun_)
+      return E_FAIL;
+    if (selection_ == index)
+      return S_OK;
+    // The engine owns candidate state. Do not publish the requested index
+    // until its Runtime reply reaches Update().
+    return host_->OnCandidateBehavior(this, CandidateBehavior::Select, index);
   });
 }
 
 HRESULT CandidateUiElement::Finalize() {
   return ComBoundary([&] {
-    // A detached element outlived its session; there is nothing to finalize.
-    return host_ ? host_->OnCandidateBehavior(
-                       this, CandidateBehavior::Finalize, 0)
-                 : E_FAIL;
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
+    if (!host_ || !begun_)
+      return E_FAIL;
+    return host_->OnCandidateBehavior(this, CandidateBehavior::Finalize,
+                                      selection_);
   });
 }
 
 HRESULT CandidateUiElement::Abort() {
   return ComBoundary([&] {
-    return host_
-               ? host_->OnCandidateBehavior(this, CandidateBehavior::Abort, 0)
-               : E_FAIL;
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
+    if (!host_)
+      return E_FAIL;
+    // Abort is intentionally idempotent. Once EndUIElement has run there is
+    // no live composition to cancel, so succeed locally without reaching the
+    // still-active text service through a stale element.
+    if (!begun_)
+      return S_OK;
+    return host_->OnCandidateBehavior(this, CandidateBehavior::Abort, 0);
   });
 }
 
 HRESULT CandidateUiElement::SetIntegrationStyle(GUID style) {
-  // Search box is the only style Windows defines. Refusing the rest keeps the
-  // host from assuming an integration Famo has not been told how to honour.
-  if (!IsEqualGUID(style, kIntegrationStyleSearchBox))
-    return E_INVALIDARG;
-  integration_style_ = style;
-  return S_OK;
+  return ComBoundary([&] {
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
+    // Search box is the only style Windows defines. Refusing the rest keeps
+    // the host from assuming an integration Famo has not been told how to
+    // honour.
+    if (!IsEqualGUID(style, kIntegrationStyleSearchBox))
+      return E_NOTIMPL;
+    integration_style_ = style;
+    return S_OK;
+  });
 }
 
 HRESULT CandidateUiElement::GetSelectionStyle(
     TfIntegratableCandidateListSelectionStyle *style) {
-  if (!style)
-    return E_POINTER;
-  // The engine always carries a highlighted candidate on the current page, and
-  // that candidate is exactly what a commit would produce, so the selection is
-  // active rather than a default the user has not landed on.
-  *style = STYLE_ACTIVE_SELECTION;
-  return S_OK;
+  return ComBoundary([&] {
+    if (!style)
+      return E_POINTER;
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
+    // The engine always carries a highlighted candidate on the current page,
+    // and that candidate is exactly what a commit would produce, so the
+    // selection is active rather than a default the user has not landed on.
+    *style = STYLE_ACTIVE_SELECTION;
+    return S_OK;
+  });
 }
 
 HRESULT CandidateUiElement::OnKeyDown(WPARAM key, LPARAM key_data,
                                       BOOL *eaten) {
-  if (!eaten)
-    return E_POINTER;
-  *eaten = FALSE;
   return ComBoundary([&] {
-    return host_ ? host_->OnCandidateKeyDown(this, key, key_data, eaten)
-                 : E_FAIL;
+    if (!eaten)
+      return E_POINTER;
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
+    *eaten = FALSE;
+    if (!host_ || !begun_)
+      return E_FAIL;
+    return host_->OnCandidateKeyDown(this, key, key_data, eaten);
   });
 }
 
 HRESULT CandidateUiElement::ShowCandidateNumbers(BOOL *show) {
-  if (!show)
-    return E_POINTER;
-  // GetString publishes candidate text only; the engine's own labels never
-  // reach the host, so it has to draw the numbers for selection to be usable.
-  *show = TRUE;
-  return S_OK;
+  return ComBoundary([&] {
+    if (!show)
+      return E_POINTER;
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
+    // GetString publishes candidate text only; the engine's own labels never
+    // reach the host, so it has to draw the numbers for selection to be usable.
+    *show = TRUE;
+    return S_OK;
+  });
 }
 
 HRESULT CandidateUiElement::FinalizeExactCompositionString() {
-  // "Exact" means commit what the user is currently being shown, which is the
-  // highlighted candidate — the same runtime verb as Behavior::Finalize.
-  return Finalize();
+  return ComBoundary([&] {
+    const HRESULT thread = RequireOwnerThread();
+    if (FAILED(thread))
+      return thread;
+    if (!host_ || !begun_)
+      return E_FAIL;
+    return host_->OnCandidateBehavior(
+        this, CandidateBehavior::FinalizeExact, 0);
+  });
 }
 
 } // namespace famo::tsf

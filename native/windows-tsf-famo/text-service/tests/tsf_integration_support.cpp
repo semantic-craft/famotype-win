@@ -27,13 +27,19 @@ bool RuntimeProcess::Start(const wchar_t *path, std::wstring_view fault,
                            bool inline_preedit, uint32_t preview_rows,
                            int32_t expected_terminal_abandons,
                            int32_t expected_clients,
-                           int32_t expected_sessions) {
+                           int32_t expected_sessions,
+                           bool candidate_preview,
+                           bool cjk_english_spacing) {
   std::wstring command =
       L"\"" + std::wstring(path) + L"\" --endpoint-suffix " +
       TestEndpointSuffix() + L" --fault " + std::wstring(fault) +
       L" --fault-after " + std::to_wstring(fault_after) +
       L" --connections " + std::to_wstring(connections) +
       L" --inline-preedit " + (inline_preedit ? L"true" : L"false") +
+      L" --candidate-preview " +
+      (candidate_preview ? L"true" : L"false") +
+      L" --cjk-english-spacing " +
+      (cjk_english_spacing ? L"true" : L"false") +
       L" --preview-rows " + std::to_wstring(preview_rows) +
       L" --expected-terminal-abandons " +
       std::to_wstring(expected_terminal_abandons) +

@@ -12,8 +12,8 @@
 
 namespace famo::tsf {
 
-// What the application asked for through ITfCandidateListUIElementBehavior.
-enum class CandidateBehavior { Select, Finalize, Abort };
+// What the application asked for through the candidate-list COM interfaces.
+enum class CandidateBehavior { Select, Finalize, Abort, FinalizeExact };
 
 // Back-channel from the UI element to the owning text service. Declared here
 // rather than taking a TextService* because candidate_ui_selfcheck links
@@ -23,8 +23,8 @@ public:
   // The element's effective visibility changed outside of Update() — the host
   // called ITfUIElement::Show(). Republish the runtime UI state.
   virtual void OnCandidateVisibilityChanged(class CandidateUiElement *element) = 0;
-  // The application drove the candidate list itself. index is page-relative
-  // and is read only for CandidateBehavior::Select.
+  // The application selected, finalized or aborted the candidate list itself.
+  // index is read only for Select; all other behaviors use engine state.
   virtual HRESULT OnCandidateBehavior(class CandidateUiElement *element,
                                       CandidateBehavior behavior,
                                       UINT index) = 0;
@@ -38,8 +38,8 @@ protected:
   ~CandidateUiHost() = default;
 };
 
-// The two bases are separate inheritance branches, each reaching IUnknown on
-// its own, so QueryInterface has to cast per branch rather than once.
+// Multiple inheritance gives the two interface subobjects distinct addresses,
+// so QueryInterface has to cast each IID to its exact interface type.
 class CandidateUiElement final : public ITfCandidateListUIElementBehavior,
                                  public ITfIntegratableCandidateListUIElement {
 public:
@@ -90,8 +90,10 @@ public:
 
 private:
   ~CandidateUiElement();
+  HRESULT RequireOwnerThread() const noexcept;
 
   std::atomic<ULONG> references_{1};
+  DWORD owner_thread_id_ = 0;
   ComPtr<ITfUIElementMgr> manager_;
   ComPtr<ITfDocumentMgr> document_;
   std::vector<std::wstring> candidates_;

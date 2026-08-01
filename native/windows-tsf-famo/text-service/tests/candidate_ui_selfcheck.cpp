@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cstdio>
+#include <thread>
 
 #include "candidate_ui_element.h"
 #include "famo_guids.h"
@@ -127,7 +128,7 @@ public:
   bool key_eaten = true;
   famo::tsf::CandidateUiElement *last = nullptr;
   famo::tsf::CandidateBehavior last_behavior =
-      famo::tsf::CandidateBehavior::Select;
+      famo::tsf::CandidateBehavior::Finalize;
   UINT last_index = 0;
   HRESULT result = S_OK;
 };
@@ -226,13 +227,23 @@ int RunChecks() {
       reinterpret_cast<void **>(behavior.put()))));
   CHECK(behavior.get() == static_cast<ITfCandidateListUIElement *>(host_drawn));
 
+  const int before_selection_updates = host_drawn_manager->updates;
   CHECK(behavior->SetSelection(2) == S_OK);
-  CHECK(host.behaviors == 1 && host.last == host_drawn &&
+  CHECK(SUCCEEDED(behavior->GetSelection(&selection)) && selection == 1);
+  // SetSelection is an engine request. The element must publish only the
+  // selection returned by the runtime, never speculative local state.
+  CHECK(host.behaviors == 1 &&
         host.last_behavior == famo::tsf::CandidateBehavior::Select &&
-        host.last_index == 2);
+        host.last_index == 2 &&
+        host_drawn_manager->updates == before_selection_updates);
+  famo::runtime::Composition selected_snapshot = Snapshot();
+  selected_snapshot.highlighted_index = 2;
+  CHECK(SUCCEEDED(host_drawn->Update(selected_snapshot)));
+  CHECK(SUCCEEDED(behavior->GetSelection(&selection)) && selection == 2);
   CHECK(behavior->Finalize() == S_OK);
-  CHECK(host.behaviors == 2 &&
-        host.last_behavior == famo::tsf::CandidateBehavior::Finalize);
+  CHECK(host.behaviors == 2 && host.last == host_drawn &&
+        host.last_behavior == famo::tsf::CandidateBehavior::Finalize &&
+        host.last_index == 2);
   CHECK(behavior->Abort() == S_OK);
   CHECK(host.behaviors == 3 &&
         host.last_behavior == famo::tsf::CandidateBehavior::Abort);
@@ -254,15 +265,15 @@ int RunChecks() {
   CHECK(SUCCEEDED(host_drawn->QueryInterface(
       IID_ITfIntegratableCandidateListUIElement,
       reinterpret_cast<void **>(integratable.put()))));
-  // Separate inheritance branch from the behavior chain, so this must be its
-  // own cast rather than the one that serves the ITfUIElement IIDs.
+  // Multiple inheritance gives these two interfaces distinct addresses, so
+  // QueryInterface must cast each IID to its exact interface type.
   CHECK(static_cast<void *>(integratable.get()) !=
         static_cast<void *>(behavior.get()));
 
   CHECK(integratable->SetIntegrationStyle(famo::tsf::kIntegrationStyleSearchBox) ==
         S_OK);
   // An unknown style is refused rather than silently accepted.
-  CHECK(integratable->SetIntegrationStyle(GUID_NULL) == E_INVALIDARG);
+  CHECK(integratable->SetIntegrationStyle(GUID_NULL) == E_NOTIMPL);
 
   TfIntegratableCandidateListSelectionStyle style = STYLE_IMPLIED_SELECTION;
   CHECK(SUCCEEDED(integratable->GetSelectionStyle(&style)));
@@ -281,16 +292,63 @@ int RunChecks() {
   CHECK(SUCCEEDED(integratable->OnKeyDown('2', 0, &eaten)));
   CHECK(host.keys == before_keys + 1 && host.last_key == '2' && eaten == TRUE);
 
-  // FinalizeExactCompositionString commits what the user is being shown, which
-  // is the same runtime verb as Behavior::Finalize.
+  // Exact finalization is distinct from converting the highlighted candidate.
   const int before_finalize = host.behaviors;
   CHECK(integratable->FinalizeExactCompositionString() == S_OK);
   CHECK(host.behaviors == before_finalize + 1 &&
-        host.last_behavior == famo::tsf::CandidateBehavior::Finalize);
+        host.last_behavior == famo::tsf::CandidateBehavior::FinalizeExact);
 
   CHECK(integratable->GetSelectionStyle(nullptr) == E_POINTER);
   CHECK(integratable->ShowCandidateNumbers(nullptr) == E_POINTER);
   CHECK(integratable->OnKeyDown('2', 0, nullptr) == E_POINTER);
+
+  // TSF owns this element on the activation thread. Every Behavior and
+  // Integratable entry point must reject a direct cross-thread call before it
+  // reads or mutates element state or reaches the host callback.
+  HRESULT wrong_thread_results[8]{};
+  TfIntegratableCandidateListSelectionStyle wrong_thread_style =
+      STYLE_ACTIVE_SELECTION;
+  BOOL wrong_thread_eaten = TRUE;
+  BOOL wrong_thread_numbers = FALSE;
+  const int behaviors_before_wrong_thread = host.behaviors;
+  const int keys_before_wrong_thread = host.keys;
+  std::thread wrong_thread([&] {
+    wrong_thread_results[0] = behavior->SetSelection(0);
+    wrong_thread_results[1] = behavior->Finalize();
+    wrong_thread_results[2] = behavior->Abort();
+    wrong_thread_results[3] =
+        integratable->SetIntegrationStyle(
+            famo::tsf::kIntegrationStyleSearchBox);
+    wrong_thread_results[4] =
+        integratable->GetSelectionStyle(&wrong_thread_style);
+    wrong_thread_results[5] =
+        integratable->OnKeyDown('2', 0, &wrong_thread_eaten);
+    wrong_thread_results[6] =
+        integratable->ShowCandidateNumbers(&wrong_thread_numbers);
+    wrong_thread_results[7] =
+        integratable->FinalizeExactCompositionString();
+  });
+  wrong_thread.join();
+  for (HRESULT result : wrong_thread_results)
+    CHECK(result == RPC_E_WRONG_THREAD);
+  CHECK(wrong_thread_eaten == TRUE && wrong_thread_numbers == FALSE);
+  CHECK(host.behaviors == behaviors_before_wrong_thread &&
+        host.keys == keys_before_wrong_thread);
+
+  // A host may retain the COM element after EndUIElement. Methods that would
+  // reach the live context must reject that stale element; Abort stays locally
+  // idempotent without calling the still-active text service.
+  CHECK(SUCCEEDED(host_drawn->Update(cleared)) && !host_drawn->begun());
+  const int behaviors_before_end = host.behaviors;
+  const int keys_before_end = host.keys;
+  CHECK(behavior->Finalize() == E_FAIL);
+  CHECK(behavior->Abort() == S_OK);
+  CHECK(integratable->FinalizeExactCompositionString() == E_FAIL);
+  BOOL ended_eaten = TRUE;
+  CHECK(integratable->OnKeyDown('2', 0, &ended_eaten) == E_FAIL);
+  CHECK(ended_eaten == FALSE);
+  CHECK(host.behaviors == behaviors_before_end && host.keys == keys_before_end);
+  CHECK(SUCCEEDED(host_drawn->Update(Snapshot())) && host_drawn->begun());
 
   // A detached element must never call back into a released host.
   const int before_detach = host.changes;
