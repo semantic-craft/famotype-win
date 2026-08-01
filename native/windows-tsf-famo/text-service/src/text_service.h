@@ -207,6 +207,7 @@ private:
   bool CloseEntry(ContextEntry *entry);
   HRESULT HandleKey(ITfContext *context, WPARAM key, LPARAM key_data,
                     bool down, bool test_only, BOOL *eaten);
+  bool KeyboardDisabled(ContextEntry *entry);
   bool HandlePreviewSelection(
       HWND source_window,
       const runtime::PreviewSelectionRequest &request);

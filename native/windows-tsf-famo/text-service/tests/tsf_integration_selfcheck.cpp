@@ -1714,6 +1714,64 @@ bool ForegroundFocusRecyclesRuntimeConnection(
   return true;
 }
 
+bool DisabledKeyboardContextPassesKeysThrough(TextServiceModule *module,
+                                              const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  ComPtr<ITfCompartmentMgr> compartments;
+  CHECK(SUCCEEDED(target.context->QueryInterface(
+      IID_ITfCompartmentMgr, reinterpret_cast<void **>(compartments.put()))));
+  ComPtr<ITfCompartment> disabled;
+  CHECK(SUCCEEDED(compartments->GetCompartment(
+      GUID_COMPARTMENT_KEYBOARD_DISABLED, disabled.put())));
+  VARIANT on;
+  VariantInit(&on);
+  on.vt = VT_I4;
+  on.lVal = 1;
+  const HRESULT disabled_set = disabled->SetValue(client_id, &on);
+  VariantClear(&on);
+  CHECK(SUCCEEDED(disabled_set));
+
+  CHECK(TestKey(key_sink.get(), target.context.get(), 'N', false));
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'N', false));
+  CHECK(target.store->text().empty());
+
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  return runtime.Finish();
+}
+
 bool AllTextStoreChecks(const wchar_t *module_path,
                         const wchar_t *runtime_path) {
   ScopedCom com;
@@ -1725,6 +1783,7 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(TerminalPublicationSlotSerializesFailures(&module, runtime_path));
   CHECK(MissingRuntimeFailsOpen(&module));
   CHECK(HealthyRoundtrip(&module, runtime_path));
+  CHECK(DisabledKeyboardContextPassesKeysThrough(&module, runtime_path));
   CHECK(DisabledInlinePreeditStaysOutOfHost(&module, runtime_path));
   CHECK(InlinePreeditPreservesUtf16Selection(&module, runtime_path));
   CHECK(PhysicalSelectionKeysAreInterpretedByEngine(&module, runtime_path));
