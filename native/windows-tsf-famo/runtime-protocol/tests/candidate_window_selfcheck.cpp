@@ -27,6 +27,97 @@ HANDLE g_fake_preview_received_event = nullptr;
 HWND g_expected_preview_source = nullptr;
 PreviewSelectionRequest g_expected_preview_request{};
 
+struct WinEventRecord {
+  DWORD event = 0;
+  HWND window = nullptr;
+  LONG object_id = 0;
+  LONG child_id = 0;
+};
+
+std::vector<WinEventRecord> *g_candidate_win_events = nullptr;
+
+void CALLBACK RecordCandidateWinEvent(HWINEVENTHOOK, DWORD event, HWND window,
+                                      LONG object_id, LONG child_id, DWORD,
+                                      DWORD) {
+  if (!g_candidate_win_events)
+    return;
+  g_candidate_win_events->push_back({event, window, object_id, child_id});
+}
+
+class CandidateWinEventRecorder {
+public:
+  ~CandidateWinEventRecorder() {
+    if (hook_)
+      UnhookWinEvent(hook_);
+    if (g_candidate_win_events == &events_)
+      g_candidate_win_events = nullptr;
+  }
+
+  bool Start() {
+    if (g_candidate_win_events)
+      return false;
+    g_candidate_win_events = &events_;
+    hook_ = SetWinEventHook(EVENT_OBJECT_IME_SHOW, EVENT_OBJECT_IME_CHANGE,
+                            nullptr, &RecordCandidateWinEvent,
+                            GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
+    if (hook_)
+      return true;
+    g_candidate_win_events = nullptr;
+    return false;
+  }
+
+  bool WaitForCount(DWORD event, size_t expected) {
+    for (int attempt = 0; attempt < 500; ++attempt) {
+      PumpMessages();
+      if (Count(event) >= expected)
+        return true;
+      Sleep(1);
+    }
+    return false;
+  }
+
+  size_t Count(DWORD event) const {
+    return static_cast<size_t>(std::count_if(
+        events_.begin(), events_.end(),
+        [event](const WinEventRecord &record) { return record.event == event; }));
+  }
+
+  void Settle() {
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      PumpMessages();
+      Sleep(1);
+    }
+    PumpMessages();
+  }
+
+  void Clear() {
+    PumpMessages();
+    events_.clear();
+  }
+
+  bool AllAreClientSelf(DWORD event) const {
+    return std::all_of(events_.begin(), events_.end(),
+                       [event](const WinEventRecord &record) {
+                         return record.event != event ||
+                                (record.window != nullptr &&
+                                 record.object_id == OBJID_CLIENT &&
+                                 record.child_id == CHILDID_SELF);
+                       });
+  }
+
+private:
+  static void PumpMessages() {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+
+  HWINEVENTHOOK hook_ = nullptr;
+  std::vector<WinEventRecord> events_;
+};
+
 LRESULT CALLBACK PreviewTargetProc(HWND window, UINT message, WPARAM wparam,
                                    LPARAM lparam) {
   if (message == WM_COPYDATA) {
@@ -342,6 +433,23 @@ bool ScrollTransitionIsBoundedAndOptional() {
   return true;
 }
 
+bool CandidateWindowReportsShowEvent() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto shown = VisibleSnapshot(100);
+  shown->revision = 1;
+  window.Publish(shown);
+  CHECK(WaitForVisibility(true));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 1);
+  CHECK(events.AllAreClientSelf(EVENT_OBJECT_IME_SHOW));
+  window.Stop();
+  return true;
+}
+
 template <typename Predicate>
 bool WaitForCounters(const CandidateWindow &window, Predicate predicate) {
   for (int attempt = 0; attempt < 1000; ++attempt) {
@@ -350,6 +458,245 @@ bool WaitForCounters(const CandidateWindow &window, Predicate predicate) {
     Sleep(1);
   }
   return false;
+}
+
+bool CandidateWindowReportsMoveEvent() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto initial = VisibleSnapshot(110);
+  initial->revision = 1;
+  window.Publish(initial);
+  WindowProbe initial_probe;
+  CHECK(WaitForVisibility(true, &initial_probe));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
+  events.Clear();
+
+  auto moved = VisibleSnapshot(111);
+  moved->revision = 2;
+  moved->ui_state.selection_capability =
+      initial->ui_state.selection_capability;
+  moved->ui_state.caret = {700, 450, 702, 470};
+  window.Publish(moved);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.anchor_only == 1;
+  }));
+  WindowProbe moved_probe = Probe();
+  CHECK(moved_probe.visible);
+  CHECK(moved_probe.rect.left != initial_probe.rect.left ||
+        moved_probe.rect.top != initial_probe.rect.top);
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_CHANGE, 1));
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 1);
+  CHECK(events.AllAreClientSelf(EVENT_OBJECT_IME_CHANGE));
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 0);
+  window.Stop();
+  return true;
+}
+
+bool CandidateWindowDoesNotReportNoOpMove() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto initial = VisibleSnapshot(112);
+  initial->revision = 1;
+  window.Publish(initial);
+  WindowProbe initial_probe;
+  CHECK(WaitForVisibility(true, &initial_probe));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
+  events.Clear();
+
+  auto same_position = VisibleSnapshot(113);
+  same_position->revision = 2;
+  same_position->ui_state.selection_capability =
+      initial->ui_state.selection_capability;
+  same_position->ui_state.work_area = {-1921, 0, 1921, 1080};
+  window.Publish(same_position);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.anchor_only == 1;
+  }));
+  WindowProbe same_probe = Probe();
+  CHECK(same_probe.visible);
+  CHECK(EqualRect(&initial_probe.rect, &same_probe.rect));
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 0);
+  window.Stop();
+  return true;
+}
+
+bool CandidateWindowReportsSizeChangeEvent() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto shown = VisibleSnapshot(115);
+  shown->revision = 1;
+  window.Publish(shown);
+  WindowProbe initial_probe;
+  CHECK(WaitForVisibility(true, &initial_probe));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
+  events.Clear();
+
+  const uint64_t full_before = window.counters().full;
+  FamoSkin wide_skin = FamoSkinDefault();
+  wide_skin.min_width = 600;
+  auto wide_style = std::make_shared<const RuntimeStyleState>(
+      RuntimeStyleState{0, std::make_shared<const CandidateStylePresentation>(
+                               CandidateStylePresentation{wide_skin,
+                                                          wide_skin})});
+  window.ActivateStyle(wide_style);
+  CHECK(WaitForCounters(window, [&](const CandidateWindow::Counters &value) {
+    return value.full > full_before;
+  }));
+  WindowProbe resized_probe;
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    resized_probe = Probe();
+    if (resized_probe.visible &&
+        resized_probe.rect.right - resized_probe.rect.left !=
+            initial_probe.rect.right - initial_probe.rect.left) {
+      break;
+    }
+    Sleep(1);
+  }
+  CHECK(resized_probe.visible);
+  CHECK(resized_probe.rect.right - resized_probe.rect.left !=
+        initial_probe.rect.right - initial_probe.rect.left);
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_CHANGE, 1));
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 1);
+  CHECK(events.AllAreClientSelf(EVENT_OBJECT_IME_CHANGE));
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 0);
+  window.Stop();
+  return true;
+}
+
+bool CandidateWindowReportsHideEvent() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto shown = VisibleSnapshot(120);
+  shown->revision = 1;
+  window.Publish(shown);
+  CHECK(WaitForVisibility(true));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
+  events.Clear();
+
+  auto hidden = VisibleSnapshot(121);
+  hidden->revision = 2;
+  hidden->ui_state.show_allowed = false;
+  window.Publish(hidden);
+  CHECK(WaitForVisibility(false));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_HIDE, 1));
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 1);
+  CHECK(events.AllAreClientSelf(EVENT_OBJECT_IME_HIDE));
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 0);
+  window.Stop();
+  return true;
+}
+
+bool CandidateWindowNeverReportsUnshownWindow() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto hidden = VisibleSnapshot(125);
+  hidden->revision = 1;
+  hidden->ui_state.show_allowed = false;
+  window.Publish(hidden);
+  CHECK(window.Prewarm());
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 0);
+  window.Stop();
+  return true;
+}
+
+bool CandidateWindowDoesNotRepeatLightDismissEvents() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto shown = VisibleSnapshot(130);
+  shown->revision = 1;
+  window.Publish(shown);
+  CHECK(WaitForVisibility(true));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
+  events.Clear();
+
+  auto repainted = std::make_shared<RuntimeSnapshot>(*shown);
+  repainted->revision = 2;
+  repainted->correlation.sequence++;
+  repainted->composition.highlighted_index = 1;
+  window.Publish(repainted);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.selection_only == 1;
+  }));
+  events.Settle();
+  CHECK(Probe().visible);
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 0);
+
+  auto hidden = std::make_shared<RuntimeSnapshot>(*repainted);
+  hidden->revision = 3;
+  hidden->correlation.sequence++;
+  hidden->ui_state.show_allowed = false;
+  window.Publish(hidden);
+  CHECK(WaitForVisibility(false));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_HIDE, 1));
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 1);
+  events.Clear();
+
+  auto still_hidden = std::make_shared<RuntimeSnapshot>(*hidden);
+  still_hidden->revision = 4;
+  still_hidden->correlation.sequence++;
+  window.Publish(still_hidden);
+  CHECK(window.Prewarm());
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 0);
+  window.Stop();
+  return true;
+}
+
+bool CandidateWindowReportsHideWhenStopped() {
+  CandidateWinEventRecorder events;
+  CHECK(events.Start());
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto shown = VisibleSnapshot(135);
+  shown->revision = 1;
+  window.Publish(shown);
+  CHECK(WaitForVisibility(true));
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_SHOW, 1));
+  events.Settle();
+  events.Clear();
+
+  window.Stop();
+  CHECK(events.WaitForCount(EVENT_OBJECT_IME_HIDE, 1));
+  events.Settle();
+  CHECK(events.Count(EVENT_OBJECT_IME_HIDE) == 1);
+  CHECK(events.AllAreClientSelf(EVENT_OBJECT_IME_HIDE));
+  CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
+  CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 0);
+  return true;
 }
 
 bool PrewarmCompletesBeforeReturn() {
@@ -812,9 +1159,31 @@ bool HangingUiDoesNotDelayEngine() {
 int wmain(int argc, wchar_t **argv) {
   if (argc > 1 && std::wstring_view(argv[1]) == L"--fake-preview-target")
     return RunFakePreviewTarget(argc, argv);
+  if (argc > 1 && std::wstring_view(argv[1]) == L"--light-dismiss-events") {
+    if (!CandidateWindowReportsShowEvent() ||
+        !CandidateWindowReportsMoveEvent() ||
+        !CandidateWindowDoesNotReportNoOpMove() ||
+        !CandidateWindowReportsSizeChangeEvent() ||
+        !CandidateWindowReportsHideEvent() ||
+        !CandidateWindowNeverReportsUnshownWindow() ||
+        !CandidateWindowDoesNotRepeatLightDismissEvents() ||
+        !CandidateWindowReportsHideWhenStopped()) {
+      return 1;
+    }
+    std::printf("candidate_window_light_dismiss: OK\n");
+    return 0;
+  }
   if (!PreviewRowsMapToAbsoluteCandidateIndexes() ||
       !PreviewRoutingBindsExactOwnerAndSourceWindow() ||
       !ScrollTransitionIsBoundedAndOptional() ||
+      !CandidateWindowReportsShowEvent() ||
+      !CandidateWindowReportsMoveEvent() ||
+      !CandidateWindowDoesNotReportNoOpMove() ||
+      !CandidateWindowReportsSizeChangeEvent() ||
+      !CandidateWindowReportsHideEvent() ||
+      !CandidateWindowNeverReportsUnshownWindow() ||
+      !CandidateWindowDoesNotRepeatLightDismissEvents() ||
+      !CandidateWindowReportsHideWhenStopped() ||
       !PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
       !InlineHostPreeditStillShowsPanelHeader() ||
