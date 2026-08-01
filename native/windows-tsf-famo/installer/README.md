@@ -92,4 +92,5 @@ UAC 提权、应用优雅退出，或 Win10 / Win11 上从旧版本到新版本�
 - `Test-FamoHealth.ps1` 检查事务终态、Stable identity、Runtime manifest、独立 Bridge 路径/ABI/hash/manifest、COM/profile、精确 runtime 路径和有界 control pipe；`PendingReboot` 还要求 runtime 缺席，并从 v2 journal 验证恢复安装器/hash 以及精确 SID 的 Task Scheduler XML。
 - `Test-FamoTsfRegistration.ps1` 检查 Stable Bridge 投影、HKCU COM、profile/category、激活状态、current-user TIP 和 stable/development 隔离；`PendingReboot` 要求 COM/profile 未注册、未激活且 TIP 不可见。
 - `smoke-harness.ps1 -RequireRuntimeOnly` 在已有 Ready stable Bridge 基线上执行升级，并要求 Bridge 路径、SHA-256、NTFS FileId、时间戳不变且 Runtime target 改变；脚本不会自行重启。
+- `fault-injection-harness.ps1` 默认从已有 `Ready` 基线扫描安装/升级注入点；`-CleanInstall` 要求起点未安装，并用 `Test-FamoHealth.ps1` 断言每点前后均为合法 `NotInstalled`；`-Uninstall` 扫描五个 uninstall 持久化边界，预先按 SHA-256 保留同一卸载器的 `.exe`/`.dat`，并强制用保留副本重入到干净 `NotInstalled`，再铺回 `Ready` 进入下一点。脚本要求日志精确出现目标注入标记，将每点立即 flush 为 JSONL，最后另写汇总 JSON；它不自提权、不重启，只能在 Bridge 未加载的隔离 VM 上跑完整矩阵。
 - 本机手动复现范围见 `smoke_test.md`；跨版本发行认证须另行批准且不阻断开发。
