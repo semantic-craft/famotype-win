@@ -42,6 +42,10 @@ public:
   std::optional<runtime::Correlation>
   PlanAbsoluteCandidate(uint64_t composition_sequence);
   std::optional<runtime::Correlation> PlanUiState();
+  // Security teardown must hide Runtime UI even while an engine reply is
+  // pending. This uses the independent, fire-and-forget UI lane and does not
+  // clear or accept the pending engine sequence.
+  std::optional<runtime::Correlation> PlanSecurityUiState();
   std::optional<runtime::Correlation> PlanClose();
   bool AcceptReply(const runtime::Correlation &reply) const;
   void CompleteUnhandled();

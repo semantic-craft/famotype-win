@@ -48,7 +48,11 @@ public:
   bool PreviewSelectionStateForTest(
       ITfTextInputProcessorEx *service, HWND *target,
       runtime::PreviewSelectionRequest *request) const;
+  uint32_t RecoveryPreparedClaimsForTest() const;
+  uint32_t RecoveryExecuteAttemptsForTest() const;
   uint32_t TerminalCleanupConnectAttemptsForTest() const;
+  uint32_t TerminalPublicationReadyForTest() const;
+  uint32_t TerminalRetiredSessionsForTest() const;
 
 private:
   using CanUnloadFn = HRESULT(STDAPICALLTYPE *)();
@@ -60,12 +64,23 @@ private:
       ITfTextInputProcessorEx *, HWND *, runtime::PreviewSelectionRequest *);
   using TerminalCleanupConnectAttemptsForTestFn =
       uint32_t(STDAPICALLTYPE *)();
+  using RecoveryPreparedClaimsForTestFn = uint32_t(STDAPICALLTYPE *)();
+  using RecoveryExecuteAttemptsForTestFn = uint32_t(STDAPICALLTYPE *)();
+  using TerminalPublicationReadyForTestFn = uint32_t(STDAPICALLTYPE *)();
+  using TerminalRetiredSessionsForTestFn = uint32_t(STDAPICALLTYPE *)();
 
   HMODULE module_ = nullptr;
   CanUnloadFn can_unload_ = nullptr;
   CreateForTestFn create_for_test_ = nullptr;
   ReactivateForTestFn reactivate_for_test_ = nullptr;
   PreviewSelectionStateForTestFn preview_selection_state_for_test_ = nullptr;
+  RecoveryPreparedClaimsForTestFn recovery_prepared_claims_for_test_ = nullptr;
+  RecoveryExecuteAttemptsForTestFn recovery_execute_attempts_for_test_ =
+      nullptr;
+  TerminalPublicationReadyForTestFn terminal_publication_ready_for_test_ =
+      nullptr;
+  TerminalRetiredSessionsForTestFn terminal_retired_sessions_for_test_ =
+      nullptr;
   TerminalCleanupConnectAttemptsForTestFn
       terminal_cleanup_connect_attempts_for_test_ = nullptr;
 };

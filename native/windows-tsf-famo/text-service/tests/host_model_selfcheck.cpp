@@ -73,6 +73,19 @@ bool DigitCanStartSchemaInput() {
   return true;
 }
 
+bool SecurityUiStateCanPassPendingComposition() {
+  ContextState state;
+  state.Open(Identity(57));
+  const auto pending = state.PlanKey(Down('N'));
+  CHECK(pending.sends_request());
+  CHECK(!state.PlanUiState());
+  const auto hidden = state.PlanSecurityUiState();
+  CHECK(hidden && hidden->sequence == pending.correlation.sequence + 1);
+  CHECK(state.AcceptReply(pending.correlation));
+  state.ApplySucceeded(Preedit("n"));
+  return true;
+}
+
 bool CandidateAndCorrelation() {
   ContextState state;
   state.Open(Identity(60));
@@ -210,6 +223,7 @@ bool UtfConversionIsStrict() {
 
 int main() {
   if (!PureTestAndExactlyOnce() || !DigitCanStartSchemaInput() ||
+      !SecurityUiStateCanPassPendingComposition() ||
       !CandidateAndCorrelation() ||
       !FailureLatchesRecovery() || !ContextsAndGenerationAreIndependent() ||
       !TransientUnavailableReleasesPendingKey() || !UtfConversionIsStrict())
