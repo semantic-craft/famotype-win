@@ -7,6 +7,7 @@
 
 #include "com_ptr.h"
 #include "fake_text_store.h"
+#include "famo_guids.h"
 #include "tsf_integration_support.h"
 
 #define CHECK(x)                                                               \
@@ -769,6 +770,123 @@ bool PreviewSelectionRequiresCapabilityAndAuthenticatedRuntimeWindow(
         DestroyWindow(fake_source);
         return true;
       });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+// The UI-less host reaches the candidate list the way TSF documents it: it
+// enumerates the begun elements and asks ours for the behavior interface.
+bool FindCandidateBehavior(ITfThreadMgr *thread_manager,
+                           ITfCandidateListUIElementBehavior **behavior) {
+  CHECK(thread_manager && behavior);
+  ComPtr<ITfUIElementMgr> ui_manager;
+  CHECK(SUCCEEDED(thread_manager->QueryInterface(
+      IID_ITfUIElementMgr, reinterpret_cast<void **>(ui_manager.put()))));
+  ComPtr<IEnumTfUIElements> elements;
+  CHECK(SUCCEEDED(ui_manager->EnumUIElements(elements.put())));
+  ITfUIElement *raw = nullptr;
+  ULONG fetched = 0;
+  while (elements->Next(1, &raw, &fetched) == S_OK && fetched == 1) {
+    ComPtr<ITfUIElement> element;
+    element.reset(raw);
+    raw = nullptr;
+    GUID guid{};
+    if (FAILED(element->GetGUID(&guid)) || guid != famo::tsf::kCandidateUiGuid)
+      continue;
+    return SUCCEEDED(element->QueryInterface(
+        IID_ITfCandidateListUIElementBehavior,
+        reinterpret_cast<void **>(behavior)));
+  }
+  return false;
+}
+
+bool HostDrivenCandidateBehaviorMatchesRuntime(TextServiceModule *module,
+                                               const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"ni");
+
+        ComPtr<ITfCandidateListUIElementBehavior> behavior;
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+
+        // The element publishes exactly the engine's current page, so the
+        // behavior index is page-relative and bounded by that page.
+        UINT count = 0;
+        CHECK(SUCCEEDED(behavior->GetCount(&count)) && count == 3);
+        CHECK(behavior->SetSelection(count) == E_INVALIDARG);
+        CHECK(store->text() == L"ni");
+
+        // Host-driven selection reaches the engine, and the resulting commit
+        // agrees with what the physical selection key produces.
+        CHECK(behavior->SetSelection(1) == S_OK);
+        CHECK(store->text() == L"\u5c3c");
+        UINT after_commit = 1;
+        CHECK(SUCCEEDED(behavior->GetCount(&after_commit)) &&
+              after_commit == 0);
+        // The composition is gone. Repeating must fail safely rather than
+        // crash the host or poison the runtime connection.
+        CHECK(behavior->SetSelection(1) == E_INVALIDARG);
+        CHECK(behavior->Finalize() == E_FAIL);
+        CHECK(store->text() == L"\u5c3c");
+
+        // Finalize commits the engine's current choice.
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"\u5c3cni");
+        CHECK(behavior->Finalize() == S_OK);
+        CHECK(store->text() == L"\u5c3c\u4f60");
+        CHECK(behavior->Finalize() == E_FAIL);
+        CHECK(store->text() == L"\u5c3c\u4f60");
+
+        // Abort drops the composition without committing anything, and stays
+        // harmless when there is nothing left to drop.
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"\u5c3c\u4f60ni");
+        CHECK(behavior->Abort() == S_OK);
+        CHECK(store->text() == L"\u5c3c\u4f60");
+        CHECK(behavior->Abort() == S_OK);
+        CHECK(store->text() == L"\u5c3c\u4f60");
+
+        // The ordinary key path still owns the composition afterwards.
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(SendKey(key_sink, context, '2', true));
+        CHECK(store->text() == L"\u5c3c\u4f60\u5c3c");
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+// A behavior call after the owning context is gone must fail, not reach into a
+// freed session. TSF holds its own reference, so the element outlives it.
+bool CandidateBehaviorAfterDeactivationFailsSafely(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  ComPtr<ITfCandidateListUIElementBehavior> behavior;
+  const bool passed = RunTextStoreSession(
+      module, [&behavior](ITfKeyEventSink *key_sink, ITfContext *context,
+                          FakeTextStore *store, ITfTextInputProcessorEx *,
+                          ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"ni");
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+        return true;
+      });
+  CHECK(behavior);
+  CHECK(behavior->SetSelection(0) == E_FAIL);
+  CHECK(behavior->Finalize() == E_FAIL);
+  CHECK(behavior->Abort() == E_FAIL);
+  behavior.reset();
   const bool runtime_finished = runtime.Finish();
   return passed && runtime_finished;
 }
@@ -1613,6 +1731,8 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(DigitCanStartCompositionWhenSchemaHandlesIt(&module, runtime_path));
   CHECK(PreviewSelectionRequiresCapabilityAndAuthenticatedRuntimeWindow(
       &module, runtime_path));
+  CHECK(HostDrivenCandidateBehaviorMatchesRuntime(&module, runtime_path));
+  CHECK(CandidateBehaviorAfterDeactivationFailsSafely(&module, runtime_path));
   CHECK(FaultFailsOpen(&module, runtime_path, L"engine-hang"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"disconnect"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"malformed"));

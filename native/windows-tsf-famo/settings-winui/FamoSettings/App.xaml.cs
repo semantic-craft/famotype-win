@@ -371,6 +371,11 @@ public partial class App : Application
             return;
         }
 
+        // #41 启动期 TIP 自愈：Ready 门 + 探针在前，健康时零写入；后台线程，
+        // 绝不阻塞启动。无头 --seed-only/--demo-appearance 已在上方早退，
+        // 安装器链路自有 Program.cs 的 --add-input-tip，不重复。
+        _ = Task.Run(() => TipSelfHeal.RunAtStartup("settings"));
+
         // 捕获 UI 线程派发器，供单实例重定向回调切回。
         _uiQueue = DispatcherQueue.GetForCurrentThread();
         if (!_uiQueue.TryEnqueue(DispatcherQueuePriority.Low, StartUpdates))

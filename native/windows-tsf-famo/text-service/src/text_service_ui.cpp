@@ -64,6 +64,86 @@ HRESULT TextService::OnLayoutChange(ITfContext *context, TfLayoutCode code,
   });
 }
 
+void TextService::OnCandidateVisibilityChanged(CandidateUiElement *element) {
+  // The host called ITfUIElement::Show() to take over or release the drawing
+  // of this element. Republish so the runtime window follows immediately.
+  if (!element || !OnActivationThread())
+    return;
+  for (auto &owned : contexts_) {
+    if (!owned || owned->candidates.get() != element)
+      continue;
+    owned->ui_state.show_allowed = element->visible() != FALSE;
+    PublishUiState(owned.get());
+    return;
+  }
+}
+
+TextService::ContextEntry *
+TextService::FindContextByCandidateElement(CandidateUiElement *element) {
+  if (!element)
+    return nullptr;
+  for (auto &owned : contexts_) {
+    if (owned && !owned->close_requested && owned->candidates.get() == element)
+      return owned.get();
+  }
+  return nullptr;
+}
+
+HRESULT TextService::OnCandidateKeyDown(CandidateUiElement *element, WPARAM key,
+                                        LPARAM key_data, BOOL *eaten) {
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  if (!OnActivationThread())
+    return RPC_E_WRONG_THREAD;
+  ContextEntry *entry = FindContextByCandidateElement(element);
+  if (!entry || !entry->context)
+    return E_FAIL;
+  // The integrated host is routing real input at the candidate list, not
+  // asking for a second keyboard model, so this is the physical key path.
+  return HandleKey(entry->context.get(), key, key_data, /*down=*/true,
+                   /*test_only=*/false, eaten);
+}
+
+HRESULT TextService::OnCandidateBehavior(CandidateUiElement *element,
+                                         CandidateBehavior behavior,
+                                         UINT index) {
+  if (!OnActivationThread())
+    return RPC_E_WRONG_THREAD;
+  ContextEntry *entry = FindContextByCandidateElement(element);
+  if (!entry)
+    return E_FAIL;
+  // The click channel's capability token authenticates an unsigned cross
+  // process WM_COPYDATA; an in-process COM call on the activation thread does
+  // not need it, and consuming it here would disable the runtime's own preview
+  // click for the same composition. The plan is the gate: it rejects a
+  // not-Ready phase, an in-flight request and a context with no composition.
+  const auto correlation =
+      entry->state.PlanAbsoluteCandidate(entry->state.displayed_sequence());
+  if (!correlation)
+    return E_FAIL;
+  runtime::Frame request;
+  request.correlation = *correlation;
+  switch (behavior) {
+  case CandidateBehavior::Select:
+    // Page-relative, unlike the click channel's SelectCandidateAbsolute, whose
+    // index space is the preview window of the *next* page.
+    request.command = runtime::Command::SelectCandidate;
+    if (!runtime::EncodeCandidateIndex(index, &request.payload)) {
+      entry->state.CompleteUnhandled();
+      return E_INVALIDARG;
+    }
+    break;
+  case CandidateBehavior::Finalize:
+    request.command = runtime::Command::CommitComposition;
+    break;
+  case CandidateBehavior::Abort:
+    request.command = runtime::Command::ClearComposition;
+    break;
+  }
+  return DeliverCandidateRequest(entry, std::move(request)) ? S_OK : E_FAIL;
+}
+
 void TextService::RefreshLayout(ContextEntry *entry, ITfContextView *view) {
   if (!entry || !entry->context)
     return;

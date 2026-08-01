@@ -8,7 +8,7 @@ endif()
 set(FAMO_IDENTITY "Development" CACHE STRING
     "Compile-time identity set: Development or Stable")
 set_property(CACHE FAMO_IDENTITY PROPERTY STRINGS Development Stable)
-set(FAMO_BRIDGE_ABI "3" CACHE STRING
+set(FAMO_BRIDGE_ABI "4" CACHE STRING
     "Stable in-process TSF Bridge ABI; bump only for a Bridge release")
 if(NOT FAMO_BRIDGE_ABI MATCHES "^[1-9][0-9]*$")
   message(FATAL_ERROR "FAMO_BRIDGE_ABI must be a positive integer")
@@ -143,6 +143,22 @@ target_compile_definitions(tsf_integration_selfcheck PRIVATE
 target_link_libraries(tsf_integration_selfcheck PRIVATE
   famo_runtime_core ole32 oleaut32)
 add_dependencies(tsf_integration_selfcheck FamoTextService FamoTestRuntime)
+
+# Manual UI-less A/B acceptance probe. Like production_runtime_verify this is
+# intentionally not a CTest: it drives the real runtime against a caller-owned
+# deployed Rime data root.
+if(TARGET FamoRuntime)
+  add_executable(uiless_candidate_probe
+    tests/fake_text_store.cpp
+    tests/tsf_integration_support.cpp
+    tests/uiless_candidate_probe.cpp)
+  target_include_directories(uiless_candidate_probe PRIVATE include src tests)
+  target_compile_definitions(uiless_candidate_probe PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(uiless_candidate_probe PRIVATE
+    famo_runtime_core ole32 oleaut32)
+  add_dependencies(uiless_candidate_probe FamoTextService FamoRuntime)
+endif()
 
 enable_testing()
 add_test(NAME host_model_selfcheck COMMAND host_model_selfcheck)

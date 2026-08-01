@@ -27,7 +27,8 @@ class TextService final : public ITfTextInputProcessorEx,
                           public ITfKeyEventSink,
                           public ITfThreadMgrEventSink,
                           public ITfCompositionSink,
-                          public ITfTextLayoutSink {
+                          public ITfTextLayoutSink,
+                          public CandidateUiHost {
 public:
   TextService();
   explicit TextService(std::wstring runtime_endpoint_suffix);
@@ -73,6 +74,12 @@ public:
                                            TfLayoutCode code,
                                            ITfContextView *view) override;
 
+  void OnCandidateVisibilityChanged(CandidateUiElement *element) override;
+  HRESULT OnCandidateBehavior(CandidateUiElement *element,
+                              CandidateBehavior behavior, UINT index) override;
+  HRESULT OnCandidateKeyDown(CandidateUiElement *element, WPARAM key,
+                             LPARAM key_data, BOOL *eaten) override;
+
 private:
   enum class DeliveryWorkKind { Recover, Cancel, Ack };
   enum class DeliveryAttemptState {
@@ -117,6 +124,13 @@ private:
     // Capability is valid only for this exact displayed composition sequence.
     // Zero means the current composition has already consumed its click.
     uint64_t selection_capability_sequence = 0;
+
+    // TSF AddRefs the element in BeginUIElement, so it can outlive this entry.
+    // Detaching here covers every erase/clear site at once.
+    ~ContextEntry() {
+      if (candidates)
+        candidates->SetHost(nullptr);
+    }
   };
 
   enum class SessionWarmupReason { Activation, Focus, Recovery };
@@ -188,6 +202,7 @@ private:
                     const runtime::Correlation &identity,
                     runtime::Status status) const;
   ContextEntry *FindContext(ITfContext *context);
+  ContextEntry *FindContextByCandidateElement(CandidateUiElement *element);
   void CloseContext(ITfContext *context);
   bool CloseEntry(ContextEntry *entry);
   HRESULT HandleKey(ITfContext *context, WPARAM key, LPARAM key_data,
@@ -195,6 +210,7 @@ private:
   bool HandlePreviewSelection(
       HWND source_window,
       const runtime::PreviewSelectionRequest &request);
+  bool DeliverCandidateRequest(ContextEntry *entry, runtime::Frame &&request);
   bool RenewSelectionCapability(ContextEntry *entry,
                                 uint64_t composition_sequence) noexcept;
   HRESULT ApplyRuntimeComposition(ContextEntry *entry,

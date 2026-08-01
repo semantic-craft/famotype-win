@@ -32,5 +32,11 @@ inline constexpr GUID kDisplayAttributeGuid = {
 inline constexpr GUID kCandidateUiGuid = {
     0x245d7538, 0x5012, 0x4dab,
     {0xb3, 0xa0, 0x01, 0x85, 0x70, 0x35, 0xfb, 0x54}};
+// GUID_INTEGRATIONSTYLE_SEARCHBOX from ctffunc.h. That header declares it with
+// DEFINE_GUID, so the symbol lives in no auto-linked import library; this file
+// already defines its GUIDs by value, so do the same rather than add a lib.
+inline constexpr GUID kIntegrationStyleSearchBox = {
+    0xe6d1bd11, 0x82f7, 0x4903,
+    {0xae, 0x21, 0x1a, 0x63, 0x97, 0xcd, 0xe2, 0xeb}};
 inline constexpr LANGID kLanguageId = 0x0804;
 } // namespace famo::tsf
