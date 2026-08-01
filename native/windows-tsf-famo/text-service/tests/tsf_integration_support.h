@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include <msctf.h>
@@ -9,6 +10,10 @@
 #include "famo_runtime_protocol.h"
 
 namespace famo::tsf::test {
+
+// The suffix TextServiceModule::CreateForTest connects on. A host that starts
+// its own runtime must serve this endpoint.
+const std::wstring &TestEndpointSuffix();
 
 class RuntimeProcess {
 public:

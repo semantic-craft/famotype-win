@@ -9,16 +9,16 @@
 namespace famo::tsf::test {
 namespace {
 
+constexpr wchar_t kTestRuntimePreviewSourceClass[] =
+    L"FamoTestRuntimePreviewSource";
+
+} // namespace
+
 const std::wstring &TestEndpointSuffix() {
   static const std::wstring suffix =
       L"dev-test-engine-" + std::to_wstring(GetCurrentProcessId());
   return suffix;
 }
-
-constexpr wchar_t kTestRuntimePreviewSourceClass[] =
-    L"FamoTestRuntimePreviewSource";
-
-} // namespace
 
 RuntimeProcess::~RuntimeProcess() { Stop(); }
 
