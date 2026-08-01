@@ -282,6 +282,7 @@ public:
       return false;
     created_ = true;
     return CreateDirectoryW(data_root().c_str(), nullptr) &&
+           CreateDirectoryW(lock_root().c_str(), nullptr) &&
            Stage(L"FamoRuntime.exe", L"FamoTestRuntime.exe") &&
            Stage(L"FamoTestEngine.dll", L"FamoRimeEngine.dll") &&
            Stage(L"FamoTextService.dll", L"FamoTextService.dll");
@@ -292,6 +293,7 @@ public:
     return directory_ + L"\\FamoTextService.dll";
   }
   std::wstring data_root() const { return directory_ + L"\\data"; }
+  std::wstring lock_root() const { return directory_ + L"\\locks"; }
   std::wstring source(const wchar_t *name) const {
     return ModuleDirectory() + L"\\" + name;
   }
@@ -305,6 +307,7 @@ public:
       DeleteFileW((directory_ + L"\\" + name).c_str());
     staged_.clear();
     RemoveDataRoot();
+    RemoveLockRoot();
     if (created_ && RemoveDirectoryW(directory_.c_str()))
       created_ = false;
   }
@@ -313,6 +316,9 @@ private:
   // The runtime only ever writes flat control state here, so one non-recursive
   // sweep is enough and cannot reach outside the staged directory.
   void RemoveDataRoot() {
+    const std::wstring log_directory = data_root() + L"\\log";
+    DeleteFileW((log_directory + L"\\famo-runtime-startup.log").c_str());
+    RemoveDirectoryW(log_directory.c_str());
     const std::wstring pattern = data_root() + L"\\*";
     WIN32_FIND_DATAW found{};
     const HANDLE search = FindFirstFileW(pattern.c_str(), &found);
@@ -324,6 +330,22 @@ private:
       FindClose(search);
     }
     RemoveDirectoryW(data_root().c_str());
+  }
+
+  void RemoveLockRoot() {
+    const std::wstring lock_directory = lock_root() + L"\\Famo.UserDataLocks";
+    const std::wstring pattern = lock_directory + L"\\*";
+    WIN32_FIND_DATAW found{};
+    const HANDLE search = FindFirstFileW(pattern.c_str(), &found);
+    if (search != INVALID_HANDLE_VALUE) {
+      do {
+        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+          DeleteFileW((lock_directory + L"\\" + found.cFileName).c_str());
+      } while (FindNextFileW(search, &found));
+      FindClose(search);
+    }
+    RemoveDirectoryW(lock_directory.c_str());
+    RemoveDirectoryW(lock_root().c_str());
   }
 
   bool Stage(const wchar_t *from, const wchar_t *to) {
@@ -347,14 +369,45 @@ public:
   ~ProbeRuntime() { Stop(); }
 
   bool Start(const std::wstring &executable, const std::wstring &suffix,
-             const std::wstring &data_root) {
+             const std::wstring &data_root, const std::wstring &lock_root) {
     std::wstring command = L"\"" + executable + L"\" --endpoint-suffix " +
                            suffix + L" --data-root \"" + data_root + L"\"";
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
-    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, ModuleDirectory().c_str(),
-                        &startup, &process_)) {
+    // This runtime owns a throwaway data root. Keep its test-only user-data
+    // lock private as well so an installed Runtime (or an MSIX-hosted runner's
+    // LOCALAPPDATA virtualization) cannot affect the probe verdict.
+    constexpr wchar_t kLockRootEnvironment[] =
+        L"FAMO_TEST_USER_DATA_LOCK_LOCALAPPDATA";
+    const DWORD previous_size =
+        GetEnvironmentVariableW(kLockRootEnvironment, nullptr, 0);
+    std::wstring previous;
+    if (previous_size > 0) {
+      previous.assign(previous_size, L'\0');
+      const DWORD copied = GetEnvironmentVariableW(
+          kLockRootEnvironment, previous.data(), previous_size);
+      if (copied == 0 || copied >= previous_size)
+        return false;
+      previous.resize(copied);
+    }
+    if (!SetEnvironmentVariableW(kLockRootEnvironment, lock_root.c_str()))
+      return false;
+    const BOOL created = CreateProcessW(
+        nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+        nullptr, ModuleDirectory().c_str(), &startup, &process_);
+    const DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
+    const BOOL restored = SetEnvironmentVariableW(
+        kLockRootEnvironment, previous_size > 0 ? previous.c_str() : nullptr);
+    const DWORD restore_error = restored ? ERROR_SUCCESS : GetLastError();
+    if (!created || !restored) {
+      if (created) {
+        TerminateProcess(process_.hProcess, 1);
+        WaitForSingleObject(process_.hProcess, 5000);
+        CloseHandle(process_.hThread);
+        CloseHandle(process_.hProcess);
+        process_ = {};
+      }
+      SetLastError(created ? restore_error : create_error);
       return false;
     }
     CloseHandle(process_.hThread);
@@ -513,7 +566,8 @@ bool Run(Mode mode, ProbeResult *result) {
   result->runtime_source = staged.source(L"FamoRuntime.exe");
 
   ProbeRuntime runtime;
-  if (!runtime.Start(staged.runtime(), suffix, staged.data_root())) {
+  if (!runtime.Start(staged.runtime(), suffix, staged.data_root(),
+                     staged.lock_root())) {
     Fail("runtime_start",
          "FamoRuntime did not reach a serving pipe and a candidate window");
     return false;
