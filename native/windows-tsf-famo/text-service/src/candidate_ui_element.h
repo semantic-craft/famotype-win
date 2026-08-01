@@ -90,8 +90,10 @@ public:
 
 private:
   ~CandidateUiElement();
+  HRESULT RequireOwnerThread() const noexcept;
 
   std::atomic<ULONG> references_{1};
+  DWORD owner_thread_id_ = 0;
   ComPtr<ITfUIElementMgr> manager_;
   ComPtr<ITfDocumentMgr> document_;
   std::vector<std::wstring> candidates_;

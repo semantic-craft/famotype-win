@@ -28,10 +28,12 @@
 // production code; only the engine behind them is the deterministic test engine,
 // which is what makes repeated runs comparable. The engine is not a party to the
 // pbShow negotiation this probe judges. Real-application acceptance is T7.
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <ctffunc.h>
@@ -291,6 +293,79 @@ Watch WatchWindow(std::string stage, DWORD process_id) {
     Sleep(10);
   }
 }
+
+// Covers the gaps between the fixed-duration stage watches: key callbacks and
+// Behavior/Integratable COM calls can synchronously change Runtime UI state.
+// This worker never touches COM; it continuously samples only the candidate
+// window owned by the exact Runtime process this probe started.
+class ContinuousVisibilityWatch {
+public:
+  explicit ContinuousVisibilityWatch(DWORD process_id)
+      : process_id_(process_id) {}
+  ~ContinuousVisibilityWatch() { Stop(); }
+
+  bool Start() {
+    if (process_id_ == 0 || worker_.joinable())
+      return false;
+    stop_.store(false, std::memory_order_release);
+    ready_.store(false, std::memory_order_release);
+    try {
+      worker_ = std::thread([this] { Run(); });
+    } catch (...) {
+      return false;
+    }
+    while (!ready_.load(std::memory_order_acquire))
+      SwitchToThread();
+    return true;
+  }
+
+  Watch Finish(std::string stage) {
+    Stop();
+    Watch result;
+    result.stage = std::move(stage);
+    result.present = present_;
+    result.ever_visible = ever_visible_;
+    result.final_visible = final_visible_;
+    result.rect = rect_;
+    return result;
+  }
+
+private:
+  void Sample() noexcept {
+    const HWND window = FindCandidateWindow(process_id_);
+    present_ = window != nullptr;
+    final_visible_ = window && IsWindowVisible(window);
+    ever_visible_ = ever_visible_ || final_visible_;
+    if (window)
+      GetWindowRect(window, &rect_);
+  }
+
+  void Run() noexcept {
+    Sample();
+    ready_.store(true, std::memory_order_release);
+    while (!stop_.load(std::memory_order_acquire)) {
+      Sleep(1);
+      Sample();
+    }
+    Sample();
+  }
+
+  void Stop() noexcept {
+    if (!worker_.joinable())
+      return;
+    stop_.store(true, std::memory_order_release);
+    worker_.join();
+  }
+
+  DWORD process_id_ = 0;
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> ready_{false};
+  std::thread worker_;
+  bool present_ = false;
+  bool ever_visible_ = false;
+  bool final_visible_ = false;
+  RECT rect_{};
+};
 
 class ScopedCom {
 public:
@@ -657,12 +732,23 @@ struct ProbeResult {
   bool sink_advised = false;
   bool session_ready = false;
   bool show_false_sent = false;
+  bool continuous_visibility_started = false;
   bool clean_shutdown = false;
 };
 
 void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
            FakeTextStore *store, ITfUIElementMgr *manager,
            UiElementSink *sink, DWORD runtime_pid, ProbeResult *result) {
+  ContinuousVisibilityWatch continuous_visibility(runtime_pid);
+  result->continuous_visibility_started = continuous_visibility.Start();
+  Expect(result->continuous_visibility_started, "continuous_window_watch",
+         "the full-drive candidate-window monitor could not start");
+  const auto finish_visibility = [&] {
+    if (result->continuous_visibility_started) {
+      result->watches.push_back(
+          continuous_visibility.Finish("full_drive"));
+    }
+  };
   result->watches.push_back(WatchWindow("before_keys", runtime_pid));
 
   for (const WPARAM key : {'N', 'I', 'H', 'A', 'O'}) {
@@ -696,6 +782,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
       result->document_after_action = store->text();
       result->watches.push_back(
           WatchWindow("after_behavior_select", runtime_pid));
+      finish_visibility();
       return;
     }
 
@@ -714,6 +801,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
       result->candidates_final = ReadCandidateList(interfaces.behavior.get());
       result->watches.push_back(
           WatchWindow("after_behavior_finalize", runtime_pid));
+      finish_visibility();
       return;
     }
 
@@ -727,6 +815,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
       result->candidates_final = result->candidates_after_action;
       result->watches.push_back(
           WatchWindow("after_behavior_abort", runtime_pid));
+      finish_visibility();
       return;
     }
 
@@ -753,6 +842,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
       result->candidates_final = result->candidates_after_action;
       result->watches.push_back(
           WatchWindow("after_integratable_key", runtime_pid));
+      finish_visibility();
       return;
     }
 
@@ -774,6 +864,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
       result->candidates_final = ReadCandidateList(interfaces.behavior.get());
       result->watches.push_back(
           WatchWindow("after_invalid_then_exact_finalize", runtime_pid));
+      finish_visibility();
       return;
     }
 
@@ -781,6 +872,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
          "the requested candidate-control interface was unavailable");
     result->watches.push_back(
         WatchWindow("after_missing_candidate_control", runtime_pid));
+    finish_visibility();
     return;
   }
 
@@ -799,6 +891,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
   PumpMessages();
   result->commit = store->text();
   result->watches.push_back(WatchWindow("after_commit", runtime_pid));
+  finish_visibility();
 }
 
 bool Run(Mode mode, ProbeResult *result) {
@@ -1067,10 +1160,22 @@ void Check(Mode mode, const ProbeResult &result) {
     Expect(!candidates->ever_visible, "window_denied",
            "the self-drawn candidate window appeared although the host answered "
            "pbShow=FALSE");
+    const Watch *full_drive = watch("full_drive");
+    Expect(result.continuous_visibility_started && full_drive &&
+               !full_drive->ever_visible,
+           "window_denied_full_drive",
+           "continuous monitoring did not prove the self-drawn window stayed "
+           "hidden throughout the key and candidate-control calls");
   } else {
     Expect(candidates->ever_visible, "window_shown",
            "the self-drawn candidate window never appeared although the host "
            "answered pbShow=TRUE");
+    const Watch *full_drive = watch("full_drive");
+    Expect(result.continuous_visibility_started && full_drive &&
+               full_drive->ever_visible,
+           "window_shown_full_drive",
+           "the full-drive monitor did not observe the allowed candidate "
+           "window positive control");
   }
 
   if (mode == Mode::ShowFalse) {
@@ -1096,6 +1201,12 @@ void Check(Mode mode, const ProbeResult &result) {
   const Watch *finished = watch(final_stage);
   Expect(finished && !finished->final_visible, "window_hidden_after_action",
          "the candidate window was visible after the mode's final action");
+  if (!HostAllowsSelfDraw(mode)) {
+    Expect(finished && !finished->ever_visible,
+           "window_never_shown_after_action",
+           "the self-drawn candidate window appeared after the host answered "
+           "pbShow=FALSE");
+  }
 }
 
 void Report(Mode mode, const ProbeResult &result) {
@@ -1114,6 +1225,8 @@ void Report(Mode mode, const ProbeResult &result) {
               JsonBool(result.service_activated));
   std::printf("  \"session_ready\": %s,\n", JsonBool(result.session_ready));
   std::printf("  \"show_false_sent\": %s,\n", JsonBool(result.show_false_sent));
+  std::printf("  \"continuous_visibility_started\": %s,\n",
+              JsonBool(result.continuous_visibility_started));
 
   std::printf("  \"element_events\": [\n");
   for (size_t index = 0; index < result.events.size(); ++index) {

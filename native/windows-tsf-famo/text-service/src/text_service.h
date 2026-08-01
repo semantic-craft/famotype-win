@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -244,11 +245,16 @@ private:
       ContextEntry *entry, const runtime::DeliveryReference &reference,
       const runtime::Composition &composition,
       const std::string **commit_override) const;
+  static std::string_view HostInlinePreedit(
+      const runtime::Composition &composition) noexcept;
+  static std::string_view ExactCompositionText(
+      const runtime::Composition &composition) noexcept;
   bool RenewSelectionCapability(ContextEntry *entry,
                                 uint64_t composition_sequence) noexcept;
   HRESULT ApplyRuntimeComposition(ContextEntry *entry,
                                   const runtime::Composition &composition,
-                                  const std::string *commit_override = nullptr);
+                                  const std::string *commit_override = nullptr)
+      noexcept;
   void RetireAbandonedSession(
       const runtime::DeliveryReference &reference);
   void RecoverConnection();

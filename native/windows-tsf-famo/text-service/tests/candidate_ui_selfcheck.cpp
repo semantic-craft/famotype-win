@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cstdio>
+#include <thread>
 
 #include "candidate_ui_element.h"
 #include "famo_guids.h"
@@ -272,7 +273,7 @@ int RunChecks() {
   CHECK(integratable->SetIntegrationStyle(famo::tsf::kIntegrationStyleSearchBox) ==
         S_OK);
   // An unknown style is refused rather than silently accepted.
-  CHECK(integratable->SetIntegrationStyle(GUID_NULL) == E_INVALIDARG);
+  CHECK(integratable->SetIntegrationStyle(GUID_NULL) == E_NOTIMPL);
 
   TfIntegratableCandidateListSelectionStyle style = STYLE_IMPLIED_SELECTION;
   CHECK(SUCCEEDED(integratable->GetSelectionStyle(&style)));
@@ -300,6 +301,54 @@ int RunChecks() {
   CHECK(integratable->GetSelectionStyle(nullptr) == E_POINTER);
   CHECK(integratable->ShowCandidateNumbers(nullptr) == E_POINTER);
   CHECK(integratable->OnKeyDown('2', 0, nullptr) == E_POINTER);
+
+  // TSF owns this element on the activation thread. Every Behavior and
+  // Integratable entry point must reject a direct cross-thread call before it
+  // reads or mutates element state or reaches the host callback.
+  HRESULT wrong_thread_results[8]{};
+  TfIntegratableCandidateListSelectionStyle wrong_thread_style =
+      STYLE_ACTIVE_SELECTION;
+  BOOL wrong_thread_eaten = TRUE;
+  BOOL wrong_thread_numbers = FALSE;
+  const int behaviors_before_wrong_thread = host.behaviors;
+  const int keys_before_wrong_thread = host.keys;
+  std::thread wrong_thread([&] {
+    wrong_thread_results[0] = behavior->SetSelection(0);
+    wrong_thread_results[1] = behavior->Finalize();
+    wrong_thread_results[2] = behavior->Abort();
+    wrong_thread_results[3] =
+        integratable->SetIntegrationStyle(
+            famo::tsf::kIntegrationStyleSearchBox);
+    wrong_thread_results[4] =
+        integratable->GetSelectionStyle(&wrong_thread_style);
+    wrong_thread_results[5] =
+        integratable->OnKeyDown('2', 0, &wrong_thread_eaten);
+    wrong_thread_results[6] =
+        integratable->ShowCandidateNumbers(&wrong_thread_numbers);
+    wrong_thread_results[7] =
+        integratable->FinalizeExactCompositionString();
+  });
+  wrong_thread.join();
+  for (HRESULT result : wrong_thread_results)
+    CHECK(result == RPC_E_WRONG_THREAD);
+  CHECK(wrong_thread_eaten == TRUE && wrong_thread_numbers == FALSE);
+  CHECK(host.behaviors == behaviors_before_wrong_thread &&
+        host.keys == keys_before_wrong_thread);
+
+  // A host may retain the COM element after EndUIElement. Methods that would
+  // reach the live context must reject that stale element; Abort stays locally
+  // idempotent without calling the still-active text service.
+  CHECK(SUCCEEDED(host_drawn->Update(cleared)) && !host_drawn->begun());
+  const int behaviors_before_end = host.behaviors;
+  const int keys_before_end = host.keys;
+  CHECK(behavior->Finalize() == E_FAIL);
+  CHECK(behavior->Abort() == S_OK);
+  CHECK(integratable->FinalizeExactCompositionString() == E_FAIL);
+  BOOL ended_eaten = TRUE;
+  CHECK(integratable->OnKeyDown('2', 0, &ended_eaten) == E_FAIL);
+  CHECK(ended_eaten == FALSE);
+  CHECK(host.behaviors == behaviors_before_end && host.keys == keys_before_end);
+  CHECK(SUCCEEDED(host_drawn->Update(Snapshot())) && host_drawn->begun());
 
   // A detached element must never call back into a released host.
   const int before_detach = host.changes;

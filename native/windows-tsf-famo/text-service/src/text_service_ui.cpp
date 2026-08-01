@@ -120,7 +120,7 @@ HRESULT TextService::OnCandidateBehavior(CandidateUiElement *element,
   if (behavior == CandidateBehavior::FinalizeExact) {
     // Copy before reserving a sequence: allocation failure must not strand the
     // ContextState with a request that was never sent.
-    exact_commit = entry->state.displayed().preedit;
+    exact_commit = ExactCompositionText(entry->state.displayed());
     if (exact_commit.empty())
       return E_FAIL;
   }

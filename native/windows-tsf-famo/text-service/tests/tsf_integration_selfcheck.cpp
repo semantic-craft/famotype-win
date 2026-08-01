@@ -904,6 +904,31 @@ bool HostDrivenCandidateBehaviorMatchesRuntime(TextServiceModule *module,
         CHECK(SendKey(key_sink, context, 'I', true));
         CHECK(SendKey(key_sink, context, '2', true));
         CHECK(store->text() == L"\u5c3c\u4f60nihao\u5c3c");
+
+        // Runtime has durably cleared the engine before the host-side exact
+        // commit is applied. An allocation failure at that boundary must be
+        // retained as deferred delivery, then applied exactly once on retry
+        // without wedging the authenticated session.
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(SendKey(key_sink, context, 'H', true));
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(SendKey(key_sink, context, 'O', true));
+        CHECK(store->text() == L"\u5c3c\u4f60nihao\u5c3cnihao");
+        {
+          ScopedEnvironment fail_apply_once(
+              "FAMO_TEST_APPLY_COMPOSITION_ALLOCATION_FAILURE_ONCE", "1");
+          CHECK(integratable->FinalizeExactCompositionString() == S_OK);
+        }
+        CHECK(store->text() == L"\u5c3c\u4f60nihao\u5c3cnihao");
+        CHECK(TestKey(key_sink, context, 'N', true));
+        UINT after_deferred_exact = 1;
+        CHECK(SUCCEEDED(behavior->GetCount(&after_deferred_exact)) &&
+              after_deferred_exact == 0);
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(store->text() == L"\u5c3c\u4f60nihao\u5c3cnihaon");
+        CHECK(behavior->Abort() == S_OK);
+        CHECK(store->text() == L"\u5c3c\u4f60nihao\u5c3cnihao");
         return true;
       });
   const bool runtime_finished = runtime.Finish();
@@ -936,6 +961,109 @@ bool NonEmptyExactClearReplyQuarantines(TextServiceModule *module,
         CHECK(store->text() == L"ni");
         CHECK(behavior->SetSelection(1) == E_FAIL);
         CHECK(behavior->Finalize() == E_FAIL);
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool ExactFinalizationUsesHostVisibleCandidatePreview(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 1, true, 0, -1, -1, -1,
+                      true));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(SendKey(key_sink, context, 'H', true));
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(SendKey(key_sink, context, 'O', true));
+        // Candidate-preview style replaces raw "nihao" in the host
+        // composition with the currently highlighted candidate.
+        CHECK(store->text() == L"\u4f60\u597d");
+        ComPtr<ITfCandidateListUIElementBehavior> behavior;
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+        ComPtr<ITfIntegratableCandidateListUIElement> integratable;
+        CHECK(SUCCEEDED(behavior->QueryInterface(
+            IID_ITfIntegratableCandidateListUIElement,
+            reinterpret_cast<void **>(integratable.put()))));
+
+        CHECK(integratable->FinalizeExactCompositionString() == S_OK);
+        CHECK(store->text() == L"\u4f60\u597d");
+        UINT after_exact = 1;
+        CHECK(SUCCEEDED(behavior->GetCount(&after_exact)) && after_exact == 0);
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool ExactFinalizationWithoutInlinePreeditUsesRawComposition(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 1, false));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(SendKey(key_sink, context, 'H', true));
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(SendKey(key_sink, context, 'O', true));
+        // The runtime candidate window still shows raw preedit even when the
+        // host document has disabled inline preedit.
+        CHECK(store->text().empty());
+        ComPtr<ITfCandidateListUIElementBehavior> behavior;
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+        ComPtr<ITfIntegratableCandidateListUIElement> integratable;
+        CHECK(SUCCEEDED(behavior->QueryInterface(
+            IID_ITfIntegratableCandidateListUIElement,
+            reinterpret_cast<void **>(integratable.put()))));
+
+        CHECK(integratable->FinalizeExactCompositionString() == S_OK);
+        CHECK(store->text() == L"nihao");
+        UINT after_exact = 1;
+        CHECK(SUCCEEDED(behavior->GetCount(&after_exact)) && after_exact == 0);
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool ExactFinalizationBypassesCommitTransforms(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 1, false, 0, -1, -1, -1,
+                      false, true));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(SendKey(key_sink, context, '1', true));
+        CHECK(store->text() == L"\u4f60");
+        CHECK(SendKey(key_sink, context, 'H', true));
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(SendKey(key_sink, context, 'O', true));
+        CHECK(store->text() == L"\u4f60");
+        ComPtr<ITfCandidateListUIElementBehavior> behavior;
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+        ComPtr<ITfIntegratableCandidateListUIElement> integratable;
+        CHECK(SUCCEEDED(behavior->QueryInterface(
+            IID_ITfIntegratableCandidateListUIElement,
+            reinterpret_cast<void **>(integratable.put()))));
+
+        CHECK(integratable->FinalizeExactCompositionString() == S_OK);
+        // Ordinary commits add CJK/English spacing under this style. Exact
+        // finalization must preserve the displayed raw value byte-for-byte.
+        CHECK(store->text() == L"\u4f60hao");
+        UINT after_exact = 1;
+        CHECK(SUCCEEDED(behavior->GetCount(&after_exact)) && after_exact == 0);
         return true;
       });
   const bool runtime_finished = runtime.Finish();
@@ -2370,6 +2498,11 @@ bool AllTextStoreChecks(const wchar_t *module_path,
       &module, runtime_path));
   CHECK(HostDrivenCandidateBehaviorMatchesRuntime(&module, runtime_path));
   CHECK(NonEmptyExactClearReplyQuarantines(&module, runtime_path));
+  CHECK(ExactFinalizationUsesHostVisibleCandidatePreview(&module,
+                                                         runtime_path));
+  CHECK(ExactFinalizationWithoutInlinePreeditUsesRawComposition(
+      &module, runtime_path));
+  CHECK(ExactFinalizationBypassesCommitTransforms(&module, runtime_path));
   CHECK(CandidateBehaviorAfterDeactivationFailsSafely(&module, runtime_path));
   CHECK(FaultFailsOpen(&module, runtime_path, L"engine-hang"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"disconnect"));
