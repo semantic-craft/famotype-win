@@ -86,11 +86,15 @@ HRESULT CandidateUiElement::QueryInterface(REFIID iid, void **object) {
   if (!object)
     return E_POINTER;
   *object = nullptr;
-  // Single inheritance chain up to IUnknown, so one cast serves every IID.
+  // One chain runs IUnknown -> ITfUIElement -> ITfCandidateListUIElement ->
+  // ...Behavior, so a single cast serves all four. Integratable is a second
+  // branch off IUnknown and needs its own cast to a different address.
   if (iid == IID_IUnknown || iid == IID_ITfUIElement ||
       iid == IID_ITfCandidateListUIElement ||
       iid == IID_ITfCandidateListUIElementBehavior)
     *object = static_cast<ITfCandidateListUIElementBehavior *>(this);
+  else if (iid == IID_ITfIntegratableCandidateListUIElement)
+    *object = static_cast<ITfIntegratableCandidateListUIElement *>(this);
   if (!*object)
     return E_NOINTERFACE;
   AddRef();
@@ -245,6 +249,52 @@ HRESULT CandidateUiElement::Abort() {
                ? host_->OnCandidateBehavior(this, CandidateBehavior::Abort, 0)
                : E_FAIL;
   });
+}
+
+HRESULT CandidateUiElement::SetIntegrationStyle(GUID style) {
+  // Search box is the only style Windows defines. Refusing the rest keeps the
+  // host from assuming an integration Famo has not been told how to honour.
+  if (!IsEqualGUID(style, kIntegrationStyleSearchBox))
+    return E_INVALIDARG;
+  integration_style_ = style;
+  return S_OK;
+}
+
+HRESULT CandidateUiElement::GetSelectionStyle(
+    TfIntegratableCandidateListSelectionStyle *style) {
+  if (!style)
+    return E_POINTER;
+  // The engine always carries a highlighted candidate on the current page, and
+  // that candidate is exactly what a commit would produce, so the selection is
+  // active rather than a default the user has not landed on.
+  *style = STYLE_ACTIVE_SELECTION;
+  return S_OK;
+}
+
+HRESULT CandidateUiElement::OnKeyDown(WPARAM key, LPARAM key_data,
+                                      BOOL *eaten) {
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  return ComBoundary([&] {
+    return host_ ? host_->OnCandidateKeyDown(this, key, key_data, eaten)
+                 : E_FAIL;
+  });
+}
+
+HRESULT CandidateUiElement::ShowCandidateNumbers(BOOL *show) {
+  if (!show)
+    return E_POINTER;
+  // GetString publishes candidate text only; the engine's own labels never
+  // reach the host, so it has to draw the numbers for selection to be usable.
+  *show = TRUE;
+  return S_OK;
+}
+
+HRESULT CandidateUiElement::FinalizeExactCompositionString() {
+  // "Exact" means commit what the user is currently being shown, which is the
+  // highlighted candidate — the same runtime verb as Behavior::Finalize.
+  return Finalize();
 }
 
 } // namespace famo::tsf

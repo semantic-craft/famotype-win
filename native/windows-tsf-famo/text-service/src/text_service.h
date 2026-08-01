@@ -77,6 +77,8 @@ public:
   void OnCandidateVisibilityChanged(CandidateUiElement *element) override;
   HRESULT OnCandidateBehavior(CandidateUiElement *element,
                               CandidateBehavior behavior, UINT index) override;
+  HRESULT OnCandidateKeyDown(CandidateUiElement *element, WPARAM key,
+                             LPARAM key_data, BOOL *eaten) override;
 
 private:
   enum class DeliveryWorkKind { Recover, Cancel, Ack };
@@ -200,6 +202,7 @@ private:
                     const runtime::Correlation &identity,
                     runtime::Status status) const;
   ContextEntry *FindContext(ITfContext *context);
+  ContextEntry *FindContextByCandidateElement(CandidateUiElement *element);
   void CloseContext(ITfContext *context);
   bool CloseEntry(ContextEntry *entry);
   HRESULT HandleKey(ITfContext *context, WPARAM key, LPARAM key_data,
