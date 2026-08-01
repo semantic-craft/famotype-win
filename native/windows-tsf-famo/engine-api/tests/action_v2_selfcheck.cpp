@@ -558,6 +558,7 @@ int main() {
   CHECK(host.v2_api().execute_action(context, &request, &result) ==
         FAMO_ENGINE_OK);
   CHECK(result->handled == 1);
+  CHECK(result->view.highlighted_index == 1);
   CHECK(host.FreeResultV2(result) == FAMO_ENGINE_OK);
 
   request = Request(FAMO_ENGINE_ACTION_CHANGE_PAGE);
@@ -590,7 +591,27 @@ int main() {
   CHECK(host.v2_api().execute_action(context, &request, &result) ==
         FAMO_ENGINE_OK);
   CHECK(Equals(result->view.preedit, "ni"));  // peek is non-mutating
+  CHECK(result->view.highlighted_index == 1);
   CHECK(host.FreeResultV2(result) == FAMO_ENGINE_OK);
+
+  request = Request(FAMO_ENGINE_ACTION_COMMIT_COMPOSITION);
+  result = nullptr;
+  CHECK(host.v2_api().execute_action(context, &request, &result) ==
+        FAMO_ENGINE_OK);
+  CHECK(result->handled == 1);
+  CHECK(Equals(result->view.commit, "\xE5\xB0\xBC"));  // 尼
+  CHECK(host.FreeResultV2(result) == FAMO_ENGINE_OK);
+
+  request = Request(FAMO_ENGINE_ACTION_PROCESS_KEY);
+  request.key.size = static_cast<uint32_t>(sizeof(request.key));
+  request.key.is_key_down = 1;
+  for (const uint32_t key : selection_keys) {
+    request.key.virtual_key = key;
+    result = nullptr;
+    CHECK(host.v2_api().execute_action(context, &request, &result) ==
+          FAMO_ENGINE_OK);
+    CHECK(host.FreeResultV2(result) == FAMO_ENGINE_OK);
+  }
 
   request = Request(FAMO_ENGINE_ACTION_SELECT_CANDIDATE_ABSOLUTE);
   request.index = 2;

@@ -263,7 +263,8 @@ void FillView(const std::string& buffer, const std::string& commit, bool handled
 
 famo_action_v2::Snapshot SnapshotFor(const std::string& buffer,
                                      const std::string& commit,
-                                     uint32_t option_status_flags = 0) {
+                                     uint32_t option_status_flags = 0,
+                                     uint32_t highlighted_index = 0) {
   famo_action_v2::Snapshot snapshot;
   snapshot.preedit = buffer;
   snapshot.preedit_sel_end = static_cast<uint32_t>(snapshot.preedit.size());
@@ -304,6 +305,11 @@ famo_action_v2::Snapshot SnapshotFor(const std::string& buffer,
     candidate.flags = i == 0 ? FAMO_CANDIDATE_FLAG_DEFAULT : 0u;
     snapshot.candidates.push_back(std::move(candidate));
   }
+  snapshot.highlighted_index =
+      snapshot.candidates.empty()
+          ? 0u
+          : (std::min)(highlighted_index,
+                       static_cast<uint32_t>(snapshot.candidates.size() - 1));
   const bool multipage = !Environment("FAMO_TEST_MULTIPAGE").empty() &&
                          snapshot.candidates.size() > 1;
   snapshot.page_size =
@@ -316,7 +322,7 @@ famo_action_v2::Snapshot SnapshotFor(const std::string& buffer,
     snapshot.state_flags |= FAMO_COMPOSITION_HAS_CANDIDATES;
   snapshot.commit_preview =
       buffer.empty() || candidates.empty() ? std::string()
-                                           : candidates.front();
+                                           : candidates[snapshot.highlighted_index];
   snapshot.schema_id = "test";
   snapshot.schema_name = "Test Engine";
   snapshot.status_flags =
@@ -335,6 +341,7 @@ famo_action_v2::Snapshot SnapshotFor(const std::string& buffer,
 struct FamoEngineContext {
   std::string buffer;
   std::string pending_commit;
+  uint32_t highlighted_index = 0;
   std::map<std::string, std::string> properties;
   std::map<std::string, int32_t> options;
   bool recovery_required = false;
@@ -872,7 +879,7 @@ int32_t RecoverTestAction(
   if (!context->has_pending_snapshot) {
     famo_action_v2::Snapshot snapshot =
         SnapshotFor(context->buffer, context->recovery_commit,
-                    OptionStatusFlags(context));
+                    OptionStatusFlags(context), context->highlighted_index);
     if (!famo_action_v2::TrimOptionalToResultBudget(&snapshot))
       return FAMO_ENGINE_E_RUNTIME;
     context->pending_snapshot = std::move(snapshot);
@@ -911,7 +918,8 @@ int32_t FAMO_ENGINE_CALL TeExecuteActionV2(
     }
     if (request->action == FAMO_ENGINE_ACTION_STATUS) {
       famo_action_v2::Snapshot snapshot =
-          SnapshotFor(context->buffer, "", OptionStatusFlags(context));
+          SnapshotFor(context->buffer, "", OptionStatusFlags(context),
+                      context->highlighted_index);
       if (!famo_action_v2::TrimOptionalToResultBudget(&snapshot))
         return FAMO_ENGINE_E_RUNTIME;
       return g_v2_results.Publish(g_host, *request, false, snapshot,
@@ -956,6 +964,7 @@ int32_t FAMO_ENGINE_CALL TeExecuteActionV2(
     // receipt. After PrepareEmergency succeeds, the test engine changes only
     // scalars and moves already-owned strings until a final snapshot exists.
     std::string next_buffer = context->buffer;
+    uint32_t next_highlighted_index = context->highlighted_index;
     bool handled = false;
     std::string commit;
     switch (request->action) {
@@ -976,30 +985,40 @@ int32_t FAMO_ENGINE_CALL TeExecuteActionV2(
             if (*selected < candidates.size()) {
               commit = candidates[*selected];
               next_buffer.clear();
+              next_highlighted_index = 0;
               handled = true;
             }
           } else if (next_buffer.empty() && key >= '0' && key <= '9' &&
                      !Environment("FAMO_TEST_DIGIT_INPUT").empty()) {
             next_buffer.push_back(static_cast<char>(key));
+            next_highlighted_index = 0;
             handled = true;
           } else if (key >= 'a' && key <= 'z') {
             next_buffer.push_back(static_cast<char>(key));
+            next_highlighted_index = 0;
             handled = true;
           } else if (key >= 'A' && key <= 'Z') {
             next_buffer.push_back(static_cast<char>(key + 32));
+            next_highlighted_index = 0;
             handled = true;
           } else if (key == 8 && !next_buffer.empty()) {
             next_buffer.pop_back();
+            next_highlighted_index = 0;
             handled = true;
           } else if (key == 27 && !next_buffer.empty()) {
             next_buffer.clear();
+            next_highlighted_index = 0;
             handled = true;
           } else if ((key == ' ' || key == 13) &&
                      !next_buffer.empty()) {
             const auto candidates = CandidatesFor(next_buffer);
-            commit =
-                candidates.empty() ? next_buffer : candidates.front();
+            commit = candidates.empty()
+                         ? next_buffer
+                         : candidates[(std::min)(
+                               next_highlighted_index,
+                               static_cast<uint32_t>(candidates.size() - 1))];
             next_buffer.clear();
+            next_highlighted_index = 0;
             handled = true;
           }
         }
@@ -1012,6 +1031,7 @@ int32_t FAMO_ENGINE_CALL TeExecuteActionV2(
         if (Environment("FAMO_TEST_UNHANDLED_SELECTION").empty()) {
           commit = candidates[request->index];
           next_buffer.clear();
+          next_highlighted_index = 0;
           handled = true;
         }
         break;
@@ -1019,22 +1039,30 @@ int32_t FAMO_ENGINE_CALL TeExecuteActionV2(
       case FAMO_ENGINE_ACTION_COMMIT_COMPOSITION:
         if (!next_buffer.empty()) {
           const auto candidates = CandidatesFor(next_buffer);
-          commit =
-              candidates.empty() ? next_buffer : candidates.front();
+          commit = candidates.empty()
+                       ? next_buffer
+                       : candidates[(std::min)(
+                             next_highlighted_index,
+                             static_cast<uint32_t>(candidates.size() - 1))];
           if (!Environment("FAMO_TEST_FORMAT_COMMIT").empty())
             commit = "\xE3\x80\x8C" + commit + "\xE3\x80\x8D";  // 「...」
           next_buffer.clear();
+          next_highlighted_index = 0;
           handled = true;
         }
         break;
       case FAMO_ENGINE_ACTION_CLEAR_COMPOSITION:
         next_buffer.clear();
+        next_highlighted_index = 0;
+        if (!Environment("FAMO_TEST_NONEMPTY_CLEAR_REPLY").empty())
+          commit = "unexpected-clear";
         handled = true;
         break;
       case FAMO_ENGINE_ACTION_HIGHLIGHT_CANDIDATE: {
         const auto candidates = CandidatesFor(next_buffer);
         if (request->index >= candidates.size())
           return FAMO_ENGINE_E_INVALID_ARGUMENT;
+        next_highlighted_index = request->index;
         handled = true;
         break;
       }
@@ -1065,6 +1093,7 @@ int32_t FAMO_ENGINE_CALL TeExecuteActionV2(
     else if (request->action == FAMO_ENGINE_ACTION_COMMIT_COMPOSITION)
       ++context->commit_count;
     context->buffer = std::move(next_buffer);
+    context->highlighted_index = next_highlighted_index;
     context->recovery_commit = std::move(commit);
 
     famo_action_v2::Snapshot snapshot;
@@ -1072,7 +1101,8 @@ int32_t FAMO_ENGINE_CALL TeExecuteActionV2(
     if (!fail_snapshot) {
       try {
         snapshot = SnapshotFor(context->buffer, context->recovery_commit,
-                               OptionStatusFlags(context));
+                               OptionStatusFlags(context),
+                               context->highlighted_index);
         snapshot_complete =
             famo_action_v2::TrimOptionalToResultBudget(&snapshot);
       } catch (...) {
