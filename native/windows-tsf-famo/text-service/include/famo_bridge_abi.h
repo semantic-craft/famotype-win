@@ -5,7 +5,7 @@
 namespace famo::tsf {
 
 #ifndef FAMO_BRIDGE_ABI_VERSION
-#define FAMO_BRIDGE_ABI_VERSION 3
+#define FAMO_BRIDGE_ABI_VERSION 4
 #endif
 
 // Increment only when the installed TSF Bridge payload changes. Product and

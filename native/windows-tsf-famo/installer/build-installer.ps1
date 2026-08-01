@@ -24,7 +24,7 @@ if (-not $NativeOutput) {
   $NativeOutput = Join-Path $NativeDir 'text-service\build-msvc-installer-stable'
 }
 if (-not $BridgeArtifact) {
-  $BridgeArtifact = Join-Path $NativeDir 'text-service\build-bridge-v3-artifact'
+  $BridgeArtifact = Join-Path $NativeDir 'text-service\build-bridge-v4-artifact'
 }
 $PayloadDir = Join-Path $NativeDir 'famo-config\payload'
 $OverlayDir = Join-Path $NativeDir 'famo-config\overlay'
