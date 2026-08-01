@@ -2341,6 +2341,53 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void InnoSetup_RecleansTheExactDesktopUserAfterMachineUnregistration()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int remove = Position(iss, "procedure RemoveActiveInstall");
+        string body = iss[remove..Position(
+            iss, "procedure CurUninstallStepChanged", remove)];
+
+        int firstUserCleanup = Position(
+            body, "'cleanup-user-for ' + OriginalUserSid");
+        int machineUnregister = Position(
+            body, "UnregisterMachineTarget(ActiveTarget)", firstUserCleanup);
+        int finalPayloadValidation = Position(
+            body, "ValidateCurrentPayloadForExecution", machineUnregister);
+        int finalUserCleanup = Position(
+            body,
+            "'cleanup-user-for ' + OriginalUserSid",
+            finalPayloadValidation);
+        int persistIntent = Position(
+            body, "PersistUninstallIntent(", finalUserCleanup);
+        Assert.True(
+            firstUserCleanup < machineUnregister &&
+            machineUnregister < finalPayloadValidation &&
+            finalPayloadValidation < finalUserCleanup &&
+            finalUserCleanup < persistIntent);
+        Assert.Contains(
+            "active payload changed before final original-user cleanup",
+            body);
+    }
+
+    [Fact]
+    public void NativeHealthAudit_ReportsAnAbsentActiveTargetWithoutJoiningIt()
+    {
+        string health = RepoText(
+            "native/windows-tsf-famo/weasel-fork/tests/Test-FamoHealth.ps1");
+        int resources = Position(health, "$resourceProblems = @()");
+        string body = health[resources..Position(health, "Add-Check 'H8'", resources)];
+
+        int activePayload = Position(
+            body, "if (-not $notInstalled -and -not $noActivePayload)");
+        int absentTarget = Position(body, "if (-not $target)", activePayload);
+        int resourceScan = Position(body, "foreach ($relative", absentTarget);
+
+        Assert.True(activePayload < absentTarget && absentTarget < resourceScan);
+        Assert.Contains("active target missing", body);
+    }
+
+    [Fact]
     public void Installer_PersistsRecoveryCleanupDebtBeforeReady()
     {
         string iss = InstallerText("famo-setup.iss");
