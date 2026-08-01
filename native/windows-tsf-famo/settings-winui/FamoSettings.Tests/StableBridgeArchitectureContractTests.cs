@@ -18,12 +18,12 @@ public sealed class StableBridgeArchitectureContractTests
         Assert.Contains("/DBridgeAbi=$bridgeAbi", script);
         Assert.Contains("/DBridgeHash=$bridgeHash", script);
         Assert.Contains(
-            "text-service\\build-bridge-v3-artifact",
+            "text-service\\build-bridge-v4-artifact",
             script);
 
         string installer = RepoText(
             "native/windows-tsf-famo/installer/famo-setup.iss");
-        Assert.Contains("#define BridgeAbi \"3\"", installer);
+        Assert.Contains("#define BridgeAbi \"4\"", installer);
 
         int runtimeFiles = Position(script, "$runtimeFiles = @(");
         int runtimeFilesEnd = Position(script, ")", runtimeFiles);
@@ -97,7 +97,7 @@ public sealed class StableBridgeArchitectureContractTests
             "native/windows-tsf-famo/text-service/src/FamoTextService.rc.in");
 
         Assert.Contains("FAMO_BRIDGE_ABI", cmake);
-        Assert.Contains("set(FAMO_BRIDGE_ABI \"3\"", cmake);
+        Assert.Contains("set(FAMO_BRIDGE_ABI \"4\"", cmake);
         Assert.Contains("FamoTextService.rc.in", cmake);
         Assert.Contains("FILEVERSION @FAMO_BRIDGE_ABI@", resource);
         Assert.Contains("FileMajorPart", artifactBuilder);
@@ -157,6 +157,44 @@ public sealed class StableBridgeArchitectureContractTests
         Assert.Contains(
             "RegWriteStringValue(HKLM64, BrandKey, 'BridgeHash',",
             installer);
+    }
+
+    [Fact]
+    public void BridgeAbi_AllFourDeclarationSitesAgree()
+    {
+        // The v2 release bumped only the installer sites and shipped a 2.0.0.0
+        // DLL while the tree still declared ABI 1 — the pinned-literal checks
+        // above were updated selectively, which is exactly how that drift
+        // slipped through. This test does not pin a number: it parses the ABI
+        // out of every declaration site and requires them to be one value.
+        string cmake = RepoText(
+            "native/windows-tsf-famo/text-service/CMakeLists.txt");
+        string header = RepoText(
+            "native/windows-tsf-famo/text-service/include/famo_bridge_abi.h");
+        string installer = RepoText(
+            "native/windows-tsf-famo/installer/famo-setup.iss");
+        string build = RepoText(
+            "native/windows-tsf-famo/installer/build-installer.ps1");
+
+        string fromCmake = Extract(
+            cmake, "set\\(FAMO_BRIDGE_ABI \"(\\d+)\"");
+        string fromHeader = Extract(
+            header, "#define FAMO_BRIDGE_ABI_VERSION (\\d+)");
+        string fromInstaller = Extract(
+            installer, "#define BridgeAbi \"(\\d+)\"");
+        string fromBuildScript = Extract(
+            build, "build-bridge-v(\\d+)-artifact");
+
+        Assert.Equal(fromCmake, fromHeader);
+        Assert.Equal(fromCmake, fromInstaller);
+        Assert.Equal(fromCmake, fromBuildScript);
+    }
+
+    private static string Extract(string text, string pattern)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(text, pattern);
+        Assert.True(match.Success, $"expected ABI declaration: {pattern}");
+        return match.Groups[1].Value;
     }
 
     private static int Position(string text, string needle, int start = 0)
