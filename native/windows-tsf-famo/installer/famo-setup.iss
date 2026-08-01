@@ -7156,6 +7156,12 @@ begin
     RaiseException('active payload changed before machine unregister');
   if not UnregisterMachineTarget(ActiveTarget) then
     RaiseException('cannot unregister Famo profile');
+  if (ReadyAnchor and not ValidateCurrentPayloadForExecution) or
+     ((not ReadyAnchor) and not ValidatePreviousPayloadForExecution) then
+    RaiseException('active payload changed before final original-user cleanup');
+  if not RunAndRequire(ProfileTool(ActiveTarget),
+    'cleanup-user-for ' + OriginalUserSid, False) then
+    RaiseException('cannot finalize the original desktop user cleanup');
   RegDeleteValue(HKLM64, RunKey, 'FamoRuntime');
   if RegQueryStringValue(HKLM64,
     'Software\Classes\CLSID\' + StableClsid + '\InprocServer32', '', RegisteredDll) then
