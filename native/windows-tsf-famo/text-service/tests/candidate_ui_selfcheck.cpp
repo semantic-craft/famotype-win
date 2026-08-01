@@ -127,7 +127,7 @@ public:
   bool key_eaten = true;
   famo::tsf::CandidateUiElement *last = nullptr;
   famo::tsf::CandidateBehavior last_behavior =
-      famo::tsf::CandidateBehavior::Select;
+      famo::tsf::CandidateBehavior::Finalize;
   UINT last_index = 0;
   HRESULT result = S_OK;
 };
@@ -226,26 +226,30 @@ int RunChecks() {
       reinterpret_cast<void **>(behavior.put()))));
   CHECK(behavior.get() == static_cast<ITfCandidateListUIElement *>(host_drawn));
 
+  const int before_selection_updates = host_drawn_manager->updates;
   CHECK(behavior->SetSelection(2) == S_OK);
-  CHECK(host.behaviors == 1 && host.last == host_drawn &&
-        host.last_behavior == famo::tsf::CandidateBehavior::Select &&
-        host.last_index == 2);
+  CHECK(SUCCEEDED(behavior->GetSelection(&selection)) && selection == 2);
+  // SetSelection changes the UI-less host's current candidate; it must not
+  // choose or commit it until Finalize.
+  CHECK(host.behaviors == 0 &&
+        host_drawn_manager->updates == before_selection_updates + 1);
   CHECK(behavior->Finalize() == S_OK);
-  CHECK(host.behaviors == 2 &&
-        host.last_behavior == famo::tsf::CandidateBehavior::Finalize);
+  CHECK(host.behaviors == 1 && host.last == host_drawn &&
+        host.last_behavior == famo::tsf::CandidateBehavior::Finalize &&
+        host.last_index == 2);
   CHECK(behavior->Abort() == S_OK);
-  CHECK(host.behaviors == 3 &&
+  CHECK(host.behaviors == 2 &&
         host.last_behavior == famo::tsf::CandidateBehavior::Abort);
   // The host's verdict is the method's result.
   host.result = E_FAIL;
-  CHECK(behavior->Finalize() == E_FAIL && host.behaviors == 4);
+  CHECK(behavior->Finalize() == E_FAIL && host.behaviors == 3);
   host.result = S_OK;
   // An index outside the published page never reaches the runtime session.
-  CHECK(behavior->SetSelection(3) == E_INVALIDARG && host.behaviors == 4);
+  CHECK(behavior->SetSelection(3) == E_INVALIDARG && host.behaviors == 3);
   // Nor does one against a list the element has already ended.
   famo::runtime::Composition cleared;
   CHECK(SUCCEEDED(host_drawn->Update(cleared)) && !host_drawn->begun());
-  CHECK(behavior->SetSelection(0) == E_INVALIDARG && host.behaviors == 4);
+  CHECK(behavior->SetSelection(0) == E_INVALIDARG && host.behaviors == 3);
   CHECK(SUCCEEDED(host_drawn->Update(Snapshot())));
 
   // An integrated host — a search box — additionally drives keyboarding and

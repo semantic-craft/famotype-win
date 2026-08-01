@@ -13,7 +13,7 @@
 namespace famo::tsf {
 
 // What the application asked for through ITfCandidateListUIElementBehavior.
-enum class CandidateBehavior { Select, Finalize, Abort };
+enum class CandidateBehavior { Finalize, Abort };
 
 // Back-channel from the UI element to the owning text service. Declared here
 // rather than taking a TextService* because candidate_ui_selfcheck links
@@ -23,8 +23,8 @@ public:
   // The element's effective visibility changed outside of Update() — the host
   // called ITfUIElement::Show(). Republish the runtime UI state.
   virtual void OnCandidateVisibilityChanged(class CandidateUiElement *element) = 0;
-  // The application drove the candidate list itself. index is page-relative
-  // and is read only for CandidateBehavior::Select.
+  // The application finalized or aborted the candidate list itself. index is
+  // the page-relative selection and is read only for Finalize.
   virtual HRESULT OnCandidateBehavior(class CandidateUiElement *element,
                                       CandidateBehavior behavior,
                                       UINT index) = 0;
