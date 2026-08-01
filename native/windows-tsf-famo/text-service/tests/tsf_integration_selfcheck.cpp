@@ -237,6 +237,23 @@ bool AllocationBoundariesReleaseReferences(TextServiceModule *module) {
   }
   CHECK(module->CanUnload());
 
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+  {
+    ScopedEnvironment fail_context_insert(
+        "FAMO_TEST_CONTEXT_INSERT_ALLOCATION_FAILURE", "1");
+    ComPtr<ITfTextInputProcessorEx> rejected;
+    CHECK(module->CreateForTest(thread_manager.get(), client_id,
+                                rejected.put()) == E_OUTOFMEMORY);
+    CHECK(!rejected);
+  }
+  CHECK(module->CanUnload());
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+
   ComPtr<ITfTextInputProcessorEx> service;
   CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
                                         service.put())));
@@ -1714,6 +1731,560 @@ bool ForegroundFocusRecyclesRuntimeConnection(
   return true;
 }
 
+bool SetKeyboardDisabled(ITfContext *context, TfClientId client_id,
+                         bool value) {
+  ComPtr<ITfCompartmentMgr> compartments;
+  CHECK(SUCCEEDED(context->QueryInterface(
+      IID_ITfCompartmentMgr, reinterpret_cast<void **>(compartments.put()))));
+  ComPtr<ITfCompartment> disabled;
+  CHECK(SUCCEEDED(compartments->GetCompartment(
+      GUID_COMPARTMENT_KEYBOARD_DISABLED, disabled.put())));
+  VARIANT setting;
+  VariantInit(&setting);
+  setting.vt = VT_I4;
+  setting.lVal = value ? 1 : 0;
+  const HRESULT result = disabled->SetValue(client_id, &setting);
+  VariantClear(&setting);
+  return SUCCEEDED(result);
+}
+
+bool HasActiveComposition(ITfContext *context, bool *active) {
+  CHECK(context && active);
+  *active = false;
+  ComPtr<ITfContextOwnerCompositionServices> services;
+  CHECK(SUCCEEDED(context->QueryInterface(
+      IID_ITfContextOwnerCompositionServices,
+      reinterpret_cast<void **>(services.put()))));
+  ComPtr<IEnumITfCompositionView> compositions;
+  CHECK(SUCCEEDED(services->EnumCompositions(compositions.put())));
+  ITfCompositionView *raw = nullptr;
+  ULONG fetched = 0;
+  const HRESULT next = compositions->Next(1, &raw, &fetched);
+  if (raw)
+    raw->Release();
+  CHECK(next == S_OK || next == S_FALSE);
+  *active = next == S_OK && fetched == 1;
+  return true;
+}
+
+bool DisabledKeyboardContextPassesKeysThrough(TextServiceModule *module,
+                                              const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  ComPtr<ITfThreadMgrEventSink> thread_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfThreadMgrEventSink, reinterpret_cast<void **>(thread_sink.put()))));
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  // A disabled context must fail open before a Runtime session is scheduled.
+  // Waiting proves the disabled context never starts eating keys later.
+  TestDocument password;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &password));
+  CHECK(SetKeyboardDisabled(password.context.get(), client_id, true));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(password.document.get())));
+  CHECK(SUCCEEDED(thread_sink->OnSetFocus(password.document.get(),
+                                          target.document.get())));
+  const auto disabled_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (std::chrono::steady_clock::now() < disabled_deadline) {
+    CHECK(TestKey(key_sink.get(), password.context.get(), 'N', false));
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(SendKey(key_sink.get(), password.context.get(), 'N', false));
+  CHECK(password.store->text().empty());
+
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+  CHECK(SUCCEEDED(thread_sink->OnSetFocus(target.document.get(),
+                                          password.document.get())));
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'N', true));
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'I', true));
+  CHECK(target.store->text() == L"ni");
+  bool composing = false;
+  CHECK(HasActiveComposition(target.context.get(), &composing) && composing);
+  ComPtr<ITfCandidateListUIElementBehavior> behavior;
+  CHECK(FindCandidateBehavior(thread_manager.get(), behavior.put()));
+  HWND original_preview_target = nullptr;
+  famo::runtime::PreviewSelectionRequest original_preview;
+  CHECK(module->PreviewSelectionStateForTest(
+      service.get(), &original_preview_target, &original_preview));
+
+  // Hosts can disable a context while it is focused. The TIP must end its
+  // existing composition and candidate element before passing later keys on.
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, true));
+  CHECK(HasActiveComposition(target.context.get(), &composing) && !composing);
+  ComPtr<ITfCandidateListUIElementBehavior> hidden_behavior;
+  CHECK(!FindCandidateBehavior(thread_manager.get(), hidden_behavior.put()));
+  CHECK(FAILED(behavior->SetSelection(0)));
+
+  CHECK(TestKey(key_sink.get(), target.context.get(), 'N', false));
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'N', false));
+  CHECK(target.store->text() == L"ni");
+
+  behavior.reset();
+
+  // Re-enabling the same focused context must use a fresh Runtime session,
+  // never the state that was retired at the security boundary.
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, false));
+  const auto reenabled_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'H', true) &&
+         std::chrono::steady_clock::now() < reenabled_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < reenabled_deadline);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'H', true));
+  CHECK(target.store->text().find(L'h') != std::wstring::npos);
+  const std::wstring reenabled_text = target.store->text();
+  CHECK(HasActiveComposition(target.context.get(), &composing) && composing);
+  ComPtr<ITfCandidateListUIElementBehavior> retry_behavior;
+  CHECK(FindCandidateBehavior(thread_manager.get(), retry_behavior.put()));
+  HWND fresh_preview_target = nullptr;
+  famo::runtime::PreviewSelectionRequest fresh_preview;
+  CHECK(module->PreviewSelectionStateForTest(
+      service.get(), &fresh_preview_target, &fresh_preview));
+  CHECK(fresh_preview.correlation.session_id !=
+            original_preview.correlation.session_id ||
+        fresh_preview.correlation.session_generation !=
+            original_preview.correlation.session_generation);
+
+  // A denied synchronous edit lock leaves cleanup debt. The candidate element
+  // still ends immediately, and the recovery window retries composition End
+  // after the host becomes writable without waiting for another user key.
+  target.store->set_deny_locks(true);
+  const size_t lock_requests_before_security_close =
+      target.store->lock_request_count();
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, true));
+  CHECK(HasActiveComposition(target.context.get(), &composing) && composing);
+  ComPtr<ITfCandidateListUIElementBehavior> denied_behavior;
+  CHECK(!FindCandidateBehavior(thread_manager.get(), denied_behavior.put()));
+  CHECK(FAILED(retry_behavior->SetSelection(0)));
+  // Exhaust the original bounded retry budget while the host keeps denying
+  // locks. This guards both against an accidental permanent 100 Hz poll and
+  // against a later compartment transition inheriting a spent budget.
+  const auto bounded_retry_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+  while (std::chrono::steady_clock::now() < bounded_retry_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(HasActiveComposition(target.context.get(), &composing) && composing);
+  CHECK(target.store->lock_request_count() -
+            lock_requests_before_security_close <=
+        28);
+
+  // Re-enable while cleanup is still denied. OnChange must reset the bounded
+  // retry opportunity; after the host unlocks, message pumping alone must end
+  // the stale composition before any new key is used to await a fresh session.
+  const size_t lock_requests_before_reenable =
+      target.store->lock_request_count();
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, false));
+  const auto reenable_retry_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
+  while (std::chrono::steady_clock::now() < reenable_retry_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(target.store->lock_request_count() >
+        lock_requests_before_reenable);
+  CHECK(HasActiveComposition(target.context.get(), &composing) && composing);
+  target.store->set_deny_locks(false);
+  const auto cleanup_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (HasActiveComposition(target.context.get(), &composing) && composing &&
+         std::chrono::steady_clock::now() < cleanup_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < cleanup_deadline && !composing);
+  CHECK(target.store->text() == reenabled_text);
+  const auto fresh_session_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < fresh_session_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < fresh_session_deadline);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'A', true));
+  CHECK(target.store->text().find(L'a') != std::wstring::npos);
+
+  retry_behavior.reset();
+  thread_sink.reset();
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(password.document->Pop(TF_POPF_ALL)));
+  password.context.reset();
+  password.document.reset();
+  password.store.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  return runtime.Finish();
+}
+
+bool DisabledDuringWarmupRejectsLateSession(TextServiceModule *module,
+                                            const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"open-session-delay"));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+
+  Sleep(20);
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, true));
+  const auto stale_deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+  while (std::chrono::steady_clock::now() < stale_deadline) {
+    PumpMessages();
+    CHECK(TestKey(key_sink.get(), target.context.get(), 'N', false));
+    Sleep(5);
+  }
+  bool composing = false;
+  CHECK(HasActiveComposition(target.context.get(), &composing) && !composing);
+  ComPtr<ITfCandidateListUIElementBehavior> behavior;
+  CHECK(!FindCandidateBehavior(thread_manager.get(), behavior.put()));
+
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, false));
+  const auto fresh_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < fresh_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < fresh_deadline);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'A', true));
+  CHECK(target.store->text() == L"a");
+
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  return runtime.Finish();
+}
+
+bool DisabledAfterPreparedClaimSkipsRecoveryExecute(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"disconnect-before-execute", 0, 3,
+                      true, 0, 1));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  const uint32_t claims_before = module->RecoveryPreparedClaimsForTest();
+  const uint32_t executes_before = module->RecoveryExecuteAttemptsForTest();
+  {
+    // The first transport disconnects after Prepare. Hold the worker only
+    // after its authenticated Claim confirms Prepared, then cross the real
+    // compartment boundary on the activation thread.
+    ScopedEnvironment pause_after_claim(
+        "FAMO_TEST_PAUSE_AFTER_RECOVERY_CLAIM", "1");
+    CHECK(SendKey(key_sink.get(), target.context.get(), 'N', true));
+    CHECK(target.store->text().empty());
+    const auto claim_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (module->RecoveryPreparedClaimsForTest() == claims_before &&
+           std::chrono::steady_clock::now() < claim_deadline) {
+      PumpMessages();
+      Sleep(5);
+    }
+    CHECK(std::chrono::steady_clock::now() < claim_deadline);
+    CHECK(module->RecoveryExecuteAttemptsForTest() == executes_before);
+    CHECK(SetKeyboardDisabled(target.context.get(), client_id, true));
+    CHECK(TestKey(key_sink.get(), target.context.get(), 'N', false));
+  }
+
+  // Releasing the paused worker must observe the security gate, skip
+  // ExecutePrepared, retire the connection, and open a genuinely fresh
+  // session when the same context is enabled again.
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, false));
+  const auto fresh_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!TestKey(key_sink.get(), target.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < fresh_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < fresh_deadline);
+  CHECK(module->RecoveryExecuteAttemptsForTest() == executes_before);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'A', true));
+  CHECK(target.store->text().find(L'a') != std::wstring::npos);
+  CHECK(target.store->text().find(L'n') == std::wstring::npos);
+
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  return runtime.Finish();
+}
+
+bool TerminalRetirePreservesSecurityAbandon(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"copy-failure", 0, 2, true, 0, 2));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  const uint32_t publication_ready_before =
+      module->TerminalPublicationReadyForTest();
+  const uint32_t retired_before = module->TerminalRetiredSessionsForTest();
+  {
+    // Keep the worker parked after publishing too, so the activation thread
+    // deterministically runs RetireAbandonedSession while a different epoch
+    // occupies the modeled priority slot and this connection-wide security
+    // Abandon remains in the ordinary bounded queue.
+    ScopedEnvironment pause_after_publication(
+        "FAMO_TEST_PAUSE_AFTER_TERMINAL_PUBLICATION", "1");
+    {
+      ScopedEnvironment pause_before_publication(
+          "FAMO_TEST_PAUSE_BEFORE_TERMINAL_PUBLICATION", "1");
+      ScopedEnvironment force_different_priority(
+          "FAMO_TEST_FORCE_DIFFERENT_EPOCH_SECURITY_PRIORITY", "1");
+      CHECK(SendKey(key_sink.get(), target.context.get(), 'N', true));
+      CHECK(target.store->text().empty());
+      const auto publication_ready_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (module->TerminalPublicationReadyForTest() ==
+                 publication_ready_before &&
+             std::chrono::steady_clock::now() < publication_ready_deadline) {
+        PumpMessages();
+        Sleep(5);
+      }
+      CHECK(std::chrono::steady_clock::now() <
+            publication_ready_deadline);
+      CHECK(SetKeyboardDisabled(target.context.get(), client_id, true));
+      PumpMessages();
+      CHECK(TestKey(key_sink.get(), target.context.get(), 'N', false));
+    }
+
+    const auto retire_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (module->TerminalRetiredSessionsForTest() == retired_before &&
+           std::chrono::steady_clock::now() < retire_deadline) {
+      PumpMessages();
+      Sleep(5);
+    }
+    CHECK(std::chrono::steady_clock::now() < retire_deadline);
+    CHECK(module->TerminalRetiredSessionsForTest() > retired_before);
+    CHECK(target.store->text().empty());
+  }
+
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, false));
+  const auto fresh_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!TestKey(key_sink.get(), target.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < fresh_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < fresh_deadline);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'A', true));
+  CHECK(target.store->text().find(L'a') != std::wstring::npos);
+  CHECK(target.store->text().find(L'n') == std::wstring::npos);
+
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  return runtime.Finish();
+}
+
+bool DisabledPendingDeliveryIsAbandoned(TextServiceModule *module,
+                                        const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 2, true, 0, 1));
+
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+  ComPtr<ITfKeyEventSink> key_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'N', true));
+  CHECK(target.store->text() == L"n");
+
+  // The Runtime has durably prepared this synthetic key, but the host cannot
+  // apply its composition. Disabling the context must retire the authenticated
+  // connection that owns that delivery instead of applying it later when edit
+  // locks become available.
+  target.store->set_deny_locks(true);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'I', true));
+  CHECK(target.store->text() == L"n");
+  {
+    ScopedEnvironment fail_first_security_abandon(
+        "FAMO_TEST_SECURITY_ABANDON_ALLOCATION_FAILURE_ONCE", "1");
+    CHECK(SetKeyboardDisabled(target.context.get(), client_id, true));
+    target.store->set_deny_locks(false);
+    PumpMessages();
+    CHECK(GetEnvironmentVariableA(
+              "FAMO_TEST_SECURITY_ABANDON_ALLOCATION_FAILURE_ONCE", nullptr,
+              0) == 0);
+  }
+
+  bool composing = true;
+  const auto disabled_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (std::chrono::steady_clock::now() < disabled_deadline) {
+    PumpMessages();
+    CHECK(TestKey(key_sink.get(), target.context.get(), 'A', false));
+    CHECK(target.store->text() == L"n");
+    CHECK(HasActiveComposition(target.context.get(), &composing));
+    if (!composing)
+      break;
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < disabled_deadline && !composing);
+  ComPtr<ITfCandidateListUIElementBehavior> behavior;
+  CHECK(!FindCandidateBehavior(thread_manager.get(), behavior.put()));
+
+  CHECK(SetKeyboardDisabled(target.context.get(), client_id, false));
+  const auto fresh_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'A', true) &&
+         std::chrono::steady_clock::now() < fresh_deadline) {
+    PumpMessages();
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < fresh_deadline);
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'A', true));
+  CHECK(target.store->text().find(L'a') != std::wstring::npos);
+  CHECK(target.store->text().find(L'i') == std::wstring::npos);
+
+  key_sink.reset();
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  return runtime.Finish();
+}
+
 bool AllTextStoreChecks(const wchar_t *module_path,
                         const wchar_t *runtime_path) {
   ScopedCom com;
@@ -1725,6 +2296,12 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(TerminalPublicationSlotSerializesFailures(&module, runtime_path));
   CHECK(MissingRuntimeFailsOpen(&module));
   CHECK(HealthyRoundtrip(&module, runtime_path));
+  CHECK(DisabledKeyboardContextPassesKeysThrough(&module, runtime_path));
+  CHECK(DisabledDuringWarmupRejectsLateSession(&module, runtime_path));
+  CHECK(DisabledAfterPreparedClaimSkipsRecoveryExecute(&module,
+                                                       runtime_path));
+  CHECK(TerminalRetirePreservesSecurityAbandon(&module, runtime_path));
+  CHECK(DisabledPendingDeliveryIsAbandoned(&module, runtime_path));
   CHECK(DisabledInlinePreeditStaysOutOfHost(&module, runtime_path));
   CHECK(InlinePreeditPreservesUtf16Selection(&module, runtime_path));
   CHECK(PhysicalSelectionKeysAreInterpretedByEngine(&module, runtime_path));

@@ -135,6 +135,14 @@ std::optional<runtime::Correlation> ContextState::PlanUiState() {
   return correlation;
 }
 
+std::optional<runtime::Correlation> ContextState::PlanSecurityUiState() {
+  if (phase_ != ContextPhase::Ready)
+    return std::nullopt;
+  runtime::Correlation correlation = identity_;
+  correlation.sequence = next_sequence_++;
+  return correlation;
+}
+
 std::optional<runtime::Correlation> ContextState::PlanClose() {
   if (phase_ != ContextPhase::Ready || pending_sequence_ != 0)
     return std::nullopt;
