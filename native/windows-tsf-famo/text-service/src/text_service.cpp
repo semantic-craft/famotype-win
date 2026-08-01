@@ -181,6 +181,23 @@ bool RefreshSelectionCapability(runtime::UiState *state) {
   return false;
 }
 
+bool CompartmentFlagSet(ITfContext *context, REFGUID compartment) {
+  ComPtr<ITfCompartmentMgr> manager;
+  if (FAILED(context->QueryInterface(
+          IID_ITfCompartmentMgr, reinterpret_cast<void **>(manager.put()))))
+    return false;
+  ComPtr<ITfCompartment> slot;
+  if (FAILED(manager->GetCompartment(compartment, slot.put())))
+    return false;
+  VARIANT value;
+  VariantInit(&value);
+  if (FAILED(slot->GetValue(&value)))
+    return false;
+  const bool set = value.vt == VT_I4 && value.lVal != 0;
+  VariantClear(&value);
+  return set;
+}
+
 } // namespace
 
 uint32_t TerminalCleanupConnectAttemptsForTest() noexcept {
@@ -779,9 +796,24 @@ HRESULT TextService::EnsureContext(ITfContext *context,
     entry->candidates->End();
   }
   SetFocused(entry, true);
+  if (KeyboardDisabled(entry))
+    return S_FALSE;
   if (!entry->session_pending)
     ScheduleSession(entry, reason);
   return S_FALSE;
+}
+
+// Password fields must never reach the engine: no session, no composition, no
+// candidate window.  Every framework that hosts one turns the keyboard off for
+// its context first -- WPF and WinUI through IsInputMethodEnabled, Chromium
+// through its disabled document manager, plain ES_PASSWORD edits through msctf
+// itself -- so the compartment is the single signal worth reading.  It is
+// cheap enough to re-read per key, which keeps a host that flips it mid-context
+// honest without a compartment event sink.
+bool TextService::KeyboardDisabled(ContextEntry *entry) {
+  return entry && entry->context &&
+         CompartmentFlagSet(entry->context.get(),
+                            GUID_COMPARTMENT_KEYBOARD_DISABLED);
 }
 
 bool TextService::StartSessionWorker() {
