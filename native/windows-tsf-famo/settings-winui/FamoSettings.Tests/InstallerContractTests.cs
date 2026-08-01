@@ -1821,6 +1821,70 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void FaultInjectionHarness_DrivesFreshInstallAndRecoverableUninstallSweeps()
+    {
+        string harness = InstallerText("fault-injection-harness.ps1");
+
+        Assert.Contains("[switch] $CleanInstall", harness);
+        Assert.Contains("[switch] $Uninstall", harness);
+        Assert.Contains("if ($CleanInstall -and $Uninstall)", harness);
+        Assert.Contains("[Environment]::Is64BitProcess", harness);
+        foreach (string phase in new[]
+        {
+            "uninstall-intent-before-commit",
+            "uninstall-intent-after-commit",
+            "uninstall-delete-anchor-before-commit",
+            "uninstall-delete-anchor-after-commit",
+            "uninstall-brand-deleted-before-anchor-retire",
+        })
+        {
+            Assert.Contains($"'{phase}'", harness);
+        }
+
+        Assert.Contains("Step = \"clean-inject:$phase\"", harness);
+        Assert.Contains("Test-FamoHealth.ps1", harness);
+        Assert.Contains("Invoke-HealthAudit 'NotInstalled'", harness);
+        Assert.Contains("($failed.Count -eq 0)", harness);
+        Assert.Contains("Test-InjectionLog $log $phase", harness);
+        Assert.Contains("Write-StepResult $step", harness);
+        Assert.Contains("$stream.Flush($true)", harness);
+        Assert.Contains(
+            "Start-Process -FilePath $settings -ArgumentList '--is-input-tip'",
+            harness);
+        Assert.DoesNotContain("& $settings --is-input-tip", harness);
+        Assert.Contains(
+            "if (-not $aborted -and -not $SkipMigration -and -not $CleanInstall)",
+            harness);
+        Assert.Contains(
+            "$readyForNextPhase = ($phase -eq $Phases[-1]) -and (-not $SkipMigration)",
+            harness);
+
+        int stage = Position(
+            harness, "$stagedUninstaller = Stage-UninstallerForReentry");
+        int inject = Position(
+            harness, "$exit = Invoke-Uninstaller $uninstaller $phase", stage);
+        int marker = Position(
+            harness, "$injectionObserved = Test-InjectionLog", inject);
+        int reenter = Position(
+            harness, "$recoveryExit = Invoke-Uninstaller", marker);
+        int verify = Position(
+            harness, "$notInstalled = (Test-NotInstalledFootprints", reenter);
+        int reinstall = Position(
+            harness, "$reinstallExit = Invoke-Installer $Installer ''", verify);
+        Assert.True(
+            stage < inject && inject < marker && marker < reenter &&
+            reenter < verify && verify < reinstall);
+
+        Assert.Contains("InjectionExitCode = $exit", harness);
+        Assert.Contains("InjectionObserved = $injectionObserved", harness);
+        Assert.Contains("RecoveryExitCode = $recoveryExit", harness);
+        Assert.Contains("$reentryUninstaller = $stagedUninstaller.Path", harness);
+        Assert.Contains("RecoveryUninstaller = $reentryUninstaller", harness);
+        Assert.Contains("NotInstalled = $notInstalled", harness);
+        Assert.Contains("ReadyForNextPhase = $readyForNextPhase", harness);
+    }
+
+    [Fact]
     public void InnoSetup_UninstallIntentPinsReentryBeforeAutomaticFileDeletion()
     {
         string iss = InstallerText("famo-setup.iss");
