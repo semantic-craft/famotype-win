@@ -839,9 +839,16 @@ bool HostDrivenCandidateBehaviorMatchesRuntime(TextServiceModule *module,
         CHECK(behavior->SetSelection(count) == E_INVALIDARG);
         CHECK(store->text() == L"ni");
 
-        // Host-driven selection reaches the engine, and the resulting commit
-        // agrees with what the physical selection key produces.
+        // SetSelection moves the UI-less host's selection without committing.
+        // Finalize then commits exactly that selected candidate.
         CHECK(behavior->SetSelection(1) == S_OK);
+        CHECK(store->text() == L"ni");
+        UINT selected = 0;
+        CHECK(SUCCEEDED(behavior->GetSelection(&selected)) && selected == 1);
+        UINT active_count = 0;
+        CHECK(SUCCEEDED(behavior->GetCount(&active_count)) &&
+              active_count == count);
+        CHECK(behavior->Finalize() == S_OK);
         CHECK(store->text() == L"\u5c3c");
         UINT after_commit = 1;
         CHECK(SUCCEEDED(behavior->GetCount(&after_commit)) &&
@@ -852,7 +859,8 @@ bool HostDrivenCandidateBehaviorMatchesRuntime(TextServiceModule *module,
         CHECK(behavior->Finalize() == E_FAIL);
         CHECK(store->text() == L"\u5c3c");
 
-        // Finalize commits the engine's current choice.
+        // Finalize without a preceding SetSelection commits the engine's
+        // current choice.
         CHECK(SendKey(key_sink, context, 'N', true));
         CHECK(SendKey(key_sink, context, 'I', true));
         CHECK(store->text() == L"\u5c3cni");

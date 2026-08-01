@@ -227,10 +227,16 @@ HRESULT CandidateUiElement::SetSelection(UINT index) {
     // index is page-relative and has to land inside it.
     if (index >= candidates_.size())
       return E_INVALIDARG;
-    return host_
-               ? host_->OnCandidateBehavior(this, CandidateBehavior::Select,
-                                            index)
-               : E_FAIL;
+    if (!host_ || !begun_ || !manager_)
+      return E_FAIL;
+    if (selection_ == index)
+      return S_OK;
+    const UINT previous = selection_;
+    selection_ = index;
+    const HRESULT updated = manager_->UpdateUIElement(element_id_);
+    if (FAILED(updated))
+      selection_ = previous;
+    return updated;
   });
 }
 
@@ -238,7 +244,7 @@ HRESULT CandidateUiElement::Finalize() {
   return ComBoundary([&] {
     // A detached element outlived its session; there is nothing to finalize.
     return host_ ? host_->OnCandidateBehavior(
-                       this, CandidateBehavior::Finalize, 0)
+                       this, CandidateBehavior::Finalize, selection_)
                  : E_FAIL;
   });
 }

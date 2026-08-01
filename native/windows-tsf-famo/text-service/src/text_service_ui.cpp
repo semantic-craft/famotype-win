@@ -128,17 +128,16 @@ HRESULT TextService::OnCandidateBehavior(CandidateUiElement *element,
   runtime::Frame request;
   request.correlation = *correlation;
   switch (behavior) {
-  case CandidateBehavior::Select:
-    // Page-relative, unlike the click channel's SelectCandidateAbsolute, whose
-    // index space is the preview window of the *next* page.
+  case CandidateBehavior::Finalize:
+    // SetSelection is local UI-less host state. Finalize submits that
+    // page-relative selection, unlike the click channel's
+    // SelectCandidateAbsolute, whose index space is the preview window of the
+    // *next* page.
     request.command = runtime::Command::SelectCandidate;
     if (!runtime::EncodeCandidateIndex(index, &request.payload)) {
       entry->state.CompleteUnhandled();
       return E_INVALIDARG;
     }
-    break;
-  case CandidateBehavior::Finalize:
-    request.command = runtime::Command::CommitComposition;
     break;
   case CandidateBehavior::Abort:
     request.command = runtime::Command::ClearComposition;
