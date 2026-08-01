@@ -38,7 +38,7 @@ HRESULT CandidateUiElement::Update(const runtime::Composition &composition,
     selection_ = 0;
     End();
     if (show_allowed)
-      *show_allowed = show_allowed_;
+      *show_allowed = visible();
     return S_OK;
   }
 
@@ -56,12 +56,17 @@ HRESULT CandidateUiElement::Update(const runtime::Composition &composition,
     if (SUCCEEDED(result)) {
       begun_ = true;
       show_allowed_ = allowed;
+      // Fresh element session: any hide the host requested for the previous
+      // element does not carry over.
+      shown_ = TRUE;
     }
   } else {
+    // UpdateUIElement carries no pbShow, so the BeginUIElement answer stands
+    // for the life of the element. Show() is how the host changes its mind.
     result = manager_->UpdateUIElement(element_id_);
   }
   if (show_allowed)
-    *show_allowed = show_allowed_;
+    *show_allowed = visible();
   return result;
 }
 
@@ -81,9 +86,15 @@ HRESULT CandidateUiElement::QueryInterface(REFIID iid, void **object) {
   if (!object)
     return E_POINTER;
   *object = nullptr;
+  // One chain runs IUnknown -> ITfUIElement -> ITfCandidateListUIElement ->
+  // ...Behavior, so a single cast serves all four. Integratable is a second
+  // branch off IUnknown and needs its own cast to a different address.
   if (iid == IID_IUnknown || iid == IID_ITfUIElement ||
-      iid == IID_ITfCandidateListUIElement)
-    *object = static_cast<ITfCandidateListUIElement *>(this);
+      iid == IID_ITfCandidateListUIElement ||
+      iid == IID_ITfCandidateListUIElementBehavior)
+    *object = static_cast<ITfCandidateListUIElementBehavior *>(this);
+  else if (iid == IID_ITfIntegratableCandidateListUIElement)
+    *object = static_cast<ITfIntegratableCandidateListUIElement *>(this);
   if (!*object)
     return E_NOINTERFACE;
   AddRef();
@@ -114,14 +125,23 @@ HRESULT CandidateUiElement::GetGUID(GUID *guid) {
 }
 
 HRESULT CandidateUiElement::Show(BOOL show) {
-  shown_ = show;
+  const BOOL requested = show ? TRUE : FALSE;
+  if (shown_ == requested)
+    return S_OK;
+  shown_ = requested;
+  // UILess contract option 1: move the element to the hide status and keep it
+  // alive so the host can keep drawing from Update notifications. The host is
+  // told so the runtime window follows immediately rather than at the next
+  // composition update.
+  if (host_)
+    host_->OnCandidateVisibilityChanged(this);
   return S_OK;
 }
 
 HRESULT CandidateUiElement::IsShown(BOOL *show) {
   if (!show)
     return E_POINTER;
-  *show = shown_;
+  *show = visible();
   return S_OK;
 }
 
@@ -199,6 +219,82 @@ HRESULT CandidateUiElement::GetCurrentPage(UINT *page) {
     return E_POINTER;
   *page = current_page_;
   return S_OK;
+}
+
+HRESULT CandidateUiElement::SetSelection(UINT index) {
+  return ComBoundary([&] {
+    // The element publishes exactly the engine's current page, so the host's
+    // index is page-relative and has to land inside it.
+    if (index >= candidates_.size())
+      return E_INVALIDARG;
+    return host_
+               ? host_->OnCandidateBehavior(this, CandidateBehavior::Select,
+                                            index)
+               : E_FAIL;
+  });
+}
+
+HRESULT CandidateUiElement::Finalize() {
+  return ComBoundary([&] {
+    // A detached element outlived its session; there is nothing to finalize.
+    return host_ ? host_->OnCandidateBehavior(
+                       this, CandidateBehavior::Finalize, 0)
+                 : E_FAIL;
+  });
+}
+
+HRESULT CandidateUiElement::Abort() {
+  return ComBoundary([&] {
+    return host_
+               ? host_->OnCandidateBehavior(this, CandidateBehavior::Abort, 0)
+               : E_FAIL;
+  });
+}
+
+HRESULT CandidateUiElement::SetIntegrationStyle(GUID style) {
+  // Search box is the only style Windows defines. Refusing the rest keeps the
+  // host from assuming an integration Famo has not been told how to honour.
+  if (!IsEqualGUID(style, kIntegrationStyleSearchBox))
+    return E_INVALIDARG;
+  integration_style_ = style;
+  return S_OK;
+}
+
+HRESULT CandidateUiElement::GetSelectionStyle(
+    TfIntegratableCandidateListSelectionStyle *style) {
+  if (!style)
+    return E_POINTER;
+  // The engine always carries a highlighted candidate on the current page, and
+  // that candidate is exactly what a commit would produce, so the selection is
+  // active rather than a default the user has not landed on.
+  *style = STYLE_ACTIVE_SELECTION;
+  return S_OK;
+}
+
+HRESULT CandidateUiElement::OnKeyDown(WPARAM key, LPARAM key_data,
+                                      BOOL *eaten) {
+  if (!eaten)
+    return E_POINTER;
+  *eaten = FALSE;
+  return ComBoundary([&] {
+    return host_ ? host_->OnCandidateKeyDown(this, key, key_data, eaten)
+                 : E_FAIL;
+  });
+}
+
+HRESULT CandidateUiElement::ShowCandidateNumbers(BOOL *show) {
+  if (!show)
+    return E_POINTER;
+  // GetString publishes candidate text only; the engine's own labels never
+  // reach the host, so it has to draw the numbers for selection to be usable.
+  *show = TRUE;
+  return S_OK;
+}
+
+HRESULT CandidateUiElement::FinalizeExactCompositionString() {
+  // "Exact" means commit what the user is currently being shown, which is the
+  // highlighted candidate — the same runtime verb as Behavior::Finalize.
+  return Finalize();
 }
 
 } // namespace famo::tsf
