@@ -75,6 +75,8 @@ public:
                                            ITfContextView *view) override;
 
   void OnCandidateVisibilityChanged(CandidateUiElement *element) override;
+  HRESULT OnCandidateBehavior(CandidateUiElement *element,
+                              CandidateBehavior behavior, UINT index) override;
 
 private:
   enum class DeliveryWorkKind { Recover, Cancel, Ack };
@@ -205,6 +207,7 @@ private:
   bool HandlePreviewSelection(
       HWND source_window,
       const runtime::PreviewSelectionRequest &request);
+  bool DeliverCandidateRequest(ContextEntry *entry, runtime::Frame &&request);
   bool RenewSelectionCapability(ContextEntry *entry,
                                 uint64_t composition_sequence) noexcept;
   HRESULT ApplyRuntimeComposition(ContextEntry *entry,

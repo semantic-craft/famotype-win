@@ -11,6 +11,9 @@
 
 namespace famo::tsf {
 
+// What the application asked for through ITfCandidateListUIElementBehavior.
+enum class CandidateBehavior { Select, Finalize, Abort };
+
 // Back-channel from the UI element to the owning text service. Declared here
 // rather than taking a TextService* because candidate_ui_selfcheck links
 // candidate_ui_element.cpp without text_service.cpp.
@@ -19,12 +22,17 @@ public:
   // The element's effective visibility changed outside of Update() — the host
   // called ITfUIElement::Show(). Republish the runtime UI state.
   virtual void OnCandidateVisibilityChanged(class CandidateUiElement *element) = 0;
+  // The application drove the candidate list itself. index is page-relative
+  // and is read only for CandidateBehavior::Select.
+  virtual HRESULT OnCandidateBehavior(class CandidateUiElement *element,
+                                      CandidateBehavior behavior,
+                                      UINT index) = 0;
 
 protected:
   ~CandidateUiHost() = default;
 };
 
-class CandidateUiElement final : public ITfCandidateListUIElement {
+class CandidateUiElement final : public ITfCandidateListUIElementBehavior {
 public:
   CandidateUiElement(ITfUIElementMgr *manager, ITfDocumentMgr *document);
 
@@ -58,6 +66,10 @@ public:
   HRESULT STDMETHODCALLTYPE SetPageIndex(UINT *indices,
                                          UINT page_count) override;
   HRESULT STDMETHODCALLTYPE GetCurrentPage(UINT *page) override;
+
+  HRESULT STDMETHODCALLTYPE SetSelection(UINT index) override;
+  HRESULT STDMETHODCALLTYPE Finalize() override;
+  HRESULT STDMETHODCALLTYPE Abort() override;
 
 private:
   ~CandidateUiElement();

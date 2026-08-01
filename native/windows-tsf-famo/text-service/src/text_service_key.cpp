@@ -238,6 +238,15 @@ bool TextService::HandlePreviewSelection(
     entry->state.CompleteUnhandled();
     return false;
   }
+  return DeliverCandidateRequest(entry, std::move(request));
+}
+
+// Sends one candidate-driven request and reconciles its reply. The caller must
+// already hold a plan from ContextState for this exact frame. Shared by the
+// runtime's click channel and by ITfCandidateListUIElementBehavior —
+// duplicating this ladder is how the quarantine/ACK contract gets broken.
+bool TextService::DeliverCandidateRequest(ContextEntry *entry,
+                                          runtime::Frame &&request) {
   DeliveryAttempt attempt = SendDelivery(entry, std::move(request));
   if (attempt.state == DeliveryAttemptState::Rejected) {
     entry->state.CompleteUnhandled();
