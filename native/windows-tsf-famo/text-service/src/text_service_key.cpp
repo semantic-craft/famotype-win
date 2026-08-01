@@ -314,16 +314,33 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
   *eaten = FALSE;
   if (!context || !OnActivationThread())
     return S_OK;
+  ContextEntry *entry = FindContext(context);
+  const bool keyboard_disabled = KeyboardDisabled(context);
+  if (entry)
+    ReconcileKeyboardSecurity(entry, keyboard_disabled);
+  if (keyboard_disabled ||
+      (entry && entry->keyboard_security !=
+                    KeyboardSecurityState::Enabled)) {
+    if (entry &&
+        entry->keyboard_security == KeyboardSecurityState::Closing) {
+      PostRecoveryWork();
+    }
+    return S_OK;
+  }
   ApplyDeliveryResult();
   ApplySessionResult();
-  ContextEntry *entry = FindContext(context);
+  entry = FindContext(context);
   if (!entry)
     return S_OK;
+  ReconcileKeyboardSecurity(entry, KeyboardDisabled(context));
+  if (entry->keyboard_security != KeyboardSecurityState::Enabled) {
+    if (entry->keyboard_security == KeyboardSecurityState::Closing)
+      PostRecoveryWork();
+    return S_OK;
+  }
   if (entry->close_requested)
     return S_OK;
   if (entry->delivery_quarantined)
-    return S_OK;
-  if (KeyboardDisabled(entry))
     return S_OK;
   if (!ApplyDeferredDelivery(entry))
     return S_OK;
@@ -437,18 +454,27 @@ void TextService::RecoverConnection() {
     session_result_.store(nullptr);
   }
   for (auto &entry : contexts_) {
+    ReconcileKeyboardSecurity(entry.get(),
+                              KeyboardDisabled(entry->context.get()));
+    const bool security_close =
+        entry->keyboard_security != KeyboardSecurityState::Enabled;
     if (entry->candidates)
       entry->candidates->End();
     entry->ui_state.show_allowed = false;
     entry->composition.ResetBehaviorState();
     PublishUiState(entry.get());
     RecoveryPlan recovery = entry->state.Fail();
-    if (recovery.commit_preedit) {
+    if (!security_close && recovery.commit_preedit) {
       entry->recovery_preedit = std::move(*recovery.commit_preedit);
       entry->recovery_cleanup_required = true;
+    } else if (security_close) {
+      entry->recovery_preedit.clear();
+      entry->recovery_cleanup_required = false;
     }
-    if (entry->ui_state.focused)
+    if (entry->keyboard_security == KeyboardSecurityState::Enabled &&
+        entry->ui_state.focused) {
       focused = entry.get();
+    }
     entry->session_pending = false;
     entry->pending_session = {};
   }
@@ -465,7 +491,8 @@ void TextService::RecoverConnection() {
 
 void TextService::UpdateCandidates(
     ContextEntry *entry, const runtime::Composition &composition) {
-  if (!entry || !entry->candidates)
+  if (!entry || !entry->candidates ||
+      entry->keyboard_security != KeyboardSecurityState::Enabled)
     return;
   if (!RenewSelectionCapability(entry, entry->state.displayed_sequence())) {
     entry->ui_state.show_allowed = false;

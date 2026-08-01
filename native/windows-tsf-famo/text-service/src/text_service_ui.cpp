@@ -83,8 +83,11 @@ TextService::FindContextByCandidateElement(CandidateUiElement *element) {
   if (!element)
     return nullptr;
   for (auto &owned : contexts_) {
-    if (owned && !owned->close_requested && owned->candidates.get() == element)
+    if (owned && !owned->close_requested &&
+        owned->keyboard_security == KeyboardSecurityState::Enabled &&
+        owned->candidates.get() == element) {
       return owned.get();
+    }
   }
   return nullptr;
 }
@@ -252,14 +255,22 @@ void TextService::SetFocused(ContextEntry *entry, bool focused) {
 void TextService::PublishUiState(ContextEntry *entry) {
   if (!entry || runtime_port_.state() != runtime::ChannelState::Ready)
     return;
-  const auto correlation = entry->state.PlanUiState();
+  const auto correlation =
+      entry->keyboard_security == KeyboardSecurityState::Enabled
+          ? entry->state.PlanUiState()
+          : entry->state.PlanSecurityUiState();
   if (!correlation)
     return;
   runtime::Frame update;
   update.command = runtime::Command::UpdateUiState;
   update.correlation = *correlation;
+  runtime::UiState published = entry->ui_state;
+  if (entry->keyboard_security != KeyboardSecurityState::Enabled) {
+    published.focused = false;
+    published.show_allowed = false;
+  }
   std::string error;
-  if (!runtime::EncodeUiState(entry->ui_state, &update.payload, &error))
+  if (!runtime::EncodeUiState(published, &update.payload, &error))
     return;
   runtime_port_.Post(std::move(update));
 }

@@ -83,6 +83,7 @@ public:
   const std::wstring &text() const { return text_; }
   const TS_SELECTION_ACP &selection() const { return selection_; }
   size_t replace_count() const { return replace_count_; }
+  size_t lock_request_count() const { return lock_request_count_; }
   void set_deny_locks(bool deny) { deny_locks_ = deny; }
 
 private:
@@ -98,6 +99,7 @@ private:
   DWORD sink_mask_ = 0;
   DWORD lock_flags_ = 0;
   bool deny_locks_ = false;
+  size_t lock_request_count_ = 0;
   size_t replace_count_ = 0;
   std::wstring text_;
   TS_SELECTION_ACP selection_{};

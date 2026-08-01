@@ -8,5 +8,9 @@ EXPORTS
   DllUnregisterServer PRIVATE
   FamoCreateTextServiceForTest PRIVATE
   FamoGetPreviewSelectionStateForTest PRIVATE
+  FamoGetRecoveryExecuteAttemptsForTest PRIVATE
+  FamoGetRecoveryPreparedClaimsForTest PRIVATE
   FamoGetTerminalCleanupConnectAttemptsForTest PRIVATE
+  FamoGetTerminalPublicationReadyForTest PRIVATE
+  FamoGetTerminalRetiredSessionsForTest PRIVATE
   FamoReactivateTextServiceForTest PRIVATE

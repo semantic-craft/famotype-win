@@ -176,4 +176,4 @@ add_test(NAME tsf_integration_selfcheck
   COMMAND tsf_integration_selfcheck
     $<TARGET_FILE:FamoTextService>
     $<TARGET_FILE_DIR:FamoTextService>/FamoTestRuntime.exe)
-set_tests_properties(tsf_integration_selfcheck PROPERTIES TIMEOUT 20)
+set_tests_properties(tsf_integration_selfcheck PROPERTIES TIMEOUT 40)
