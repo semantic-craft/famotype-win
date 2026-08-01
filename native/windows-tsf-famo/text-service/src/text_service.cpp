@@ -181,6 +181,23 @@ bool RefreshSelectionCapability(runtime::UiState *state) {
   return false;
 }
 
+bool CompartmentFlagSet(ITfContext *context, REFGUID compartment) {
+  ComPtr<ITfCompartmentMgr> manager;
+  if (FAILED(context->QueryInterface(
+          IID_ITfCompartmentMgr, reinterpret_cast<void **>(manager.put()))))
+    return false;
+  ComPtr<ITfCompartment> slot;
+  if (FAILED(manager->GetCompartment(compartment, slot.put())))
+    return false;
+  VARIANT value;
+  VariantInit(&value);
+  if (FAILED(slot->GetValue(&value)))
+    return false;
+  const bool set = value.vt == VT_I4 && value.lVal != 0;
+  VariantClear(&value);
+  return set;
+}
+
 } // namespace
 
 uint32_t TerminalCleanupConnectAttemptsForTest() noexcept {
@@ -780,9 +797,21 @@ HRESULT TextService::EnsureContext(ITfContext *context,
     entry->candidates->End();
   }
   SetFocused(entry, true);
+  if (KeyboardDisabled(entry))
+    return S_FALSE;
   if (!entry->session_pending)
     ScheduleSession(entry, reason);
   return S_FALSE;
+}
+
+// Password fields must never reach the engine: no session, no composition, no
+// candidate window. Password hosts disable the keyboard for their TSF context;
+// re-read that context-specific signal for every key so a mid-focus change also
+// fails open to the application.
+bool TextService::KeyboardDisabled(ContextEntry *entry) {
+  return entry && entry->context &&
+         CompartmentFlagSet(entry->context.get(),
+                            GUID_COMPARTMENT_KEYBOARD_DISABLED);
 }
 
 bool TextService::StartSessionWorker() {
