@@ -979,6 +979,29 @@ int RunBoundDesktopOperationCurrent(
   return result;
 }
 
+bool ScheduledTaskCompletionCanBeSampled(
+    bool this_run_time_observed, bool *observed_this_run) noexcept {
+  if (!observed_this_run || !this_run_time_observed)
+    return false;
+  if (!*observed_this_run) {
+    *observed_this_run = true;
+    return false;
+  }
+  return true;
+}
+
+bool TryAcceptScheduledTaskCompletion(TASK_STATE state, LONG last_result,
+                                      bool this_run_started,
+                                      DWORD *accepted_exit_code) noexcept {
+  if (!accepted_exit_code || !this_run_started ||
+      state != TASK_STATE_READY ||
+      last_result == SCHED_S_TASK_HAS_NOT_RUN) {
+    return false;
+  }
+  *accepted_exit_code = static_cast<DWORD>(last_result);
+  return true;
+}
+
 HRESULT RunAsScheduledDesktopUser(
     std::wstring_view sid, const std::wstring &executable,
     const std::wstring &arguments, DWORD *child_exit_code) {
@@ -1174,23 +1197,41 @@ HRESULT RunAsScheduledDesktopUser(
         break;
       task_registered = true;
 
+      // LastTaskResult describes the last run, so READY/default-zero can be
+      // visible before this newly requested instance starts. Bind completion
+      // to the LastRunTime transition of this unique task registration.
+      DATE baseline_last_run_time = 0.0;
+      result = registered->get_LastRunTime(&baseline_last_run_time);
+      if (FAILED(result))
+        break;
       result = registered->Run(empty, &running);
       if (FAILED(result))
         break;
       const ULONGLONG deadline = GetTickCount64() + kTaskTimeoutMs;
+      bool observed_this_run = false;
       for (;;) {
-        TASK_STATE state = TASK_STATE_UNKNOWN;
-        LONG last_result = SCHED_S_TASK_HAS_NOT_RUN;
-        const HRESULT state_result = registered->get_State(&state);
-        const HRESULT last_result_read =
-            registered->get_LastTaskResult(&last_result);
-        if (SUCCEEDED(state_result) && SUCCEEDED(last_result_read) &&
-            state != TASK_STATE_QUEUED && state != TASK_STATE_RUNNING &&
-            last_result != SCHED_S_TASK_HAS_NOT_RUN) {
-          if (child_exit_code)
-            *child_exit_code = static_cast<DWORD>(last_result);
-          result = S_OK;
-          break;
+        DATE last_run_time = baseline_last_run_time;
+        const HRESULT last_run_time_read =
+            registered->get_LastRunTime(&last_run_time);
+        if (SUCCEEDED(last_run_time_read) &&
+            ScheduledTaskCompletionCanBeSampled(
+                last_run_time != baseline_last_run_time,
+                &observed_this_run)) {
+          TASK_STATE state = TASK_STATE_UNKNOWN;
+          LONG last_result = SCHED_S_TASK_HAS_NOT_RUN;
+          const HRESULT state_result = registered->get_State(&state);
+          const HRESULT last_result_read =
+              registered->get_LastTaskResult(&last_result);
+          DWORD accepted_exit_code = STILL_ACTIVE;
+          if (SUCCEEDED(state_result) && SUCCEEDED(last_result_read) &&
+              TryAcceptScheduledTaskCompletion(
+                  state, last_result, observed_this_run,
+                  &accepted_exit_code)) {
+            if (child_exit_code)
+              *child_exit_code = accepted_exit_code;
+            result = S_OK;
+            break;
+          }
         }
         if (GetTickCount64() >= deadline) {
           running->Stop();

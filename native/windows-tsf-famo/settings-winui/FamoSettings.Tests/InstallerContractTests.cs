@@ -2044,6 +2044,39 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void NativeProfileTool_BindsScheduledExitToThisTaskInvocation()
+    {
+        string tool = RepoText(
+            "native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
+        int scheduled = Position(tool, "HRESULT RunAsScheduledDesktopUser");
+        string body = tool[scheduled..Position(
+            tool, "int RunBoundDesktopOperation(", scheduled)];
+
+        int baseline = Position(
+            body, "get_LastRunTime(&baseline_last_run_time)");
+        int run = Position(body, "registered->Run(empty, &running)", baseline);
+        int observed = Position(
+            body, "get_LastRunTime(&last_run_time)", run);
+        int sample = Position(
+            body, "ScheduledTaskCompletionCanBeSampled(", observed);
+        int state = Position(body, "registered->get_State(&state)", sample);
+        int accept = Position(
+            body, "TryAcceptScheduledTaskCompletion(", state);
+
+        Assert.True(
+            baseline < run && run < observed && observed < sample &&
+            sample < state && state < accept);
+        Assert.Contains(
+            "last_run_time != baseline_last_run_time", body);
+
+        string selfcheck = RepoText(
+            "native/windows-tsf-famo/text-service/tests/user_data_cleanup_selfcheck.cpp");
+        Assert.Contains("TASK_STATE_READY, 0, false", selfcheck);
+        Assert.Contains("TASK_STATE_UNKNOWN, TASK_STATE_DISABLED", selfcheck);
+        Assert.Contains("exit_code != STILL_ACTIVE", selfcheck);
+    }
+
+    [Fact]
     public void NativeRegistration_RemovesLegacyPerUserComOverrideOnRegister()
     {
         string source = RepoText("native/windows-tsf-famo/text-service/src/registration.cpp");
