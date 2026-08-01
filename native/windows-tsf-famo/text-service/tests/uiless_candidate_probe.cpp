@@ -139,6 +139,10 @@ struct Watch {
 
 struct CandidateList {
   bool available = false;
+  bool count_called = false;
+  HRESULT count_result = E_NOTIMPL;
+  bool selection_called = false;
+  HRESULT selection_result = E_NOTIMPL;
   UINT count = 0;
   UINT selection = 0;
   std::wstring selected;
@@ -157,7 +161,7 @@ struct BehaviorObservation {
 
 struct IntegratableObservation {
   bool available = false;
-  bool distinct_interface_branch = false;
+  bool distinct_interface_addresses = false;
   bool selection_style_called = false;
   HRESULT selection_style_result = E_NOTIMPL;
   TfIntegratableCandidateListSelectionStyle selection_style =
@@ -601,9 +605,20 @@ CandidateList ReadCandidateList(ITfCandidateListUIElement *candidates) {
   CandidateList list;
   if (!candidates)
     return list;
+  list.count_called = true;
+  list.count_result = candidates->GetCount(&list.count);
+  if (FAILED(list.count_result))
+    return list;
+  list.selection_called = true;
+  list.selection_result = candidates->GetSelection(&list.selection);
+  if (FAILED(list.selection_result) ||
+      (list.count == 0 ? list.selection != 0
+                       : list.selection >= list.count)) {
+    if (SUCCEEDED(list.selection_result))
+      list.selection_result = E_UNEXPECTED;
+    return list;
+  }
   list.available = true;
-  candidates->GetCount(&list.count);
-  candidates->GetSelection(&list.selection);
   BOOL shown = FALSE;
   if (SUCCEEDED(candidates->IsShown(&shown)))
     list.is_shown = shown ? 1 : 0;
@@ -665,7 +680,7 @@ void Drive(Mode mode, ITfKeyEventSink *keys, ITfContext *context,
     result->behavior.available = static_cast<bool>(interfaces.behavior);
     result->integratable.available =
         static_cast<bool>(interfaces.integratable);
-    result->integratable.distinct_interface_branch =
+    result->integratable.distinct_interface_addresses =
         interfaces.behavior && interfaces.integratable &&
         static_cast<void *>(interfaces.behavior.get()) !=
             static_cast<void *>(interfaces.integratable.get());
@@ -970,9 +985,9 @@ void Check(Mode mode, const ProbeResult &result) {
     Expect(result.behavior.available && result.integratable.available,
            "integratable_available",
            "the UI element did not expose both candidate-list interfaces");
-    Expect(result.integratable.distinct_interface_branch,
-           "integratable_distinct_branch",
-           "Behavior and Integratable unexpectedly used the same COM pointer");
+    Expect(result.integratable.distinct_interface_addresses,
+           "integratable_distinct_interface_addresses",
+           "Behavior and Integratable interface addresses unexpectedly matched");
     Expect(result.integratable.selection_style_called &&
                result.integratable.selection_style_result == S_OK &&
                result.integratable.selection_style == STYLE_ACTIVE_SELECTION,
@@ -1016,9 +1031,9 @@ void Check(Mode mode, const ProbeResult &result) {
                result.integratable.finalize_exact_result == S_OK,
            "integratable_finalize_exact",
            "FinalizeExactCompositionString did not succeed after rejection");
-    Expect(result.commit == kExpectedCommit,
+    Expect(result.commit == L"nihao",
            "integratable_finalize_exact_commit",
-           "FinalizeExactCompositionString did not commit U+4F60 U+597D");
+           "FinalizeExactCompositionString did not commit raw nihao preedit");
     Expect(result.candidates_final.available &&
                result.candidates_final.count == 0,
            "integratable_finalize_exact_end",
@@ -1111,26 +1126,44 @@ void Report(Mode mode, const ProbeResult &result) {
   }
   std::printf("  ],\n");
 
-  std::printf("  \"candidate_list\": {\"available\": %s, \"count\": %u, "
-              "\"selection\": %u, \"selected\": %s, \"is_shown\": %s},\n",
-              JsonBool(result.candidates.available), result.candidates.count,
+  std::printf("  \"candidate_list\": {\"available\": %s, "
+              "\"get_count_result\": %s, \"get_selection_result\": %s, "
+              "\"count\": %u, \"selection\": %u, \"selected\": %s, "
+              "\"is_shown\": %s},\n",
+              JsonBool(result.candidates.available),
+              JsonHresult(result.candidates.count_called,
+                          result.candidates.count_result).c_str(),
+              JsonHresult(result.candidates.selection_called,
+                          result.candidates.selection_result).c_str(),
+              result.candidates.count,
               result.candidates.selection,
               JsonString(result.candidates.selected).c_str(),
               JsonTriState(result.candidates.is_shown));
 
   std::printf(
       "  \"candidate_list_after_action\": {\"available\": %s, "
+      "\"get_count_result\": %s, \"get_selection_result\": %s, "
       "\"count\": %u, \"selection\": %u, \"selected\": %s, "
       "\"is_shown\": %s},\n",
       JsonBool(result.candidates_after_action.available),
+      JsonHresult(result.candidates_after_action.count_called,
+                  result.candidates_after_action.count_result).c_str(),
+      JsonHresult(result.candidates_after_action.selection_called,
+                  result.candidates_after_action.selection_result).c_str(),
       result.candidates_after_action.count,
       result.candidates_after_action.selection,
       JsonString(result.candidates_after_action.selected).c_str(),
       JsonTriState(result.candidates_after_action.is_shown));
   std::printf(
-      "  \"candidate_list_final\": {\"available\": %s, \"count\": %u, "
-      "\"selection\": %u, \"selected\": %s, \"is_shown\": %s},\n",
+      "  \"candidate_list_final\": {\"available\": %s, "
+      "\"get_count_result\": %s, \"get_selection_result\": %s, "
+      "\"count\": %u, \"selection\": %u, \"selected\": %s, "
+      "\"is_shown\": %s},\n",
       JsonBool(result.candidates_final.available),
+      JsonHresult(result.candidates_final.count_called,
+                  result.candidates_final.count_result).c_str(),
+      JsonHresult(result.candidates_final.selection_called,
+                  result.candidates_final.selection_result).c_str(),
       result.candidates_final.count, result.candidates_final.selection,
       JsonString(result.candidates_final.selected).c_str(),
       JsonTriState(result.candidates_final.is_shown));
@@ -1147,13 +1180,14 @@ void Report(Mode mode, const ProbeResult &result) {
       JsonHresult(result.behavior.abort_called, result.behavior.abort_result)
           .c_str());
   std::printf(
-      "  \"integratable\": {\"available\": %s, \"distinct_branch\": %s, "
+      "  \"integratable\": {\"available\": %s, "
+      "\"distinct_interface_addresses\": %s, "
       "\"selection_style_result\": %s, \"selection_style\": %s, "
       "\"show_numbers_result\": %s, \"show_numbers\": %s, "
       "\"key_result\": %s, \"key_eaten\": %s, "
       "\"finalize_exact_result\": %s},\n",
       JsonBool(result.integratable.available),
-      JsonBool(result.integratable.distinct_interface_branch),
+      JsonBool(result.integratable.distinct_interface_addresses),
       JsonHresult(result.integratable.selection_style_called,
                   result.integratable.selection_style_result)
           .c_str(),

@@ -86,9 +86,9 @@ HRESULT CandidateUiElement::QueryInterface(REFIID iid, void **object) {
   if (!object)
     return E_POINTER;
   *object = nullptr;
-  // One chain runs IUnknown -> ITfUIElement -> ITfCandidateListUIElement ->
-  // ...Behavior, so a single cast serves all four. Integratable is a second
-  // branch off IUnknown and needs its own cast to a different address.
+  // Behavior carries the ITfUIElement/ITfCandidateListUIElement chain, so one
+  // cast serves those IIDs. Integratable has a distinct interface-subobject
+  // address and therefore needs its own exact cast.
   if (iid == IID_IUnknown || iid == IID_ITfUIElement ||
       iid == IID_ITfCandidateListUIElement ||
       iid == IID_ITfCandidateListUIElementBehavior)
@@ -227,16 +227,13 @@ HRESULT CandidateUiElement::SetSelection(UINT index) {
     // index is page-relative and has to land inside it.
     if (index >= candidates_.size())
       return E_INVALIDARG;
-    if (!host_ || !begun_ || !manager_)
+    if (!host_ || !begun_)
       return E_FAIL;
     if (selection_ == index)
       return S_OK;
-    const UINT previous = selection_;
-    selection_ = index;
-    const HRESULT updated = manager_->UpdateUIElement(element_id_);
-    if (FAILED(updated))
-      selection_ = previous;
-    return updated;
+    // The engine owns candidate state. Do not publish the requested index
+    // until its Runtime reply reaches Update().
+    return host_->OnCandidateBehavior(this, CandidateBehavior::Select, index);
   });
 }
 
@@ -298,9 +295,11 @@ HRESULT CandidateUiElement::ShowCandidateNumbers(BOOL *show) {
 }
 
 HRESULT CandidateUiElement::FinalizeExactCompositionString() {
-  // "Exact" means commit what the user is currently being shown, which is the
-  // highlighted candidate — the same runtime verb as Behavior::Finalize.
-  return Finalize();
+  return ComBoundary([&] {
+    return host_ ? host_->OnCandidateBehavior(
+                       this, CandidateBehavior::FinalizeExact, 0)
+                 : E_FAIL;
+  });
 }
 
 } // namespace famo::tsf

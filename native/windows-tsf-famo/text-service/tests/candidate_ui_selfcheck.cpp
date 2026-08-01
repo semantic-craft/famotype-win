@@ -228,28 +228,34 @@ int RunChecks() {
 
   const int before_selection_updates = host_drawn_manager->updates;
   CHECK(behavior->SetSelection(2) == S_OK);
+  CHECK(SUCCEEDED(behavior->GetSelection(&selection)) && selection == 1);
+  // SetSelection is an engine request. The element must publish only the
+  // selection returned by the runtime, never speculative local state.
+  CHECK(host.behaviors == 1 &&
+        host.last_behavior == famo::tsf::CandidateBehavior::Select &&
+        host.last_index == 2 &&
+        host_drawn_manager->updates == before_selection_updates);
+  famo::runtime::Composition selected_snapshot = Snapshot();
+  selected_snapshot.highlighted_index = 2;
+  CHECK(SUCCEEDED(host_drawn->Update(selected_snapshot)));
   CHECK(SUCCEEDED(behavior->GetSelection(&selection)) && selection == 2);
-  // SetSelection changes the UI-less host's current candidate; it must not
-  // choose or commit it until Finalize.
-  CHECK(host.behaviors == 0 &&
-        host_drawn_manager->updates == before_selection_updates + 1);
   CHECK(behavior->Finalize() == S_OK);
-  CHECK(host.behaviors == 1 && host.last == host_drawn &&
+  CHECK(host.behaviors == 2 && host.last == host_drawn &&
         host.last_behavior == famo::tsf::CandidateBehavior::Finalize &&
         host.last_index == 2);
   CHECK(behavior->Abort() == S_OK);
-  CHECK(host.behaviors == 2 &&
+  CHECK(host.behaviors == 3 &&
         host.last_behavior == famo::tsf::CandidateBehavior::Abort);
   // The host's verdict is the method's result.
   host.result = E_FAIL;
-  CHECK(behavior->Finalize() == E_FAIL && host.behaviors == 3);
+  CHECK(behavior->Finalize() == E_FAIL && host.behaviors == 4);
   host.result = S_OK;
   // An index outside the published page never reaches the runtime session.
-  CHECK(behavior->SetSelection(3) == E_INVALIDARG && host.behaviors == 3);
+  CHECK(behavior->SetSelection(3) == E_INVALIDARG && host.behaviors == 4);
   // Nor does one against a list the element has already ended.
   famo::runtime::Composition cleared;
   CHECK(SUCCEEDED(host_drawn->Update(cleared)) && !host_drawn->begun());
-  CHECK(behavior->SetSelection(0) == E_INVALIDARG && host.behaviors == 3);
+  CHECK(behavior->SetSelection(0) == E_INVALIDARG && host.behaviors == 4);
   CHECK(SUCCEEDED(host_drawn->Update(Snapshot())));
 
   // An integrated host — a search box — additionally drives keyboarding and
@@ -258,8 +264,8 @@ int RunChecks() {
   CHECK(SUCCEEDED(host_drawn->QueryInterface(
       IID_ITfIntegratableCandidateListUIElement,
       reinterpret_cast<void **>(integratable.put()))));
-  // Separate inheritance branch from the behavior chain, so this must be its
-  // own cast rather than the one that serves the ITfUIElement IIDs.
+  // Multiple inheritance gives these two interfaces distinct addresses, so
+  // QueryInterface must cast each IID to its exact interface type.
   CHECK(static_cast<void *>(integratable.get()) !=
         static_cast<void *>(behavior.get()));
 
@@ -285,12 +291,11 @@ int RunChecks() {
   CHECK(SUCCEEDED(integratable->OnKeyDown('2', 0, &eaten)));
   CHECK(host.keys == before_keys + 1 && host.last_key == '2' && eaten == TRUE);
 
-  // FinalizeExactCompositionString commits what the user is being shown, which
-  // is the same runtime verb as Behavior::Finalize.
+  // Exact finalization is distinct from converting the highlighted candidate.
   const int before_finalize = host.behaviors;
   CHECK(integratable->FinalizeExactCompositionString() == S_OK);
   CHECK(host.behaviors == before_finalize + 1 &&
-        host.last_behavior == famo::tsf::CandidateBehavior::Finalize);
+        host.last_behavior == famo::tsf::CandidateBehavior::FinalizeExact);
 
   CHECK(integratable->GetSelectionStyle(nullptr) == E_POINTER);
   CHECK(integratable->ShowCandidateNumbers(nullptr) == E_POINTER);

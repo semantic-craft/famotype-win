@@ -62,6 +62,17 @@ bool SameSession(const runtime::Correlation &left,
          left.session_generation == right.session_generation;
 }
 
+bool IsSuccessfulEmptyComposition(const runtime::Composition &composition) {
+  return composition.handled && composition.preedit.empty() &&
+         composition.commit.empty() && composition.commit_preview.empty() &&
+         composition.candidates.empty() &&
+         composition.preview_candidates.empty() &&
+         composition.highlighted_index == 0 && composition.page_index == 0 &&
+         composition.page_size == 0 && composition.preedit_sel_start == 0 &&
+         composition.preedit_sel_end == 0 &&
+         composition.preedit_cursor_pos == 0;
+}
+
 uint32_t SpecialKey(WPARAM key, LPARAM key_data) {
   const bool extended = (key_data & (1ll << 24)) != 0;
   const uint32_t scan_code = static_cast<uint32_t>((key_data >> 16) & 0xff);
@@ -167,10 +178,13 @@ HostKey TextService::MakeKey(WPARAM key, LPARAM key_data, bool down,
 }
 
 HRESULT TextService::ApplyRuntimeComposition(
-    ContextEntry *entry, const runtime::Composition &composition) {
+    ContextEntry *entry, const runtime::Composition &composition,
+    const std::string *commit_override) {
   if (!entry || !entry->context)
     return E_INVALIDARG;
   runtime::Composition host_composition = composition;
+  if (commit_override)
+    host_composition.commit = *commit_override;
   if ((composition.state_flags & runtime::kHostInlinePreedit) == 0) {
     host_composition.preedit.clear();
     host_composition.preedit_sel_start = 0;
@@ -187,6 +201,24 @@ HRESULT TextService::ApplyRuntimeComposition(
   return entry->composition.Apply(
       entry->context.get(), client_id_, host_composition,
       static_cast<ITfCompositionSink *>(this));
+}
+
+bool TextService::ResolveCandidateCommitOverride(
+    ContextEntry *entry, const runtime::DeliveryReference &reference,
+    const runtime::Composition &composition,
+    const std::string **commit_override) const {
+  if (!entry || !commit_override)
+    return false;
+  *commit_override = nullptr;
+  if (!entry->exact_candidate_commit)
+    return true;
+  if (reference.command != runtime::Command::ClearComposition ||
+      reference.correlation != entry->exact_candidate_commit->correlation ||
+      !IsSuccessfulEmptyComposition(composition)) {
+    return false;
+  }
+  *commit_override = &entry->exact_candidate_commit->preedit;
+  return true;
 }
 
 bool TextService::HandlePreviewSelection(
@@ -246,9 +278,22 @@ bool TextService::HandlePreviewSelection(
 // runtime's click channel and by ITfCandidateListUIElementBehavior —
 // duplicating this ladder is how the quarantine/ACK contract gets broken.
 bool TextService::DeliverCandidateRequest(ContextEntry *entry,
-                                          runtime::Frame &&request) {
+                                          runtime::Frame &&request,
+                                          std::string exact_commit) {
+  if (!entry)
+    return false;
+  if (!exact_commit.empty()) {
+    if (request.command != runtime::Command::ClearComposition ||
+        entry->exact_candidate_commit) {
+      entry->state.CompleteUnhandled();
+      return false;
+    }
+    entry->exact_candidate_commit.emplace(
+        ExactCandidateCommit{request.correlation, std::move(exact_commit)});
+  }
   DeliveryAttempt attempt = SendDelivery(entry, std::move(request));
   if (attempt.state == DeliveryAttemptState::Rejected) {
+    entry->exact_candidate_commit.reset();
     entry->state.CompleteUnhandled();
     return false;
   }
@@ -279,6 +324,7 @@ bool TextService::DeliverCandidateRequest(ContextEntry *entry,
     // This is an exact terminal reply, not an ambiguous execution. Complete
     // the host plan and retain it for the normal ACK path without poisoning
     // the runtime connection; the next valid key can continue in-place.
+    entry->exact_candidate_commit.reset();
     entry->state.CompleteUnhandled();
     entry->applied_delivery = attempt.reference;
     return false;
@@ -290,18 +336,27 @@ bool TextService::DeliverCandidateRequest(ContextEntry *entry,
     QuarantineDelivery(entry);
     return true;
   }
+  const std::string *commit_override = nullptr;
+  if (!ResolveCandidateCommitOverride(entry, attempt.reference, composition,
+                                      &commit_override)) {
+    entry->pending_delivery = attempt.reference;
+    QuarantineDelivery(entry);
+    return true;
+  }
   if (!composition.handled) {
+    entry->exact_candidate_commit.reset();
     entry->state.CompleteUnhandled();
     entry->applied_delivery = attempt.reference;
     return false;
   }
-  if (FAILED(ApplyRuntimeComposition(entry, composition))) {
+  if (FAILED(ApplyRuntimeComposition(entry, composition, commit_override))) {
     entry->pending_delivery = attempt.reference;
     entry->deferred_delivery_composition = std::move(composition);
     return true;
   }
   entry->state.ApplySucceeded(composition);
   UpdateCandidates(entry, composition);
+  entry->exact_candidate_commit.reset();
   entry->applied_delivery = attempt.reference;
   return true;
 }
@@ -475,6 +530,7 @@ void TextService::RecoverConnection() {
         entry->ui_state.focused) {
       focused = entry.get();
     }
+    entry->exact_candidate_commit.reset();
     entry->session_pending = false;
     entry->pending_session = {};
   }
