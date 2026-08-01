@@ -144,6 +144,22 @@ target_link_libraries(tsf_integration_selfcheck PRIVATE
   famo_runtime_core ole32 oleaut32)
 add_dependencies(tsf_integration_selfcheck FamoTextService FamoTestRuntime)
 
+# Manual UI-less A/B acceptance probe. Like production_runtime_verify this is
+# intentionally not a CTest: it drives the real runtime against a caller-owned
+# deployed Rime data root.
+if(TARGET FamoRuntime)
+  add_executable(uiless_candidate_probe
+    tests/fake_text_store.cpp
+    tests/tsf_integration_support.cpp
+    tests/uiless_candidate_probe.cpp)
+  target_include_directories(uiless_candidate_probe PRIVATE include src tests)
+  target_compile_definitions(uiless_candidate_probe PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(uiless_candidate_probe PRIVATE
+    famo_runtime_core ole32 oleaut32)
+  add_dependencies(uiless_candidate_probe FamoTextService FamoRuntime)
+endif()
+
 enable_testing()
 add_test(NAME host_model_selfcheck COMMAND host_model_selfcheck)
 add_test(NAME commit_behavior_selfcheck COMMAND commit_behavior_selfcheck)
