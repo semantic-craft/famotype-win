@@ -480,6 +480,10 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
   if (attempt.state == DeliveryAttemptState::Rejected) {
     entry->state.CompleteUnhandled();
     entry->composition.ObserveUnhandledKey(key, down);
+    // Deploy can retire this logical session while an editor remains focused,
+    // so no later TSF focus callback is guaranteed to reopen it.
+    if (attempt.status == runtime::Status::StaleRequest)
+      RecoverConnection();
     return S_OK;
   }
   if (attempt.state == DeliveryAttemptState::PrepareUnknown) {
