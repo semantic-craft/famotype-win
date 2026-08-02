@@ -5,8 +5,9 @@ using Microsoft.Win32;
 namespace Famo.Settings.Core;
 
 /// <summary>
-/// 把法墨 TIP 加入/移出【当前用户】的输入法列表（input.dll!InstallLayoutOrTip，
-/// 即 Win+Space / 语言设置里可见可切）。上游 WeaselSetup 注册后就做这一步，
+/// 把法墨 TIP 加入/移出【当前用户】的输入法列表（input.dll!InstallLayoutOrTip
+/// 引导 + Windows International 模块持久化，即 Win+Space / 语言设置里可见可切）。
+/// 上游 WeaselSetup 注册后就做这一步，
 /// 法墨改用 regsvr32（仅机器级 CLSID/profile 注册）后曾缺失——注册 ≠ 进列表。
 /// 红线：提权安装段绝不写用户配置，故本步骤只能以原始用户身份在首启链路
 /// （--seed-only）执行；卸载侧经 --remove-input-tip 反向移除。
@@ -56,38 +57,54 @@ public static class InputMethodList
     {
         int lastError = 0;
         Exception? lastException = null;
-        bool result = RetryEnsureFamoInUserList(
-            install: () =>
-            {
-                try
+        string languageListError = "";
+        bool result = TryEnsureDurableFamoInUserList(
+            ensureNative: () => RetryEnsureFamoInUserList(
+                install: () =>
                 {
-                    bool installed = InstallLayoutOrTip(FamoTip, 0);
-                    if (!installed)
+                    try
                     {
-                        lastError = Marshal.GetLastPInvokeError();
+                        bool installed = InstallLayoutOrTip(FamoTip, 0);
+                        if (!installed)
+                        {
+                            lastError = Marshal.GetLastPInvokeError();
+                        }
+                        return installed;
                     }
-                    return installed;
-                }
-                catch (Exception ex)
-                {
-                    lastException = ex;
-                    return false;
-                }
-            },
-            isAlreadyPresent: () =>
-                TryIsFamoInUserList(out bool present) && present,
-            delay: Thread.Sleep,
-            maxAttempts: 20,
-            delayMilliseconds: 500);
+                    catch (Exception ex)
+                    {
+                        lastException = ex;
+                        return false;
+                    }
+                },
+                isAlreadyPresent: () =>
+                    TryIsFamoInUserList(out bool present) && present,
+                delay: Thread.Sleep,
+                maxAttempts: 20,
+                delayMilliseconds: 500),
+            persistWithUserLanguageList: () =>
+                EnsureFamoWithUserLanguageList(out languageListError));
         if (!result && logFailures)
         {
-            string detail = lastException is null
+            string nativeDetail = lastException is null
                 ? $"Win32={lastError}"
                 : lastException.Message;
             FamoLog.Append(
-                $"InstallLayoutOrTip(install) failed after retry: {detail}");
+                $"InstallLayoutOrTip(install) failed after retry: native={nativeDetail}; language-list={languageListError}");
         }
         return result;
+    }
+
+    internal static bool TryEnsureDurableFamoInUserList(
+        Func<bool> ensureNative,
+        Func<bool> persistWithUserLanguageList)
+    {
+        _ = ensureNative();
+        // InstallLayoutOrTip can expose a process-local healthy readback while
+        // Windows has not persisted the current-user language list. Converge
+        // through the official language-list API and treat its fresh readback
+        // as authoritative.
+        return persistWithUserLanguageList();
     }
 
     internal static bool RetryEnsureFamoInUserList(
@@ -219,24 +236,60 @@ public static class InputMethodList
         return !isStillPresent();
     }
 
+    private static bool EnsureFamoWithUserLanguageList(out string error)
+    {
+        const string script = """
+            $ErrorActionPreference = 'Stop'
+            $tip = '0804:{54EAD76A-B864-4A6D-9C82-148E3352BEE7}{0158C2BA-4E96-4BA8-B505-E1BBEBB3FA33}'
+            $list = Get-WinUserLanguageList
+            $target = $null
+            foreach ($language in $list) {
+              if ([string]::Equals([string]$language.LanguageTag, 'zh-Hans-CN', [StringComparison]::OrdinalIgnoreCase) -or
+                  [string]::Equals([string]$language.LanguageTag, 'zh-CN', [StringComparison]::OrdinalIgnoreCase)) {
+                $target = $language
+                break
+              }
+            }
+            if ($null -eq $target) {
+              foreach ($language in $list) {
+                foreach ($entry in $language.InputMethodTips) {
+                  if ($entry.StartsWith('0804:', [StringComparison]::OrdinalIgnoreCase)) {
+                    $target = $language
+                    break
+                  }
+                }
+                if ($null -ne $target) { break }
+              }
+            }
+            if ($null -eq $target) {
+              throw 'Simplified Chinese user language is unavailable'
+            }
+            $present = $false
+            foreach ($entry in $target.InputMethodTips) {
+              if ([string]::Equals($entry, $tip, [StringComparison]::OrdinalIgnoreCase)) {
+                $present = $true
+                break
+              }
+            }
+            if (-not $present) {
+              $target.InputMethodTips.Add($tip)
+            }
+            Set-WinUserLanguageList -LanguageList $list -Force
+            foreach ($language in Get-WinUserLanguageList) {
+              foreach ($entry in $language.InputMethodTips) {
+                if ([string]::Equals($entry, $tip, [StringComparison]::OrdinalIgnoreCase)) {
+                  exit 0
+                }
+              }
+            }
+            exit 1
+            """;
+
+        return RunUserLanguageListScript(script, out error);
+    }
+
     private static bool RemoveFamoWithUserLanguageList(out string error)
     {
-        error = "";
-        if (!OperatingSystem.IsWindows())
-        {
-            error = "Windows-only International module unavailable";
-            return false;
-        }
-
-        string powershell = Path.Combine(
-            Environment.SystemDirectory,
-            @"WindowsPowerShell\v1.0\powershell.exe");
-        if (!File.Exists(powershell))
-        {
-            error = "Windows PowerShell not found";
-            return false;
-        }
-
         const string script = """
             $ErrorActionPreference = 'Stop'
             $tip = '0804:{54EAD76A-B864-4A6D-9C82-148E3352BEE7}{0158C2BA-4E96-4BA8-B505-E1BBEBB3FA33}'
@@ -262,6 +315,27 @@ public static class InputMethodList
             }
             exit 0
             """;
+
+        return RunUserLanguageListScript(script, out error);
+    }
+
+    private static bool RunUserLanguageListScript(string script, out string error)
+    {
+        error = "";
+        if (!OperatingSystem.IsWindows())
+        {
+            error = "Windows-only International module unavailable";
+            return false;
+        }
+
+        string powershell = Path.Combine(
+            Environment.SystemDirectory,
+            @"WindowsPowerShell\v1.0\powershell.exe");
+        if (!File.Exists(powershell))
+        {
+            error = "Windows PowerShell not found";
+            return false;
+        }
 
         try
         {
