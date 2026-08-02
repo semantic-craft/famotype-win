@@ -10,7 +10,7 @@ param(
   [string] $NativeOutput = '',
   [string] $BridgeArtifact = '',
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.5.12',
+  [string] $AppVersion = '1.5.13',
   [ValidateSet('Stable')]
   [string] $Identity = 'Stable',
   [string] $Configuration = 'Release',
