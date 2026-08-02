@@ -167,10 +167,11 @@ public sealed class TipSelfHealTests
     }
 
     // ── Runtime 接线：安装期可在 Activating 启动，但必须有界等到 Ready，
-    //    再委托共享 helper 做双稳定回读，不能复制第三套探针/修复循环 ──
+    //    立即委托一次后还要跨过安装结束时的 Windows 输入源重整窗口再复查；
+    //    两次都复用共享 helper，不能复制第三套探针/修复循环 ──
 
     [Fact]
-    public void RuntimeStartup_WaitsForReadyThenDelegatesSharedStableSelfHeal()
+    public void RuntimeStartup_RechecksAfterReadySettles()
     {
         string main = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
@@ -195,7 +196,19 @@ public sealed class TipSelfHealTests
         Assert.True(
             ready < delegated,
             "the singleton runtime must wait through its own Activating projection, then delegate only after Ready");
+        int settledReady = main.IndexOf(
+            "ProductionInstallAllowed(ModuleDirectory(), false)",
+            delegated,
+            StringComparison.Ordinal);
+        int redelegated = main.IndexOf(
+            "--tip-self-heal",
+            delegated + 1,
+            StringComparison.Ordinal);
+        Assert.True(settledReady > delegated && redelegated > settledReady,
+            "the runtime must remain Ready through a bounded post-install settling window, then delegate a second time");
         Assert.Contains("kTipSelfHealReadyAttempts", main);
+        Assert.Contains("kTipSelfHealPostReadyAttempts", main);
+        Assert.Contains("kTipSelfHealPostReadyDelayMs", main);
         Assert.Contains(".detach()", main);
         Assert.Contains("tip-selfheal", main);
         Assert.DoesNotContain("--is-input-tip", main);

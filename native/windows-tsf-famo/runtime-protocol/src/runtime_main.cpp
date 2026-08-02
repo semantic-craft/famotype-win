@@ -297,8 +297,10 @@ int wmain(int argc, wchar_t **argv) {
   // miss the transition. Wait only while this exact target remains Activating;
   // PendingReboot, RolledBack, uninstall, or a different target stop the task.
   // Once Ready, delegate the full probe/add/two-stable-readback loop to the
-  // settings companion instead of copying a third implementation. Detached
-  // thread: startup and typing never block on the bounded wait or repair.
+  // settings companion instead of copying a third implementation. Windows can
+  // still rebuild the user input-source list as Setup exits, so repeat the
+  // delegated check after a bounded Ready-only settling window. Detached
+  // thread: startup and typing never block on either check.
   std::thread([data_root] {
     constexpr int kTipSelfHealReadyAttempts = 60;
     constexpr DWORD kTipSelfHealReadyDelayMs = 1000;
@@ -322,7 +324,23 @@ int wmain(int argc, wchar_t **argv) {
     const int result = RunSettingsHeadless(settings, L"--tip-self-heal");
     if (result != 0)
       AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
-                              "exit=" + std::to_string(result));
+                              "initial exit=" + std::to_string(result));
+    if (result < 0)
+      return; // do not overlap a companion that may have hit our wait bound
+
+    constexpr int kTipSelfHealPostReadyAttempts = 10;
+    constexpr DWORD kTipSelfHealPostReadyDelayMs = 1000;
+    for (int attempt = 0; attempt < kTipSelfHealPostReadyAttempts; ++attempt) {
+      Sleep(kTipSelfHealPostReadyDelayMs);
+      if (!ProductionInstallAllowed(ModuleDirectory(), false))
+        return;
+    }
+    const int settled_result =
+        RunSettingsHeadless(settings, L"--tip-self-heal");
+    if (settled_result != 0)
+      AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                              "settled exit=" +
+                                  std::to_string(settled_result));
   }).detach();
 
   CandidateWindow candidate_window;
