@@ -148,7 +148,11 @@ int RunChecks() {
   auto *element = new famo::tsf::CandidateUiElement(manager, nullptr);
   BOOL allowed = TRUE;
   CHECK(SUCCEEDED(element->Update(Snapshot(), &allowed)));
-  CHECK(element->begun() && !allowed && manager->begins == 1);
+  // UI-less hosts do not inspect contents during BeginUIElement. When they
+  // return FALSE to own presentation, the first UpdateUIElement is what tells
+  // them the candidate data is ready.
+  CHECK(element->begun() && !allowed && manager->begins == 1 &&
+        manager->updates == 1);
 
   DWORD flags = 0;
   UINT count = 0;
@@ -166,7 +170,7 @@ int RunChecks() {
   UINT pages[1]{};
   CHECK(SUCCEEDED(element->GetPageIndex(pages, 1, &page_count)));
   CHECK(page_count == 1 && pages[0] == 0);
-  CHECK(SUCCEEDED(element->Update(Snapshot())) && manager->updates == 1);
+  CHECK(SUCCEEDED(element->Update(Snapshot())) && manager->updates == 2);
   famo::runtime::Composition empty;
   CHECK(SUCCEEDED(element->Update(empty)) && manager->ends == 1);
   CHECK(!element->begun());

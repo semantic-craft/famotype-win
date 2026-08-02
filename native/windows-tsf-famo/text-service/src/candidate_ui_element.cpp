@@ -64,6 +64,11 @@ HRESULT CandidateUiElement::Update(const runtime::Composition &composition,
       // Fresh element session: any hide the host requested for the previous
       // element does not carry over.
       shown_ = TRUE;
+      // A UI-less host does not inspect candidate contents in BeginUIElement;
+      // FALSE means it starts reading them at UpdateUIElement. Publish that
+      // first complete update immediately instead of waiting for another key.
+      if (!allowed)
+        result = manager_->UpdateUIElement(element_id_);
     }
   } else {
     // UpdateUIElement carries no pbShow, so the BeginUIElement answer stands
