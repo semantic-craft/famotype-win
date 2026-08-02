@@ -2,8 +2,8 @@
   "spdxVersion": "SPDX-2.3",
   "dataLicense": "CC0-1.0",
   "SPDXID": "SPDXRef-DOCUMENT",
-  "name": "Famo-Windows-1.5.13",
-  "documentNamespace": "https://github.com/semantic-craft/famotype-win/spdx/famo-windows-1.5.13",
+  "name": "Famo-Windows-1.5.14",
+  "documentNamespace": "https://github.com/semantic-craft/famotype-win/spdx/famo-windows-1.5.14",
   "creationInfo": {
     "created": "2026-07-21T15:00:00Z",
     "creators": [
@@ -17,7 +17,7 @@
     {
       "name": "Famo Windows",
       "SPDXID": "SPDXRef-Package-Famo-Windows",
-      "versionInfo": "1.5.13",
+      "versionInfo": "1.5.14",
       "downloadLocation": "NOASSERTION",
       "filesAnalyzed": false,
       "licenseConcluded": "GPL-3.0-only",
