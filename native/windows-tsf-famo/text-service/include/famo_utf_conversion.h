@@ -7,6 +7,7 @@
 namespace famo::tsf {
 
 bool Utf8ToUtf16(std::string_view input, std::wstring *output);
+bool Utf16ToUtf8(std::wstring_view input, std::string *output);
 
 struct Utf16Preedit {
   std::wstring text;

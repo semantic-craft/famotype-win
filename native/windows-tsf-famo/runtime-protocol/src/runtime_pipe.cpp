@@ -61,6 +61,14 @@ bool PreservesLogicalConnection(Command command) {
          command == Command::AbandonSession;
 }
 
+std::chrono::milliseconds MaximumCallDeadline(Command command) {
+  if (command == Command::OpenSession)
+    return kSessionOpenDeadline;
+  if (command == Command::SearchCandidates)
+    return kSearchCandidatesDeadline;
+  return kHardCallDeadline;
+}
+
 } // namespace
 
 PipeRuntimePort::PipeRuntimePort(uint32_t bridge_abi)
@@ -423,8 +431,7 @@ CallResult PipeRuntimePort::Call(Frame &&request,
                                  std::chrono::milliseconds deadline) {
   const auto started = std::chrono::steady_clock::now();
   const std::chrono::milliseconds maximum =
-      request.command == Command::OpenSession ? kSessionOpenDeadline
-                                               : kHardCallDeadline;
+      MaximumCallDeadline(request.command);
   deadline = std::min(deadline, maximum);
   if (deadline.count() <= 0)
     return {};
@@ -445,8 +452,7 @@ CallResult PipeRuntimePort::CallUntil(
       PreservesLogicalConnection(request.command);
   CallResult immediate;
   const std::chrono::milliseconds maximum =
-      request.command == Command::OpenSession ? kSessionOpenDeadline
-                                               : kHardCallDeadline;
+      MaximumCallDeadline(request.command);
   absolute_deadline =
       std::min(absolute_deadline, started + maximum);
   if (absolute_deadline <= started + std::chrono::milliseconds(1)) {

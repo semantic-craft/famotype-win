@@ -40,6 +40,11 @@ struct RuntimeServiceTestAccess {
   static size_t SessionCount(const RuntimeService &service) {
     return service.sessions_.size();
   }
+  static std::vector<std::string>
+  FilterSearchCandidates(std::span<const Candidate> candidates,
+                         std::string_view query) {
+    return RuntimeService::FilterSearchCandidates(candidates, query);
+  }
 };
 } // namespace famo::runtime
 
@@ -304,6 +309,19 @@ int main() {
         active_style_text->find("color_scheme: wuda") != std::string::npos);
   CHECK(service.engine_generation() == 2);
 
+  const std::vector<Candidate> redundant_search_candidates{
+      {"\xe4\xbd\xa0\xe5\xa5\xbd", "", "", 0, 0},
+      {"\xe6\x8b\x9f\xe5\xa5\xbd", "", "", 0, 0},
+      {"\xe4\xbd\xa0", "", "", 0, 0},
+      {"ni", "", "", 0, 0},
+      {"\xe6\x8b\x9f\xe5\xa5\xbd", "", "", 0, 0}};
+  const std::vector<std::string> filtered_search_candidates =
+      RuntimeServiceTestAccess::FilterSearchCandidates(
+          redundant_search_candidates, "ni");
+  CHECK(filtered_search_candidates ==
+        std::vector<std::string>({"\xe6\x8b\x9f\xe5\xa5\xbd",
+                                  "\xe4\xbd\xa0"}));
+
   CHECK(service.Start(L"FamoTestEngine.dll", data_root_utf8.c_str(), &error));
   CHECK(service.readiness() == RuntimeReadiness::Ready);
   CHECK(service.engine_generation() == 2);
@@ -359,6 +377,44 @@ int main() {
   CHECK(DecodeHelloResponse(hello_reply.payload, &hello_selection, &error));
   CHECK(hello_selection.selected_protocol_version == kProtocolVersion);
   CHECK(service.Dispatch(hello).status == Status::Ok);
+
+  const size_t sessions_before_search =
+      RuntimeServiceTestAccess::SessionCount(service);
+  const std::shared_ptr<const RuntimeSnapshot> snapshot_before_search =
+      sink.latest;
+  Frame search = Request(Command::SearchCandidates, 1);
+  search.correlation.session_id = 0;
+  search.correlation.session_generation = 0;
+  CHECK(EncodeSearchQuery("ni", &search.payload, &error));
+  const Frame search_reply = service.Dispatch(search);
+  CHECK(search_reply.status == Status::Ok);
+  std::vector<std::string> search_results;
+  CHECK(DecodeSearchCandidates(search_reply.payload, &search_results,
+                               &error));
+  CHECK(!search_results.empty() &&
+        search_results[0] == "\xe4\xbd\xa0");
+  CHECK(RuntimeServiceTestAccess::SessionCount(service) ==
+        sessions_before_search);
+  CHECK(sink.latest == snapshot_before_search);
+
+  Frame unsupported_search = search;
+  unsupported_search.correlation.sequence = 2;
+  CHECK(EncodeSearchQuery("\xe4\xbd\xa0", &unsupported_search.payload,
+                          &error));
+  const Frame unsupported_reply = service.Dispatch(unsupported_search);
+  CHECK(unsupported_reply.status == Status::Ok);
+  CHECK(DecodeSearchCandidates(unsupported_reply.payload, &search_results,
+                               &error));
+  CHECK(search_results.empty());
+  CHECK(RuntimeServiceTestAccess::SessionCount(service) ==
+        sessions_before_search);
+  CHECK(sink.latest == snapshot_before_search);
+
+  Frame legacy_search = search;
+  legacy_search.wire_version = kMinSupportedProtocolVersion;
+  legacy_search.correlation.client_id =
+      previous_version_hello.correlation.client_id;
+  CHECK(service.Dispatch(legacy_search).status == Status::InvalidFrame);
 
   Frame open = Request(Command::OpenSession, 1);
   CHECK(EncodeOpenSession("test", &open.payload, &error));

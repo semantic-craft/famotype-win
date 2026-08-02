@@ -11,13 +11,16 @@
 #include "abi_boundary.h"
 #include "famo_guids.h"
 #include "famo_install_state.h"
+#include "famo_utf_conversion.h"
 #include "module_state.h"
+#include "search_candidate_list.h"
 
 namespace famo::tsf {
 
 namespace {
 
 std::atomic<uint64_t> g_activation_generation{0};
+std::atomic<uint64_t> g_search_generation{0};
 constexpr UINT kRecoveryMessage = WM_APP + 0x46;
 constexpr UINT_PTR kKeyboardSecurityRetryTimer = 0x4641;
 constexpr UINT kKeyboardSecurityRetryDelayMs = 10;
@@ -296,6 +299,11 @@ HRESULT TextService::QueryInterface(REFIID iid, void **object) {
     *object = static_cast<ITfCompositionSink *>(this);
   else if (iid == IID_ITfTextLayoutSink)
     *object = static_cast<ITfTextLayoutSink *>(this);
+  else if (iid == IID_ITfFunctionProvider)
+    *object = static_cast<ITfFunctionProvider *>(this);
+  else if (iid == IID_ITfFunction ||
+           iid == IID_ITfFnSearchCandidateProvider)
+    *object = static_cast<ITfFnSearchCandidateProvider *>(this);
   if (!*object)
     return E_NOINTERFACE;
   AddRef();
@@ -358,9 +366,21 @@ bool TextService::PreviewSelectionStateForTest(
   return false;
 }
 
+bool TextService::UiStateForTest(ITfContext *context,
+                                 runtime::UiState *state) const noexcept {
+  if (!context || !state || !OnActivationThread())
+    return false;
+  for (const auto &entry : contexts_) {
+    if (entry && entry->context.get() == context) {
+      *state = entry->ui_state;
+      return true;
+    }
+  }
+  return false;
+}
+
 HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
-                                  TfClientId client_id,
-                                  bool advise_key_sink) {
+                                  TfClientId client_id, bool advise_key_sink) {
   if (!thread_manager || thread_manager_)
     return E_INVALIDARG;
   activation_thread_ = GetCurrentThreadId();
@@ -416,6 +436,25 @@ HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
   if (FAILED(result)) {
     Deactivate();
     return result;
+  }
+  result = thread_manager_->QueryInterface(
+      IID_ITfSourceSingle,
+      reinterpret_cast<void **>(function_source_.put()));
+  if (FAILED(result)) {
+    Deactivate();
+    return result;
+  }
+  result = function_source_->AdviseSingleSink(
+      client_id_, IID_ITfFunctionProvider,
+      static_cast<ITfFunctionProvider *>(this));
+  if (SUCCEEDED(result)) {
+    function_provider_advised_ = true;
+  } else {
+    // Search conversion is additive. A host that has already occupied the
+    // single application-provider slot must not lose ordinary IME input.
+    function_source_.reset();
+    OutputDebugStringA(
+        "FamoTextService function provider registration unavailable\n");
   }
   if (!StartRecoveryWindow() || !StartSessionWorker()) {
     Deactivate();
@@ -568,6 +607,10 @@ HRESULT TextService::DeactivateCore() {
       source->UnadviseSink(thread_sink_cookie_);
     thread_sink_cookie_ = TF_INVALID_COOKIE;
   }
+  if (function_source_ && function_provider_advised_)
+    function_source_->UnadviseSingleSink(client_id_, IID_ITfFunctionProvider);
+  function_provider_advised_ = false;
+  function_source_.reset();
   runtime_port_.Stop();
   ui_manager_.reset();
   keystroke_manager_.reset();
@@ -723,6 +766,15 @@ void TextService::ForceDeactivateCleanup() noexcept {
   } catch (...) {
   }
   thread_sink_cookie_ = TF_INVALID_COOKIE;
+  try {
+    if (function_source_ && function_provider_advised_) {
+      function_source_->UnadviseSingleSink(client_id_,
+                                           IID_ITfFunctionProvider);
+    }
+  } catch (...) {
+  }
+  function_provider_advised_ = false;
+  function_source_.reset();
   ui_manager_.reset();
   keystroke_manager_.reset();
   thread_manager_.reset();
@@ -732,6 +784,117 @@ void TextService::ForceDeactivateCleanup() noexcept {
 
 bool TextService::OnActivationThread() const {
   return activation_thread_ != 0 && activation_thread_ == GetCurrentThreadId();
+}
+
+HRESULT TextService::GetType(GUID *guid) {
+  return ComBoundary([&]() -> HRESULT {
+    if (!guid)
+      return E_POINTER;
+    *guid = kTextServiceClsid;
+    return S_OK;
+  });
+}
+
+HRESULT TextService::GetDescription(BSTR *description) {
+  return ComBoundary([&]() -> HRESULT {
+    if (!description)
+      return E_POINTER;
+    *description = SysAllocString(kProfileName);
+    return *description ? S_OK : E_OUTOFMEMORY;
+  });
+}
+
+HRESULT TextService::GetFunction(REFGUID guid, REFIID iid,
+                                 IUnknown **function) {
+  return ComBoundary([&]() -> HRESULT {
+    if (!function)
+      return E_POINTER;
+    *function = nullptr;
+    if (guid != GUID_NULL || iid != IID_ITfFnSearchCandidateProvider)
+      return E_NOINTERFACE;
+    return QueryInterface(iid, reinterpret_cast<void **>(function));
+  });
+}
+
+HRESULT TextService::GetDisplayName(BSTR *name) {
+  return GetDescription(name);
+}
+
+HRESULT TextService::GetSearchCandidates(BSTR query, BSTR application_id,
+                                         ITfCandidateList **candidates) {
+  return ComBoundary([&]() -> HRESULT {
+    if (!candidates)
+      return E_POINTER;
+    *candidates = nullptr;
+    if (!query || !application_id)
+      return E_INVALIDARG;
+    if (!thread_manager_ || !OnActivationThread())
+      return E_UNEXPECTED;
+    if (SysStringLen(query) == 0)
+      return S_FALSE;
+
+    std::string reading;
+    if (!Utf16ToUtf8(
+            std::wstring_view(query, static_cast<size_t>(SysStringLen(query))),
+            &reading)) {
+      return E_INVALIDARG;
+    }
+    runtime::Frame request;
+    request.command = runtime::Command::SearchCandidates;
+    std::string error;
+    if (!runtime::EncodeSearchQuery(reading, &request.payload, &error))
+      return E_INVALIDARG;
+
+    uint64_t search_generation = ++g_search_generation;
+    if (search_generation == 0)
+      search_generation = ++g_search_generation;
+    uint64_t search_client_id =
+        (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this)) ^
+        (search_generation * UINT64_C(0x9e3779b97f4a7c15));
+    if (search_client_id == 0 || search_client_id == runtime_client_id_)
+      search_client_id = runtime_client_id_ ^ UINT64_C(0x8000000000000000) ^
+                         search_generation;
+    if (search_client_id == 0 || search_client_id == runtime_client_id_) {
+      search_client_id = runtime_client_id_ + 1;
+      if (search_client_id == 0)
+        search_client_id = 1;
+    }
+
+    const runtime::Correlation connection{
+        search_client_id, activation_generation_, search_generation, 0, 0, 0};
+    runtime::PipeRuntimePort search_port{kBridgeAbiVersion};
+    if (!ConnectRuntimePort(&search_port, connection, false, nullptr))
+      return E_FAIL;
+    request.correlation = connection;
+    request.correlation.sequence = 1;
+    const runtime::CallResult result = search_port.Call(
+        std::move(request), runtime::kSearchCandidatesDeadline);
+    search_port.Stop();
+    if (result.status != runtime::Status::Ok)
+      return E_FAIL;
+
+    std::vector<std::string> encoded_candidates;
+    if (!runtime::DecodeSearchCandidates(result.reply.payload,
+                                         &encoded_candidates, &error)) {
+      return E_FAIL;
+    }
+    if (encoded_candidates.empty())
+      return S_FALSE;
+    std::vector<std::wstring> converted;
+    converted.reserve(encoded_candidates.size());
+    for (const std::string &candidate : encoded_candidates) {
+      std::wstring value;
+      if (!Utf8ToUtf16(candidate, &value) || value.empty())
+        return E_FAIL;
+      converted.push_back(std::move(value));
+    }
+    return CreateSearchCandidateList(std::move(converted), candidates);
+  });
+}
+
+HRESULT TextService::SetResult(BSTR query, BSTR application_id, BSTR result) {
+  return (query && application_id && result) ? E_NOTIMPL : E_INVALIDARG;
 }
 
 bool TextService::RenewSelectionCapability(
@@ -747,12 +910,20 @@ bool TextService::RenewSelectionCapability(
 
 bool TextService::ConnectRuntime(const runtime::Correlation &identity,
                                  bool retry_terminal_debt) {
-  if (runtime_port_.state() == runtime::ChannelState::Ready &&
-      runtime_port_.connection_generation() ==
-          identity.connection_generation) {
+  return ConnectRuntimePort(&runtime_port_, identity, retry_terminal_debt,
+                            &session_worker_stop_);
+}
+
+bool TextService::ConnectRuntimePort(
+    runtime::PipeRuntimePort *port, const runtime::Correlation &identity,
+    bool retry_terminal_debt, const std::atomic<bool> *cancelled) {
+  if (!port)
+    return false;
+  if (port->state() == runtime::ChannelState::Ready &&
+      port->connection_generation() == identity.connection_generation) {
     return true;
   }
-  runtime_port_.Stop();
+  port->Stop();
   runtime::PipeEndpoint endpoint;
   std::string error;
   if (!runtime::BuildCurrentPipeEndpoint(runtime_endpoint_suffix_, &endpoint,
@@ -783,14 +954,14 @@ bool TextService::ConnectRuntime(const runtime::Correlation &identity,
   if (retry_terminal_debt) {
     RetryTerminalAbandonDebts(
         runtime_endpoint_suffix_, runtime_executable_name_, endpoint, expected,
-        &session_worker_stop_);
+        cancelled);
   }
   runtime::Correlation connection = identity;
   connection.session_id = 0;
   connection.session_generation = 0;
   connection.sequence = 0;
-  return runtime_port_.Connect(endpoint, expected, connection, deadline, &error,
-                               &session_worker_stop_);
+  return port->Connect(endpoint, expected, connection, deadline, &error,
+                       cancelled);
 }
 
 HRESULT TextService::EnsureContext(ITfContext *context,

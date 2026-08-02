@@ -39,6 +39,27 @@ to Runtime: after the optional UI pipe misses startup or disconnects, only the
 Bridge still owns the queued TSF state that must be replayed to a replacement
 Runtime.
 
+Bridge ABI 4 is the frozen UI-less-candidate release. The in-process TSF
+facade implements host ownership through
+`ITfIntegratableCandidateListUIElement`; this must remain in the TIP because
+only the Bridge participates in the host's TSF UI-element negotiation. ABI 4
+continues to use Runtime protocol v3. Its bytes and artifact directory are
+immutable after publication.
+
+Bridge ABI 5 is the next exceptional Bridge release. It adds two contracts
+that cannot live wholly in Runtime:
+
+- `ITfFunctionProvider` / `ITfFnSearchCandidateProvider`, which Windows Search
+  discovers on the in-process TIP, with engine-backed candidates carried over
+  the new stateless Runtime protocol v4 command;
+- caret-range collapse plus host-DPI coordinate normalization, which requires
+  the Bridge-owned `ITfContextView`, view HWND, and edit-session range.
+
+ABI 5 is installed only at `bridge\v5`; it never replaces ABI 3 or ABI 4
+bytes. It becomes a frozen production artifact only after the signed DLL is
+used to create and verify a new manifest. Until then, development artifacts
+remain unsigned evidence and are not release artifacts.
+
 ## Artifact rules
 
 `installer/build-bridge-artifact.ps1` creates:
@@ -69,19 +90,22 @@ Bridge artifacts for a production build.
 
 Runtime protocol v3 adds an extended `Hello` carrying the Bridge ABI and a
 protocol range. Runtime v3 still accepts legacy v2 empty `Hello` frames and
-replies using the client's negotiated wire version.
+replies using the client's negotiated wire version. Runtime protocol v4 adds
+the stateless `SearchCandidates` command; v2/v3 peers reject that command while
+their existing session commands remain compatible.
 
-Compatibility for the first migration is:
+Current compatibility is:
 
-| Bridge | Runtime v2 | Runtime v3 |
-| --- | --- | --- |
-| Legacy Bridge, wire v2 | yes | yes |
-| Stable Bridge ABI 1, extended Hello | no | yes |
+| Bridge | Runtime v2 | Runtime v3 | Runtime v4 |
+| --- | --- | --- | --- |
+| Legacy Bridge, wire v2 | yes | yes | yes |
+| Bridge ABI 3/4, wire through v3 | no | yes | yes |
+| Bridge ABI 5, wire v4 | no | no | yes |
 
-The installer lays down and verifies Runtime v3 before it registers Stable
-Bridge ABI 1, so it never activates the new Bridge against Runtime v2.
-Subsequent Runtime releases must continue to accept the protocol range frozen
-in the Bridge artifact. Before a future protocol removal:
+The installer lays down and verifies the matching Runtime before it registers
+a new Bridge, so it never activates ABI 5 against a pre-v4 Runtime. Subsequent
+Runtime releases must continue to accept the protocol range frozen in each
+Bridge artifact. Before a future protocol removal:
 
 1. release a Runtime that accepts both the old and new Bridge;
 2. confirm that Runtime is broadly installed;
@@ -95,8 +119,9 @@ Automated gates prove artifact separation, protocol compatibility, native
 tests, payload contracts, and installer compilation. A release is not accepted
 as reboot-free until Windows system testing records both:
 
-- one migration from the legacy version-directory DLL to
-  `bridge\v1` (this migration may require one final reboot);
+- one migration from the previously frozen Bridge to the new `bridge\vN`
+  directory (this migration may require one final reboot when the old Bridge
+  is loaded);
 - at least two consecutive Runtime-only upgrades where the Bridge path and
   SHA-256 remain unchanged, `PendingReboot` is never entered, and typing works
   in existing and newly opened applications.

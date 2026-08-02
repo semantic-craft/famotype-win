@@ -244,6 +244,10 @@ private:
                        const PipeClientIdentity *owner = nullptr);
   Frame DispatchSessionCommand(const Frame &request, const SessionKey &key,
                                Session &session);
+  Frame DispatchSearchCandidatesLocked(const Frame &request);
+  static std::vector<std::string>
+  FilterSearchCandidates(std::span<const Candidate> candidates,
+                         std::string_view query);
   Frame RecoverSessionCommand(const Frame &request, const SessionKey &key,
                               Session &session);
   Frame CompleteSessionCommand(const Frame &request, Session &session,

@@ -15,7 +15,7 @@
   #define Identity "Stable"
 #endif
 #ifndef BridgeAbi
-  #define BridgeAbi "4"
+  #define BridgeAbi "5"
 #endif
 #ifndef BridgeHash
   #define BridgeHash "0000000000000000000000000000000000000000000000000000000000000000"

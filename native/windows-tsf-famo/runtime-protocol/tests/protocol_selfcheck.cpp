@@ -56,7 +56,7 @@ int main() {
   CHECK(DecodeFrame(bytes, &parsed, &error));
   CHECK(parsed.command == source.command);
   CHECK(parsed.correlation == source.correlation);
-  CHECK(kProtocolVersion == 3);
+  CHECK(kProtocolVersion == 4);
   CHECK(kMinSupportedProtocolVersion == 2);
   auto previous_version = bytes;
   previous_version[4] = 2;
@@ -138,6 +138,29 @@ int main() {
   CHECK(EncodeOpenSession(std::string(kMaxStringBytes, 'a'), &payload, &error));
   CHECK(!EncodeOpenSession(std::string(kMaxStringBytes + 1, 'a'), &payload,
                            &error));
+
+  CHECK(EncodeSearchQuery("nihao", &payload, &error));
+  std::string search_query;
+  CHECK(DecodeSearchQuery(payload, &search_query, &error));
+  CHECK(search_query == "nihao");
+  CHECK(!EncodeSearchQuery("", &payload, &error));
+  CHECK(!EncodeSearchQuery(std::string(kMaxSearchQueryBytes + 1, 'n'),
+                           &payload, &error));
+  const std::string invalid_search_utf8{"\xc0\xaf", 2};
+  CHECK(!EncodeSearchQuery(invalid_search_utf8, &payload, &error));
+
+  const std::vector<std::string> search_candidates{
+      "\xe4\xbd\xa0", "\xe4\xbd\xa0\xe5\xa5\xbd",
+      "\xe6\x8b\x9f\xe5\xa5\xbd"};
+  CHECK(EncodeSearchCandidates(search_candidates, &payload, &error));
+  std::vector<std::string> decoded_search_candidates;
+  CHECK(DecodeSearchCandidates(payload, &decoded_search_candidates, &error));
+  CHECK(decoded_search_candidates == search_candidates);
+  std::vector<std::string> too_many_search_candidates(
+      kMaxSearchCandidateCount + 1, "x");
+  CHECK(!EncodeSearchCandidates(too_many_search_candidates, &payload, &error));
+  const std::vector<std::string> empty_search_candidate{""};
+  CHECK(!EncodeSearchCandidates(empty_search_candidate, &payload, &error));
 
   CHECK(EncodePageDirection(true, &payload));
   bool backward = false;
@@ -350,6 +373,13 @@ int main() {
   CHECK(EncodeFrame(source, &bytes, &error));
   CHECK(DecodeFrame(bytes, &parsed, &error));
   CHECK(parsed.command == Command::SelectCandidateAbsolute);
+  source.command = Command::SearchCandidates;
+  source.wire_version = 3;
+  CHECK(!EncodeFrame(source, &bytes, &error));
+  source.wire_version = kProtocolVersion;
+  CHECK(EncodeFrame(source, &bytes, &error));
+  CHECK(DecodeFrame(bytes, &parsed, &error));
+  CHECK(parsed.command == Command::SearchCandidates);
 
   static_assert(noexcept(EncodeFrame(source, &bytes, &error)));
   static_assert(std::is_nothrow_invocable_r_v<

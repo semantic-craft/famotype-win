@@ -1,5 +1,6 @@
 #include "famo_tsf_host_model.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace famo::tsf {
@@ -57,6 +58,38 @@ bool IsCompositionKey(uint32_t key) {
 }
 
 } // namespace
+
+std::optional<runtime::UiRect>
+NormalizeLayoutCaret(runtime::UiRect caret,
+                     const runtime::UiRect &view_bounds, bool clipped) {
+  const int64_t edge_tolerance = clipped ? 0 : 2;
+  if (view_bounds.left >= view_bounds.right ||
+      view_bounds.top >= view_bounds.bottom || caret.left > caret.right ||
+      caret.top >= caret.bottom) {
+    return std::nullopt;
+  }
+
+  const int64_t left = caret.left;
+  const int64_t top = caret.top;
+  const int64_t right = caret.right;
+  const int64_t bottom = caret.bottom;
+  if (right < static_cast<int64_t>(view_bounds.left) - edge_tolerance ||
+      left > static_cast<int64_t>(view_bounds.right) + edge_tolerance ||
+      bottom < static_cast<int64_t>(view_bounds.top) - edge_tolerance ||
+      top > static_cast<int64_t>(view_bounds.bottom) + edge_tolerance) {
+    return std::nullopt;
+  }
+
+  caret.left = (std::clamp)(caret.left, view_bounds.left, view_bounds.right);
+  caret.right =
+      (std::clamp)(caret.right, view_bounds.left, view_bounds.right);
+  caret.top = (std::clamp)(caret.top, view_bounds.top, view_bounds.bottom);
+  caret.bottom =
+      (std::clamp)(caret.bottom, view_bounds.top, view_bounds.bottom);
+  if (caret.left > caret.right || caret.top >= caret.bottom)
+    return std::nullopt;
+  return caret;
+}
 
 void ContextState::Open(const runtime::Correlation &session_identity) {
   identity_ = session_identity;

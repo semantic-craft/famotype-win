@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <string>
 
 #include "../famo_candidate_access.h"
@@ -134,7 +135,110 @@ void ComputeAnchorImpl(const FamoRect& caret, const FamoRect& work,
   *out_flipped = flipped;
 }
 
-}  // namespace
+void ComputeWindowAnchorImpl(const FamoRect& caret, const FamoRect& work,
+                             FamoSize content, int32_t shadow_margin,
+                             int32_t* out_x, int32_t* out_y,
+                             uint32_t* out_flipped) {
+  const int32_t margin = (std::max)(0, shadow_margin);
+  const int32_t kGap = 6;
+  const FamoSize surface{content.cx + 2 * margin,
+                         content.cy + 2 * margin};
+  int32_t window_x = caret.left - margin;
+  int32_t window_y = caret.bottom + kGap - margin;
+  uint32_t flipped = 0;
+
+  if (window_y + surface.cy > work.bottom) {
+    const int32_t above = caret.top - content.cy - kGap - margin;
+    if (above >= work.top) {
+      window_y = above;
+      flipped = 1;
+    }
+  }
+
+  const int32_t max_x = work.right - surface.cx;
+  if (window_x > max_x) window_x = max_x;
+  if (window_x < work.left) window_x = work.left;
+  const int32_t max_y = work.bottom - surface.cy;
+  if (window_y > max_y) window_y = max_y;
+  if (window_y < work.top) window_y = work.top;
+
+  *out_x = window_x + margin;
+  *out_y = window_y + margin;
+  *out_flipped = flipped;
+}
+
+void FitSurfaceInsideWorkArea(const FamoRect& work, FamoSize* content,
+                              int32_t* shadow_margin) {
+  if (!content || !shadow_margin)
+    return;
+  const auto extent = [](int32_t start, int32_t end) {
+    return static_cast<int32_t>((std::clamp)(
+        static_cast<int64_t>(end) - start, INT64_C(0),
+        static_cast<int64_t>((std::numeric_limits<int32_t>::max)())));
+  };
+  const int32_t work_width = extent(work.left, work.right);
+  const int32_t work_height = extent(work.top, work.bottom);
+  const int32_t maximum_shadow =
+      (std::min)(work_width / 2, work_height / 2);
+  *shadow_margin =
+      (std::clamp)(*shadow_margin, int32_t{0}, maximum_shadow);
+  const int32_t maximum_content_width = work_width - 2 * *shadow_margin;
+  const int32_t maximum_content_height = work_height - 2 * *shadow_margin;
+  content->cx = (std::clamp)(content->cx, int32_t{0}, maximum_content_width);
+  content->cy = (std::clamp)(content->cy, int32_t{0}, maximum_content_height);
+}
+
+FamoRect ClipRectToContent(const FamoRect &rect, const FamoSize &content) {
+  const int32_t right = (std::max)(content.cx, int32_t{0});
+  const int32_t bottom = (std::max)(content.cy, int32_t{0});
+  FamoRect clipped{
+      (std::clamp)(rect.left, int32_t{0}, right),
+      (std::clamp)(rect.top, int32_t{0}, bottom),
+      (std::clamp)(rect.right, int32_t{0}, right),
+      (std::clamp)(rect.bottom, int32_t{0}, bottom),
+  };
+  if (clipped.right <= clipped.left || clipped.bottom <= clipped.top)
+    return {};
+  return clipped;
+}
+
+void ClipCandidateToContent(FamoCandidateRects *candidate,
+                            const FamoSize &content) {
+  if (!candidate)
+    return;
+  candidate->bounds = ClipRectToContent(candidate->bounds, content);
+  candidate->label = ClipRectToContent(candidate->label, content);
+  candidate->text = ClipRectToContent(candidate->text, content);
+  candidate->comment = ClipRectToContent(candidate->comment, content);
+}
+
+void ClipLayoutToContent(FamoLayoutResult *layout) {
+  if (!layout)
+    return;
+  layout->preedit = ClipRectToContent(layout->preedit, layout->content_size);
+  layout->aux = ClipRectToContent(layout->aux, layout->content_size);
+  layout->highlight =
+      ClipRectToContent(layout->highlight, layout->content_size);
+  layout->status_icon =
+      ClipRectToContent(layout->status_icon, layout->content_size);
+  layout->prev_page =
+      ClipRectToContent(layout->prev_page, layout->content_size);
+  layout->next_page =
+      ClipRectToContent(layout->next_page, layout->content_size);
+  for (uint32_t index = 0;
+       index < (std::min)(layout->candidate_count, FAMO_MAX_LAID_CANDIDATES);
+       ++index) {
+    ClipCandidateToContent(&layout->candidates[index], layout->content_size);
+  }
+  for (uint32_t index = 0; index < (std::min)(layout->preview_candidate_count,
+                                              FAMO_MAX_PREVIEW_CANDIDATES);
+       ++index) {
+    ClipCandidateToContent(&layout->preview_candidates[index],
+                           layout->content_size);
+  }
+}
+
+} // namespace
 
 namespace {
 
@@ -158,6 +262,25 @@ void ComputeAnchorCpp(const FamoRect* caret, const FamoRect* work,
     uint32_t next_flipped = 0;
     ComputeAnchorImpl(*caret, *work, content, &next_x, &next_y,
                       &next_flipped);
+    *out_x = next_x;
+    *out_y = next_y;
+    *out_flipped = next_flipped;
+  } catch (...) {
+  }
+}
+
+void ComputeWindowAnchorCpp(const FamoRect* caret, const FamoRect* work,
+                            FamoSize content, int32_t shadow_margin,
+                            int32_t* out_x, int32_t* out_y,
+                            uint32_t* out_flipped) noexcept {
+  if (!caret || !work || !out_x || !out_y || !out_flipped)
+    return;
+  try {
+    int32_t next_x = 0;
+    int32_t next_y = 0;
+    uint32_t next_flipped = 0;
+    ComputeWindowAnchorImpl(*caret, *work, content, shadow_margin, &next_x,
+                            &next_y, &next_flipped);
     *out_x = next_x;
     *out_y = next_y;
     *out_flipped = next_flipped;
@@ -572,20 +695,24 @@ int32_t CandidateUiLayoutImpl(const FamoCompositionView* view,
     out->content_size = ClampSize(m, content_w, content_h);
   }
 
+  // Drop-shadow margin (paint buffer = content + 2*margin; host offsets window by
+  // -margin). Anchoring stays on content_size so the content lands at the caret.
+  out->shadow_margin = ShadowMargin(sk, in.dpi);
+  FitSurfaceInsideWorkArea(in.work_area, &out->content_size,
+                           &out->shadow_margin);
+
   // Status-icon slot (top-right of the panel) when the skin reserves one.
   if (m.status_icon > 0) {
     int32_t s = m.status_icon;
     int32_t right = out->content_size.cx - panel_margin_x;
     out->status_icon = FamoRect{right - s, m.margin_y, right, m.margin_y + s};
   }
-
-  // Drop-shadow margin (paint buffer = content + 2*margin; host offsets window by
-  // -margin). Anchoring stays on content_size so the content lands at the caret.
-  out->shadow_margin = ShadowMargin(sk, in.dpi);
+  ClipLayoutToContent(out);
 
   // Caret-follow + screen-edge flip → final origin.
-  ComputeAnchorImpl(in.caret_rect, in.work_area, out->content_size,
-                    &out->origin_x, &out->origin_y, &out->flipped);
+  ComputeWindowAnchorImpl(in.caret_rect, in.work_area, out->content_size,
+                          out->shadow_margin, &out->origin_x, &out->origin_y,
+                          &out->flipped);
 
   return FAMO_UI_OK;
 }
@@ -621,6 +748,14 @@ extern "C" void FamoComputeAnchor(
     int32_t* out_x, int32_t* out_y, uint32_t* out_flipped) noexcept {
   FAMO_C_ABI_SEH_VOID(ComputeAnchorCpp(
       caret, work, content, out_x, out_y, out_flipped));
+}
+
+extern "C" void FamoComputeWindowAnchor(
+    const FamoRect* caret, const FamoRect* work, FamoSize content,
+    int32_t shadow_margin, int32_t* out_x, int32_t* out_y,
+    uint32_t* out_flipped) noexcept {
+  FAMO_C_ABI_SEH_VOID(ComputeWindowAnchorCpp(
+      caret, work, content, shadow_margin, out_x, out_y, out_flipped));
 }
 
 // ── The layout entry point ───────────────────────────────────────────────────

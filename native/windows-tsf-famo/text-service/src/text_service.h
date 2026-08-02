@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <msctf.h>
+#include <ctffunc.h>
 
 #include "candidate_ui_element.h"
 #include "com_ptr.h"
@@ -31,6 +32,8 @@ class TextService final : public ITfTextInputProcessorEx,
                           public ITfCompartmentEventSink,
                           public ITfCompositionSink,
                           public ITfTextLayoutSink,
+                          public ITfFunctionProvider,
+                          public ITfFnSearchCandidateProvider,
                           public CandidateUiHost {
 public:
   TextService();
@@ -48,8 +51,9 @@ public:
                                        DWORD flags) override;
   HRESULT ActivateForTest(ITfThreadMgr *thread_manager, TfClientId client_id);
   bool PreviewSelectionStateForTest(
-      HWND *target,
-      runtime::PreviewSelectionRequest *request) const noexcept;
+      HWND *target, runtime::PreviewSelectionRequest *request) const noexcept;
+  bool UiStateForTest(ITfContext *context,
+                      runtime::UiState *state) const noexcept;
 
   HRESULT STDMETHODCALLTYPE OnSetFocus(BOOL foreground) override;
   HRESULT STDMETHODCALLTYPE OnTestKeyDown(ITfContext *context, WPARAM key,
@@ -78,6 +82,16 @@ public:
   HRESULT STDMETHODCALLTYPE OnLayoutChange(ITfContext *context,
                                            TfLayoutCode code,
                                            ITfContextView *view) override;
+
+  HRESULT STDMETHODCALLTYPE GetType(GUID *guid) override;
+  HRESULT STDMETHODCALLTYPE GetDescription(BSTR *description) override;
+  HRESULT STDMETHODCALLTYPE GetFunction(REFGUID guid, REFIID iid,
+                                        IUnknown **function) override;
+  HRESULT STDMETHODCALLTYPE GetDisplayName(BSTR *name) override;
+  HRESULT STDMETHODCALLTYPE GetSearchCandidates(
+      BSTR query, BSTR application_id, ITfCandidateList **candidates) override;
+  HRESULT STDMETHODCALLTYPE SetResult(BSTR query, BSTR application_id,
+                                      BSTR result) override;
 
   void OnCandidateVisibilityChanged(CandidateUiElement *element) override;
   HRESULT OnCandidateBehavior(CandidateUiElement *element,
@@ -190,6 +204,10 @@ private:
   bool OnActivationThread() const;
   bool ConnectRuntime(const runtime::Correlation &identity,
                       bool retry_terminal_debt = true);
+  bool ConnectRuntimePort(runtime::PipeRuntimePort *port,
+                          const runtime::Correlation &identity,
+                          bool retry_terminal_debt,
+                          const std::atomic<bool> *cancelled);
   HRESULT EnsureContext(
       ITfContext *context,
       SessionWarmupReason reason = SessionWarmupReason::Focus);
@@ -276,6 +294,8 @@ private:
   ComPtr<ITfThreadMgr> thread_manager_;
   ComPtr<ITfKeystrokeMgr> keystroke_manager_;
   ComPtr<ITfUIElementMgr> ui_manager_;
+  ComPtr<ITfSourceSingle> function_source_;
+  bool function_provider_advised_ = false;
   runtime::PipeRuntimePort runtime_port_{kBridgeAbiVersion};
   std::wstring runtime_endpoint_suffix_;
   std::wstring runtime_executable_name_;

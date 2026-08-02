@@ -359,6 +359,14 @@ void FamoComputeAnchor(const FamoRect* caret, const FamoRect* work_area,
                        FamoSize content, int32_t* out_x, int32_t* out_y,
                        uint32_t* out_flipped) FAMO_CANDIDATE_UI_NOEXCEPT;
 
+// The layered-window variant of FamoComputeAnchor. The returned coordinates
+// remain the content origin, but the clamp includes the symmetric shadow ring
+// used by the host window so the complete surface stays inside the work area.
+void FamoComputeWindowAnchor(
+    const FamoRect* caret, const FamoRect* work_area, FamoSize content,
+    int32_t shadow_margin, int32_t* out_x, int32_t* out_y,
+    uint32_t* out_flipped) FAMO_CANDIDATE_UI_NOEXCEPT;
+
 #ifdef __cplusplus
 }
 #endif
