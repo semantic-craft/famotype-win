@@ -1441,6 +1441,37 @@ bool FaultFailsOpen(TextServiceModule *module, const wchar_t *runtime_path,
   return passed && runtime_finished;
 }
 
+bool StaleFocusedSessionRecoversWithoutFocusChange(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"stale-session", 0, 2));
+  const bool passed = RunTextStoreSession(
+      module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *store, ITfTextInputProcessorEx *,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        // A configuration deploy retires the Runtime session while this host
+        // can remain focused indefinitely. The first exact StaleRequest must
+        // pass that physical key through, then schedule a fresh session
+        // without relying on a later TSF focus notification.
+        CHECK(SendKey(key_sink, context, 'N', false));
+        CHECK(store->text().empty());
+
+        const auto ready_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!TestKey(key_sink, context, 'A', true) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+          PumpMessages();
+          Sleep(5);
+        }
+        CHECK(std::chrono::steady_clock::now() < ready_deadline);
+        CHECK(SendKey(key_sink, context, 'A', true));
+        CHECK(store->text() == L"a");
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
 bool RecoveryEditFailureIsCleanedBeforeReconnect(
     TextServiceModule *module, const wchar_t *runtime_path) {
   RuntimeProcess runtime;
@@ -2783,6 +2814,8 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(FaultFailsOpen(&module, runtime_path, L"disconnect"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"malformed"));
   CHECK(FaultFailsOpen(&module, runtime_path, L"late"));
+  CHECK(StaleFocusedSessionRecoversWithoutFocusChange(&module,
+                                                       runtime_path));
   CHECK(RecoveryEditFailureIsCleanedBeforeReconnect(&module, runtime_path));
   CHECK(TerminalDeliveryRecoversWithoutDeactivation(&module, runtime_path));
   CHECK(TerminalSessionPreservesSiblingRecovery(&module, runtime_path));

@@ -261,7 +261,12 @@ bool ServeOnceImpl(const PipeEndpoint &endpoint, Service *service,
       break;
 
     Frame reply;
-    if (inject && fault == ServerFault::OpenSessionUnavailable) {
+    if (inject && fault == ServerFault::StaleSession) {
+      reply.command = request.command;
+      reply.flags = kFlagResponse;
+      reply.status = Status::StaleRequest;
+      reply.correlation = request.correlation;
+    } else if (inject && fault == ServerFault::OpenSessionUnavailable) {
       reply.command = request.command;
       reply.flags = kFlagResponse;
       reply.status = Status::Unavailable;
@@ -437,6 +442,8 @@ bool ParseServerFault(std::string_view value, ServerFault *fault) {
     *fault = ServerFault::OpenSessionHang;
   else if (value == "open-session-unavailable")
     *fault = ServerFault::OpenSessionUnavailable;
+  else if (value == "stale-session")
+    *fault = ServerFault::StaleSession;
   else if (value == "ui-hang")
     *fault = ServerFault::UiHang;
   else if (value == "late")

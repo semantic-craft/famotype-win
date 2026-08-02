@@ -53,6 +53,7 @@ enum class ServerFault {
   OpenSessionDelay,
   OpenSessionHang,
   OpenSessionUnavailable,
+  StaleSession,
   UiHang,
   LateReply,
   DisconnectBeforeExecute,
