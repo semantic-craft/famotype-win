@@ -292,28 +292,37 @@ int wmain(int argc, wchar_t **argv) {
     return 0;
   }
 
-  // #41: bounded TIP self-heal. The installer's Ready path only proves the TIP
-  // was in the user's input list at install time; a later system or user
-  // language-list change can remove it, leaving the candidate UI unreachable.
-  // Ready-only gate -- stricter than the startup gate above, which also admits
-  // Activating -- then probe before repair via the settings companion's
-  // headless verbs (the installer's exact probe/add implementation, no third
-  // copy). Detached thread: startup and typing never block on repair.
+  // #41: bounded TIP self-heal. A clean install starts this runtime while its
+  // projection is still Activating, so a one-shot Ready check can permanently
+  // miss the transition. Wait only while this exact target remains Activating;
+  // PendingReboot, RolledBack, uninstall, or a different target stop the task.
+  // Once Ready, delegate the full probe/add/two-stable-readback loop to the
+  // settings companion instead of copying a third implementation. Detached
+  // thread: startup and typing never block on the bounded wait or repair.
   std::thread([data_root] {
-    if (!ProductionInstallAllowed(ModuleDirectory(), false))
-      return; // PendingReboot/RolledBack/uninstalled expect the TIP absent
+    constexpr int kTipSelfHealReadyAttempts = 60;
+    constexpr DWORD kTipSelfHealReadyDelayMs = 1000;
+    bool ready = false;
+    for (int attempt = 0; attempt < kTipSelfHealReadyAttempts; ++attempt) {
+      if (!ProductionInstallAllowed(ModuleDirectory(), true))
+        return;
+      if (ProductionInstallAllowed(ModuleDirectory(), false)) {
+        ready = true;
+        break;
+      }
+      Sleep(kTipSelfHealReadyDelayMs);
+    }
+    if (!ready) {
+      AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                              "ready transition timed out");
+      return;
+    }
     const std::wstring settings =
         ModuleDirectory() + L"\\settings\\FamoSettings.exe";
-    const int probe = RunSettingsHeadless(settings, L"--is-input-tip");
-    if (probe == 0)
-      return; // healthy: zero writes, no log churn on every logon
-    const int repair = RunSettingsHeadless(settings, L"--add-input-tip");
-    const int readback = RunSettingsHeadless(settings, L"--is-input-tip");
-    AppendStartupDiagnostic(data_root, "tip-selfheal",
-                            readback == 0 ? 0 : 3,
-                            "probe=" + std::to_string(probe) +
-                                " repair=" + std::to_string(repair) +
-                                " readback=" + std::to_string(readback));
+    const int result = RunSettingsHeadless(settings, L"--tip-self-heal");
+    if (result != 0)
+      AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                              "exit=" + std::to_string(result));
   }).detach();
 
   CandidateWindow candidate_window;
