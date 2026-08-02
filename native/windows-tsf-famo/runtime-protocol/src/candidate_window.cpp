@@ -7,7 +7,10 @@
 #include <objbase.h>
 #include <windows.h>
 
+#include <UIAutomation.h>
+
 #include "../../famo-candidate-ui/famo_candidate_ui.h"
+#include "candidate_automation.h"
 #include "candidate_skin.h"
 #include "dib_surface.h"
 #include "win_handle.h"
@@ -78,6 +81,29 @@ bool SameUiExceptPlacement(const UiState &left, const UiState &right) {
          left.selection_capability == right.selection_capability;
 }
 
+bool SurfaceFitsWorkArea(const FamoLayoutResult &layout,
+                         const UiRect &work_area) {
+  const int64_t work_width =
+      static_cast<int64_t>(work_area.right) - work_area.left;
+  const int64_t work_height =
+      static_cast<int64_t>(work_area.bottom) - work_area.top;
+  const int64_t margin = (std::max)(layout.shadow_margin, 0);
+  const int64_t surface_width =
+      static_cast<int64_t>(layout.content_size.cx) + 2 * margin;
+  const int64_t surface_height =
+      static_cast<int64_t>(layout.content_size.cy) + 2 * margin;
+  return work_width > 0 && work_height > 0 && surface_width > 0 &&
+         surface_height > 0 && surface_width <= work_width &&
+         surface_height <= work_height;
+}
+
+bool SameWorkAreaExtent(const UiRect &left, const UiRect &right) {
+  return static_cast<int64_t>(left.right) - left.left ==
+             static_cast<int64_t>(right.right) - right.left &&
+         static_cast<int64_t>(left.bottom) - left.top ==
+             static_cast<int64_t>(right.bottom) - right.top;
+}
+
 class ViewAdapter {
 public:
   explicit ViewAdapter(const Composition &source) {
@@ -141,6 +167,7 @@ private:
 struct WindowNotifications {
   HANDLE update_event = nullptr;
   std::atomic<uint64_t> *system_generation = nullptr;
+  CandidateAutomation *automation = nullptr;
   FamoLayoutResult layout{};
   PreviewSelectionRequest selection_request{};
   PipeClientIdentity selection_owner{};
@@ -166,6 +193,35 @@ LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
       SetEvent(notifications->update_event);
     }
   }
+  if (message == WM_GETOBJECT) {
+    auto *notifications = reinterpret_cast<WindowNotifications *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (notifications && notifications->automation &&
+        static_cast<LONG>(lparam) == UiaRootObjectId) {
+      return notifications->automation->HandleGetObject(wparam, lparam);
+    }
+  }
+  if (message == kCandidateAutomationSelectMessage) {
+    auto *notifications = reinterpret_cast<WindowNotifications *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    const uint32_t generation = static_cast<uint32_t>(wparam);
+    const uint32_t index = static_cast<uint32_t>(lparam);
+    if (notifications && notifications->automation &&
+        notifications->automation->IsCurrentItem(generation, index) &&
+        notifications->page_size != 0) {
+      const uint64_t absolute =
+          static_cast<uint64_t>(notifications->page_index) *
+              notifications->page_size +
+          index;
+      if (absolute <= UINT32_MAX) {
+        PreviewSelectionRequest request = notifications->selection_request;
+        request.absolute_index = static_cast<uint32_t>(absolute);
+        SendPreviewSelectionToOwner(window, request,
+                                    notifications->selection_owner);
+      }
+    }
+    return 0;
+  }
   if (message == WM_LBUTTONUP) {
     auto *notifications = reinterpret_cast<WindowNotifications *>(
         GetWindowLongPtrW(window, GWLP_USERDATA));
@@ -187,6 +243,12 @@ LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
   }
   if (message == WM_MOUSEACTIVATE)
     return MA_NOACTIVATE;
+  if (message == WM_DESTROY) {
+    auto *notifications = reinterpret_cast<WindowNotifications *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (notifications && notifications->automation)
+      notifications->automation->WindowDestroyed();
+  }
   if (message == WM_NCHITTEST && GetWindowLongPtrW(window, GWLP_USERDATA) == 0)
     return HTTRANSPARENT;
   return DefWindowProcW(window, message, wparam, lparam);
@@ -282,6 +344,10 @@ void HideCandidateWindow(HWND window) {
   const bool was_visible = IsWindowVisible(window) != FALSE;
   ShowWindow(window, SW_HIDE);
   if (was_visible && IsWindowVisible(window) == FALSE) {
+    auto *notifications = reinterpret_cast<WindowNotifications *>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (notifications && notifications->automation)
+      notifications->automation->Hide();
     NotifyWinEvent(EVENT_OBJECT_IME_HIDE, window, OBJID_CLIENT, CHILDID_SELF);
   }
 }
@@ -732,6 +798,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       state->fault == Fault::Create
           ? nullptr
           : CreateLayeredWindow(kCandidateWindowClassName, &notifications);
+  std::unique_ptr<CandidateAutomation> automation =
+      CandidateAutomation::Create(window);
+  notifications.automation = automation.get();
   // The mode indicator is a short-lived, click-through status toast rather
   // than a candidate/composition surface, so it does not publish IME
   // light-dismiss events.
@@ -748,6 +817,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     uint64_t started_ms = 0;
     ScrollTransitionPlan plan{};
     FamoLayoutResult target_layout{};
+    Composition target_composition;
     int margin = 0;
     HWND foreground_window = nullptr;
   } animation;
@@ -840,6 +910,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       if (complete) {
         animation.active = false;
         notifications.layout = animation.target_layout;
+        if (automation)
+          automation->Present(animation.target_composition,
+                              animation.target_layout, animation.margin);
       }
       continue;
     }
@@ -862,6 +935,9 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
               animation.target_layout.origin_y - animation.margin)) {
         HideCandidateWindow(window);
         presented_snapshot.reset();
+      } else if (automation) {
+        automation->Present(animation.target_composition,
+                            animation.target_layout, animation.margin);
       }
     }
     if (state->fault == Fault::Hang) {
@@ -1004,7 +1080,10 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     if (stable_presentation &&
         snapshot->composition == presented_snapshot->composition &&
         SameUiExceptPlacement(snapshot->ui_state,
-                              presented_snapshot->ui_state)) {
+                              presented_snapshot->ui_state) &&
+        SameWorkAreaExtent(snapshot->ui_state.work_area,
+                           presented_snapshot->ui_state.work_area) &&
+        SurfaceFitsWorkArea(presented_layout, snapshot->ui_state.work_area)) {
       const UiRect &caret = snapshot->ui_state.caret;
       const UiRect &work = snapshot->ui_state.work_area;
       const FamoRect caret_rect{caret.left, caret.top, caret.right,
@@ -1013,14 +1092,17 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       int32_t origin_x = 0;
       int32_t origin_y = 0;
       uint32_t flipped = 0;
-      FamoComputeAnchor(&caret_rect, &work_rect,
-                        presented_layout.content_size, &origin_x, &origin_y,
-                        &flipped);
+      FamoComputeWindowAnchor(
+          &caret_rect, &work_rect, presented_layout.content_size,
+          presented_layout.shadow_margin, &origin_x, &origin_y, &flipped);
       if (MoveVisible(window, origin_x - presented_layout.shadow_margin,
                       origin_y - presented_layout.shadow_margin)) {
         presented_layout.origin_x = origin_x;
         presented_layout.origin_y = origin_y;
         presented_layout.flipped = flipped;
+        if (automation)
+          automation->Move(presented_layout,
+                           presented_layout.shadow_margin);
         presented_snapshot = snapshot;
         state->anchor_only_count.fetch_add(1, std::memory_order_relaxed);
         continue;
@@ -1172,6 +1254,8 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       notifications.page_size = snapshot->composition.page_size;
       notifications.shadow_margin = margin;
       notifications.foreground_window = frame_foreground;
+      if (automation && !animate_scroll)
+        automation->Present(snapshot->composition, layout, margin);
       presented_snapshot = snapshot;
       presented_presentation = active_presentation;
       presented_layout = layout;
@@ -1183,6 +1267,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         animation.started_ms = GetTickCount64();
         animation.plan = transition;
         animation.target_layout = layout;
+        animation.target_composition = snapshot->composition;
         animation.margin = margin;
         animation.foreground_window = frame_foreground;
       }

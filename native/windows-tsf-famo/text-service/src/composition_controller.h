@@ -27,6 +27,8 @@ public:
   HRESULT Recover(ITfContext *context, TfClientId client_id,
                   std::string_view confirmed_preedit, ITfCompositionSink *sink);
   HRESULT End(ITfContext *context, TfClientId client_id);
+  HRESULT CloneLayoutCaret(TfEditCookie cookie, ITfContext *context,
+                           ITfRange **range) const;
   bool CompositionTerminated(ITfComposition *composition);
   void ObserveUnhandledKey(WPARAM key, bool down);
   void ResetBehaviorState();

@@ -156,6 +156,12 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
   }
   if (request.wire_version != client->second.protocol_version)
     return Reply(request, Status::InvalidFrame);
+  if (request.command == Command::SearchCandidates) {
+    if (client->second.protocol_version < 4 || c.session_id != 0 ||
+        c.session_generation != 0 || c.sequence == 0)
+      return Reply(request, Status::InvalidFrame);
+    return DispatchSearchCandidatesLocked(request);
+  }
   if (c.session_id == 0 || c.session_generation == 0 || c.sequence == 0)
     return Reply(request, Status::InvalidFrame);
 
@@ -254,6 +260,112 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
     return Reply(request, Status::StaleRequest);
   }
   return DispatchSessionCommand(request, key, found->second);
+}
+
+std::vector<std::string> RuntimeService::FilterSearchCandidates(
+    std::span<const Candidate> candidates, std::string_view query) {
+  std::vector<std::string> filtered;
+  filtered.reserve((std::min)(candidates.size(),
+                              static_cast<size_t>(kMaxSearchCandidateCount)));
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    const std::string &text = candidates[index].text;
+    if (text.empty() || text == query)
+      continue;
+    const bool duplicate = std::any_of(
+        candidates.begin(), candidates.begin() + index,
+        [&](const Candidate &earlier) { return earlier.text == text; });
+    if (duplicate)
+      continue;
+    const bool has_shorter_prefix = std::any_of(
+        candidates.begin(), candidates.end(), [&](const Candidate &other) {
+          return !other.text.empty() && other.text.size() < text.size() &&
+                 text.starts_with(other.text);
+        });
+    if (has_shorter_prefix)
+      continue;
+    filtered.push_back(text);
+    if (filtered.size() == kMaxSearchCandidateCount)
+      break;
+  }
+  return filtered;
+}
+
+Frame RuntimeService::DispatchSearchCandidatesLocked(const Frame &request) {
+  std::string query;
+  std::string error;
+  if (!DecodeSearchQuery(request.payload, &query, &error))
+    return Reply(request, Status::InvalidFrame);
+
+  for (char &character : query) {
+    const unsigned char value = static_cast<unsigned char>(character);
+    if (value >= 'A' && value <= 'Z') {
+      character = static_cast<char>(value - 'A' + 'a');
+      continue;
+    }
+    if ((value >= 'a' && value <= 'z') ||
+        (value >= '0' && value <= '9') || value == '\'') {
+      continue;
+    }
+    Frame reply = Reply(request, Status::Ok);
+    if (!EncodeSearchCandidates({}, &reply.payload, &error))
+      return Reply(request, Status::Unavailable);
+    return reply;
+  }
+
+  if (!EnsureRetiredCapacityLocked(1))
+    return Reply(request, Status::Unavailable);
+  FamoEngineContext *context = nullptr;
+  const FamoUtf8String engine_schema = EngineString(selected_schema_);
+  if (engine_.CreateContext(&engine_schema, &context) != FAMO_ENGINE_OK ||
+      !context || !ApplyOptionsLocked(context, options_)) {
+    if (context)
+      (void)DestroyOrRetireContextLocked(context);
+    return Reply(request, Status::EngineError);
+  }
+
+  Frame result = Reply(request, Status::EngineError);
+  try {
+    Composition composition;
+    bool converted = true;
+    uint64_t timestamp = 1;
+    for (const unsigned char character : query) {
+      FamoEngineActionRequestV2 action =
+          FamoEngineHost::Action(FAMO_ENGINE_ACTION_PROCESS_KEY);
+      action.key = EngineKey(
+          {character, 0, 0, 1, timestamp++});
+      FamoEngineActionResultLease action_result;
+      FamoEngineRecoveryOutcome outcome;
+      const int32_t action_status = engine_.ExecuteActionRecovering(
+          context, &action, 2, &action_result, &outcome);
+      Composition next_composition;
+      if (!outcome.business_dispatched || outcome.recovery_pending ||
+          action_status != FAMO_ENGINE_OK || !action_result ||
+          action_result->action != action.action ||
+          action_result->result_flags != 0 ||
+          (action_result->handled != 0) != outcome.handled ||
+          !CopyResult(*action_result, action.action,
+                      FAMO_ENGINE_V2_MAX_VIEW_CANDIDATES, &next_composition,
+                      &error)) {
+        converted = false;
+        break;
+      }
+      composition = std::move(next_composition);
+    }
+    if (converted) {
+      const std::vector<std::string> candidates =
+          FilterSearchCandidates(composition.candidates, query);
+      result = Reply(request, Status::Ok);
+      if (!EncodeSearchCandidates(candidates, &result.payload, &error))
+        result = Reply(request, Status::Unavailable);
+    }
+  } catch (...) {
+    result = Reply(request, Status::Unavailable);
+  }
+  if (!DestroyOrRetireContextLocked(context) &&
+      result.status == Status::Ok) {
+    return Reply(request, Status::Unavailable);
+  }
+  return result;
 }
 
 Frame RuntimeService::DispatchSessionCommand(const Frame &request,

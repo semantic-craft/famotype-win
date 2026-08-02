@@ -1,10 +1,14 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include <windows.h>
+#include <objbase.h>
+#include <UIAutomation.h>
+#include <wrl/client.h>
 
 #include "candidate_skin.h"
 #include "candidate_window.h"
@@ -19,6 +23,7 @@
   } while (0)
 
 using namespace famo::runtime;
+using Microsoft::WRL::ComPtr;
 
 namespace {
 
@@ -116,6 +121,403 @@ private:
 
   HWINEVENTHOOK hook_ = nullptr;
   std::vector<WinEventRecord> events_;
+};
+
+struct AutomationEventCounts {
+  volatile LONG opened = 0;
+  volatile LONG closed = 0;
+  volatile LONG selected = 0;
+  volatile LONG layout_invalidated = 0;
+  volatile LONG selection_invalidated = 0;
+  volatile LONG bounds_changed = 0;
+  volatile LONG offscreen_changed = 0;
+  volatile LONG selection_property_changed = 0;
+  volatile LONG structure_changed = 0;
+};
+
+class AutomationEventRecorder final : public IUIAutomationEventHandler {
+public:
+  AutomationEventRecorder(AutomationEventCounts *counts, HANDLE opened,
+                          HANDLE closed, HANDLE selected)
+      : counts_(counts), opened_(opened), closed_(closed),
+        selected_(selected) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+    if (!object)
+      return E_POINTER;
+    *object = nullptr;
+    if (iid == IID_IUnknown || iid == IID_IUIAutomationEventHandler)
+      *object = static_cast<IUIAutomationEventHandler *>(this);
+    if (!*object)
+      return E_NOINTERFACE;
+    AddRef();
+    return S_OK;
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG remaining = --references_;
+    if (remaining == 0)
+      delete this;
+    return remaining;
+  }
+
+  HRESULT STDMETHODCALLTYPE HandleAutomationEvent(IUIAutomationElement *,
+                                                   EVENTID event) override {
+    if (!counts_)
+      return S_OK;
+    if (event == UIA_MenuOpenedEventId) {
+      InterlockedIncrement(&counts_->opened);
+      SetEvent(opened_);
+    } else if (event == UIA_MenuClosedEventId) {
+      InterlockedIncrement(&counts_->closed);
+      SetEvent(closed_);
+    } else if (event == UIA_SelectionItem_ElementSelectedEventId) {
+      InterlockedIncrement(&counts_->selected);
+      SetEvent(selected_);
+    } else if (event == UIA_LayoutInvalidatedEventId) {
+      InterlockedIncrement(&counts_->layout_invalidated);
+    } else if (event == UIA_Selection_InvalidatedEventId) {
+      InterlockedIncrement(&counts_->selection_invalidated);
+    }
+    return S_OK;
+  }
+
+private:
+  ~AutomationEventRecorder() = default;
+
+  std::atomic<ULONG> references_{1};
+  AutomationEventCounts *counts_ = nullptr;
+  HANDLE opened_ = nullptr;
+  HANDLE closed_ = nullptr;
+  HANDLE selected_ = nullptr;
+};
+
+class AutomationPropertyRecorder final
+    : public IUIAutomationPropertyChangedEventHandler {
+public:
+  explicit AutomationPropertyRecorder(AutomationEventCounts *counts)
+      : counts_(counts) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+    if (!object)
+      return E_POINTER;
+    *object = nullptr;
+    if (iid == IID_IUnknown ||
+        iid == IID_IUIAutomationPropertyChangedEventHandler) {
+      *object = static_cast<IUIAutomationPropertyChangedEventHandler *>(this);
+    }
+    if (!*object)
+      return E_NOINTERFACE;
+    AddRef();
+    return S_OK;
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG remaining = --references_;
+    if (remaining == 0)
+      delete this;
+    return remaining;
+  }
+
+  HRESULT STDMETHODCALLTYPE HandlePropertyChangedEvent(
+      IUIAutomationElement *, PROPERTYID property, VARIANT) override {
+    if (!counts_)
+      return S_OK;
+    if (property == UIA_BoundingRectanglePropertyId)
+      InterlockedIncrement(&counts_->bounds_changed);
+    else if (property == UIA_IsOffscreenPropertyId)
+      InterlockedIncrement(&counts_->offscreen_changed);
+    else if (property == UIA_SelectionItemIsSelectedPropertyId)
+      InterlockedIncrement(&counts_->selection_property_changed);
+    return S_OK;
+  }
+
+private:
+  ~AutomationPropertyRecorder() = default;
+  std::atomic<ULONG> references_{1};
+  AutomationEventCounts *counts_ = nullptr;
+};
+
+class AutomationStructureRecorder final
+    : public IUIAutomationStructureChangedEventHandler {
+public:
+  explicit AutomationStructureRecorder(AutomationEventCounts *counts)
+      : counts_(counts) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+    if (!object)
+      return E_POINTER;
+    *object = nullptr;
+    if (iid == IID_IUnknown ||
+        iid == IID_IUIAutomationStructureChangedEventHandler) {
+      *object = static_cast<IUIAutomationStructureChangedEventHandler *>(this);
+    }
+    if (!*object)
+      return E_NOINTERFACE;
+    AddRef();
+    return S_OK;
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG remaining = --references_;
+    if (remaining == 0)
+      delete this;
+    return remaining;
+  }
+
+  HRESULT STDMETHODCALLTYPE HandleStructureChangedEvent(
+      IUIAutomationElement *, StructureChangeType, SAFEARRAY *) override {
+    if (counts_)
+      InterlockedIncrement(&counts_->structure_changed);
+    return S_OK;
+  }
+
+private:
+  ~AutomationStructureRecorder() = default;
+  std::atomic<ULONG> references_{1};
+  AutomationEventCounts *counts_ = nullptr;
+};
+
+class ScopedCom {
+public:
+  ScopedCom() : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+  ~ScopedCom() {
+    if (SUCCEEDED(result_))
+      CoUninitialize();
+  }
+  HRESULT result() const { return result_; }
+
+private:
+  HRESULT result_;
+};
+
+uintptr_t ParseUintPtr(const wchar_t *value) {
+  return static_cast<uintptr_t>(_wcstoui64(value, nullptr, 10));
+}
+
+int RunAutomationListener(int argc, wchar_t **argv) {
+  if (argc != 9)
+    return 2;
+  const HWND window = reinterpret_cast<HWND>(ParseUintPtr(argv[2]));
+  const HANDLE ready = reinterpret_cast<HANDLE>(ParseUintPtr(argv[3]));
+  const HANDLE opened = reinterpret_cast<HANDLE>(ParseUintPtr(argv[4]));
+  const HANDLE closed = reinterpret_cast<HANDLE>(ParseUintPtr(argv[5]));
+  const HANDLE selected = reinterpret_cast<HANDLE>(ParseUintPtr(argv[6]));
+  const HANDLE stop = reinterpret_cast<HANDLE>(ParseUintPtr(argv[7]));
+  const HANDLE mapping = reinterpret_cast<HANDLE>(ParseUintPtr(argv[8]));
+  auto *counts = static_cast<AutomationEventCounts *>(
+      MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+                    sizeof(AutomationEventCounts)));
+  if (!window || !ready || !opened || !closed || !selected || !stop ||
+      !mapping || !counts) {
+    return 3;
+  }
+
+  ScopedCom com;
+  if (FAILED(com.result()))
+    return 4;
+  ComPtr<IUIAutomation> automation;
+  if (FAILED(CoCreateInstance(CLSID_CUIAutomation8, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(automation.GetAddressOf())))) {
+    return 5;
+  }
+  ComPtr<IUIAutomationElement> root;
+  if (FAILED(automation->ElementFromHandle(window, root.GetAddressOf())))
+    return 6;
+  auto *recorder =
+      new AutomationEventRecorder(counts, opened, closed, selected);
+  ComPtr<IUIAutomationEventHandler> events;
+  events.Attach(recorder);
+  ComPtr<IUIAutomationPropertyChangedEventHandler> properties;
+  properties.Attach(new AutomationPropertyRecorder(counts));
+  ComPtr<IUIAutomationStructureChangedEventHandler> structure;
+  structure.Attach(new AutomationStructureRecorder(counts));
+  PROPERTYID observed_properties[] = {
+      UIA_BoundingRectanglePropertyId, UIA_IsOffscreenPropertyId,
+      UIA_SelectionItemIsSelectedPropertyId};
+  if (FAILED(automation->AddAutomationEventHandler(
+          UIA_MenuOpenedEventId, root.Get(), TreeScope_Element, nullptr,
+          events.Get())) ||
+      FAILED(automation->AddAutomationEventHandler(
+          UIA_MenuClosedEventId, root.Get(), TreeScope_Element, nullptr,
+          events.Get())) ||
+      FAILED(automation->AddAutomationEventHandler(
+          UIA_SelectionItem_ElementSelectedEventId, root.Get(),
+          TreeScope_Subtree, nullptr, events.Get())) ||
+      FAILED(automation->AddAutomationEventHandler(
+          UIA_LayoutInvalidatedEventId, root.Get(), TreeScope_Element, nullptr,
+          events.Get())) ||
+      FAILED(automation->AddAutomationEventHandler(
+          UIA_Selection_InvalidatedEventId, root.Get(), TreeScope_Element,
+          nullptr, events.Get())) ||
+      FAILED(automation->AddPropertyChangedEventHandlerNativeArray(
+          root.Get(), TreeScope_Subtree, nullptr, properties.Get(),
+          observed_properties,
+          static_cast<int>(std::size(observed_properties)))) ||
+      FAILED(automation->AddStructureChangedEventHandler(
+          root.Get(), TreeScope_Element, nullptr, structure.Get()))) {
+    return 7;
+  }
+  SetEvent(ready);
+  const DWORD wait = WaitForSingleObject(stop, 30000);
+  const bool removed =
+      SUCCEEDED(automation->RemoveAutomationEventHandler(
+          UIA_MenuOpenedEventId, root.Get(), events.Get())) &&
+      SUCCEEDED(automation->RemoveAutomationEventHandler(
+          UIA_MenuClosedEventId, root.Get(), events.Get())) &&
+      SUCCEEDED(automation->RemoveAutomationEventHandler(
+          UIA_SelectionItem_ElementSelectedEventId, root.Get(),
+          events.Get())) &&
+      SUCCEEDED(automation->RemoveAutomationEventHandler(
+          UIA_LayoutInvalidatedEventId, root.Get(), events.Get())) &&
+      SUCCEEDED(automation->RemoveAutomationEventHandler(
+          UIA_Selection_InvalidatedEventId, root.Get(), events.Get())) &&
+      SUCCEEDED(automation->RemovePropertyChangedEventHandler(
+          root.Get(), properties.Get())) &&
+      SUCCEEDED(automation->RemoveStructureChangedEventHandler(
+          root.Get(), structure.Get()));
+  UnmapViewOfFile(counts);
+  return wait == WAIT_OBJECT_0 && removed ? 0 : 8;
+}
+
+class AutomationListenerProcess {
+public:
+  ~AutomationListenerProcess() { (void)Finish(); }
+
+  bool Start(HWND window) {
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    ready_ = CreateEventW(&security, TRUE, FALSE, nullptr);
+    opened_ = CreateEventW(&security, TRUE, FALSE, nullptr);
+    closed_ = CreateEventW(&security, TRUE, FALSE, nullptr);
+    selected_ = CreateEventW(&security, TRUE, FALSE, nullptr);
+    stop_ = CreateEventW(&security, TRUE, FALSE, nullptr);
+    mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, &security,
+                                  PAGE_READWRITE, 0,
+                                  sizeof(AutomationEventCounts), nullptr);
+    counts_ = mapping_ ? static_cast<AutomationEventCounts *>(MapViewOfFile(
+                            mapping_, FILE_MAP_ALL_ACCESS, 0, 0,
+                            sizeof(AutomationEventCounts)))
+                       : nullptr;
+    if (!ready_ || !opened_ || !closed_ || !selected_ || !stop_ ||
+        !mapping_ || !counts_) {
+      return false;
+    }
+    *counts_ = {};
+    wchar_t module[32768]{};
+    if (GetModuleFileNameW(nullptr, module,
+                           static_cast<DWORD>(std::size(module))) == 0) {
+      return false;
+    }
+    const auto number = [](const void *value) {
+      return std::to_wstring(reinterpret_cast<uintptr_t>(value));
+    };
+    std::wstring command =
+        L"\"" + std::wstring(module) + L"\" --uia-listener " +
+        number(window) + L" " + number(ready_) + L" " + number(opened_) +
+        L" " + number(closed_) + L" " + number(selected_) + L" " +
+        number(stop_) + L" " + number(mapping_);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                        &process_)) {
+      return false;
+    }
+    return WaitForSingleObject(ready_, 3000) == WAIT_OBJECT_0;
+  }
+
+  bool Wait(EVENTID event) const {
+    HANDLE signal = nullptr;
+    if (event == UIA_MenuOpenedEventId)
+      signal = opened_;
+    else if (event == UIA_MenuClosedEventId)
+      signal = closed_;
+    else if (event == UIA_SelectionItem_ElementSelectedEventId)
+      signal = selected_;
+    return signal && WaitForSingleObject(signal, 3000) == WAIT_OBJECT_0;
+  }
+
+  LONG Count(EVENTID event) const {
+    if (!counts_)
+      return 0;
+    const volatile LONG *value = nullptr;
+    if (event == UIA_MenuOpenedEventId)
+      value = &counts_->opened;
+    else if (event == UIA_MenuClosedEventId)
+      value = &counts_->closed;
+    else if (event == UIA_SelectionItem_ElementSelectedEventId)
+      value = &counts_->selected;
+    else if (event == UIA_LayoutInvalidatedEventId)
+      value = &counts_->layout_invalidated;
+    else if (event == UIA_Selection_InvalidatedEventId)
+      value = &counts_->selection_invalidated;
+    return value ? InterlockedCompareExchange(
+                       const_cast<volatile LONG *>(value), 0, 0)
+                 : 0;
+  }
+
+  LONG PropertyCount(PROPERTYID property) const {
+    if (!counts_)
+      return 0;
+    const volatile LONG *value = nullptr;
+    if (property == UIA_BoundingRectanglePropertyId)
+      value = &counts_->bounds_changed;
+    else if (property == UIA_IsOffscreenPropertyId)
+      value = &counts_->offscreen_changed;
+    else if (property == UIA_SelectionItemIsSelectedPropertyId)
+      value = &counts_->selection_property_changed;
+    return value ? InterlockedCompareExchange(
+                       const_cast<volatile LONG *>(value), 0, 0)
+                 : 0;
+  }
+
+  LONG StructureCount() const {
+    return counts_ ? InterlockedCompareExchange(
+                         &counts_->structure_changed, 0, 0)
+                   : 0;
+  }
+
+  bool Finish() {
+    bool success = true;
+    if (process_.hProcess) {
+      SetEvent(stop_);
+      const DWORD wait = WaitForSingleObject(process_.hProcess, 5000);
+      DWORD exit_code = STILL_ACTIVE;
+      GetExitCodeProcess(process_.hProcess, &exit_code);
+      success = wait == WAIT_OBJECT_0 && exit_code == 0;
+    }
+    if (process_.hThread)
+      CloseHandle(process_.hThread);
+    if (process_.hProcess)
+      CloseHandle(process_.hProcess);
+    process_ = {};
+    if (counts_)
+      UnmapViewOfFile(counts_);
+    counts_ = nullptr;
+    const HANDLE handles[] = {ready_, opened_, closed_, selected_, stop_,
+                              mapping_};
+    for (HANDLE handle : handles) {
+      if (handle)
+        CloseHandle(handle);
+    }
+    ready_ = opened_ = closed_ = selected_ = stop_ = mapping_ = nullptr;
+    return success;
+  }
+
+private:
+  PROCESS_INFORMATION process_{};
+  HANDLE ready_ = nullptr;
+  HANDLE opened_ = nullptr;
+  HANDLE closed_ = nullptr;
+  HANDLE selected_ = nullptr;
+  HANDLE stop_ = nullptr;
+  HANDLE mapping_ = nullptr;
+  AutomationEventCounts *counts_ = nullptr;
 };
 
 LRESULT CALLBACK PreviewTargetProc(HWND window, UINT message, WPARAM wparam,
@@ -497,6 +899,77 @@ bool CandidateWindowReportsMoveEvent() {
   return true;
 }
 
+bool CandidateWindowRelayoutsWhenWorkAreaShrinks() {
+  CandidateWindow window;
+  CHECK(window.Start());
+  auto initial = VisibleSnapshot(114);
+  initial->revision = 1;
+  window.Publish(initial);
+  WindowProbe initial_probe;
+  CHECK(WaitForVisibility(true, &initial_probe));
+  const CandidateWindow::Counters before = window.counters();
+  const LONG initial_width = initial_probe.rect.right - initial_probe.rect.left;
+  CHECK(initial_width > 2);
+
+  auto constrained = std::make_shared<RuntimeSnapshot>(*initial);
+  constrained->revision = 2;
+  ++constrained->correlation.sequence;
+  ++constrained->ui_sequence;
+  constrained->ui_state.work_area = {0, 0, initial_width - 1, 1080};
+  constrained->ui_state.caret = {initial_width - 4, 300, initial_width - 2,
+                                 320};
+  window.Publish(constrained);
+  CHECK(
+      WaitForCounters(window, [before](const CandidateWindow::Counters &value) {
+        return value.full > before.full;
+      }));
+  WindowProbe probe;
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    probe = Probe();
+    if (probe.visible &&
+        probe.rect.left >= constrained->ui_state.work_area.left &&
+        probe.rect.top >= constrained->ui_state.work_area.top &&
+        probe.rect.right <= constrained->ui_state.work_area.right &&
+        probe.rect.bottom <= constrained->ui_state.work_area.bottom) {
+      break;
+    }
+    Sleep(1);
+  }
+  CHECK(probe.visible);
+  CHECK(probe.rect.left >= constrained->ui_state.work_area.left);
+  CHECK(probe.rect.top >= constrained->ui_state.work_area.top);
+  CHECK(probe.rect.right <= constrained->ui_state.work_area.right);
+  CHECK(probe.rect.bottom <= constrained->ui_state.work_area.bottom);
+  CHECK(window.counters().anchor_only == before.anchor_only);
+
+  const CandidateWindow::Counters constrained_counters = window.counters();
+  auto expanded = std::make_shared<RuntimeSnapshot>(*initial);
+  expanded->revision = 3;
+  expanded->correlation.sequence = constrained->correlation.sequence + 1;
+  expanded->ui_sequence = constrained->ui_sequence + 1;
+  window.Publish(expanded);
+  CHECK(WaitForCounters(
+      window, [constrained_counters](const CandidateWindow::Counters &value) {
+        return value.full > constrained_counters.full;
+      }));
+  WindowProbe expanded_probe;
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    expanded_probe = Probe();
+    if (expanded_probe.visible &&
+        expanded_probe.rect.right - expanded_probe.rect.left >
+            probe.rect.right - probe.rect.left) {
+      break;
+    }
+    Sleep(1);
+  }
+  CHECK(expanded_probe.visible);
+  CHECK(expanded_probe.rect.right - expanded_probe.rect.left >
+        probe.rect.right - probe.rect.left);
+  CHECK(window.counters().anchor_only == constrained_counters.anchor_only);
+  window.Stop();
+  return true;
+}
+
 bool CandidateWindowDoesNotReportNoOpMove() {
   CandidateWinEventRecorder events;
   CHECK(events.Start());
@@ -515,7 +988,7 @@ bool CandidateWindowDoesNotReportNoOpMove() {
   same_position->revision = 2;
   same_position->ui_state.selection_capability =
       initial->ui_state.selection_capability;
-  same_position->ui_state.work_area = {-1921, 0, 1921, 1080};
+  same_position->ui_state.work_area = {-1921, 0, 1919, 1080};
   window.Publish(same_position);
   CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
     return value.anchor_only == 1;
@@ -696,6 +1169,184 @@ bool CandidateWindowReportsHideWhenStopped() {
   CHECK(events.AllAreClientSelf(EVENT_OBJECT_IME_HIDE));
   CHECK(events.Count(EVENT_OBJECT_IME_SHOW) == 0);
   CHECK(events.Count(EVENT_OBJECT_IME_CHANGE) == 0);
+  return true;
+}
+
+bool CandidateWindowExposesAccessibleTreeAndEvents() {
+  ScopedCom com;
+  CHECK(SUCCEEDED(com.result()));
+  ComPtr<IUIAutomation> automation;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_CUIAutomation8, nullptr, CLSCTX_INPROC_SERVER,
+      IID_PPV_ARGS(automation.GetAddressOf()))));
+
+  CandidateWindow window;
+  CHECK(window.Start());
+  WindowProbe probe;
+  CHECK(WaitForVisibility(false, &probe));
+  CHECK(probe.window);
+
+  ComPtr<IUIAutomationElement> root;
+  CHECK(SUCCEEDED(
+      automation->ElementFromHandle(probe.window, root.GetAddressOf())));
+  BSTR automation_id = nullptr;
+  CHECK(SUCCEEDED(root->get_CurrentAutomationId(&automation_id)) &&
+        automation_id &&
+        std::wstring_view(automation_id, SysStringLen(automation_id)) ==
+            L"IME_Candidate_Window");
+  SysFreeString(automation_id);
+  CONTROLTYPEID control_type = 0;
+  CHECK(SUCCEEDED(root->get_CurrentControlType(&control_type)) &&
+        control_type == UIA_ListControlTypeId);
+
+  AutomationListenerProcess listener;
+  CHECK(listener.Start(probe.window));
+
+  auto shown = VisibleSnapshot(140);
+  shown->revision = 1;
+  window.Publish(shown);
+  CHECK(WaitForVisibility(true, &probe));
+  CHECK(listener.Wait(UIA_MenuOpenedEventId));
+  Sleep(25);
+  CHECK(listener.Count(UIA_MenuOpenedEventId) == 1);
+  CHECK(listener.Count(UIA_SelectionItem_ElementSelectedEventId) == 0);
+  CHECK(listener.Count(UIA_LayoutInvalidatedEventId) >= 1);
+  CHECK(listener.Count(UIA_Selection_InvalidatedEventId) >= 1);
+  CHECK(listener.PropertyCount(UIA_BoundingRectanglePropertyId) >= 1);
+  CHECK(listener.PropertyCount(UIA_IsOffscreenPropertyId) >= 1);
+  CHECK(listener.StructureCount() >= 1);
+
+  BOOL offscreen = TRUE;
+  CHECK(SUCCEEDED(root->get_CurrentIsOffscreen(&offscreen)) && !offscreen);
+  RECT root_bounds{};
+  CHECK(SUCCEEDED(root->get_CurrentBoundingRectangle(&root_bounds)) &&
+        root_bounds.right > root_bounds.left &&
+        root_bounds.bottom > root_bounds.top);
+
+  ComPtr<IUIAutomationCondition> true_condition;
+  CHECK(SUCCEEDED(
+      automation->CreateTrueCondition(true_condition.GetAddressOf())));
+  ComPtr<IUIAutomationElementArray> children;
+  CHECK(SUCCEEDED(root->FindAll(TreeScope_Children, true_condition.Get(),
+                                children.GetAddressOf())));
+  int child_count = 0;
+  CHECK(SUCCEEDED(children->get_Length(&child_count)) && child_count == 2);
+  ComPtr<IUIAutomationElement> first;
+  ComPtr<IUIAutomationElement> second;
+  CHECK(SUCCEEDED(children->GetElement(0, first.GetAddressOf())));
+  CHECK(SUCCEEDED(children->GetElement(1, second.GetAddressOf())));
+  BSTR first_name = nullptr;
+  BSTR second_name = nullptr;
+  CHECK(SUCCEEDED(first->get_CurrentName(&first_name)) && first_name &&
+        std::wstring_view(first_name, SysStringLen(first_name)) == L"\u4f60");
+  CHECK(SUCCEEDED(second->get_CurrentName(&second_name)) && second_name &&
+        std::wstring_view(second_name, SysStringLen(second_name)) == L"\u5c3c");
+  SysFreeString(first_name);
+  SysFreeString(second_name);
+
+  VARIANT first_selected;
+  VARIANT second_selected;
+  VariantInit(&first_selected);
+  VariantInit(&second_selected);
+  CHECK(SUCCEEDED(first->GetCurrentPropertyValue(
+      UIA_SelectionItemIsSelectedPropertyId, &first_selected)));
+  CHECK(SUCCEEDED(second->GetCurrentPropertyValue(
+      UIA_SelectionItemIsSelectedPropertyId, &second_selected)));
+  CHECK(first_selected.vt == VT_BOOL && first_selected.boolVal == VARIANT_TRUE);
+  CHECK(second_selected.vt == VT_BOOL &&
+        second_selected.boolVal == VARIANT_FALSE);
+  VariantClear(&first_selected);
+  VariantClear(&second_selected);
+
+  ComPtr<IUIAutomationSelectionPattern> selection;
+  CHECK(SUCCEEDED(root->GetCurrentPatternAs(
+      UIA_SelectionPatternId, IID_PPV_ARGS(selection.GetAddressOf()))));
+  ComPtr<IUIAutomationElementArray> selected_items;
+  CHECK(SUCCEEDED(
+      selection->GetCurrentSelection(selected_items.GetAddressOf())));
+  int selected_count = 0;
+  CHECK(SUCCEEDED(selected_items->get_Length(&selected_count)) &&
+        selected_count == 1);
+
+  RECT first_bounds{};
+  CHECK(SUCCEEDED(first->get_CurrentBoundingRectangle(&first_bounds)) &&
+        first_bounds.left >= root_bounds.left &&
+        first_bounds.top >= root_bounds.top &&
+        first_bounds.right <= root_bounds.right &&
+        first_bounds.bottom <= root_bounds.bottom);
+
+  auto selected = std::make_shared<RuntimeSnapshot>(*shown);
+  selected->revision = 2;
+  ++selected->correlation.sequence;
+  selected->composition.highlighted_index = 1;
+  const LONG selection_invalidated_before =
+      listener.Count(UIA_Selection_InvalidatedEventId);
+  window.Publish(selected);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.selection_only >= 1;
+  }));
+  CHECK(listener.Wait(UIA_SelectionItem_ElementSelectedEventId));
+  Sleep(25);
+  CHECK(listener.Count(UIA_SelectionItem_ElementSelectedEventId) == 1);
+  CHECK(listener.Count(UIA_Selection_InvalidatedEventId) >
+        selection_invalidated_before);
+  CHECK(listener.PropertyCount(UIA_SelectionItemIsSelectedPropertyId) >= 2);
+  VariantInit(&second_selected);
+  CHECK(SUCCEEDED(second->GetCurrentPropertyValue(
+      UIA_SelectionItemIsSelectedPropertyId, &second_selected)) &&
+        second_selected.vt == VT_BOOL &&
+        second_selected.boolVal == VARIANT_TRUE);
+  VariantClear(&second_selected);
+
+  auto moved = std::make_shared<RuntimeSnapshot>(*selected);
+  moved->revision = 3;
+  ++moved->correlation.sequence;
+  ++moved->ui_sequence;
+  moved->ui_state.caret = {700, 450, 702, 470};
+  const LONG bounds_before =
+      listener.PropertyCount(UIA_BoundingRectanglePropertyId);
+  const LONG layout_before = listener.Count(UIA_LayoutInvalidatedEventId);
+  window.Publish(moved);
+  CHECK(WaitForCounters(window, [](const CandidateWindow::Counters &value) {
+    return value.anchor_only >= 1;
+  }));
+  RECT moved_root{};
+  RECT moved_second{};
+  CHECK(SUCCEEDED(root->get_CurrentBoundingRectangle(&moved_root)) &&
+        SUCCEEDED(second->get_CurrentBoundingRectangle(&moved_second)));
+  CHECK(moved_root.left != root_bounds.left || moved_root.top != root_bounds.top);
+  CHECK(moved_second.left >= moved_root.left &&
+        moved_second.top >= moved_root.top &&
+        moved_second.right <= moved_root.right &&
+        moved_second.bottom <= moved_root.bottom);
+  Sleep(25);
+  CHECK(listener.PropertyCount(UIA_BoundingRectanglePropertyId) >
+        bounds_before);
+  CHECK(listener.Count(UIA_LayoutInvalidatedEventId) > layout_before);
+
+  auto hidden = std::make_shared<RuntimeSnapshot>(*moved);
+  hidden->revision = 4;
+  ++hidden->correlation.sequence;
+  hidden->ui_state.show_allowed = false;
+  const LONG offscreen_before =
+      listener.PropertyCount(UIA_IsOffscreenPropertyId);
+  const LONG structure_before = listener.StructureCount();
+  window.Publish(hidden);
+  CHECK(WaitForVisibility(false));
+  CHECK(listener.Wait(UIA_MenuClosedEventId));
+  auto still_hidden = std::make_shared<RuntimeSnapshot>(*hidden);
+  still_hidden->revision = 5;
+  ++still_hidden->correlation.sequence;
+  window.Publish(still_hidden);
+  CHECK(window.Prewarm());
+  Sleep(25);
+  CHECK(listener.Count(UIA_MenuClosedEventId) == 1);
+  CHECK(listener.PropertyCount(UIA_IsOffscreenPropertyId) > offscreen_before);
+  CHECK(listener.StructureCount() > structure_before);
+  CHECK(SUCCEEDED(root->get_CurrentIsOffscreen(&offscreen)) && offscreen);
+
+  CHECK(listener.Finish());
+  window.Stop();
   return true;
 }
 
@@ -1159,6 +1810,8 @@ bool HangingUiDoesNotDelayEngine() {
 int wmain(int argc, wchar_t **argv) {
   if (argc > 1 && std::wstring_view(argv[1]) == L"--fake-preview-target")
     return RunFakePreviewTarget(argc, argv);
+  if (argc > 1 && std::wstring_view(argv[1]) == L"--uia-listener")
+    return RunAutomationListener(argc, argv);
   if (argc > 1 && std::wstring_view(argv[1]) == L"--light-dismiss-events") {
     if (!CandidateWindowReportsShowEvent() ||
         !CandidateWindowReportsMoveEvent() ||
@@ -1178,17 +1831,18 @@ int wmain(int argc, wchar_t **argv) {
       !ScrollTransitionIsBoundedAndOptional() ||
       !CandidateWindowReportsShowEvent() ||
       !CandidateWindowReportsMoveEvent() ||
+      !CandidateWindowRelayoutsWhenWorkAreaShrinks() ||
       !CandidateWindowDoesNotReportNoOpMove() ||
       !CandidateWindowReportsSizeChangeEvent() ||
       !CandidateWindowReportsHideEvent() ||
       !CandidateWindowNeverReportsUnshownWindow() ||
       !CandidateWindowDoesNotRepeatLightDismissEvents() ||
       !CandidateWindowReportsHideWhenStopped() ||
+      !CandidateWindowExposesAccessibleTreeAndEvents() ||
       !PrewarmCompletesBeforeReturn() ||
       !HiddenHighDpiStateDoesNotDelayFirstVisible() ||
       !InlineHostPreeditStillShowsPanelHeader() ||
-      !HealthyWindowAndHideRules() ||
-      !FirstVisibleBudgetAfterPrewarm() ||
+      !HealthyWindowAndHideRules() || !FirstVisibleBudgetAfterPrewarm() ||
       !FastPathsAndDeviceRecoveryAreObservable() ||
       !ModeIndicatorRequiresFreshCaretAndDeduplicates() ||
       !PaintFailureHidesWithoutBlockingEngine() ||

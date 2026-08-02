@@ -29,7 +29,8 @@ bool RuntimeProcess::Start(const wchar_t *path, std::wstring_view fault,
                            int32_t expected_clients,
                            int32_t expected_sessions,
                            bool candidate_preview,
-                           bool cjk_english_spacing) {
+                           bool cjk_english_spacing,
+                           bool parallel) {
   std::wstring command =
       L"\"" + std::wstring(path) + L"\" --endpoint-suffix " +
       TestEndpointSuffix() + L" --fault " + std::wstring(fault) +
@@ -44,7 +45,8 @@ bool RuntimeProcess::Start(const wchar_t *path, std::wstring_view fault,
       L" --expected-terminal-abandons " +
       std::to_wstring(expected_terminal_abandons) +
       L" --expected-clients " + std::to_wstring(expected_clients) +
-      L" --expected-sessions " + std::to_wstring(expected_sessions);
+      L" --expected-sessions " + std::to_wstring(expected_sessions) +
+      (parallel ? L" --parallel" : L"");
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
@@ -130,8 +132,8 @@ bool TextServiceModule::Load(const wchar_t *path) {
   module_ = LoadLibraryW(path);
   if (!module_)
     return false;
-  can_unload_ = reinterpret_cast<CanUnloadFn>(
-      GetProcAddress(module_, "DllCanUnloadNow"));
+  can_unload_ =
+      reinterpret_cast<CanUnloadFn>(GetProcAddress(module_, "DllCanUnloadNow"));
   create_for_test_ = reinterpret_cast<CreateForTestFn>(
       GetProcAddress(module_, "FamoCreateTextServiceForTest"));
   reactivate_for_test_ = reinterpret_cast<ReactivateForTestFn>(
@@ -139,15 +141,17 @@ bool TextServiceModule::Load(const wchar_t *path) {
   preview_selection_state_for_test_ =
       reinterpret_cast<PreviewSelectionStateForTestFn>(
           GetProcAddress(module_, "FamoGetPreviewSelectionStateForTest"));
+  ui_state_for_test_ = reinterpret_cast<UiStateForTestFn>(
+      GetProcAddress(module_, "FamoGetUiStateForTest"));
   recovery_prepared_claims_for_test_ =
-      reinterpret_cast<RecoveryPreparedClaimsForTestFn>(GetProcAddress(
-          module_, "FamoGetRecoveryPreparedClaimsForTest"));
+      reinterpret_cast<RecoveryPreparedClaimsForTestFn>(
+          GetProcAddress(module_, "FamoGetRecoveryPreparedClaimsForTest"));
   recovery_execute_attempts_for_test_ =
-      reinterpret_cast<RecoveryExecuteAttemptsForTestFn>(GetProcAddress(
-          module_, "FamoGetRecoveryExecuteAttemptsForTest"));
+      reinterpret_cast<RecoveryExecuteAttemptsForTestFn>(
+          GetProcAddress(module_, "FamoGetRecoveryExecuteAttemptsForTest"));
   terminal_publication_ready_for_test_ =
-      reinterpret_cast<TerminalPublicationReadyForTestFn>(GetProcAddress(
-          module_, "FamoGetTerminalPublicationReadyForTest"));
+      reinterpret_cast<TerminalPublicationReadyForTestFn>(
+          GetProcAddress(module_, "FamoGetTerminalPublicationReadyForTest"));
   terminal_retired_sessions_for_test_ =
       reinterpret_cast<TerminalRetiredSessionsForTestFn>(GetProcAddress(
           module_, "FamoGetTerminalRetiredSessionsForTest"));
@@ -156,6 +160,7 @@ bool TextServiceModule::Load(const wchar_t *path) {
           module_, "FamoGetTerminalCleanupConnectAttemptsForTest"));
   return can_unload_ && create_for_test_ && reactivate_for_test_ &&
          preview_selection_state_for_test_ &&
+         ui_state_for_test_ &&
          recovery_prepared_claims_for_test_ &&
          recovery_execute_attempts_for_test_ &&
          terminal_publication_ready_for_test_ &&
@@ -212,6 +217,13 @@ bool TextServiceModule::PreviewSelectionStateForTest(
     ITfTextInputProcessorEx *service, HWND *target,
     runtime::PreviewSelectionRequest *request) const {
   return preview_selection_state_for_test_(service, target, request) != FALSE;
+}
+
+bool TextServiceModule::UiStateForTest(ITfTextInputProcessorEx *service,
+                                       ITfContext *context,
+                                       runtime::UiState *state) const {
+  return ui_state_for_test_ &&
+         ui_state_for_test_(service, context, state) != FALSE;
 }
 
 } // namespace famo::tsf::test

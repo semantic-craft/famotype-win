@@ -254,6 +254,45 @@ HRESULT CompositionController::End(ITfContext *context, TfClientId client_id) {
   return ended;
 }
 
+HRESULT CompositionController::CloneLayoutCaret(TfEditCookie cookie,
+                                                ITfContext *context,
+                                                ITfRange **range) const {
+  if (!context || !range)
+    return E_INVALIDARG;
+  *range = nullptr;
+
+  ComPtr<ITfRange> source;
+  TfAnchor anchor = TF_ANCHOR_END;
+  HRESULT result = S_OK;
+  if (composition_) {
+    result = composition_->GetRange(source.put());
+  } else {
+    TF_SELECTION selection{};
+    ULONG fetched = 0;
+    result = context->GetSelection(cookie, TF_DEFAULT_SELECTION, 1,
+                                   &selection, &fetched);
+    if (SUCCEEDED(result) && fetched == 1 && selection.range) {
+      source.reset(selection.range);
+      if (selection.style.ase == TF_AE_START)
+        anchor = TF_ANCHOR_START;
+    } else if (SUCCEEDED(result)) {
+      result = E_FAIL;
+    }
+  }
+  if (FAILED(result) || !source)
+    return FAILED(result) ? result : E_FAIL;
+
+  ComPtr<ITfRange> caret;
+  result = source->Clone(caret.put());
+  if (FAILED(result))
+    return result;
+  result = caret->Collapse(cookie, anchor);
+  if (FAILED(result))
+    return result;
+  *range = caret.detach();
+  return S_OK;
+}
+
 HRESULT CompositionController::ApplyInSession(TfEditCookie cookie,
                                               ITfContext *context,
                                               const CompositionPlan &plan,

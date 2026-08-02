@@ -8,7 +8,7 @@ endif()
 set(FAMO_IDENTITY "Development" CACHE STRING
     "Compile-time identity set: Development or Stable")
 set_property(CACHE FAMO_IDENTITY PROPERTY STRINGS Development Stable)
-set(FAMO_BRIDGE_ABI "4" CACHE STRING
+set(FAMO_BRIDGE_ABI "5" CACHE STRING
     "Stable in-process TSF Bridge ABI; bump only for a Bridge release")
 if(NOT FAMO_BRIDGE_ABI MATCHES "^[1-9][0-9]*$")
   message(FATAL_ERROR "FAMO_BRIDGE_ABI must be a positive integer")
@@ -64,6 +64,7 @@ add_library(FamoTextService SHARED
   src/dll_module.cpp
   src/module_state.cpp
   src/registration.cpp
+  src/search_candidate_list.cpp
   src/text_service.cpp
   src/text_service_key.cpp
   src/text_service_ui.cpp

@@ -51,6 +51,33 @@ private:
   std::string name_;
 };
 
+class ScopedDpiAwareness {
+public:
+  explicit ScopedDpiAwareness(DPI_AWARENESS_CONTEXT awareness)
+      : previous_(SetThreadDpiAwarenessContext(awareness)) {}
+  ~ScopedDpiAwareness() {
+    if (previous_)
+      SetThreadDpiAwarenessContext(previous_);
+  }
+  explicit operator bool() const { return previous_ != nullptr; }
+
+private:
+  DPI_AWARENESS_CONTEXT previous_ = nullptr;
+};
+
+UINT ExpectedPhysicalDpi(HWND window) {
+  const UINT reported = GetDpiForWindow(window);
+  POINT scale[2] = {{0, 0}, {96, 0}};
+  if (!LogicalToPhysicalPointForPerMonitorDPI(window, &scale[0]) ||
+      !LogicalToPhysicalPointForPerMonitorDPI(window, &scale[1])) {
+    return reported;
+  }
+  const int64_t span = static_cast<int64_t>(scale[1].x) - scale[0].x;
+  const int64_t dpi =
+      static_cast<int64_t>(reported == 0 ? 96 : reported) * span / 96;
+  return dpi > 0 ? static_cast<UINT>(dpi) : reported;
+}
+
 bool TestKey(ITfKeyEventSink *sink, ITfContext *context, WPARAM key,
              bool expected_eaten) {
   BOOL eaten = FALSE;
@@ -218,6 +245,252 @@ bool HealthyRoundtrip(TextServiceModule *module, const wchar_t *runtime_path) {
       });
   const bool runtime_finished = runtime.Finish();
   return passed && runtime_finished;
+}
+
+bool CompositionLayoutUsesActiveRangeEnd(TextServiceModule *module,
+                                         const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  const bool passed = RunTextStoreSession(
+      module, [module](ITfKeyEventSink *key_sink, ITfContext *context,
+                       FakeTextStore *store, ITfTextInputProcessorEx *service,
+                       ITfThreadMgr *, ITfDocumentMgr *) {
+        ScopedDpiAwareness unaware(DPI_AWARENESS_CONTEXT_UNAWARE);
+        CHECK(static_cast<bool>(unaware));
+        HWND view_window = CreateWindowExW(
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP, 0, 0,
+            1024, 768, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CHECK(view_window != nullptr);
+        CHECK(AreDpiAwarenessContextsEqual(
+            GetWindowDpiAwarenessContext(view_window),
+            DPI_AWARENESS_CONTEXT_UNAWARE));
+        store->set_window_for_test(view_window);
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"ni");
+
+        // Model a WebView host whose document selection spans a different
+        // range while the TSF composition remains active. Candidate placement
+        // must follow the composition's active end, not this host selection.
+        store->set_selection_for_test(0, 1, TS_AE_START);
+        ComPtr<ITfTextLayoutSink> layout_sink;
+        CHECK(SUCCEEDED(service->QueryInterface(
+            IID_ITfTextLayoutSink,
+            reinterpret_cast<void **>(layout_sink.put()))));
+        const size_t before = store->text_ext_query_count();
+        CHECK(SUCCEEDED(
+            layout_sink->OnLayoutChange(context, TF_LC_CHANGE, nullptr)));
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (store->text_ext_query_count() == before &&
+               std::chrono::steady_clock::now() < deadline) {
+          PumpMessages();
+          Sleep(5);
+        }
+        CHECK(store->text_ext_query_count() > before);
+        CHECK(store->screen_ext_query_count() > 0);
+        CHECK(store->window_query_count() > 0);
+        CHECK(store->last_text_ext_start() == 2);
+        CHECK(store->last_text_ext_end() == 2);
+
+        famo::runtime::UiState published{};
+        CHECK(module->UiStateForTest(service, context, &published));
+        CHECK(published.layout_available);
+        POINT expected_corners[2] = {{0, 0}, {1, 16}};
+        CHECK(LogicalToPhysicalPointForPerMonitorDPI(view_window,
+                                                     &expected_corners[0]));
+        CHECK(LogicalToPhysicalPointForPerMonitorDPI(view_window,
+                                                     &expected_corners[1]));
+        CHECK(published.caret.left == expected_corners[0].x);
+        CHECK(published.caret.top == expected_corners[0].y);
+        CHECK(published.caret.right == expected_corners[1].x);
+        CHECK(published.caret.bottom == expected_corners[1].y);
+        MONITORINFO monitor_info{sizeof(monitor_info)};
+        {
+          ScopedDpiAwareness physical(
+              DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+          CHECK(static_cast<bool>(physical));
+          RECT expected_caret{expected_corners[0].x, expected_corners[0].y,
+                              expected_corners[1].x, expected_corners[1].y};
+          const HMONITOR monitor =
+              MonitorFromRect(&expected_caret, MONITOR_DEFAULTTONEAREST);
+          CHECK(monitor != nullptr);
+          CHECK(GetMonitorInfoW(monitor, &monitor_info));
+        }
+        CHECK(published.work_area.left == monitor_info.rcWork.left);
+        CHECK(published.work_area.top == monitor_info.rcWork.top);
+        CHECK(published.work_area.right == monitor_info.rcWork.right);
+        CHECK(published.work_area.bottom == monitor_info.rcWork.bottom);
+        CHECK(published.dpi == ExpectedPhysicalDpi(view_window));
+        std::printf("tsf_layout_physical dpi=%u caret=%ld,%ld,%ld,%ld "
+                    "work=%ld,%ld,%ld,%ld\n",
+                    published.dpi, static_cast<long>(published.caret.left),
+                    static_cast<long>(published.caret.top),
+                    static_cast<long>(published.caret.right),
+                    static_cast<long>(published.caret.bottom),
+                    static_cast<long>(published.work_area.left),
+                    static_cast<long>(published.work_area.top),
+                    static_cast<long>(published.work_area.right),
+                    static_cast<long>(published.work_area.bottom));
+        store->set_window_for_test(nullptr);
+        CHECK(DestroyWindow(view_window));
+
+        {
+          ScopedDpiAwareness system(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+          CHECK(static_cast<bool>(system));
+          HWND system_window =
+              CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"STATIC",
+                              L"", WS_POPUP, 0, 0, 1024, 768, nullptr, nullptr,
+                              GetModuleHandleW(nullptr), nullptr);
+          CHECK(system_window != nullptr);
+          CHECK(AreDpiAwarenessContextsEqual(
+              GetWindowDpiAwarenessContext(system_window),
+              DPI_AWARENESS_CONTEXT_SYSTEM_AWARE));
+          store->set_window_for_test(system_window);
+          const size_t system_before = store->text_ext_query_count();
+          CHECK(SUCCEEDED(
+              layout_sink->OnLayoutChange(context, TF_LC_CHANGE, nullptr)));
+          const auto system_deadline =
+              std::chrono::steady_clock::now() + std::chrono::seconds(1);
+          while (store->text_ext_query_count() == system_before &&
+                 std::chrono::steady_clock::now() < system_deadline) {
+            PumpMessages();
+            Sleep(5);
+          }
+          CHECK(store->text_ext_query_count() > system_before);
+          famo::runtime::UiState system_published{};
+          CHECK(module->UiStateForTest(service, context, &system_published));
+          CHECK(system_published.layout_available);
+          CHECK(system_published.dpi == ExpectedPhysicalDpi(system_window));
+          CHECK(GetDpiForWindow(system_window) > 0);
+          std::printf("tsf_layout_system_aware dpi=%u reported=%u\n",
+                      system_published.dpi, GetDpiForWindow(system_window));
+          store->set_window_for_test(nullptr);
+          CHECK(DestroyWindow(system_window));
+        }
+        return true;
+      });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool SearchCandidateProviderIsDiscoverable(TextServiceModule *module,
+                                           const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path, L"none", 0, 4, true, 0, -1, -1, -1, false,
+                      false, true));
+  ComPtr<ITfCandidateList> surviving_list;
+  const bool passed = RunTextStoreSession(
+      module, [&surviving_list](ITfKeyEventSink *, ITfContext *,
+                               FakeTextStore *, ITfTextInputProcessorEx *,
+                               ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        ComPtr<ITfFunctionProvider> provider;
+        // The test export activates the service with the harness's application
+        // client id, so TSF exposes its single sink through the reserved app
+        // provider key. Production activation supplies the TIP client id and
+        // indexes this same provider by the CLSID returned from GetType.
+        CHECK(SUCCEEDED(thread_manager->GetFunctionProvider(
+            GUID_APP_FUNCTIONPROVIDER, provider.put())));
+        GUID type{};
+        CHECK(SUCCEEDED(provider->GetType(&type)) &&
+              type == famo::tsf::kTextServiceClsid);
+        BSTR description = nullptr;
+        CHECK(SUCCEEDED(provider->GetDescription(&description)) &&
+              description != nullptr && SysStringLen(description) > 0);
+        SysFreeString(description);
+
+        ComPtr<ITfFnSearchCandidateProvider> search;
+        CHECK(SUCCEEDED(provider->GetFunction(
+            GUID_NULL, IID_ITfFnSearchCandidateProvider,
+            reinterpret_cast<IUnknown **>(search.put()))));
+        BSTR display_name = nullptr;
+        CHECK(SUCCEEDED(search->GetDisplayName(&display_name)) &&
+              display_name != nullptr && SysStringLen(display_name) > 0);
+        SysFreeString(display_name);
+
+        CHECK(search->GetSearchCandidates(nullptr, nullptr,
+                                          surviving_list.put()) ==
+              E_INVALIDARG);
+        CHECK(!surviving_list);
+        BSTR application_id = SysAllocString(L"");
+        BSTR empty_query = SysAllocString(L"");
+        CHECK(application_id && empty_query);
+        CHECK(search->GetSearchCandidates(empty_query, application_id,
+                                          surviving_list.put()) == S_FALSE);
+        CHECK(!surviving_list);
+        SysFreeString(empty_query);
+
+        BSTR query = SysAllocString(L"ni");
+        CHECK(query);
+        CHECK(search->GetSearchCandidates(query, application_id, nullptr) ==
+              E_POINTER);
+        CHECK(SUCCEEDED(search->GetSearchCandidates(
+            query, application_id, surviving_list.put())));
+        CHECK(surviving_list);
+
+        ULONG count = 0;
+        CHECK(SUCCEEDED(surviving_list->GetCandidateNum(&count)) && count == 3);
+        CHECK(surviving_list->GetCandidateNum(nullptr) == E_POINTER);
+        ComPtr<ITfCandidateString> first;
+        CHECK(SUCCEEDED(surviving_list->GetCandidate(0, first.put())));
+        CHECK(surviving_list->GetCandidate(0, nullptr) == E_INVALIDARG);
+        ULONG index = ULONG_MAX;
+        CHECK(SUCCEEDED(first->GetIndex(&index)) && index == 0);
+        BSTR first_text = nullptr;
+        CHECK(SUCCEEDED(first->GetString(&first_text)) && first_text &&
+              std::wstring_view(first_text, SysStringLen(first_text)) ==
+                  L"\u4f60");
+        SysFreeString(first_text);
+        CHECK(surviving_list->GetCandidate(count, first.put()) == E_FAIL);
+        CHECK(!first);
+
+        ComPtr<IEnumTfCandidates> enumerator;
+        CHECK(SUCCEEDED(
+            surviving_list->EnumCandidates(enumerator.put())));
+        ComPtr<ITfCandidateString> enumerated;
+        ULONG fetched = 0;
+        CHECK(enumerator->Next(1, enumerated.put(), nullptr) == S_OK);
+        CHECK(SUCCEEDED(enumerated->GetIndex(&index)) && index == 0);
+        enumerated.reset();
+        CHECK(SUCCEEDED(enumerator->Reset()));
+        CHECK(enumerator->Next(1, nullptr, &fetched) == E_INVALIDARG);
+        CHECK(enumerator->Next(1, enumerated.put(), &fetched) == S_OK &&
+              fetched == 1);
+        CHECK(SUCCEEDED(enumerated->GetIndex(&index)) && index == 0);
+        ComPtr<IEnumTfCandidates> clone;
+        CHECK(SUCCEEDED(enumerator->Clone(clone.put())));
+        CHECK(clone->Skip(1) == S_OK);
+        enumerated.reset();
+        fetched = 0;
+        CHECK(clone->Next(2, enumerated.put(), &fetched) == S_FALSE &&
+              fetched == 1);
+        CHECK(SUCCEEDED(enumerated->GetIndex(&index)) && index == 2);
+        CHECK(SUCCEEDED(enumerator->Reset()));
+        CHECK(enumerator->Skip(count + 1) == S_FALSE);
+
+        CHECK(SUCCEEDED(surviving_list->SetResult(0, CAND_SELECTED)));
+        CHECK(SUCCEEDED(surviving_list->SetResult(ULONG_MAX, CAND_CANCELED)));
+        CHECK(surviving_list->SetResult(count, CAND_FINALIZED) ==
+              E_INVALIDARG);
+        CHECK(surviving_list->SetResult(
+                  0, static_cast<TfCandidateResult>(99)) == E_INVALIDARG);
+        BSTR result = SysAllocString(L"\u4f60");
+        CHECK(result);
+        CHECK(search->SetResult(query, application_id, result) == E_NOTIMPL);
+        SysFreeString(result);
+        SysFreeString(query);
+        SysFreeString(application_id);
+        return true;
+      });
+  CHECK(passed);
+  CHECK(surviving_list);
+  CHECK(!module->CanUnload());
+  ULONG count = 0;
+  CHECK(SUCCEEDED(surviving_list->GetCandidateNum(&count)) && count == 3);
+  surviving_list.reset();
+  CHECK(module->CanUnload());
+  const bool runtime_finished = runtime.Finish();
+  return runtime_finished;
 }
 
 bool AllocationBoundariesReleaseReferences(TextServiceModule *module) {
@@ -2484,6 +2757,8 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(TerminalPublicationSlotSerializesFailures(&module, runtime_path));
   CHECK(MissingRuntimeFailsOpen(&module));
   CHECK(HealthyRoundtrip(&module, runtime_path));
+  CHECK(CompositionLayoutUsesActiveRangeEnd(&module, runtime_path));
+  CHECK(SearchCandidateProviderIsDiscoverable(&module, runtime_path));
   CHECK(DisabledKeyboardContextPassesKeysThrough(&module, runtime_path));
   CHECK(DisabledDuringWarmupRejectsLateSession(&module, runtime_path));
   CHECK(DisabledAfterPreparedClaimSkipsRecoveryExecute(&module,

@@ -10,9 +10,11 @@ namespace famo::runtime {
 
 constexpr uint32_t kProtocolMagic = 0x4f4d4146; // "FAMO" little-endian.
 constexpr uint16_t kMinSupportedProtocolVersion = 2;
-constexpr uint16_t kProtocolVersion = 3;
+constexpr uint16_t kProtocolVersion = 4;
 constexpr uint16_t kHeaderSize = 76;
 constexpr uint32_t kMaxCandidateCount = 64;
+constexpr uint32_t kMaxSearchQueryBytes = 256;
+constexpr uint32_t kMaxSearchCandidateCount = 20;
 constexpr uint32_t kMaxStringBytes = 1024 * 1024;
 // ABI v2 permits one engine-owned result allocation up to 8 MiB. The wire
 // budget adds every composition-only field and string-length prefix so even a
@@ -68,6 +70,9 @@ enum class Command : uint16_t {
   // session. The payload is DeliveryReference and the frame correlation is
   // the owning connection identity. Sibling sessions in that epoch survive.
   AbandonSession = 23,
+  // Protocol v4 stateless reading conversion. It creates no logical session,
+  // publishes no UI snapshot, and emits no IME message or event.
+  SearchCandidates = 24,
 };
 
 enum class Status : uint32_t {
@@ -294,6 +299,17 @@ bool EncodeOpenSession(std::string_view schema, std::vector<uint8_t> *payload,
                        std::string *error) noexcept;
 bool DecodeOpenSession(std::span<const uint8_t> payload, std::string *schema,
                        std::string *error) noexcept;
+bool EncodeSearchQuery(std::string_view query,
+                       std::vector<uint8_t> *payload,
+                       std::string *error) noexcept;
+bool DecodeSearchQuery(std::span<const uint8_t> payload, std::string *query,
+                       std::string *error) noexcept;
+bool EncodeSearchCandidates(std::span<const std::string> candidates,
+                            std::vector<uint8_t> *payload,
+                            std::string *error) noexcept;
+bool DecodeSearchCandidates(std::span<const uint8_t> payload,
+                            std::vector<std::string> *candidates,
+                            std::string *error) noexcept;
 bool EncodeKeyEvent(const KeyEvent &key,
                     std::vector<uint8_t> *payload) noexcept;
 bool DecodeKeyEvent(std::span<const uint8_t> payload, KeyEvent *key,

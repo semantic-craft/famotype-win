@@ -26,7 +26,8 @@ public:
              int32_t expected_clients = -1,
              int32_t expected_sessions = -1,
              bool candidate_preview = false,
-             bool cjk_english_spacing = false);
+             bool cjk_english_spacing = false,
+             bool parallel = false);
   bool Finish();
   HWND PreviewSourceWindow() const;
 
@@ -50,6 +51,8 @@ public:
   bool PreviewSelectionStateForTest(
       ITfTextInputProcessorEx *service, HWND *target,
       runtime::PreviewSelectionRequest *request) const;
+  bool UiStateForTest(ITfTextInputProcessorEx *service, ITfContext *context,
+                      runtime::UiState *state) const;
   uint32_t RecoveryPreparedClaimsForTest() const;
   uint32_t RecoveryExecuteAttemptsForTest() const;
   uint32_t TerminalCleanupConnectAttemptsForTest() const;
@@ -58,14 +61,17 @@ public:
 
 private:
   using CanUnloadFn = HRESULT(STDAPICALLTYPE *)();
-  using CreateForTestFn = HRESULT(STDAPICALLTYPE *)(
-      ITfThreadMgr *, TfClientId, const wchar_t *, ITfTextInputProcessorEx **);
+  using CreateForTestFn = HRESULT(STDAPICALLTYPE *)(ITfThreadMgr *, TfClientId,
+                                                    const wchar_t *,
+                                                    ITfTextInputProcessorEx **);
   using ReactivateForTestFn = HRESULT(STDAPICALLTYPE *)(
       ITfTextInputProcessorEx *, ITfThreadMgr *, TfClientId);
   using PreviewSelectionStateForTestFn = BOOL(STDAPICALLTYPE *)(
       ITfTextInputProcessorEx *, HWND *, runtime::PreviewSelectionRequest *);
-  using TerminalCleanupConnectAttemptsForTestFn =
-      uint32_t(STDAPICALLTYPE *)();
+  using UiStateForTestFn = BOOL(STDAPICALLTYPE *)(ITfTextInputProcessorEx *,
+                                                  ITfContext *,
+                                                  runtime::UiState *);
+  using TerminalCleanupConnectAttemptsForTestFn = uint32_t(STDAPICALLTYPE *)();
   using RecoveryPreparedClaimsForTestFn = uint32_t(STDAPICALLTYPE *)();
   using RecoveryExecuteAttemptsForTestFn = uint32_t(STDAPICALLTYPE *)();
   using TerminalPublicationReadyForTestFn = uint32_t(STDAPICALLTYPE *)();
@@ -76,6 +82,7 @@ private:
   CreateForTestFn create_for_test_ = nullptr;
   ReactivateForTestFn reactivate_for_test_ = nullptr;
   PreviewSelectionStateForTestFn preview_selection_state_for_test_ = nullptr;
+  UiStateForTestFn ui_state_for_test_ = nullptr;
   RecoveryPreparedClaimsForTestFn recovery_prepared_claims_for_test_ = nullptr;
   RecoveryExecuteAttemptsForTestFn recovery_execute_attempts_for_test_ =
       nullptr;
