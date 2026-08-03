@@ -217,6 +217,29 @@ bool KeyboardCompartmentDisabled(ITfContext *context) {
   return disabled;
 }
 
+HRESULT PublishOpenInputMode(ITfThreadMgr *thread_manager,
+                             TfClientId client_id) {
+  if (!thread_manager || client_id == TF_CLIENTID_NULL)
+    return E_INVALIDARG;
+  ComPtr<ITfCompartmentMgr> manager;
+  HRESULT result = thread_manager->QueryInterface(
+      IID_ITfCompartmentMgr, reinterpret_cast<void **>(manager.put()));
+  if (FAILED(result))
+    return result;
+  ComPtr<ITfCompartment> slot;
+  result = manager->GetCompartment(GUID_COMPARTMENT_KEYBOARD_OPENCLOSE,
+                                   slot.put());
+  if (FAILED(result))
+    return result;
+  VARIANT value;
+  VariantInit(&value);
+  value.vt = VT_I4;
+  value.lVal = 1;
+  result = slot->SetValue(client_id, &value);
+  VariantClear(&value);
+  return result;
+}
+
 HRESULT GetKeyboardDisabledSource(ITfContext *context, ITfSource **source) {
   if (!context || !source)
     return E_INVALIDARG;
@@ -399,7 +422,13 @@ HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
   activation_generation_ = ++g_activation_generation;
   timing_enabled_ = TimingEnabled();
 
-  HRESULT result = thread_manager_->QueryInterface(
+  HRESULT result = PublishOpenInputMode(thread_manager_.get(), client_id_);
+  if (FAILED(result)) {
+    Deactivate();
+    return result;
+  }
+
+  result = thread_manager_->QueryInterface(
       IID_ITfKeystrokeMgr,
       reinterpret_cast<void **>(keystroke_manager_.put()));
   if (FAILED(result)) {

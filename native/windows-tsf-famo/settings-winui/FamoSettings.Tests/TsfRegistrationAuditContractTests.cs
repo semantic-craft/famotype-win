@@ -51,6 +51,16 @@ public sealed class TsfRegistrationAuditContractTests
     }
 
     [Fact]
+    public void AuditScriptVerifiesInputModeCapabilityCategory()
+    {
+        string script = File.ReadAllText(RepoFile("native/windows-tsf-famo/weasel-fork/tests/Test-FamoTsfRegistration.ps1"));
+
+        Assert.Contains("TSF-INPUT-MODE", script);
+        Assert.Contains("{CCF05DD7-4A87-11D7-A6E2-00065B84435C}", script);
+        Assert.Contains("input mode compartment capability", script);
+    }
+
+    [Fact]
     public void AuditScriptExplainsMissingStateAndCanEmitJsonForCi()
     {
         string script = File.ReadAllText(RepoFile("native/windows-tsf-famo/weasel-fork/tests/Test-FamoTsfRegistration.ps1"));

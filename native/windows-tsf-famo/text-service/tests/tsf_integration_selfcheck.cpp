@@ -180,6 +180,54 @@ bool RunTextStoreSession(
          manager_deactivated;
 }
 
+bool ActivationPublishesOpenInputMode(TextServiceModule *module) {
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  ComPtr<ITfCompartmentMgr> compartments;
+  CHECK(SUCCEEDED(thread_manager->QueryInterface(
+      IID_ITfCompartmentMgr,
+      reinterpret_cast<void **>(compartments.put()))));
+  ComPtr<ITfCompartment> keyboard_open;
+  CHECK(SUCCEEDED(compartments->GetCompartment(
+      GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, keyboard_open.put())));
+  VARIANT value;
+  VariantInit(&value);
+  value.vt = VT_I4;
+  value.lVal = 0;
+  CHECK(SUCCEEDED(keyboard_open->SetValue(client_id, &value)));
+
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(thread_manager.get(), client_id,
+                                        service.put())));
+
+  VariantClear(&value);
+  CHECK(SUCCEEDED(keyboard_open->GetValue(&value)));
+  const bool opened = value.vt == VT_I4 && value.lVal != 0;
+  VariantClear(&value);
+
+  CHECK(SUCCEEDED(service->Deactivate()));
+  service.reset();
+  CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  keyboard_open.reset();
+  compartments.reset();
+  CHECK(SUCCEEDED(thread_manager->Deactivate()));
+  thread_manager.reset();
+  CHECK(opened);
+  CHECK(module->CanUnload());
+  return true;
+}
+
 bool HealthyRoundtrip(TextServiceModule *module, const wchar_t *runtime_path) {
   RuntimeProcess runtime;
   CHECK(runtime.Start(runtime_path));
@@ -2784,6 +2832,7 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   TextServiceModule module;
   CHECK(module.Load(module_path));
   CHECK(AllocationBoundariesReleaseReferences(&module));
+  CHECK(ActivationPublishesOpenInputMode(&module));
   CHECK(ForcedDeactivationAbandonsTerminalDelivery(&module, runtime_path));
   CHECK(TerminalPublicationSlotSerializesFailures(&module, runtime_path));
   CHECK(MissingRuntimeFailsOpen(&module));

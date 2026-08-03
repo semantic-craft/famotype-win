@@ -2098,7 +2098,7 @@ HRESULT SwitchAwayFromProfile() {
   return ProfileActive() ? E_FAIL : result;
 }
 
-bool KeyboardCategoryRegistered() {
+bool CategoryRegistered(REFGUID expected) {
   const HRESULT initialized =
       CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   const bool owns_com = SUCCEEDED(initialized);
@@ -2117,7 +2117,7 @@ bool KeyboardCategoryRegistered() {
     GUID item{};
     ULONG fetched = 0;
     while (items->Next(1, &item, &fetched) == S_OK && fetched == 1) {
-      if (IsEqualGUID(item, GUID_TFCAT_TIP_KEYBOARD)) {
+      if (IsEqualGUID(item, expected)) {
         found = true;
         break;
       }
@@ -2129,15 +2129,25 @@ bool KeyboardCategoryRegistered() {
   return found;
 }
 
+bool RequiredCategoriesRegistered() {
+  return CategoryRegistered(GUID_TFCAT_TIP_KEYBOARD) &&
+         CategoryRegistered(GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT);
+}
+
+bool RequiredCategoriesAbsent() {
+  return !CategoryRegistered(GUID_TFCAT_TIP_KEYBOARD) &&
+         !CategoryRegistered(GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT);
+}
+
 void WaitForRegistrationVisibility(bool present, bool expected_enabled = true) {
   constexpr DWORD kPollIntervalMs = 50;
   constexpr DWORD kMaxWaitMs = 2000;
   for (DWORD waited = 0; waited < kMaxWaitMs; waited += kPollIntervalMs) {
     const bool visible = RegistryPresent() && ProfileRegistered() &&
                          ProfileEnabled() == expected_enabled &&
-                         KeyboardCategoryRegistered();
+                         RequiredCategoriesRegistered();
     const bool removed = !RegistryPresent() && !ProfileRegistered() &&
-                         !KeyboardCategoryRegistered();
+                         RequiredCategoriesAbsent();
     if ((present && visible) || (!present && removed))
       return;
     Sleep(kPollIntervalMs);
@@ -2149,7 +2159,7 @@ void WaitForMachineRegistrationRemoval() {
   constexpr DWORD kMaxWaitMs = 2000;
   for (DWORD waited = 0; waited < kMaxWaitMs; waited += kPollIntervalMs) {
     if (!RegistryPresentAt(HKEY_LOCAL_MACHINE) && !ProfileRegistered() &&
-        !KeyboardCategoryRegistered())
+        RequiredCategoriesAbsent())
       return;
     Sleep(kPollIntervalMs);
   }
@@ -2157,7 +2167,7 @@ void WaitForMachineRegistrationRemoval() {
 
 bool MachineRegistrationPresent() {
   return RegistryPresentAt(HKEY_LOCAL_MACHINE) && ProfileRegistered() &&
-         KeyboardCategoryRegistered();
+         RequiredCategoriesRegistered();
 }
 
 void WaitForMachineRegistrationVisibility() {
@@ -2183,6 +2193,7 @@ HRESULT UnregisterMachineWithoutLoadingServiceDll() {
       GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
       GUID_TFCAT_TIPCAP_SECUREMODE,
       GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+      GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
       GUID_TFCAT_TIPCAP_COMLESS,
       GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER,
   };
@@ -2228,7 +2239,7 @@ HRESULT UnregisterMachineWithoutLoadingServiceDll() {
                                  : tip_removed);
   WaitForMachineRegistrationRemoval();
   return !RegistryPresentAt(HKEY_LOCAL_MACHINE) && !ProfileRegistered() &&
-                 !KeyboardCategoryRegistered()
+                 RequiredCategoriesAbsent()
              ? S_OK
              : E_FAIL;
 }
@@ -2413,7 +2424,7 @@ int wmain(int argc, wchar_t **argv) {
     const bool machine_registry =
         RegistryPresentAt(HKEY_LOCAL_MACHINE);
     const bool profile = ProfileRegistered();
-    const bool category = KeyboardCategoryRegistered();
+    const bool category = RequiredCategoriesRegistered();
     std::wprintf(L"machine_registry=%ls profile=%ls category=%ls\n",
                  machine_registry ? L"present" : L"absent",
                  profile ? L"present" : L"absent",
@@ -2573,7 +2584,7 @@ int wmain(int argc, wchar_t **argv) {
   const bool registry = RegistryPresent();
   const bool profile = ProfileRegistered();
   const bool enabled = ProfileEnabled();
-  const bool category = KeyboardCategoryRegistered();
+  const bool category = RequiredCategoriesRegistered();
   const bool active = ProfileActive();
   if (command == L"register-machine" || command == L"check-machine") {
     const bool machine = RegistryPresentAt(HKEY_LOCAL_MACHINE);
