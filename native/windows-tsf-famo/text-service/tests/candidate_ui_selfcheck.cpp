@@ -168,8 +168,18 @@ int RunChecks() {
 
   UINT page_count = 0;
   UINT pages[1]{};
+  // The documented discovery call uses a null buffer and size zero. Hosts
+  // treat S_OK as the contract success before allocating the page array.
+  CHECK(element->GetPageIndex(nullptr, 0, &page_count) == S_OK);
+  CHECK(page_count == 1);
   CHECK(SUCCEEDED(element->GetPageIndex(pages, 1, &page_count)));
   CHECK(page_count == 1 && pages[0] == 0);
+  UINT split_pages[2]{0, 2};
+  CHECK(SUCCEEDED(element->SetPageIndex(split_pages, 2)));
+  UINT undersized = 99;
+  CHECK(element->GetPageIndex(&undersized, 1, &page_count) == E_INVALIDARG);
+  CHECK(page_count == 2 && undersized == 99);
+  CHECK(SUCCEEDED(element->SetPageIndex(pages, 1)));
   CHECK(SUCCEEDED(element->Update(Snapshot())) && manager->updates == 2);
   famo::runtime::Composition empty;
   CHECK(SUCCEEDED(element->Update(empty)) && manager->ends == 1);

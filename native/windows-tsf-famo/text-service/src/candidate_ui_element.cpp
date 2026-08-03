@@ -199,12 +199,18 @@ HRESULT CandidateUiElement::GetString(UINT index, BSTR *value) {
 
 HRESULT CandidateUiElement::GetPageIndex(UINT *indices, UINT size,
                                          UINT *page_count) {
-  if (!page_count || (size != 0 && !indices))
+  if (!page_count)
     return E_POINTER;
   *page_count = static_cast<UINT>(pages_.size());
-  const UINT copied = std::min(size, *page_count);
-  std::copy_n(pages_.begin(), copied, indices);
-  return copied == *page_count ? S_OK : S_FALSE;
+  // The documented discovery call is (nullptr, 0, &count). Returning S_FALSE
+  // there makes UI-less hosts treat the candidate list as unreadable before
+  // they allocate its page-index buffer.
+  if (!indices)
+    return size == 0 ? S_OK : E_INVALIDARG;
+  if (size < *page_count)
+    return E_INVALIDARG;
+  std::copy(pages_.begin(), pages_.end(), indices);
+  return S_OK;
 }
 
 HRESULT CandidateUiElement::SetPageIndex(UINT *indices, UINT page_count) {
