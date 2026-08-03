@@ -10,7 +10,9 @@
 #include <vector>
 
 #include <windows.h>
+#include <sddl.h>
 
+#include "famo_pipe_security.h"
 #include "famo_runtime_control.h"
 #include "famo_runtime_pipe.h"
 #include "../src/pipe_io.h"
@@ -27,6 +29,29 @@
 using namespace famo::runtime;
 
 namespace {
+
+bool PipeSecurityAllowsRestrictedClients() {
+  PipeEndpoint endpoint{L"\\\\.\\pipe\\Famo.Runtime.v2.test.1.default",
+                        L"S-1-5-21-111-222-333-1001", 1};
+  SECURITY_ATTRIBUTES attributes{};
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  CHECK(BuildPipeSecurity(endpoint, &attributes, &descriptor, nullptr));
+  LPWSTR sddl = nullptr;
+  CHECK(ConvertSecurityDescriptorToStringSecurityDescriptorW(
+      descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &sddl,
+      nullptr));
+  const std::wstring security(sddl);
+  LocalFree(sddl);
+  LocalFree(descriptor);
+  CHECK(security.find(L"(A;;GA;;;SY)") != std::wstring::npos);
+  CHECK(security.find(L"(A;;GA;;;S-1-5-21-111-222-333-1001)") !=
+        std::wstring::npos);
+  CHECK(security.find(L"(A;;GWGR;;;AC)") != std::wstring::npos);
+  CHECK(security.find(L"(A;;GWGR;;;S-1-15-2-2)") != std::wstring::npos);
+  CHECK(security.find(L";;;WD)") == std::wstring::npos);
+  CHECK(security.find(L";;;AN)") == std::wstring::npos);
+  return true;
+}
 
 std::wstring ModulePath() {
   std::wstring path(32768, L'\0');
@@ -1488,7 +1513,8 @@ int wmain(int argc, wchar_t **argv) {
   }
   if (argc != 1)
     return 2;
-  if (!ExtendedHelloRoundtrip() || !NormalRoundtrip() ||
+  if (!PipeSecurityAllowsRestrictedClients() ||
+      !ExtendedHelloRoundtrip() || !NormalRoundtrip() ||
       !AbsolutePreviewSelectionRoundtrip() ||
       !WrongPeerRejected() ||
       !ConnectFailureIsOffHotPath() ||

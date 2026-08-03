@@ -183,8 +183,14 @@ bool BuildPipeSecurity(const PipeEndpoint &endpoint,
       *error = "invalid security descriptor arguments";
     return false;
   }
+  // AppContainer clients still carry the desktop user's SID, but Windows
+  // performs a second access check against their restricted SID set. Keep the
+  // existing per-user boundary and grant only pipe read/write to both modern
+  // application-package classes; without these ACEs, hosts such as SearchHost
+  // load the TIP but cannot open the out-of-process Runtime channel.
   const std::wstring sddl =
-      L"D:P(A;;GA;;;SY)(A;;GA;;;" + endpoint.user_sid + L")";
+      L"D:P(A;;GA;;;SY)(A;;GA;;;" + endpoint.user_sid +
+      L")(A;;GRGW;;;AC)(A;;GRGW;;;S-1-15-2-2)";
   if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
           sddl.c_str(), SDDL_REVISION_1, descriptor, nullptr)) {
     WinError("ConvertStringSecurityDescriptor", error);
