@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.16"
+  #define AppVersion  "1.5.17"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
