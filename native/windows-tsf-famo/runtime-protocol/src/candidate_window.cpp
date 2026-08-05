@@ -13,6 +13,7 @@
 #include "candidate_automation.h"
 #include "candidate_skin.h"
 #include "dib_surface.h"
+
 #include "win_handle.h"
 
 namespace famo::runtime {
@@ -51,6 +52,22 @@ bool ApplySystemHighContrast(FamoSkin *skin) {
                            SystemColor(COLOR_WINDOWTEXT),
                            SystemColor(COLOR_HIGHLIGHT),
                            SystemColor(COLOR_HIGHLIGHTTEXT));
+  return true;
+}
+
+bool PrepareCandidateStylePresentation(
+    std::string_view text, bool exists,
+    std::shared_ptr<const void> *presentation) {
+  if (!presentation)
+    return false;
+  CandidateStylePresentation style{FamoSkinDefault(), FamoSkinDefault()};
+  if (exists &&
+      (!ParseCandidateSkinForTheme(text, false, &style.light) ||
+       !ParseCandidateSkinForTheme(text, true, &style.dark))) {
+    return false;
+  }
+  *presentation =
+      std::make_shared<const CandidateStylePresentation>(std::move(style));
   return true;
 }
 
@@ -170,6 +187,7 @@ struct WindowNotifications {
   CandidateAutomation *automation = nullptr;
   FamoLayoutResult layout{};
   PreviewSelectionRequest selection_request{};
+  HWND selection_target = nullptr;
   PipeClientIdentity selection_owner{};
   uint32_t page_index = 0;
   uint32_t page_size = 0;
@@ -216,8 +234,8 @@ LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
       if (absolute <= UINT32_MAX) {
         PreviewSelectionRequest request = notifications->selection_request;
         request.absolute_index = static_cast<uint32_t>(absolute);
-        SendPreviewSelectionToOwner(window, request,
-                                    notifications->selection_owner);
+        SendPreviewSelection(window, request, notifications->selection_target,
+                             notifications->selection_owner);
       }
     }
     return 0;
@@ -236,8 +254,8 @@ LRESULT WindowProcImpl(HWND window, UINT message, WPARAM wparam,
                            notifications->page_size, &selection)) {
       PreviewSelectionRequest request = notifications->selection_request;
       request.absolute_index = selection.absolute_index;
-      SendPreviewSelectionToOwner(window, request,
-                                  notifications->selection_owner);
+      SendPreviewSelection(window, request, notifications->selection_target,
+                           notifications->selection_owner);
       return 0;
     }
   }
@@ -265,12 +283,33 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
   }
 }
 
+HINSTANCE WindowModule() noexcept {
+  HMODULE module = nullptr;
+  return GetModuleHandleExW(
+             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+             reinterpret_cast<LPCWSTR>(&WindowProc), &module)
+             ? module
+             : nullptr;
+}
+
+void PinWindowModuleForDetachedThread() noexcept {
+  HMODULE module = nullptr;
+  (void)GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_PIN,
+                          reinterpret_cast<LPCWSTR>(&WindowProc), &module);
+}
+
 HWND CreateLayeredWindow(const wchar_t *class_name,
                          WindowNotifications *notifications,
-                         bool click_through = false) {
+                         bool click_through = false,
+                         HWND owner = nullptr,
+                         HINSTANCE module = nullptr) {
+  if (!module)
+    return nullptr;
   WNDCLASSW window_class{};
   window_class.lpfnWndProc = WindowProc;
-  window_class.hInstance = GetModuleHandleW(nullptr);
+  window_class.hInstance = module;
   // A NULL class cursor makes Windows keep whatever shape the pointer already
   // had when it enters the window, so a transient busy cursor sticks over the
   // panel until the pointer leaves it.
@@ -281,13 +320,42 @@ HWND CreateLayeredWindow(const wchar_t *class_name,
       GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
     return nullptr;
   }
-  DWORD ex_style =
-      WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+  DWORD ex_style = WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+  if (!owner)
+    ex_style |= WS_EX_TOPMOST;
   if (click_through)
     ex_style |= WS_EX_TRANSPARENT;
   return CreateWindowExW(ex_style, class_name, L"", WS_POPUP, 0, 0, 1, 1,
-                         nullptr, nullptr, GetModuleHandleW(nullptr),
-                         notifications);
+                         owner, nullptr, module, notifications);
+}
+
+HWND InProcessOwner(const RuntimeSnapshot &snapshot) {
+  HWND owner = reinterpret_cast<HWND>(snapshot.source_window);
+  DWORD process_id = 0;
+  if (!owner || !IsWindow(owner) ||
+      GetWindowThreadProcessId(owner, &process_id) == 0 ||
+      process_id != GetCurrentProcessId()) {
+    return nullptr;
+  }
+  return owner;
+}
+
+// True only when the snapshot names an owner this process can no longer use.
+// A snapshot that names no owner at all is an ordinary "nothing to present"
+// state: the popup is hidden and kept, so it survives losing and regaining
+// layout without changing HWND identity.
+bool InProcessOwnerLost(const RuntimeSnapshot &snapshot) {
+  return snapshot.require_in_process_owner && snapshot.source_window != 0 &&
+         !InProcessOwner(snapshot);
+}
+
+bool SourceWindowStillActive(const RuntimeSnapshot &snapshot) {
+  HWND source = reinterpret_cast<HWND>(snapshot.source_window);
+  if (!source)
+    return true;
+  if (InProcessOwner(snapshot))
+    return true;
+  return GetForegroundWindow() == source;
 }
 
 struct ObservedWindow {
@@ -323,7 +391,9 @@ void NotifyCandidateShownOrChanged(HWND window,
 
 bool MoveVisible(HWND window, int x, int y) {
   const ObservedWindow before = ObserveWindow(window);
-  if (!SetWindowPos(window, HWND_TOPMOST, x, y, 0, 0,
+  const HWND insert_after = GetWindow(window, GW_OWNER) ? HWND_TOP
+                                                        : HWND_TOPMOST;
+  if (!SetWindowPos(window, insert_after, x, y, 0, 0,
                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
     return false;
   }
@@ -351,6 +421,7 @@ void HideCandidateWindow(HWND window) {
     NotifyWinEvent(EVENT_OBJECT_IME_HIDE, window, OBJID_CLIENT, CHILDID_SELF);
   }
 }
+
 
 bool ShouldShow(const RuntimeSnapshot &snapshot) {
   const UiState &ui = snapshot.ui_state;
@@ -424,6 +495,37 @@ bool PrewarmRenderer(FamoTextResources *resources, const FamoSkin *skin,
 }
 
 } // namespace
+
+bool SendPreviewSelection(
+    HWND source_window, const PreviewSelectionRequest &request,
+    HWND in_process_target,
+    const PipeClientIdentity &selection_owner) noexcept {
+  if (!in_process_target)
+    return SendPreviewSelectionToOwner(source_window, request,
+                                       selection_owner);
+  if (selection_owner || !source_window || !IsWindow(source_window) ||
+      !IsWindow(in_process_target) || request.correlation.client_id == 0 ||
+      request.composition_sequence == 0 || !request.selection_capability)
+    return false;
+  DWORD source_process_id = 0;
+  DWORD target_process_id = 0;
+  if (GetWindowThreadProcessId(source_window, &source_process_id) == 0 ||
+      GetWindowThreadProcessId(in_process_target, &target_process_id) == 0 ||
+      source_process_id != GetCurrentProcessId() ||
+      target_process_id != GetCurrentProcessId()) {
+    return false;
+  }
+  COPYDATASTRUCT data{static_cast<ULONG_PTR>(kPreviewSelectionCopyDataId),
+                      static_cast<DWORD>(sizeof(request)),
+                      const_cast<PreviewSelectionRequest *>(&request)};
+  DWORD_PTR handled = 0;
+  return SendMessageTimeoutW(
+             in_process_target, WM_COPYDATA,
+             reinterpret_cast<WPARAM>(source_window),
+             reinterpret_cast<LPARAM>(&data), SMTO_ABORTIFHUNG | SMTO_BLOCK,
+             100, &handled) != 0 &&
+         handled != 0;
+}
 
 bool SendPreviewSelectionToOwner(
     HWND source_window, const PreviewSelectionRequest &request,
@@ -678,23 +780,20 @@ bool CandidateWindow::Prewarm() {
          state->prewarm_succeeded.load(std::memory_order_acquire);
 }
 
-bool CandidateWindow::PrepareStyle(
+bool PrepareCandidateStyle(
     std::string_view text, bool exists,
     std::shared_ptr<const void> *presentation) noexcept {
   try {
-    if (!presentation)
-      return false;
-    CandidateStylePresentation style{FamoSkinDefault(), FamoSkinDefault()};
-    if (exists &&
-        (!ParseCandidateSkinForTheme(text, false, &style.light) ||
-         !ParseCandidateSkinForTheme(text, true, &style.dark)))
-      return false;
-    *presentation =
-        std::make_shared<const CandidateStylePresentation>(std::move(style));
-    return true;
+    return PrepareCandidateStylePresentation(text, exists, presentation);
   } catch (...) {
     return false;
   }
+}
+
+bool CandidateWindow::PrepareStyle(
+    std::string_view text, bool exists,
+    std::shared_ptr<const void> *presentation) noexcept {
+  return PrepareCandidateStyle(text, exists, presentation);
 }
 
 void CandidateWindow::ActivateStyle(
@@ -742,10 +841,38 @@ void CandidateWindow::Stop() noexcept {
       return;
     SetEvent(state->stop_event);
     if (thread_.joinable()) {
-      if (WaitForSingleObject(thread_.native_handle(), 250) == WAIT_OBJECT_0)
+      const uint64_t deadline = GetTickCount64() + 250;
+      bool stopped = false;
+      while (!stopped) {
+        const uint64_t now = GetTickCount64();
+        const DWORD remaining = now >= deadline
+                                    ? 0
+                                    : static_cast<DWORD>(deadline - now);
+        HANDLE worker = thread_.native_handle();
+        const DWORD wait = MsgWaitForMultipleObjects(
+            1, &worker, FALSE, remaining, QS_SENDMESSAGE);
+        if (wait == WAIT_OBJECT_0) {
+          stopped = true;
+        } else if (wait == WAIT_OBJECT_0 + 1) {
+          // An owned popup can be inside SetWindowPos while its owner thread is
+          // deactivating the TIP. Dispatch only sent (nonqueued) messages so
+          // the renderer can finish without re-entering posted key input.
+          MSG message{};
+          PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
+        } else {
+          break;
+        }
+      }
+      if (stopped)
         thread_.join();
-      else
+      else {
+        // A faulted renderer must not strand a thread whose instructions or
+        // registered window procedures can be unloaded with the TSF DLL.
+        // Pinning is a last-resort process-lifetime safety barrier used only
+        // after the bounded shutdown deadline has expired.
+        PinWindowModuleForDetachedThread();
         thread_.detach();
+      }
     }
   } catch (...) {
     try {
@@ -763,10 +890,13 @@ void CandidateWindow::Publish(
     return;
   try {
     auto targeted = std::make_shared<RuntimeSnapshot>(*snapshot);
-    targeted->source_window = snapshot->ui_state.focused
-                                  ? reinterpret_cast<uintptr_t>(
-                                        GetForegroundWindow())
-                                  : 0;
+    if (targeted->source_window == 0 &&
+        !targeted->require_in_process_owner) {
+      targeted->source_window = snapshot->ui_state.focused
+                                    ? reinterpret_cast<uintptr_t>(
+                                          GetForegroundWindow())
+                                    : 0;
+    }
     snapshot = std::move(targeted);
   } catch (...) {
     // Rendering remains best effort, but an unbound frame is never clickable.
@@ -792,22 +922,40 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   // background work without using a real-time priority class.
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  const HINSTANCE window_module = WindowModule();
   std::atomic<uint64_t> system_generation{0};
   WindowNotifications notifications{state->update_event, &system_generation};
-  HWND window =
-      state->fault == Fault::Create
-          ? nullptr
-          : CreateLayeredWindow(kCandidateWindowClassName, &notifications);
-  std::unique_ptr<CandidateAutomation> automation =
-      CandidateAutomation::Create(window);
-  notifications.automation = automation.get();
+  HWND window = nullptr;
+  std::unique_ptr<CandidateAutomation> automation;
+  const auto destroy_candidate_window = [&] {
+    if (window && IsWindow(window)) {
+      HideCandidateWindow(window);
+      DestroyWindow(window);
+    }
+    automation.reset();
+    notifications.automation = nullptr;
+    window = nullptr;
+  };
+  const auto recreate_candidate_window = [&](HWND owner) {
+    destroy_candidate_window();
+    window = state->fault == Fault::Create
+                 ? nullptr
+                 : CreateLayeredWindow(kCandidateWindowClassName,
+                                       &notifications, false, owner,
+                                       window_module);
+    automation = CandidateAutomation::Create(window);
+    notifications.automation = automation.get();
+    return window != nullptr;
+  };
+  (void)recreate_candidate_window(nullptr);
   // The mode indicator is a short-lived, click-through status toast rather
   // than a candidate/composition surface, so it does not publish IME
   // light-dismiss events.
   HWND mode_window =
       state->fault == Fault::Create
           ? nullptr
-          : CreateLayeredWindow(kModeIndicatorClassName, nullptr, true);
+          : CreateLayeredWindow(kModeIndicatorClassName, nullptr, true,
+                                nullptr, window_module);
   DibSurface surface;
   DibSurface previous_surface;
   DibSurface animation_surface;
@@ -863,12 +1011,20 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
                     static_cast<uint64_t>(MAXDWORD)));
       timeout = timeout == INFINITE ? remaining : (std::min)(timeout, remaining);
     }
+    if (presented_snapshot && presented_snapshot->require_in_process_owner)
+      timeout = timeout == INFINITE ? 100 : (std::min)(timeout, DWORD{100});
     const DWORD wait =
         MsgWaitForMultipleObjects(2, events, FALSE, timeout, QS_ALLINPUT);
     if (wait == WAIT_OBJECT_0)
       break;
     if (wait == WAIT_TIMEOUT) {
       const uint64_t now = GetTickCount64();
+      if (presented_snapshot && InProcessOwnerLost(*presented_snapshot)) {
+        animation.active = false;
+        destroy_candidate_window();
+        presented_snapshot.reset();
+        continue;
+      }
       if (mode_indicator.active &&
           (now >= mode_indicator.expires_ms ||
            (mode_indicator.foreground_window &&
@@ -981,7 +1137,16 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       skin = &high_contrast_skin;
     const bool prewarm =
         state->prewarm_requested.exchange(false, std::memory_order_acq_rel);
-    const bool should_show = snapshot && ShouldShow(*snapshot);
+    const bool should_show =
+        snapshot && ShouldShow(*snapshot) &&
+        (!snapshot->require_in_process_owner || InProcessOwner(*snapshot));
+    const HWND owner = snapshot ? InProcessOwner(*snapshot) : nullptr;
+    if (owner &&
+        (!window || !IsWindow(window) || GetWindow(window, GW_OWNER) != owner) &&
+        !recreate_candidate_window(owner)) {
+      presented_snapshot.reset();
+      continue;
+    }
     const uint64_t current_system_generation =
         system_generation.load(std::memory_order_relaxed);
     if (resource_system_generation != current_system_generation) {
@@ -1040,7 +1205,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       if (switch_id != mode_indicator.last_switch) {
         mode_indicator.last_switch = switch_id;
         HWND foreground = reinterpret_cast<HWND>(snapshot->source_window);
-        if ((!foreground || GetForegroundWindow() == foreground) &&
+        if (SourceWindowStillActive(*snapshot) &&
             ShowModeIndicator(mode_window, &mode_surface, resources, skin,
                               *snapshot)) {
           mode_indicator.active = true;
@@ -1052,8 +1217,11 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       }
     }
     if (!window || !snapshot || !should_show) {
-      if (window)
+      if (window && snapshot && InProcessOwnerLost(*snapshot)) {
+        destroy_candidate_window();
+      } else if (window) {
         HideCandidateWindow(window);
+      }
       presented_snapshot.reset();
       continue;
     }
@@ -1069,6 +1237,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
         presented_high_contrast == high_contrast &&
         presented_system_generation == current_system_generation &&
         snapshot->source_window == presented_snapshot->source_window &&
+        snapshot->selection_target == presented_snapshot->selection_target &&
         snapshot->selection_owner == presented_snapshot->selection_owner;
     if (stable_presentation &&
         snapshot->composition == presented_snapshot->composition &&
@@ -1217,7 +1386,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
     }
     HWND frame_foreground =
         reinterpret_cast<HWND>(snapshot->source_window);
-    if (frame_foreground && GetForegroundWindow() != frame_foreground) {
+    if (!SourceWindowStillActive(*snapshot)) {
       HideCandidateWindow(window);
       presented_snapshot.reset();
       continue;
@@ -1236,9 +1405,11 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
                                 layout.origin_y - margin)) {
       HideCandidateWindow(window);
       presented_snapshot.reset();
-    } else if (frame_foreground &&
-               GetForegroundWindow() != frame_foreground) {
-      HideCandidateWindow(window);
+    } else if (!SourceWindowStillActive(*snapshot)) {
+      if (snapshot->require_in_process_owner)
+        destroy_candidate_window();
+      else
+        HideCandidateWindow(window);
       notifications.foreground_window = nullptr;
       presented_snapshot.reset();
     } else {
@@ -1249,6 +1420,7 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
       notifications.selection_request =
           {snapshot->correlation, snapshot->composition_sequence, 0, 0,
            snapshot->ui_state.selection_capability};
+      notifications.selection_target = snapshot->selection_target;
       notifications.selection_owner = snapshot->selection_owner;
       notifications.page_index = snapshot->composition.page_index;
       notifications.page_size = snapshot->composition.page_size;
@@ -1275,9 +1447,10 @@ void CandidateWindow::ThreadMain(std::shared_ptr<State> state) noexcept {
   }
   if (mode_window)
     DestroyWindow(mode_window);
-  if (window) {
-    HideCandidateWindow(window);
-    DestroyWindow(window);
+  destroy_candidate_window();
+  if (window_module) {
+    (void)UnregisterClassW(kModeIndicatorClassName, window_module);
+    (void)UnregisterClassW(kCandidateWindowClassName, window_module);
   }
   FamoTextResourcesDestroy(resources);
   if (SUCCEEDED(com))

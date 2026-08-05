@@ -42,12 +42,14 @@ HRESULT SelectRangeEnd(TfEditCookie cookie, ITfContext *context,
 
 HRESULT SelectPreeditRange(TfEditCookie cookie, ITfContext *context,
                            ITfRange *range, const Utf16Preedit &preedit) {
-  uint32_t start = preedit.selection_start;
-  uint32_t end = preedit.selection_end;
-  if (start == end)
-    start = end = preedit.cursor;
-  if (start > end || end > preedit.text.size())
-    return E_INVALIDARG;
+  // The host selection during composition is the caret, not the segment being
+  // converted. Which part of the preedit is under conversion is expressed with
+  // display attributes over sub-ranges; handing the host a selection that
+  // spans the composition instead makes it treat the whole preedit as a
+  // highlighted block, which is not what any conforming text store expects.
+  const uint32_t caret = preedit.cursor <= preedit.text.size()
+                             ? preedit.cursor
+                             : static_cast<uint32_t>(preedit.text.size());
 
   ComPtr<ITfRange> selected;
   HRESULT result = range->Clone(selected.put());
@@ -57,18 +59,18 @@ HRESULT SelectPreeditRange(TfEditCookie cookie, ITfContext *context,
   if (FAILED(result))
     return result;
   LONG moved = 0;
-  result = selected->ShiftEnd(cookie, static_cast<LONG>(end), &moved, nullptr);
-  if (FAILED(result) || moved != static_cast<LONG>(end))
+  result =
+      selected->ShiftEnd(cookie, static_cast<LONG>(caret), &moved, nullptr);
+  if (FAILED(result) || moved != static_cast<LONG>(caret))
     return FAILED(result) ? result : E_FAIL;
-  result = selected->ShiftStart(cookie, static_cast<LONG>(start), &moved, nullptr);
-  if (FAILED(result) || moved != static_cast<LONG>(start))
+  result =
+      selected->ShiftStart(cookie, static_cast<LONG>(caret), &moved, nullptr);
+  if (FAILED(result) || moved != static_cast<LONG>(caret))
     return FAILED(result) ? result : E_FAIL;
 
   TF_SELECTION selection{};
   selection.range = selected.get();
-  selection.style.ase = start == end
-                            ? TF_AE_NONE
-                            : (preedit.cursor <= start ? TF_AE_START : TF_AE_END);
+  selection.style.ase = TF_AE_END;
   selection.style.fInterimChar = FALSE;
   return context->SetSelection(cookie, 1, &selection);
 }
@@ -256,7 +258,8 @@ HRESULT CompositionController::End(ITfContext *context, TfClientId client_id) {
 
 HRESULT CompositionController::CloneLayoutCaret(TfEditCookie cookie,
                                                 ITfContext *context,
-                                                ITfRange **range) const {
+                                                ITfRange **range,
+                                                TfAnchor *caret_edge) const {
   if (!context || !range)
     return E_INVALIDARG;
   *range = nullptr;
@@ -289,6 +292,44 @@ HRESULT CompositionController::CloneLayoutCaret(TfEditCookie cookie,
   result = caret->Collapse(cookie, anchor);
   if (FAILED(result))
     return result;
+
+  // Widen the caret over the character it sits against. A text store measures
+  // laid-out text, so a zero-length range has nothing to report: some return
+  // TS_E_NOLAYOUT, and Chromium returns a sentinel rectangle outside its own
+  // view. Every shipping IME measures a non-empty range for this reason. The
+  // caller collapses the returned rectangle back to the anchor edge, so
+  // placement still follows the composition's active end.
+  //
+  // The measurement range is built from a fresh document range and given an
+  // explicit extent. Neither Collapse nor SetExtent takes effect on a range
+  // cloned from a live ITfComposition -- both are clamped to the composition's
+  // own bounds and silently leave the full extent in place.
+  if (caret_edge)
+    *caret_edge = anchor;
+  ComPtr<ITfRangeACP> source_acp;
+  ComPtr<ITfRange> measured;
+  ComPtr<ITfRangeACP> measured_acp;
+  LONG source_start = 0;
+  LONG source_count = 0;
+  if (SUCCEEDED(source->QueryInterface(
+          IID_ITfRangeACP, reinterpret_cast<void **>(source_acp.put()))) &&
+      SUCCEEDED(source_acp->GetExtent(&source_start, &source_count)) &&
+      SUCCEEDED(context->GetStart(cookie, measured.put())) &&
+      SUCCEEDED(measured->QueryInterface(
+          IID_ITfRangeACP, reinterpret_cast<void **>(measured_acp.put())))) {
+    const LONG caret_position = anchor == TF_ANCHOR_END
+                                    ? source_start + source_count
+                                    : source_start;
+    // Nothing to widen over in an empty document: ask for the bare caret and
+    // let the host answer as best it can.
+    const bool widen = source_count > 0;
+    const LONG start =
+        widen && anchor == TF_ANCHOR_END ? caret_position - 1 : caret_position;
+    if (SUCCEEDED(measured_acp->SetExtent(start, widen ? 1 : 0))) {
+      *range = measured.detach();
+      return S_OK;
+    }
+  }
   *range = caret.detach();
   return S_OK;
 }
@@ -398,6 +439,15 @@ HRESULT CompositionController::ApplyInSession(TfEditCookie cookie,
                                      reinterpret_cast<void **>(service.put()));
     if (FAILED(result))
       return result;
+    // Put the preedit in before starting the composition, so the composition
+    // is created over a range that already holds text. Hosts that snapshot the
+    // composition extent when it starts (Chromium's TSFTextStore) otherwise
+    // keep an empty extent forever: they accept the text, report the property,
+    // and still hand the renderer nothing, which leaves the preedit invisible
+    // and every caret query answered from an unlaid-out state.
+    result = ReplaceRange(cookie, context, selection.get(), preedit.text);
+    if (FAILED(result))
+      return result;
     result = service->StartComposition(cookie, selection.get(), sink,
                                        composition_.put());
     if (FAILED(result) || !composition_)
@@ -411,6 +461,23 @@ HRESULT CompositionController::ApplyInSession(TfEditCookie cookie,
   result = ReplaceRange(cookie, context, range.get(), preedit.text);
   if (FAILED(result))
     return result;
+  // Publish the display attribute over the composition. Chromium and XAML text
+  // stores build their composition by tracking GUID_PROP_ATTRIBUTE; a range
+  // without it is accepted into their buffer but never handed to the renderer,
+  // so the preedit stays invisible and no caret geometry is ever laid out.
+  // CUAS/EDIT hosts do not need it, which is why only those hosts worked.
+  if (display_attribute_atom_ != TF_INVALID_GUIDATOM) {
+    ComPtr<ITfProperty> attribute;
+    if (SUCCEEDED(context->GetProperty(GUID_PROP_ATTRIBUTE,
+                                       attribute.put()))) {
+      VARIANT value;
+      VariantInit(&value);
+      value.vt = VT_I4;
+      value.lVal = static_cast<LONG>(display_attribute_atom_);
+      (void)attribute->SetValue(cookie, range.get(), &value);
+      VariantClear(&value);
+    }
+  }
   (void)SelectPreeditRange(cookie, context, range.get(), preedit);
   return S_OK;
 }

@@ -56,7 +56,7 @@ int main() {
   CHECK(DecodeFrame(bytes, &parsed, &error));
   CHECK(parsed.command == source.command);
   CHECK(parsed.correlation == source.correlation);
-  CHECK(kProtocolVersion == 4);
+  CHECK(kProtocolVersion == 5);
   CHECK(kMinSupportedProtocolVersion == 2);
   auto previous_version = bytes;
   previous_version[4] = 2;

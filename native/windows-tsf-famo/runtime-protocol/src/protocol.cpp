@@ -12,11 +12,18 @@ namespace {
 
 bool KnownCommand(uint16_t value) {
   return value >= static_cast<uint16_t>(Command::Hello) &&
-         value <= static_cast<uint16_t>(Command::SearchCandidates);
+         value <= static_cast<uint16_t>(Command::GetStyleOverlay);
 }
 
 bool CommandSupported(Command command, uint16_t wire_version) {
-  return command != Command::SearchCandidates || wire_version >= 4;
+  switch (command) {
+  case Command::SearchCandidates:
+    return wire_version >= 4;
+  case Command::GetStyleOverlay:
+    return wire_version >= 5;
+  default:
+    return true;
+  }
 }
 
 bool KnownStatus(uint32_t value) {
@@ -421,6 +428,50 @@ bool DecodeSearchQuery(std::span<const uint8_t> payload, std::string *query,
       return false;
     }
     *query = std::move(decoded);
+    return true;
+  });
+}
+
+bool EncodeStyleOverlay(std::string_view text, bool exists,
+                        std::vector<uint8_t> *payload,
+                        std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!payload || text.size() > kMaxStringBytes ||
+        (!exists && !text.empty()) || !IsValidUtf8(text)) {
+      if (error)
+        *error = "invalid style overlay";
+      return false;
+    }
+    Writer writer;
+    writer.U8(exists ? 1 : 0);
+    if (!writer.String(text, error))
+      return false;
+    *payload = writer.Take();
+    return true;
+  });
+}
+
+bool DecodeStyleOverlay(std::span<const uint8_t> payload, std::string *text,
+                        bool *exists, std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!text || !exists) {
+      if (error)
+        *error = "style overlay targets are required";
+      return false;
+    }
+    Reader reader(payload);
+    uint8_t present = 0;
+    std::string decoded;
+    if (!reader.U8(&present) || present > 1 ||
+        !reader.String(decoded, error) || !Finish(reader, error) ||
+        decoded.size() > kMaxStringBytes ||
+        (present == 0 && !decoded.empty())) {
+      if (error && error->empty())
+        *error = "invalid style overlay";
+      return false;
+    }
+    *exists = present == 1;
+    *text = std::move(decoded);
     return true;
   });
 }

@@ -10,7 +10,7 @@ namespace famo::runtime {
 
 constexpr uint32_t kProtocolMagic = 0x4f4d4146; // "FAMO" little-endian.
 constexpr uint16_t kMinSupportedProtocolVersion = 2;
-constexpr uint16_t kProtocolVersion = 4;
+constexpr uint16_t kProtocolVersion = 5;
 constexpr uint16_t kHeaderSize = 76;
 constexpr uint32_t kMaxCandidateCount = 64;
 constexpr uint32_t kMaxSearchQueryBytes = 256;
@@ -73,6 +73,13 @@ enum class Command : uint16_t {
   // Protocol v4 stateless reading conversion. It creates no logical session,
   // publishes no UI snapshot, and emits no IME message or event.
   SearchCandidates = 24,
+  // Protocol v5. The candidate surface is drawn in the host process, but the
+  // appearance it draws with is user configuration, which the Runtime owns and
+  // is the only party able to read. A Bridge loaded into a sandboxed host
+  // cannot resolve or open the user's data root at all, so it asks for the
+  // overlay over this authenticated channel instead of touching the file
+  // system. Stateless: no session, no snapshot, no IME event.
+  GetStyleOverlay = 25,
 };
 
 enum class Status : uint32_t {
@@ -310,6 +317,14 @@ bool EncodeSearchCandidates(std::span<const std::string> candidates,
 bool DecodeSearchCandidates(std::span<const uint8_t> payload,
                             std::vector<std::string> *candidates,
                             std::string *error) noexcept;
+// The style overlay as the Runtime read it: `exists` distinguishes "the user
+// has no overlay, use defaults" from "the overlay is empty", which the text
+// alone cannot express.
+bool EncodeStyleOverlay(std::string_view text, bool exists,
+                        std::vector<uint8_t> *payload,
+                        std::string *error) noexcept;
+bool DecodeStyleOverlay(std::span<const uint8_t> payload, std::string *text,
+                        bool *exists, std::string *error) noexcept;
 bool EncodeKeyEvent(const KeyEvent &key,
                     std::vector<uint8_t> *payload) noexcept;
 bool DecodeKeyEvent(std::span<const uint8_t> payload, KeyEvent *key,

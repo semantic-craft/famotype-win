@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -100,6 +101,81 @@ void PumpMessages() {
   }
 }
 
+struct CandidateWindowProbe {
+  HWND window = nullptr;
+  bool visible = false;
+  // Restricts the search to the candidate owned by this window. Earlier tests
+  // in the same process can leave a candidate window behind when a renderer
+  // thread outlives its bounded shutdown, so "any candidate in this process"
+  // is not a stable identity to assert on.
+  HWND required_owner = nullptr;
+};
+
+BOOL CALLBACK FindProcessCandidateWindow(HWND window, LPARAM parameter) {
+  DWORD process_id = 0;
+  if (GetWindowThreadProcessId(window, &process_id) == 0 ||
+      process_id != GetCurrentProcessId()) {
+    return TRUE;
+  }
+  wchar_t class_name[64]{};
+  if (GetClassNameW(window, class_name,
+                    static_cast<int>(std::size(class_name))) == 0 ||
+      std::wstring_view(class_name) != L"FamoRuntimeCandidateWindow") {
+    return TRUE;
+  }
+  auto *probe = reinterpret_cast<CandidateWindowProbe *>(parameter);
+  if (probe->required_owner &&
+      GetWindow(window, GW_OWNER) != probe->required_owner) {
+    return TRUE;
+  }
+  probe->window = window;
+  probe->visible = IsWindowVisible(window) != FALSE;
+  return probe->visible ? FALSE : TRUE;
+}
+
+CandidateWindowProbe ProbeProcessCandidateWindow(HWND required_owner) {
+  CandidateWindowProbe probe;
+  probe.required_owner = required_owner;
+  EnumWindows(&FindProcessCandidateWindow,
+              reinterpret_cast<LPARAM>(&probe));
+  return probe;
+}
+
+// Waits for one specific popup to become hidden without being destroyed.
+// Scanning for "some hidden candidate window" cannot express that: whichever
+// text service the machine has active is loaded into this process too and
+// presents its own popup on the same owner, so identity has to be asserted on
+// the handle that was actually observed.
+bool WaitForCandidateHidden(HWND window) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline) {
+    PumpMessages();
+    if (IsWindow(window) && !IsWindowVisible(window))
+      return true;
+    Sleep(5);
+  }
+  return false;
+}
+
+bool WaitForProcessCandidateVisibility(bool visible,
+                                       CandidateWindowProbe *result = nullptr,
+                                       HWND required_owner = nullptr) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline) {
+    PumpMessages();
+    CandidateWindowProbe probe = ProbeProcessCandidateWindow(required_owner);
+    if (probe.window && probe.visible == visible) {
+      if (result)
+        *result = probe;
+      return true;
+    }
+    Sleep(5);
+  }
+  return false;
+}
+
 using SessionCheck = std::function<bool(
     ITfKeyEventSink *, ITfContext *, FakeTextStore *, ITfTextInputProcessorEx *,
     ITfThreadMgr *, ITfDocumentMgr *)>;
@@ -123,10 +199,124 @@ bool CreateTestDocument(ITfThreadMgr *thread_manager, TfClientId client_id,
   return true;
 }
 
-bool RunTextStoreSession(
-    TextServiceModule *module, const SessionCheck &check,
-    std::chrono::steady_clock::duration *activation_elapsed = nullptr,
-    bool wait_for_session = true) {
+// A thread manager that delivers focus for the already-focused document from
+// inside AdviseSink, the way Chromium, Electron and SearchHost text stores do.
+// Everything else is the real thread manager, so the only difference from an
+// ordinary activation is when the first context is created: while Activate is
+// still running rather than after it returns.
+class ReentrantFocusThreadMgr final : public ITfThreadMgr, public ITfSource {
+public:
+  ReentrantFocusThreadMgr(ITfThreadMgr *inner, ITfDocumentMgr *focused)
+      : inner_(inner), focused_(focused) {
+    inner_->QueryInterface(IID_ITfSource,
+                           reinterpret_cast<void **>(source_.put()));
+  }
+
+  bool reentered() const { return reentered_; }
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+    if (!object)
+      return E_POINTER;
+    if (iid == IID_IUnknown || iid == IID_ITfThreadMgr) {
+      *object = static_cast<ITfThreadMgr *>(this);
+    } else if (iid == IID_ITfSource) {
+      *object = static_cast<ITfSource *>(this);
+    } else {
+      // Everything the text service acquires by QueryInterface -- the
+      // keystroke manager, the UI element manager, the single-sink source --
+      // comes straight from the real thread manager.
+      return inner_->QueryInterface(iid, object);
+    }
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+  ULONG STDMETHODCALLTYPE Release() override {
+    const ULONG remaining = --references_;
+    if (remaining == 0)
+      delete this;
+    return remaining;
+  }
+
+  HRESULT STDMETHODCALLTYPE AdviseSink(REFIID iid, IUnknown *sink,
+                                       DWORD *cookie) override {
+    const HRESULT result = source_->AdviseSink(iid, sink, cookie);
+    if (FAILED(result) || iid != IID_ITfThreadMgrEventSink)
+      return result;
+    ComPtr<ITfThreadMgrEventSink> thread_sink;
+    if (SUCCEEDED(sink->QueryInterface(
+            IID_ITfThreadMgrEventSink,
+            reinterpret_cast<void **>(thread_sink.put())))) {
+      thread_sink->OnSetFocus(focused_.get(), nullptr);
+      reentered_ = true;
+    }
+    return result;
+  }
+  HRESULT STDMETHODCALLTYPE UnadviseSink(DWORD cookie) override {
+    return source_->UnadviseSink(cookie);
+  }
+
+  HRESULT STDMETHODCALLTYPE Activate(TfClientId *id) override {
+    return inner_->Activate(id);
+  }
+  HRESULT STDMETHODCALLTYPE Deactivate() override {
+    return inner_->Deactivate();
+  }
+  HRESULT STDMETHODCALLTYPE CreateDocumentMgr(ITfDocumentMgr **mgr) override {
+    return inner_->CreateDocumentMgr(mgr);
+  }
+  HRESULT STDMETHODCALLTYPE EnumDocumentMgrs(IEnumTfDocumentMgrs **mgrs)
+      override {
+    return inner_->EnumDocumentMgrs(mgrs);
+  }
+  HRESULT STDMETHODCALLTYPE GetFocus(ITfDocumentMgr **mgr) override {
+    return inner_->GetFocus(mgr);
+  }
+  HRESULT STDMETHODCALLTYPE SetFocus(ITfDocumentMgr *mgr) override {
+    return inner_->SetFocus(mgr);
+  }
+  HRESULT STDMETHODCALLTYPE AssociateFocus(HWND window, ITfDocumentMgr *mgr,
+                                           ITfDocumentMgr **previous)
+      override {
+    return inner_->AssociateFocus(window, mgr, previous);
+  }
+  HRESULT STDMETHODCALLTYPE IsThreadFocus(BOOL *focus) override {
+    return inner_->IsThreadFocus(focus);
+  }
+  HRESULT STDMETHODCALLTYPE GetFunctionProvider(
+      REFCLSID clsid, ITfFunctionProvider **provider) override {
+    return inner_->GetFunctionProvider(clsid, provider);
+  }
+  HRESULT STDMETHODCALLTYPE EnumFunctionProviders(
+      IEnumTfFunctionProviders **providers) override {
+    return inner_->EnumFunctionProviders(providers);
+  }
+  HRESULT STDMETHODCALLTYPE GetGlobalCompartment(ITfCompartmentMgr **mgr)
+      override {
+    return inner_->GetGlobalCompartment(mgr);
+  }
+
+private:
+  ~ReentrantFocusThreadMgr() = default;
+
+  std::atomic<ULONG> references_{1};
+  ComPtr<ITfThreadMgr> inner_;
+  ComPtr<ITfSource> source_;
+  ComPtr<ITfDocumentMgr> focused_;
+  bool reentered_ = false;
+};
+
+// A context created by a synchronous OnSetFocus keeps whatever the text
+// service held at that moment for its whole life. Activation therefore has to
+// finish acquiring every interface a callback can need before it advises the
+// first sink; when it does not, the candidate UI element is built around a
+// null ITfUIElementMgr and the host never gets a candidate list even though
+// keys and composition keep working.
+bool ReentrantActivationFocusStillBeginsCandidates(
+    TextServiceModule *module, const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+
   ComPtr<ITfThreadMgr> thread_manager;
   CHECK(SUCCEEDED(CoCreateInstance(
       CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
@@ -136,6 +326,66 @@ bool RunTextStoreSession(
 
   TestDocument target;
   CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
+
+  ComPtr<ReentrantFocusThreadMgr> host(new ReentrantFocusThreadMgr(
+      thread_manager.get(), target.document.get()));
+  host->Release();
+
+  ComPtr<ITfTextInputProcessorEx> service;
+  CHECK(SUCCEEDED(module->CreateForTest(
+      static_cast<ITfThreadMgr *>(host.get()), client_id, service.put())));
+  CHECK(host->reentered());
+
+  ComPtr<ITfKeyEventSink> key_sink;
+  CHECK(SUCCEEDED(service->QueryInterface(
+      IID_ITfKeyEventSink, reinterpret_cast<void **>(key_sink.put()))));
+  const auto ready_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!TestKey(key_sink.get(), target.context.get(), 'N', true) &&
+         std::chrono::steady_clock::now() < ready_deadline) {
+    Sleep(5);
+  }
+  CHECK(std::chrono::steady_clock::now() < ready_deadline);
+
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'N', true));
+  CHECK(SendKey(key_sink.get(), target.context.get(), 'I', true));
+  CHECK(target.store->text() == L"ni");
+
+  famo::runtime::UiState published{};
+  CHECK(module->UiStateForTest(service.get(), target.context.get(),
+                               &published));
+  CHECK(published.show_allowed);
+
+  key_sink.reset();
+  const bool service_deactivated = SUCCEEDED(service->Deactivate());
+  service.reset();
+  host.reset();
+  const bool document_popped = SUCCEEDED(target.document->Pop(TF_POPF_ALL));
+  target.context.reset();
+  target.document.reset();
+  target.store.reset();
+  const bool manager_deactivated = SUCCEEDED(thread_manager->Deactivate());
+  thread_manager.reset();
+  const bool runtime_finished = runtime.Finish();
+  return service_deactivated && document_popped && manager_deactivated &&
+         runtime_finished;
+}
+
+bool RunTextStoreSession(
+    TextServiceModule *module, const SessionCheck &check,
+    std::chrono::steady_clock::duration *activation_elapsed = nullptr,
+    bool wait_for_session = true, HWND initial_window = nullptr) {
+  ComPtr<ITfThreadMgr> thread_manager;
+  CHECK(SUCCEEDED(CoCreateInstance(
+      CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER, IID_ITfThreadMgr,
+      reinterpret_cast<void **>(thread_manager.put()))));
+  TfClientId client_id = TF_CLIENTID_NULL;
+  CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
+
+  TestDocument target;
+  CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  target.store->set_window_for_test(initial_window);
   CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
 
   ComPtr<ITfTextInputProcessorEx> service;
@@ -295,6 +545,28 @@ bool HealthyRoundtrip(TextServiceModule *module, const wchar_t *runtime_path) {
   return passed && runtime_finished;
 }
 
+bool OptionalContextSinkFailureStillTypes(TextServiceModule *module,
+                                          const wchar_t *runtime_path,
+                                          const char *failure_name) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  bool passed = false;
+  {
+    ScopedEnvironment unavailable(failure_name, "1");
+    passed = RunTextStoreSession(
+        module, [](ITfKeyEventSink *key_sink, ITfContext *context,
+                   FakeTextStore *store, ITfTextInputProcessorEx *,
+                   ITfThreadMgr *, ITfDocumentMgr *) {
+          CHECK(TestKey(key_sink, context, 'N', true));
+          CHECK(SendKey(key_sink, context, 'N', true));
+          CHECK(store->text() == L"n");
+          return true;
+        });
+  }
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
 bool CompositionLayoutUsesActiveRangeEnd(TextServiceModule *module,
                                          const wchar_t *runtime_path) {
   RuntimeProcess runtime;
@@ -338,13 +610,17 @@ bool CompositionLayoutUsesActiveRangeEnd(TextServiceModule *module,
         CHECK(store->text_ext_query_count() > before);
         CHECK(store->screen_ext_query_count() > 0);
         CHECK(store->window_query_count() > 0);
-        CHECK(store->last_text_ext_start() == 2);
+        // The layout query covers the last composed character rather than a
+        // zero-length caret: a text store measures laid-out text, so an empty
+        // range has nothing to report. Placement still follows the
+        // composition's active end, which is this range's right edge.
+        CHECK(store->last_text_ext_start() == 1);
         CHECK(store->last_text_ext_end() == 2);
 
         famo::runtime::UiState published{};
         CHECK(module->UiStateForTest(service, context, &published));
         CHECK(published.layout_available);
-        POINT expected_corners[2] = {{0, 0}, {1, 16}};
+        POINT expected_corners[2] = {{1, 0}, {1, 16}};
         CHECK(LogicalToPhysicalPointForPerMonitorDPI(view_window,
                                                      &expected_corners[0]));
         CHECK(LogicalToPhysicalPointForPerMonitorDPI(view_window,
@@ -418,6 +694,40 @@ bool CompositionLayoutUsesActiveRangeEnd(TextServiceModule *module,
         }
         return true;
       });
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool CandidateWindowUsesContextViewOwner(TextServiceModule *module,
+                                         const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  HWND owner = CreateWindowExW(
+      0, L"STATIC", L"tsf-candidate-owner", WS_OVERLAPPEDWINDOW, 0, 0, 1024,
+      768, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(owner != nullptr);
+  ShowWindow(owner, SW_SHOW);
+  CHECK(SetForegroundWindow(owner));
+  CHECK(GetForegroundWindow() == owner);
+  const bool passed = RunTextStoreSession(
+      module, [owner](ITfKeyEventSink *key_sink, ITfContext *context,
+                 FakeTextStore *, ITfTextInputProcessorEx *service,
+                 ITfThreadMgr *, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        ComPtr<ITfTextLayoutSink> layout_sink;
+        CHECK(SUCCEEDED(service->QueryInterface(
+            IID_ITfTextLayoutSink,
+            reinterpret_cast<void **>(layout_sink.put()))));
+        CHECK(SUCCEEDED(
+            layout_sink->OnLayoutChange(context, TF_LC_CHANGE, nullptr)));
+
+        CandidateWindowProbe probe;
+        CHECK(WaitForProcessCandidateVisibility(true, &probe));
+        CHECK(GetWindow(probe.window, GW_OWNER) == owner);
+        return true;
+      }, nullptr, true, owner);
+  CHECK(DestroyWindow(owner));
   const bool runtime_finished = runtime.Finish();
   return passed && runtime_finished;
 }
@@ -917,8 +1227,14 @@ bool TerminalPublicationSlotSerializesFailures(
   return true;
 }
 
-bool DisabledInlinePreeditStaysOutOfHost(TextServiceModule *module,
-                                         const wchar_t *runtime_path) {
+// Turning inline preedit off is a preference about what the user reads, not
+// permission to leave the host with no composition. A text store can only
+// measure text it holds, so a composition-less host answers GetTextExt with
+// nothing usable and the candidate window loses its anchor. The composition is
+// therefore maintained either way; the preference only decides what the
+// candidate window itself draws.
+bool DisabledInlinePreeditStillComposesInHost(TextServiceModule *module,
+                                              const wchar_t *runtime_path) {
   RuntimeProcess runtime;
   CHECK(runtime.Start(runtime_path, L"none", 0, 1, false));
   const bool passed = RunTextStoreSession(
@@ -927,7 +1243,7 @@ bool DisabledInlinePreeditStaysOutOfHost(TextServiceModule *module,
                  ITfThreadMgr *, ITfDocumentMgr *) {
         CHECK(SendKey(key_sink, context, 'N', true));
         CHECK(SendKey(key_sink, context, 'I', true));
-        CHECK(store->text().empty());
+        CHECK(store->text() == L"ni");
         CHECK(SendKey(key_sink, context, '2', true));
         CHECK(store->text() == L"\x5c3c");
         return true;
@@ -950,9 +1266,15 @@ bool InlinePreeditPreservesUtf16Selection(TextServiceModule *module,
         CHECK(store->selection().acpStart == 2 &&
               store->selection().acpEnd == 2);
 
+        // The engine marks 1..4 as the segment being converted, but the host
+        // selection is the caret, not the segment: a host that is told the
+        // selection spans several characters treats the composition as a
+        // range selection and measures it as one. Only the cursor offset
+        // crosses over, converted from bytes to UTF-16 like every other case
+        // here.
         CHECK(SendKey(key_sink, context, 'B', true));
         CHECK(store->text() == L"abcdef");
-        CHECK(store->selection().acpStart == 1 &&
+        CHECK(store->selection().acpStart == 4 &&
               store->selection().acpEnd == 4);
 
         CHECK(SendKey(key_sink, context, 'C', true));
@@ -1137,6 +1459,131 @@ bool FindCandidateBehavior(ITfThreadMgr *thread_manager,
         reinterpret_cast<void **>(behavior)));
   }
   return false;
+}
+
+bool CandidateWindowHonorsHostShowDecision(TextServiceModule *module,
+                                           const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  HWND owner = CreateWindowExW(
+      0, L"STATIC", L"tsf-candidate-visibility-owner", WS_OVERLAPPEDWINDOW,
+      0, 0, 1024, 768, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(owner != nullptr);
+  ShowWindow(owner, SW_SHOW);
+  CHECK(SetForegroundWindow(owner));
+
+  const bool passed = RunTextStoreSession(
+      module,
+      [owner](ITfKeyEventSink *key_sink, ITfContext *context, FakeTextStore *,
+              ITfTextInputProcessorEx *service, ITfThreadMgr *thread_manager,
+              ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        ComPtr<ITfTextLayoutSink> layout_sink;
+        CHECK(SUCCEEDED(service->QueryInterface(
+            IID_ITfTextLayoutSink,
+            reinterpret_cast<void **>(layout_sink.put()))));
+        CHECK(SUCCEEDED(
+            layout_sink->OnLayoutChange(context, TF_LC_CHANGE, nullptr)));
+
+        CandidateWindowProbe shown;
+        CHECK(WaitForProcessCandidateVisibility(true, &shown, owner));
+        CHECK(GetWindow(shown.window, GW_OWNER) == owner);
+        ComPtr<ITfCandidateListUIElementBehavior> behavior;
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+
+        CHECK(SUCCEEDED(behavior->Show(FALSE)));
+        CHECK(WaitForCandidateHidden(shown.window));
+
+        CHECK(SUCCEEDED(behavior->Show(TRUE)));
+        CandidateWindowProbe restored;
+        CHECK(WaitForProcessCandidateVisibility(true, &restored, owner));
+        CHECK(restored.window == shown.window);
+        CHECK(GetWindow(restored.window, GW_OWNER) == owner);
+        return true;
+      },
+      nullptr, true, owner);
+  CHECK(DestroyWindow(owner));
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
+}
+
+bool InProcessCandidateClickBindsExactOwner(TextServiceModule *module,
+                                            const wchar_t *runtime_path) {
+  RuntimeProcess runtime;
+  CHECK(runtime.Start(runtime_path));
+  HWND owner = CreateWindowExW(
+      0, L"STATIC", L"tsf-candidate-click-owner", WS_OVERLAPPEDWINDOW, 0, 0,
+      1024, 768, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(owner != nullptr);
+  ShowWindow(owner, SW_SHOW);
+  CHECK(SetForegroundWindow(owner));
+
+  const bool passed = RunTextStoreSession(
+      module,
+      [module, owner](ITfKeyEventSink *key_sink, ITfContext *context,
+                      FakeTextStore *store,
+                      ITfTextInputProcessorEx *service,
+                      ITfThreadMgr *thread_manager, ITfDocumentMgr *) {
+        CHECK(SendKey(key_sink, context, 'N', true));
+        CHECK(SendKey(key_sink, context, 'I', true));
+        CHECK(store->text() == L"ni");
+        ComPtr<ITfTextLayoutSink> layout_sink;
+        CHECK(SUCCEEDED(service->QueryInterface(
+            IID_ITfTextLayoutSink,
+            reinterpret_cast<void **>(layout_sink.put()))));
+        CHECK(SUCCEEDED(
+            layout_sink->OnLayoutChange(context, TF_LC_CHANGE, nullptr)));
+
+        CandidateWindowProbe candidate;
+        CHECK(WaitForProcessCandidateVisibility(true, &candidate));
+        CHECK(GetWindow(candidate.window, GW_OWNER) == owner);
+        ComPtr<ITfCandidateListUIElementBehavior> behavior;
+        CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
+
+        HWND target = nullptr;
+        famo::runtime::PreviewSelectionRequest request;
+        CHECK(module->PreviewSelectionStateForTest(service, &target, &request));
+        CHECK(target && request.selection_capability &&
+              request.composition_sequence != 0);
+        request.absolute_index = 1;
+        const auto send = [&](HWND source) {
+          COPYDATASTRUCT copy{
+              static_cast<ULONG_PTR>(
+                  famo::runtime::kPreviewSelectionCopyDataId),
+              static_cast<DWORD>(sizeof(request)), &request};
+          return SendMessageW(target, WM_COPYDATA,
+                              reinterpret_cast<WPARAM>(source),
+                              reinterpret_cast<LPARAM>(&copy));
+        };
+
+        HWND wrong_source = CreateWindowExW(
+            0, L"STATIC", L"wrong-candidate-source", 0, 0, 0, 0, 0,
+            HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CHECK(wrong_source != nullptr);
+        CHECK(send(wrong_source) == FALSE);
+        CHECK(send(candidate.window) == TRUE);
+        CHECK(send(candidate.window) == FALSE);
+        CHECK(DestroyWindow(wrong_source));
+
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (store->text() == L"ni" &&
+               std::chrono::steady_clock::now() < deadline) {
+          PumpMessages();
+          Sleep(1);
+        }
+        CHECK(store->text() == L"\u5c3c");
+        CandidateWindowProbe hidden;
+        CHECK(WaitForProcessCandidateVisibility(false, &hidden));
+        ComPtr<ITfCandidateListUIElementBehavior> ended;
+        CHECK(!FindCandidateBehavior(thread_manager, ended.put()));
+        return true;
+      },
+      nullptr, true, owner);
+  CHECK(DestroyWindow(owner));
+  const bool runtime_finished = runtime.Finish();
+  return passed && runtime_finished;
 }
 
 bool HostDrivenCandidateBehaviorMatchesRuntime(TextServiceModule *module,
@@ -1335,9 +1782,11 @@ bool ExactFinalizationWithoutInlinePreeditUsesRawComposition(
         CHECK(SendKey(key_sink, context, 'H', true));
         CHECK(SendKey(key_sink, context, 'A', true));
         CHECK(SendKey(key_sink, context, 'O', true));
-        // The runtime candidate window still shows raw preedit even when the
-        // host document has disabled inline preedit.
-        CHECK(store->text().empty());
+        // Disabling inline preedit changes what the candidate window draws,
+        // not whether the host holds a composition, so the raw syllables are
+        // in the document already. Exact finalization has to keep them
+        // verbatim rather than replace them with a converted string.
+        CHECK(store->text() == L"nihao");
         ComPtr<ITfCandidateListUIElementBehavior> behavior;
         CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
         ComPtr<ITfIntegratableCandidateListUIElement> integratable;
@@ -1371,7 +1820,9 @@ bool ExactFinalizationBypassesCommitTransforms(
         CHECK(SendKey(key_sink, context, 'H', true));
         CHECK(SendKey(key_sink, context, 'A', true));
         CHECK(SendKey(key_sink, context, 'O', true));
-        CHECK(store->text() == L"\u4f60");
+        // The committed character plus the live composition, which the host
+        // holds whether or not inline preedit is switched on.
+        CHECK(store->text() == L"\u4f60hao");
         ComPtr<ITfCandidateListUIElementBehavior> behavior;
         CHECK(FindCandidateBehavior(thread_manager, behavior.put()));
         ComPtr<ITfIntegratableCandidateListUIElement> integratable;
@@ -1529,12 +1980,16 @@ bool RecoveryEditFailureIsCleanedBeforeReconnect(
                  FakeTextStore *store, ITfTextInputProcessorEx *,
                  ITfThreadMgr *, ITfDocumentMgr *) {
         CHECK(SendKey(key_sink, context, 'N', true));
-        CHECK(store->text() == L"n" && store->replace_count() == 1);
+        CHECK(store->text() == L"n");
+        // What matters is that the denied lock leaves the document untouched,
+        // not how many writes seeding the composition took.
+        const size_t settled_replaces = store->replace_count();
 
         store->set_deny_locks(true);
         CHECK(SendKey(key_sink, context, 'I', false));
         store->set_deny_locks(false);
-        CHECK(store->text() == L"n" && store->replace_count() == 1);
+        CHECK(store->text() == L"n" &&
+              store->replace_count() == settled_replaces);
 
         const auto ready_deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -1864,8 +2319,11 @@ bool MultiContextFaultRecoversEveryComposition(
   }
   CHECK(std::chrono::steady_clock::now() < ready_deadline);
   CHECK(SendKey(key_sink.get(), second.context.get(), 'N', true));
-  CHECK(first.store->replace_count() == 1 &&
-        second.store->replace_count() == 1);
+  // Seeding a composition may take more than one write. What this has to rule
+  // out is one context being serviced and the other dropped, so compare the
+  // two rather than pinning a literal count.
+  CHECK(first.store->replace_count() > 0 &&
+        second.store->replace_count() == first.store->replace_count());
 
   CHECK(SendKey(key_sink.get(), second.context.get(), 'I', false));
   PumpMessages();
@@ -2319,6 +2777,13 @@ bool DisabledKeyboardContextPassesKeysThrough(TextServiceModule *module,
   CHECK(SUCCEEDED(thread_manager->Activate(&client_id)));
   TestDocument target;
   CHECK(CreateTestDocument(thread_manager.get(), client_id, &target));
+  HWND owner = CreateWindowExW(
+      0, L"STATIC", L"tsf-password-security-owner", WS_OVERLAPPEDWINDOW, 0,
+      0, 1024, 768, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(owner != nullptr);
+  target.store->set_window_for_test(owner);
+  ShowWindow(owner, SW_SHOW);
+  CHECK(SetForegroundWindow(owner));
   CHECK(SUCCEEDED(thread_manager->SetFocus(target.document.get())));
 
   ComPtr<ITfTextInputProcessorEx> service;
@@ -2370,10 +2835,14 @@ bool DisabledKeyboardContextPassesKeysThrough(TextServiceModule *module,
   famo::runtime::PreviewSelectionRequest original_preview;
   CHECK(module->PreviewSelectionStateForTest(
       service.get(), &original_preview_target, &original_preview));
+  CandidateWindowProbe security_candidate;
+  CHECK(WaitForProcessCandidateVisibility(true, &security_candidate, owner));
+  CHECK(GetWindow(security_candidate.window, GW_OWNER) == owner);
 
   // Hosts can disable a context while it is focused. The TIP must end its
   // existing composition and candidate element before passing later keys on.
   CHECK(SetKeyboardDisabled(target.context.get(), client_id, true));
+  CHECK(WaitForCandidateHidden(security_candidate.window));
   CHECK(HasActiveComposition(target.context.get(), &composing) && !composing);
   ComPtr<ITfCandidateListUIElementBehavior> hidden_behavior;
   CHECK(!FindCandidateBehavior(thread_manager.get(), hidden_behavior.put()));
@@ -2482,9 +2951,11 @@ bool DisabledKeyboardContextPassesKeysThrough(TextServiceModule *module,
   password.document.reset();
   password.store.reset();
   CHECK(SUCCEEDED(target.document->Pop(TF_POPF_ALL)));
+  target.store->set_window_for_test(nullptr);
   target.context.reset();
   target.document.reset();
   target.store.reset();
+  CHECK(DestroyWindow(owner));
   CHECK(SUCCEEDED(thread_manager->Deactivate()));
   thread_manager.reset();
   return runtime.Finish();
@@ -2837,7 +3308,16 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   CHECK(TerminalPublicationSlotSerializesFailures(&module, runtime_path));
   CHECK(MissingRuntimeFailsOpen(&module));
   CHECK(HealthyRoundtrip(&module, runtime_path));
+  CHECK(OptionalContextSinkFailureStillTypes(
+      &module, runtime_path,
+      "FAMO_TEST_KEYBOARD_DISABLED_SINK_UNAVAILABLE"));
+  CHECK(OptionalContextSinkFailureStillTypes(
+      &module, runtime_path, "FAMO_TEST_LAYOUT_SINK_UNAVAILABLE"));
   CHECK(CompositionLayoutUsesActiveRangeEnd(&module, runtime_path));
+  CHECK(ReentrantActivationFocusStillBeginsCandidates(&module, runtime_path));
+  CHECK(CandidateWindowUsesContextViewOwner(&module, runtime_path));
+  CHECK(CandidateWindowHonorsHostShowDecision(&module, runtime_path));
+  CHECK(InProcessCandidateClickBindsExactOwner(&module, runtime_path));
   CHECK(SearchCandidateProviderIsDiscoverable(&module, runtime_path));
   CHECK(DisabledKeyboardContextPassesKeysThrough(&module, runtime_path));
   CHECK(DisabledDuringWarmupRejectsLateSession(&module, runtime_path));
@@ -2845,7 +3325,7 @@ bool AllTextStoreChecks(const wchar_t *module_path,
                                                        runtime_path));
   CHECK(TerminalRetirePreservesSecurityAbandon(&module, runtime_path));
   CHECK(DisabledPendingDeliveryIsAbandoned(&module, runtime_path));
-  CHECK(DisabledInlinePreeditStaysOutOfHost(&module, runtime_path));
+  CHECK(DisabledInlinePreeditStillComposesInHost(&module, runtime_path));
   CHECK(InlinePreeditPreservesUtf16Selection(&module, runtime_path));
   CHECK(PhysicalSelectionKeysAreInterpretedByEngine(&module, runtime_path));
   CHECK(DigitCanStartCompositionWhenSchemaHandlesIt(&module, runtime_path));
@@ -2886,10 +3366,42 @@ bool AllTextStoreChecks(const wchar_t *module_path,
   return true;
 }
 
+bool OptionalContextSinkChecks(const wchar_t *module_path,
+                               const wchar_t *runtime_path) {
+  ScopedCom com;
+  CHECK(SUCCEEDED(com.result()));
+  TextServiceModule module;
+  CHECK(module.Load(module_path));
+  CHECK(OptionalContextSinkFailureStillTypes(
+      &module, runtime_path,
+      "FAMO_TEST_KEYBOARD_DISABLED_SINK_UNAVAILABLE"));
+  CHECK(OptionalContextSinkFailureStillTypes(
+      &module, runtime_path, "FAMO_TEST_LAYOUT_SINK_UNAVAILABLE"));
+  CHECK(module.CanUnload());
+  return true;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+  if (argc == 4 && std::wstring_view(argv[3]) == L"optional-context-sinks") {
+    if (!OptionalContextSinkChecks(argv[1], argv[2]))
+      return 1;
+    std::printf("tsf_optional_context_sinks: OK\n");
+    return 0;
+  }
+  if (argc == 4 && std::wstring_view(argv[3]) == L"reentrant-activation") {
+    ScopedCom com;
+    if (FAILED(com.result()))
+      return 1;
+    TextServiceModule module;
+    if (!module.Load(argv[1]) ||
+        !ReentrantActivationFocusStillBeginsCandidates(&module, argv[2]))
+      return 1;
+    std::printf("tsf_reentrant_activation: OK\n");
+    return 0;
+  }
   if (argc != 3)
     return 2;
   if (!AllTextStoreChecks(argv[1], argv[2]))

@@ -18,6 +18,7 @@
 #include <ctffunc.h>
 
 #include "candidate_ui_element.h"
+#include "candidate_window.h"
 #include "com_ptr.h"
 #include "composition_controller.h"
 #include "famo_bridge_abi.h"
@@ -34,6 +35,7 @@ class TextService final : public ITfTextInputProcessorEx,
                           public ITfTextLayoutSink,
                           public ITfFunctionProvider,
                           public ITfFnSearchCandidateProvider,
+                          public ITfDisplayAttributeProvider,
                           public CandidateUiHost {
 public:
   TextService();
@@ -93,6 +95,11 @@ public:
   HRESULT STDMETHODCALLTYPE SetResult(BSTR query, BSTR application_id,
                                       BSTR result) override;
 
+  HRESULT STDMETHODCALLTYPE EnumDisplayAttributeInfo(
+      IEnumTfDisplayAttributeInfo **enumerator) override;
+  HRESULT STDMETHODCALLTYPE GetDisplayAttributeInfo(
+      REFGUID guid, ITfDisplayAttributeInfo **info) override;
+
   void OnCandidateVisibilityChanged(CandidateUiElement *element) override;
   HRESULT OnCandidateBehavior(CandidateUiElement *element,
                               CandidateBehavior behavior, UINT index) override;
@@ -132,6 +139,7 @@ private:
     ComPtr<ITfSource> keyboard_disabled_source;
     DWORD keyboard_disabled_sink_cookie = TF_INVALID_COOKIE;
     runtime::UiState ui_state;
+    HWND candidate_owner = nullptr;
     runtime::Correlation pending_session;
     std::string recovery_preedit;
     std::optional<runtime::DeliveryReference> pending_delivery;
@@ -339,6 +347,16 @@ private:
   std::condition_variable session_retry_wake_;
   HWND recovery_window_ = nullptr;
   bool recovery_message_posted_ = false;
+  runtime::CandidateWindow candidate_window_;
+  uint64_t candidate_revision_ = 0;
+  TfGuidAtom display_attribute_atom_ = TF_INVALID_GUIDATOM;
+  // Appearance the Runtime read from the user's data root and sent over the
+  // pipe. The Bridge is loaded into hosts that cannot resolve or open that
+  // root at all, so it never reads the overlay itself. Written by the session
+  // worker after each connect, read by the activation thread when publishing.
+  std::atomic<std::shared_ptr<const runtime::RuntimeStyleState>>
+      runtime_style_;
+  bool FetchRuntimeStyle();
 };
 
 HRESULT CreateTextServiceInstance(REFIID iid, void **object);

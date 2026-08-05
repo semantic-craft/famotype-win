@@ -2071,73 +2071,55 @@ public sealed class InstallerContractTests
         Assert.True(startup < desktop && desktop < create);
         Assert.Contains("L\"winsta0\\\\default\"", body);
         Assert.Contains("STARTUPINFOW", body);
+        Assert.Contains("ExecutableDirectory(executable)", body);
+        Assert.Contains("CreateEnvironmentBlock", body);
+        Assert.Contains("CREATE_UNICODE_ENVIRONMENT", body);
+        Assert.Contains("DestroyEnvironmentBlock", body);
     }
 
     [Fact]
-    public void NativeProfileTool_BreaksPackagedInstallerContextThroughValidatedRelay()
+    public void NativeProfileTool_BreaksInstallerContextWithTheExactShellUser()
     {
         string tool = RepoText(
             "native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
-        int direct = Position(
-            tool, "int RunBoundDesktopOperationCurrent");
-        string directBody = tool[
-            direct..Position(tool, "int RunBoundDesktopOperation(", direct)];
-        int outer = Position(tool, "int RunBoundDesktopOperation(", direct);
+        int outer = Position(tool, "int RunBoundDesktopOperation(");
         string outerBody = tool[
             outer..Position(tool, "std::wstring TextServiceGuidText", outer)];
 
-        Assert.Contains("CurrentProcessTokenMatchesSid(sid)", directBody);
-        Assert.Contains("TokenIsMediumIntegrityDesktop", directBody);
-        Assert.Contains("ResolveDesktopOperation", directBody);
-        Assert.Contains("CreateProcessW", directBody);
-        Assert.Contains("desktop-relay-for", outerBody);
-        Assert.Contains("RunAsScheduledDesktopUser(", outerBody);
-        Assert.Contains("ModulePath()", outerBody);
-        Assert.Contains("RunBoundDesktopOperationCurrent(", tool);
-        Assert.Contains(
-            "argv[2], argv[3], argv[4], argv[5], argv[6]", tool);
-        Assert.Contains("ITaskService", tool);
-        Assert.Contains("TASK_LOGON_INTERACTIVE_TOKEN", tool);
-        Assert.Contains("TASK_RUNLEVEL_LUA", tool);
-        Assert.Contains("DeleteTask", tool);
+        Assert.Contains("ResolveDesktopOperation", outerBody);
+        Assert.Contains("RunAsDesktopUser(", outerBody);
+        Assert.Contains("validated_arguments", outerBody);
+        Assert.Contains("child_exit_code", outerBody);
+        Assert.Contains("TokenMatchesSid(shell_token, expected_sid)", tool);
+        Assert.Contains("CreateProcessWithTokenW", tool);
+        Assert.Contains("CreateEnvironmentBlock", tool);
+        Assert.DoesNotContain("desktop-relay-for", tool);
+        Assert.DoesNotContain("desktop-relay-current-for", tool);
+        Assert.DoesNotContain("desktop-breakaway-current-for", tool);
+        Assert.DoesNotContain("RunAsScheduledDesktopUser", tool);
+        Assert.DoesNotContain("ITaskService", tool);
 
         string cmake = RepoText(
             "native/windows-tsf-famo/text-service/CMakeLists.txt");
-        Assert.Contains("taskschd", cmake, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("oleaut32", cmake, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("userenv", cmake, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("taskschd", cmake, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void NativeProfileTool_BindsScheduledExitToThisTaskInvocation()
+    public void NativeProfileTool_PropagatesTheExactShellChildExit()
     {
         string tool = RepoText(
             "native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
-        int scheduled = Position(tool, "HRESULT RunAsScheduledDesktopUser");
-        string body = tool[scheduled..Position(
-            tool, "int RunBoundDesktopOperation(", scheduled)];
+        int run = Position(tool, "int RunBoundDesktopOperation(");
+        string body = tool[run..Position(
+            tool, "std::wstring TextServiceGuidText", run)];
 
-        int baseline = Position(
-            body, "get_LastRunTime(&baseline_last_run_time)");
-        int run = Position(body, "registered->Run(empty, &running)", baseline);
-        int observed = Position(
-            body, "get_LastRunTime(&last_run_time)", run);
-        int sample = Position(
-            body, "ScheduledTaskCompletionCanBeSampled(", observed);
-        int state = Position(body, "registered->get_State(&state)", sample);
-        int accept = Position(
-            body, "TryAcceptScheduledTaskCompletion(", state);
-
-        Assert.True(
-            baseline < run && run < observed && observed < sample &&
-            sample < state && state < accept);
-        Assert.Contains(
-            "last_run_time != baseline_last_run_time", body);
-
-        string selfcheck = RepoText(
-            "native/windows-tsf-famo/text-service/tests/user_data_cleanup_selfcheck.cpp");
-        Assert.Contains("TASK_STATE_READY, 0, false", selfcheck);
-        Assert.Contains("TASK_STATE_UNKNOWN, TASK_STATE_DISABLED", selfcheck);
-        Assert.Contains("exit_code != STILL_ACTIVE", selfcheck);
+        int initialize = Position(body, "DWORD child_exit_code = STILL_ACTIVE");
+        int launch = Position(body, "RunAsDesktopUser(", initialize);
+        int propagate = Position(body, "child_exit_code != STILL_ACTIVE", launch);
+        Assert.True(initialize < launch && launch < propagate);
+        Assert.DoesNotContain("LastTaskResult", body);
+        Assert.DoesNotContain("TASK_STATE_READY", body);
     }
 
     [Fact]

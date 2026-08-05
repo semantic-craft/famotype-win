@@ -18,12 +18,12 @@ public sealed class StableBridgeArchitectureContractTests
         Assert.Contains("/DBridgeAbi=$bridgeAbi", script);
         Assert.Contains("/DBridgeHash=$bridgeHash", script);
         Assert.Contains(
-            "text-service\\build-bridge-v5-artifact",
+            "text-service\\build-bridge-v13-artifact",
             script);
 
         string installer = RepoText(
             "native/windows-tsf-famo/installer/famo-setup.iss");
-        Assert.Contains("#define BridgeAbi \"5\"", installer);
+        Assert.Contains("#define BridgeAbi \"13\"", installer);
 
         int runtimeFiles = Position(script, "$runtimeFiles = @(");
         int runtimeFilesEnd = Position(script, ")", runtimeFiles);
@@ -97,11 +97,57 @@ public sealed class StableBridgeArchitectureContractTests
             "native/windows-tsf-famo/text-service/src/FamoTextService.rc.in");
 
         Assert.Contains("FAMO_BRIDGE_ABI", cmake);
-        Assert.Contains("set(FAMO_BRIDGE_ABI \"5\"", cmake);
+        Assert.Contains("set(FAMO_BRIDGE_ABI \"13\"", cmake);
         Assert.Contains("FamoTextService.rc.in", cmake);
         Assert.Contains("FILEVERSION @FAMO_BRIDGE_ABI@", resource);
         Assert.Contains("FileMajorPart", artifactBuilder);
         Assert.Contains("$BridgeAbi", artifactBuilder);
+    }
+
+    [Fact]
+    public void HostOwnedCandidate_PresentsInTheExactContextViewOwner()
+    {
+        string cmake = RepoText(
+            "native/windows-tsf-famo/text-service/CMakeLists.txt");
+        string service = RepoText(
+            "native/windows-tsf-famo/text-service/src/text_service.cpp");
+        string ui = RepoText(
+            "native/windows-tsf-famo/text-service/src/text_service_ui.cpp");
+        string candidate = RepoText(
+            "native/windows-tsf-famo/runtime-protocol/src/candidate_window.cpp");
+
+        Assert.Contains("famo_candidate_window", cmake);
+        Assert.Contains("candidate_window_.Start()", service);
+        Assert.Contains("view->GetWnd(&window)", ui);
+        Assert.Contains("entry->candidate_owner = window", ui);
+        Assert.Contains("snapshot->require_in_process_owner = true", ui);
+        Assert.Contains("snapshot->selection_target = recovery_window_", ui);
+        Assert.Contains("published.show_allowed = false", ui);
+        Assert.Contains("GetWindow(window, GW_OWNER) != owner", candidate);
+        Assert.DoesNotContain("pbShow = TRUE", ui);
+    }
+
+    [Fact]
+    public void CandidateAppearance_ReachesTheHostOverTheWireNotFromDisk()
+    {
+        string service = RepoText(
+            "native/windows-tsf-famo/text-service/src/text_service.cpp");
+        string ui = RepoText(
+            "native/windows-tsf-famo/text-service/src/text_service_ui.cpp");
+        string candidate = RepoText(
+            "native/windows-tsf-famo/runtime-protocol/src/candidate_window.cpp");
+
+        // The presenter draws inside the host process, and a sandboxed host
+        // such as SearchHost cannot read the user profile at all. Appearance
+        // therefore has to arrive over the authenticated pipe and ride on the
+        // published snapshot; a presenter that opens the style file itself
+        // silently falls back to the built-in skin in exactly those hosts.
+        Assert.Contains("Command::GetStyleOverlay", service);
+        Assert.Contains("snapshot->style = runtime_style_.load()", ui);
+        Assert.Contains("next_presentation = snapshot->style->presentation",
+                        candidate);
+        Assert.DoesNotContain("style_root", candidate);
+        Assert.DoesNotContain("ReadRuntimeStyleOverlay", candidate);
     }
 
     [Fact]
