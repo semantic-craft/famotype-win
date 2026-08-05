@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "runtime_style_config.h"
+
 namespace famo::runtime {
 
 bool IsShiftModeSwitch(const KeyEvent &key, uint32_t before_status,
@@ -162,6 +164,12 @@ Frame RuntimeService::DispatchLocked(const Frame &request,
       return Reply(request, Status::InvalidFrame);
     return DispatchSearchCandidatesLocked(request);
   }
+  if (request.command == Command::GetStyleOverlay) {
+    if (client->second.protocol_version < 5 || c.session_id != 0 ||
+        c.session_generation != 0 || c.sequence == 0)
+      return Reply(request, Status::InvalidFrame);
+    return DispatchStyleOverlayLocked(request);
+  }
   if (c.session_id == 0 || c.session_generation == 0 || c.sequence == 0)
     return Reply(request, Status::InvalidFrame);
 
@@ -288,6 +296,21 @@ std::vector<std::string> RuntimeService::FilterSearchCandidates(
       break;
   }
   return filtered;
+}
+
+Frame RuntimeService::DispatchStyleOverlayLocked(const Frame &request) {
+  // The overlay is read here because this process owns the user's data root
+  // and is the only one that can reach it from every host, sandboxed or not.
+  RuntimeStyleOverlay overlay;
+  if (!ReadRuntimeStyleOverlay(data_root_, &overlay))
+    return Reply(request, Status::Unavailable);
+  std::string error;
+  Frame reply = Reply(request, Status::Ok);
+  if (!EncodeStyleOverlay(overlay.text, overlay.exists, &reply.payload,
+                          &error)) {
+    return Reply(request, Status::Unavailable);
+  }
+  return reply;
 }
 
 Frame RuntimeService::DispatchSearchCandidatesLocked(const Frame &request) {

@@ -9,6 +9,7 @@
 namespace famo::tsf {
 namespace {
 
+
 runtime::UiRect ToUiRect(const RECT &rect) {
   return {rect.left, rect.top, rect.right, rect.bottom};
 }
@@ -130,6 +131,7 @@ HRESULT TextService::OnLayoutChange(ITfContext *context, TfLayoutCode code,
     return S_OK;
   if (code == TF_LC_DESTROY) {
     entry->ui_state.layout_available = false;
+    entry->candidate_owner = nullptr;
     PublishUiState(entry);
     return S_OK;
   }
@@ -243,6 +245,7 @@ void TextService::RefreshLayout(ContextEntry *entry, ITfContextView *view) {
   if (!active_view &&
       FAILED(entry->context->GetActiveView(active_view.put()))) {
     entry->ui_state.layout_available = false;
+    entry->candidate_owner = nullptr;
     PublishUiState(entry);
     return;
   }
@@ -271,13 +274,22 @@ HRESULT TextService::CaptureLayout(ITfContext *context, ITfContextView *view,
   if (!entry)
     return S_OK;
   ComPtr<ITfRange> layout_caret;
+  TfAnchor caret_edge = TF_ANCHOR_END;
   HRESULT result = entry->composition.CloneLayoutCaret(
-      cookie, entry->context.get(), layout_caret.put());
+      cookie, entry->context.get(), layout_caret.put(), &caret_edge);
   RECT caret{};
   RECT view_bounds{};
   BOOL clipped = FALSE;
   if (SUCCEEDED(result))
     result = view->GetTextExt(cookie, layout_caret.get(), &caret, &clipped);
+  if (SUCCEEDED(result)) {
+    // The measured extent covers the character the caret sits against; collapse
+    // it back to the caret's own edge so placement is unchanged.
+    if (caret_edge == TF_ANCHOR_END)
+      caret.left = caret.right;
+    else
+      caret.right = caret.left;
+  }
   if (SUCCEEDED(result))
     result = view->GetScreenExt(&view_bounds);
   if (result == TS_E_NOLAYOUT || FAILED(result)) {
@@ -289,6 +301,7 @@ HRESULT TextService::CaptureLayout(ITfContext *context, ITfContextView *view,
   HWND window = nullptr;
   if (FAILED(view->GetWnd(&window)))
     window = nullptr;
+  entry->candidate_owner = window;
   DPI_AWARENESS_CONTEXT awareness = nullptr;
   if (window) {
     awareness = GetWindowDpiAwarenessContext(window);
@@ -392,6 +405,34 @@ void TextService::PublishUiState(ContextEntry *entry) {
     published.focused = false;
     published.show_allowed = false;
   }
+  try {
+    auto snapshot = std::make_shared<runtime::RuntimeSnapshot>();
+    snapshot->correlation = *correlation;
+    snapshot->composition = entry->state.displayed();
+    snapshot->ui_state = published;
+    snapshot->source_window =
+        reinterpret_cast<uintptr_t>(entry->candidate_owner);
+    snapshot->style = runtime_style_.load();
+    snapshot->selection_target = recovery_window_;
+    snapshot->require_in_process_owner = true;
+    snapshot->composition_sequence = entry->state.displayed_sequence();
+    snapshot->ui_sequence = correlation->sequence;
+    snapshot->revision = ++candidate_revision_;
+    candidate_window_.Publish(std::move(snapshot));
+  } catch (...) {
+    // Candidate presentation is best effort and never changes input delivery.
+  }
+  // The in-process presenter draws the candidate so the popup can be owned by
+  // ITfContextView::GetWnd, and the Runtime must not put a second one on
+  // screen. It can only do that when this context actually has a usable owner
+  // window; when it does not, muting the Runtime unconditionally would leave
+  // nobody drawing at all. The host's own refusal is carried in show_allowed
+  // and still suppresses both, so a host that takes the candidate UI over
+  // never competes with a Famo popup.
+  const bool presented_in_process =
+      entry->candidate_owner != nullptr && IsWindow(entry->candidate_owner);
+  if (presented_in_process)
+    published.show_allowed = false;
   std::string error;
   if (!runtime::EncodeUiState(published, &update.payload, &error))
     return;

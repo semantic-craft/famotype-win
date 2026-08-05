@@ -20,7 +20,7 @@ import their full daemon or plugin framework into the Windows release.
 | Engine/session ABI | `FamoRimeEngine.dll` behind `famo_engine_api.h` and active Weasel sessions | ABI active, session unavailable, maintenance disabled, degraded backend | Fail open while maintenance runs, recreate/reselect sessions after runtime/engine recovery | `FamoEngineApiContractTests`, `Test-FamoHealth.ps1` H9, `MaintenanceSafeTypingContractTests` |
 | Deployer and maintenance queue | Settings `DeployService` plus `FamoDeploy.exe` | `Idle`, `Pending`, `Running`, `Succeeded`, `Failed`, `RetryAvailable` | Queue/coalesce reloads, show retryable failure, keep settings UI responsive, do not block typing | `DeployServiceTests`, `SettingsReloadStatusContractTests`, `ApplyFeedbackContractTests`, smoke `MAINT`, diagnostics `deployQueue` |
 | Settings UI apply surface | WinUI pages and `App.ReportReloadResult` | Current reload token, pending/running/succeeded/failed status | Surface honest status and retry affordance without freezing the page | `SettingsReloadStatusContractTests`, `ApplyFeedbackContractTests` |
-| Candidate/status UI and TSF UIElement | Weasel candidate renderer, Famo status bar/popup, `ITfCandidateListUIElement` facade | Visible, hidden, empty, lost focus, lost capture, stale-state risk | Hide or clear mirrors when composition/session/runtime state disappears; record panel failure separately from runtime/deploy | `PANEL-SMOOTHNESS.md`, `PanelSmoothnessContractTests`, smoke `PANEL`, health `panelFailureBoundary = SeparateFromRuntimeAndDeploy` |
+| Candidate/status UI and TSF UIElement | Shared candidate renderer with the ABI 6 in-process host-owned presenter, Runtime status UI, `ITfCandidateListUIElement` facade | Visible, hidden, exact `ITfContextView::GetWnd` owner, host `Show` decision, keyboard-disabled, lost focus, stale-state risk | Hide or destroy the host-owned popup when its exact owner/security/session disappears; Runtime receives self-drawing disabled to prevent a duplicate popup; record panel failure separately from runtime/deploy | `candidate_window_selfcheck`, `tsf_integration_selfcheck`, `PANEL-SMOOTHNESS.md`, `PanelSmoothnessContractTests`, smoke `PANEL` |
 | Safe diagnostics and local timing | `Get-FamoDiagnostics.ps1` plus `FamoTimingLog` | Read-only bundle, opt-in timing, bounded/rate-limited log | Collect local support evidence without reading clipboard, typed text, dictionaries, secrets, or user Weasel files | `DiagnosticsAndTimingContractTests`, diagnostics `healthProbeMs`/`ipcPipeConnectMs`/`deployQueue`/`candidateStatusUi` |
 
 ## Deployer Failure Boundary
@@ -47,6 +47,14 @@ Candidate/status stale-state checks can run without rebuilding the engine.
 - `PANEL-SMOOTHNESS.md` owns renderer behavior: no focus steal, first-frame DPI,
   empty/focus/input-method/maintenance/killed-runtime/lost-capture cleanup, and
   TSF UIElement metadata.
+- Candidate layout, painting, UIA, and light-dismiss stay in one shared renderer.
+  ABI 6's Bridge adapter creates the candidate HWND inside the host process and
+  owns it to the exact `ITfContextView::GetWnd`; Runtime remains the engine and
+  state authority and does not create a second popup for that Bridge.
+- `candidate_window_selfcheck` covers exact ownership, owner replacement,
+  non-topmost owned movement, style hot reload, and registered-class cleanup.
+  `tsf_integration_selfcheck` covers host `Show(FALSE/TRUE)`, same-process click
+  capability binding, and immediate keyboard-disabled hiding.
 - The `PANEL` smoke row is intentionally a GUI observation row, not an engine
   deploy or schema rebuild row. It can be run after S03-S06/MAINT against the
   installed runtime and current session state.

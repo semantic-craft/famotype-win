@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <thread>
 
 #include "../../famo-candidate-ui/famo_candidate_ui.h"
@@ -30,6 +31,20 @@ bool PreviewSelectionAt(const FamoLayoutResult &layout, int x, int y,
 bool SendPreviewSelectionToOwner(
     HWND source_window, const PreviewSelectionRequest &request,
     const PipeClientIdentity &selection_owner) noexcept;
+
+// Routes a candidate click either to a same-process message window owned by
+// the in-process TSF presenter or to the authenticated TSF process used by the
+// standalone Runtime presenter. Exactly one route must be supplied.
+bool SendPreviewSelection(
+    HWND source_window, const PreviewSelectionRequest &request,
+    HWND in_process_target,
+    const PipeClientIdentity &selection_owner) noexcept;
+
+// Parses a style overlay into the presentation the renderer draws with. Free
+// of any sink instance so the Bridge can turn an overlay it received over the
+// pipe into a presentation without owning a Runtime service.
+bool PrepareCandidateStyle(std::string_view text, bool exists,
+                           std::shared_ptr<const void> *presentation) noexcept;
 
 bool PlanScrollTransition(const FamoLayoutResult &previous,
                           const FamoLayoutResult &next,

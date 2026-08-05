@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.19"
+  #define AppVersion  "1.5.28"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -15,7 +15,7 @@
   #define Identity "Stable"
 #endif
 #ifndef BridgeAbi
-  #define BridgeAbi "5"
+  #define BridgeAbi "13"
 #endif
 #ifndef BridgeHash
   #define BridgeHash "0000000000000000000000000000000000000000000000000000000000000000"

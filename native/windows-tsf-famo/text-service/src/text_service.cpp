@@ -9,6 +9,7 @@
 #include <bcrypt.h>
 
 #include "abi_boundary.h"
+#include "display_attribute.h"
 #include "famo_guids.h"
 #include "famo_install_state.h"
 #include "famo_utf_conversion.h"
@@ -29,6 +30,7 @@ constexpr int kSessionOpenAttempts = 3;
 constexpr std::chrono::milliseconds kSessionRetryDelay{20};
 constexpr size_t kMaxTerminalAbandonDebts = 64;
 constexpr size_t kMaxTerminalDebtRetriesPerConnect = 4;
+
 
 struct TerminalAbandonDebt {
   std::wstring endpoint_suffix;
@@ -327,6 +329,8 @@ HRESULT TextService::QueryInterface(REFIID iid, void **object) {
   else if (iid == IID_ITfFunction ||
            iid == IID_ITfFnSearchCandidateProvider)
     *object = static_cast<ITfFnSearchCandidateProvider *>(this);
+  else if (iid == IID_ITfDisplayAttributeProvider)
+    *object = static_cast<ITfDisplayAttributeProvider *>(this);
   if (!*object)
     return E_NOINTERFACE;
   AddRef();
@@ -422,6 +426,37 @@ HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
   activation_generation_ = ++g_activation_generation;
   timing_enabled_ = TimingEnabled();
 
+  // Resolve the atom used to publish GUID_PROP_ATTRIBUTE over compositions.
+  // Hosts that reconstruct the composition from that property need it; the
+  // profile already registers GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER for it.
+  display_attribute_atom_ = TF_INVALID_GUIDATOM;
+  {
+    ComPtr<ITfCategoryMgr> categories;
+    if (SUCCEEDED(CoCreateInstance(
+            CLSID_TF_CategoryMgr, nullptr, CLSCTX_INPROC_SERVER,
+            IID_ITfCategoryMgr,
+            reinterpret_cast<void **>(categories.put())))) {
+      TfGuidAtom atom = TF_INVALID_GUIDATOM;
+      if (SUCCEEDED(categories->RegisterGUID(kDisplayAttributeGuid, &atom)))
+        display_attribute_atom_ = atom;
+    }
+  }
+
+  // Every sink advised below can be called back synchronously, before this
+  // function returns. Chromium text stores do exactly that: they deliver
+  // ITfThreadMgrEventSink::OnSetFocus for the already-focused document during
+  // AdviseSink, which reaches EnsureContext and schedules the first warmup.
+  // StartSessionWorker resets the pending warmup slots, so it must run before
+  // anything can fill them; otherwise that first request is discarded while
+  // the context stays session_pending forever and every key passes through.
+  candidate_revision_ = 0;
+  if (!StartRecoveryWindow() ||
+      !candidate_window_.Start() ||
+      !StartSessionWorker()) {
+    Deactivate();
+    return E_OUTOFMEMORY;
+  }
+
   HRESULT result = PublishOpenInputMode(thread_manager_.get(), client_id_);
   if (FAILED(result)) {
     Deactivate();
@@ -431,6 +466,26 @@ HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
   result = thread_manager_->QueryInterface(
       IID_ITfKeystrokeMgr,
       reinterpret_cast<void **>(keystroke_manager_.put()));
+  if (FAILED(result)) {
+    Deactivate();
+    return result;
+  }
+  // Every interface a callback can need is acquired before the first sink is
+  // advised. A context created by a synchronous OnSetFocus keeps whatever the
+  // UI element manager was at that moment for its whole life, so acquiring it
+  // afterwards leaves that context permanently unable to begin a candidate
+  // element: keys and composition still work, and only the candidate window is
+  // missing.
+  result = thread_manager_->QueryInterface(
+      IID_ITfUIElementMgr,
+      reinterpret_cast<void **>(ui_manager_.put()));
+  if (FAILED(result)) {
+    Deactivate();
+    return result;
+  }
+  result = thread_manager_->QueryInterface(
+      IID_ITfSourceSingle,
+      reinterpret_cast<void **>(function_source_.put()));
   if (FAILED(result)) {
     Deactivate();
     return result;
@@ -459,20 +514,6 @@ HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
     Deactivate();
     return result;
   }
-  result = thread_manager_->QueryInterface(
-      IID_ITfUIElementMgr,
-      reinterpret_cast<void **>(ui_manager_.put()));
-  if (FAILED(result)) {
-    Deactivate();
-    return result;
-  }
-  result = thread_manager_->QueryInterface(
-      IID_ITfSourceSingle,
-      reinterpret_cast<void **>(function_source_.put()));
-  if (FAILED(result)) {
-    Deactivate();
-    return result;
-  }
   result = function_source_->AdviseSingleSink(
       client_id_, IID_ITfFunctionProvider,
       static_cast<ITfFunctionProvider *>(this));
@@ -485,11 +526,6 @@ HRESULT TextService::ActivateCore(ITfThreadMgr *thread_manager,
     OutputDebugStringA(
         "FamoTextService function provider registration unavailable\n");
   }
-  if (!StartRecoveryWindow() || !StartSessionWorker()) {
-    Deactivate();
-    return E_OUTOFMEMORY;
-  }
-
   ComPtr<ITfDocumentMgr> focus;
   if (SUCCEEDED(thread_manager_->GetFocus(focus.put()))) {
     ComPtr<ITfContext> context = TopContext(focus.get());
@@ -624,6 +660,7 @@ HRESULT TextService::DeactivateCore() {
     entry->state.Close();
   }
   contexts_.clear();
+  candidate_window_.Stop();
   StopRecoveryWindow();
 
   if (keystroke_manager_ && key_sink_advised_)
@@ -749,6 +786,10 @@ void TextService::ForceDeactivateCleanup() noexcept {
   } catch (...) {
   }
   try {
+    candidate_window_.Stop();
+  } catch (...) {
+  }
+  try {
     StopRecoveryWindow();
   } catch (...) {
     recovery_window_ = nullptr;
@@ -847,6 +888,27 @@ HRESULT TextService::GetFunction(REFGUID guid, REFIID iid,
 
 HRESULT TextService::GetDisplayName(BSTR *name) {
   return GetDescription(name);
+}
+
+HRESULT TextService::EnumDisplayAttributeInfo(
+    IEnumTfDisplayAttributeInfo **enumerator) {
+  return ComBoundary(
+      [&] { return CreateDisplayAttributeInfoEnum(enumerator); });
+}
+
+HRESULT TextService::GetDisplayAttributeInfo(REFGUID guid,
+                                             ITfDisplayAttributeInfo **info) {
+  return ComBoundary([&]() -> HRESULT {
+    if (!info)
+      return E_POINTER;
+    *info = nullptr;
+    // ITfDisplayAttributeMgr resolves the atom Famo publishes over the
+    // composition by creating a fresh instance of this class, so this must
+    // answer without any activation state.
+    if (!IsEqualGUID(guid, kDisplayAttributeGuid))
+      return E_INVALIDARG;
+    return CreateCompositionDisplayAttributeInfo(info);
+  });
 }
 
 HRESULT TextService::GetSearchCandidates(BSTR query, BSTR application_id,
@@ -956,13 +1018,15 @@ bool TextService::ConnectRuntimePort(
   runtime::PipeEndpoint endpoint;
   std::string error;
   if (!runtime::BuildCurrentPipeEndpoint(runtime_endpoint_suffix_, &endpoint,
-                                         &error))
+                                         &error)) {
     return false;
+  }
   std::wstring expected;
   std::chrono::milliseconds deadline{500};
   if (runtime_executable_name_ == L"FamoRuntime.exe") {
-    if (!runtime::ResolveProductionRuntime(&expected))
+    if (!runtime::ResolveProductionRuntime(&expected)) {
       return false;
+    }
     if (!WaitNamedPipeW(endpoint.name.c_str(), 0) &&
         GetLastError() == ERROR_FILE_NOT_FOUND) {
       std::wstring command = L"\"" + expected + L"\"";
@@ -989,8 +1053,42 @@ bool TextService::ConnectRuntimePort(
   connection.session_id = 0;
   connection.session_generation = 0;
   connection.sequence = 0;
-  return port->Connect(endpoint, expected, connection, deadline, &error,
-                       cancelled);
+  const bool connected = port->Connect(endpoint, expected, connection,
+                                       deadline, &error, cancelled);
+  if (!connected) {
+  }
+  return connected;
+}
+
+bool TextService::FetchRuntimeStyle() {
+  // Runs on the session worker, which owns runtime_port_. A Runtime that
+  // predates this command answers InvalidFrame; the presenter then keeps its
+  // built-in appearance rather than failing the connection.
+  runtime::Frame request;
+  request.command = runtime::Command::GetStyleOverlay;
+  request.correlation = {runtime_client_id_, activation_generation_,
+                         connection_generation_, 0, 0, 1};
+  const runtime::CallResult result =
+      runtime_port_.Call(std::move(request), runtime::kHardCallDeadline);
+  if (result.status != runtime::Status::Ok)
+    return false;
+  std::string text;
+  bool exists = false;
+  std::string error;
+  if (!runtime::DecodeStyleOverlay(result.reply.payload, &text, &exists,
+                                   &error)) {
+    return false;
+  }
+  std::shared_ptr<const void> presentation;
+  if (!runtime::PrepareCandidateStyle(text, exists, &presentation))
+    return false;
+  try {
+    runtime_style_.store(std::make_shared<const runtime::RuntimeStyleState>(
+        runtime::RuntimeStyleState{0, std::move(presentation)}));
+  } catch (...) {
+    return false;
+  }
+  return true;
 }
 
 HRESULT TextService::EnsureContext(ITfContext *context,
@@ -1008,26 +1106,42 @@ HRESULT TextService::EnsureContext(ITfContext *context,
     if (!owned->candidates)
       return E_OUTOFMEMORY;
     owned->candidates->SetHost(this);
-    if (FAILED(GetKeyboardDisabledSource(
-            context, owned->keyboard_disabled_source.put())) ||
-        FAILED(owned->keyboard_disabled_source->AdviseSink(
+    owned->composition.SetDisplayAttribute(display_attribute_atom_);
+    const bool keyboard_sink_forced_unavailable =
+        GetEnvironmentVariableA(
+            "FAMO_TEST_KEYBOARD_DISABLED_SINK_UNAVAILABLE", nullptr, 0) != 0;
+    const bool keyboard_sink_advised =
+        !keyboard_sink_forced_unavailable &&
+        SUCCEEDED(GetKeyboardDisabledSource(
+            context, owned->keyboard_disabled_source.put())) &&
+        SUCCEEDED(owned->keyboard_disabled_source->AdviseSink(
             IID_ITfCompartmentEventSink,
             static_cast<ITfCompartmentEventSink *>(this),
-            &owned->keyboard_disabled_sink_cookie))) {
-      return S_FALSE;
-    }
-    ComPtr<ITfSource> context_source;
-    if (FAILED(context->QueryInterface(
-            IID_ITfSource,
-            reinterpret_cast<void **>(context_source.put()))) ||
-        FAILED(context_source->AdviseSink(
-            IID_ITfTextLayoutSink, static_cast<ITfTextLayoutSink *>(this),
-            &owned->layout_sink_cookie))) {
-      owned->keyboard_disabled_source->UnadviseSink(
-          owned->keyboard_disabled_sink_cookie);
+            &owned->keyboard_disabled_sink_cookie));
+    if (!keyboard_sink_advised) {
+      // Some Chromium text stores expose the compartment value but not its
+      // notification source. Keep the context: focus and every test/real key
+      // still re-read the value before any engine request, and an unreadable
+      // value remains security-disabled.
       owned->keyboard_disabled_sink_cookie = TF_INVALID_COOKIE;
       owned->keyboard_disabled_source.reset();
-      return S_FALSE;
+    }
+    ComPtr<ITfSource> context_source;
+    const bool layout_sink_forced_unavailable =
+        GetEnvironmentVariableA("FAMO_TEST_LAYOUT_SINK_UNAVAILABLE", nullptr,
+                                0) != 0;
+    const bool layout_sink_advised =
+        !layout_sink_forced_unavailable &&
+        SUCCEEDED(context->QueryInterface(
+            IID_ITfSource,
+            reinterpret_cast<void **>(context_source.put()))) &&
+        SUCCEEDED(context_source->AdviseSink(
+            IID_ITfTextLayoutSink, static_cast<ITfTextLayoutSink *>(this),
+            &owned->layout_sink_cookie));
+    if (!layout_sink_advised) {
+      // Candidate updates request an active-view layout when the host cannot
+      // send ITfTextLayoutSink notifications.
+      owned->layout_sink_cookie = TF_INVALID_COOKIE;
     }
     try {
       if (GetEnvironmentVariableA(
@@ -1800,6 +1914,10 @@ void TextService::SessionWorkerMain() noexcept {
                 result.reply.payload.empty();
         if (ready) {
           opened = true;
+          // Refresh the appearance once per opened connection: this is the
+          // only point where the worker owns the port and the peer is known
+          // good. A refusal leaves the built-in appearance in place.
+          (void)FetchRuntimeStyle();
           break;
         }
         const bool retryable =

@@ -2,6 +2,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -658,13 +660,16 @@ BOOL CALLBACK FindCandidate(HWND window, LPARAM parameter) {
   if (std::wstring_view(name) != L"FamoRuntimeCandidateWindow")
     return TRUE;
   auto *probe = reinterpret_cast<WindowProbe *>(parameter);
-  probe->window = window;
-  probe->visible = IsWindowVisible(window) != FALSE;
-  probe->ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
-  probe->cursor =
-      reinterpret_cast<HCURSOR>(GetClassLongPtrW(window, GCLP_HCURSOR));
-  GetWindowRect(window, &probe->rect);
-  return FALSE;
+  const bool visible = IsWindowVisible(window) != FALSE;
+  if (!probe->window || (!probe->visible && visible)) {
+    probe->window = window;
+    probe->visible = visible;
+    probe->ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    probe->cursor =
+        reinterpret_cast<HCURSOR>(GetClassLongPtrW(window, GCLP_HCURSOR));
+    GetWindowRect(window, &probe->rect);
+  }
+  return visible ? FALSE : TRUE;
 }
 
 WindowProbe Probe() {
@@ -675,6 +680,11 @@ WindowProbe Probe() {
 
 bool WaitForVisibility(bool visible, WindowProbe *result = nullptr) {
   for (int attempt = 0; attempt < 1000; ++attempt) {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
     WindowProbe probe = Probe();
     if (probe.window && probe.visible == visible) {
       if (result)
@@ -701,6 +711,232 @@ bool PreviewRowsMapToAbsoluteCandidateIndexes() {
   CHECK(selection.absolute_index == 10);
   CHECK(!PreviewSelectionAt(layout, 5, 5, 0, 2, &selection));
   CHECK(!PreviewSelectionAt(layout, 15, 25, 0, 0, &selection));
+  return true;
+}
+
+bool CandidateWindowUsesExplicitInProcessOwner() {
+  HWND owner = CreateWindowExW(0, L"STATIC", L"candidate-owner",
+                               WS_OVERLAPPEDWINDOW,
+                               0, 0, 640, 480, nullptr, nullptr,
+                               GetModuleHandleW(nullptr), nullptr);
+  CHECK(owner != nullptr);
+  ShowWindow(owner, SW_SHOWNOACTIVATE);
+  CHECK(IsWindowVisible(owner));
+  CHECK(SetForegroundWindow(owner));
+  CHECK(GetForegroundWindow() == owner);
+
+  CandidateWindow candidate;
+  CHECK(candidate.Start());
+  auto snapshot = VisibleSnapshot(190);
+  snapshot->revision = 1;
+  snapshot->source_window = reinterpret_cast<uintptr_t>(owner);
+  snapshot->require_in_process_owner = true;
+  candidate.Publish(snapshot);
+
+  WindowProbe probe;
+  CHECK(WaitForVisibility(true, &probe));
+  CHECK(GetWindow(probe.window, GW_OWNER) == owner);
+  CHECK((probe.ex_style & WS_EX_TOPMOST) == 0);
+
+  auto moved = std::make_shared<RuntimeSnapshot>(*snapshot);
+  moved->revision = 2;
+  moved->ui_state.caret.left += 40;
+  moved->ui_state.caret.right += 40;
+  candidate.Publish(moved);
+  WindowProbe moved_probe = probe;
+  for (int attempt = 0; attempt < 1000; ++attempt) {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+    moved_probe = Probe();
+    if (moved_probe.visible && moved_probe.rect.left != probe.rect.left)
+      break;
+    Sleep(1);
+  }
+  CHECK(moved_probe.visible && moved_probe.rect.left != probe.rect.left);
+  CHECK((moved_probe.ex_style & WS_EX_TOPMOST) == 0);
+
+  candidate.Stop();
+  CHECK(DestroyWindow(owner));
+  return true;
+}
+
+bool CandidateWindowReleasesRegisteredClasses() {
+  const HINSTANCE module = GetModuleHandleW(nullptr);
+  CHECK(module != nullptr);
+  (void)UnregisterClassW(L"FamoRuntimeCandidateWindow", module);
+  (void)UnregisterClassW(L"FamoRuntimeModeIndicator", module);
+
+  CandidateWindow candidate;
+  CHECK(candidate.Start());
+  CHECK(candidate.Prewarm());
+  candidate.Stop();
+
+  WNDCLASSW registered{};
+  CHECK(!GetClassInfoW(module, L"FamoRuntimeCandidateWindow", &registered));
+  CHECK(!GetClassInfoW(module, L"FamoRuntimeModeIndicator", &registered));
+  return true;
+}
+
+bool CandidateWindowFollowsOwnerLifecycle() {
+  HWND first_owner = CreateWindowExW(
+      0, L"STATIC", L"first-candidate-owner", WS_OVERLAPPEDWINDOW, 0, 0, 640,
+      480, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(first_owner != nullptr);
+  ShowWindow(first_owner, SW_SHOW);
+  CHECK(SetForegroundWindow(first_owner));
+
+  CandidateWindow candidate;
+  CHECK(candidate.Start());
+  auto first = VisibleSnapshot(195);
+  first->revision = 1;
+  first->source_window = reinterpret_cast<uintptr_t>(first_owner);
+  first->require_in_process_owner = true;
+  candidate.Publish(first);
+  WindowProbe first_probe;
+  CHECK(WaitForVisibility(true, &first_probe));
+  CHECK(GetWindow(first_probe.window, GW_OWNER) == first_owner);
+
+  CHECK(DestroyWindow(first_owner));
+  for (int attempt = 0; attempt < 1000 && IsWindow(first_probe.window);
+       ++attempt) {
+    MSG message{};
+    PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
+    Sleep(1);
+  }
+  CHECK(!IsWindow(first_probe.window));
+
+  HWND replacement_owner = CreateWindowExW(
+      0, L"STATIC", L"replacement-candidate-owner", WS_OVERLAPPEDWINDOW, 0,
+      0, 640, 480, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(replacement_owner != nullptr);
+  ShowWindow(replacement_owner, SW_SHOW);
+  CHECK(SetForegroundWindow(replacement_owner));
+  auto replacement = VisibleSnapshot(196);
+  replacement->revision = 2;
+  replacement->source_window =
+      reinterpret_cast<uintptr_t>(replacement_owner);
+  replacement->require_in_process_owner = true;
+  candidate.Publish(replacement);
+  WindowProbe replacement_probe;
+  CHECK(WaitForVisibility(true, &replacement_probe));
+  CHECK(GetWindow(replacement_probe.window, GW_OWNER) == replacement_owner);
+
+  candidate.Stop();
+  CHECK(DestroyWindow(replacement_owner));
+  return true;
+}
+
+std::string Utf8Path(std::wstring_view path) {
+  const int count = WideCharToMultiByte(
+      CP_UTF8, WC_ERR_INVALID_CHARS, path.data(),
+      static_cast<int>(path.size()), nullptr, 0, nullptr, nullptr);
+  if (count <= 0)
+    return {};
+  std::string result(static_cast<size_t>(count), '\0');
+  return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, path.data(),
+                             static_cast<int>(path.size()), result.data(),
+                             count, nullptr, nullptr) == count
+             ? result
+             : std::string{};
+}
+
+// The presenter takes its appearance from the snapshot the Runtime publishes
+// and never reads the user's data root itself: it is loaded into hosts, some
+// sandboxed, that cannot resolve or open that root at all.
+std::shared_ptr<const RuntimeStyleState> StyleWithMargin(int margin_x) {
+  const std::string overlay =
+      "style:\n  margin_x: " + std::to_string(margin_x) + "\n";
+  std::shared_ptr<const void> presentation;
+  if (!PrepareCandidateStyle(overlay, true, &presentation))
+    return nullptr;
+  return std::make_shared<const RuntimeStyleState>(
+      RuntimeStyleState{0, std::move(presentation)});
+}
+
+bool CandidateWindowTakesAppearanceFromPublishedStyle() {
+  HWND owner = CreateWindowExW(
+      0, L"STATIC", L"style-candidate-owner", WS_OVERLAPPEDWINDOW, 0, 0, 640,
+      480, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(owner != nullptr);
+  ShowWindow(owner, SW_SHOW);
+  CHECK(SetForegroundWindow(owner));
+
+  CandidateWindow candidate;
+  CHECK(candidate.Start());
+  auto snapshot = VisibleSnapshot(198);
+  snapshot->revision = 1;
+  snapshot->source_window = reinterpret_cast<uintptr_t>(owner);
+  snapshot->require_in_process_owner = true;
+  snapshot->style = StyleWithMargin(2);
+  CHECK(snapshot->style != nullptr);
+  candidate.Publish(snapshot);
+  WindowProbe initial;
+  CHECK(WaitForVisibility(true, &initial));
+  const LONG initial_width = initial.rect.right - initial.rect.left;
+  CHECK(initial_width > 0);
+
+  auto restyled = std::make_shared<RuntimeSnapshot>(*snapshot);
+  restyled->revision = 2;
+  restyled->style = StyleWithMargin(40);
+  CHECK(restyled->style != nullptr);
+  candidate.Publish(restyled);
+
+  WindowProbe reloaded = initial;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (std::chrono::steady_clock::now() < deadline) {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+    reloaded = Probe();
+    if (reloaded.visible &&
+        reloaded.rect.right - reloaded.rect.left > initial_width) {
+      break;
+    }
+    Sleep(5);
+  }
+  CHECK(reloaded.visible);
+  CHECK(reloaded.rect.right - reloaded.rect.left > initial_width);
+
+  candidate.Stop();
+  CHECK(DestroyWindow(owner));
+  return true;
+}
+
+bool PreviewRoutingSupportsInProcessTarget() {
+  WNDCLASSW target_class{};
+  target_class.lpfnWndProc = PreviewTargetProc;
+  target_class.hInstance = GetModuleHandleW(nullptr);
+  target_class.lpszClassName = kPreviewSelectionWindowClass;
+  CHECK(RegisterClassW(&target_class) ||
+        GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
+
+  HWND source = CreateWindowExW(0, L"STATIC", L"candidate-source", WS_POPUP,
+                                0, 0, 1, 1, nullptr, nullptr,
+                                GetModuleHandleW(nullptr), nullptr);
+  HWND target = CreateWindowExW(
+      0, kPreviewSelectionWindowClass, L"in-process-target", 0, 0, 0, 0, 0,
+      HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+  CHECK(source && target);
+  g_preview_received_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  CHECK(g_preview_received_event);
+  g_expected_preview_source = source;
+  g_expected_preview_request = {
+      {101, 102, 103, 104, 105, 106}, 100, 1, 0, {107, 108}};
+
+  CHECK(SendPreviewSelection(source, g_expected_preview_request, target, {}));
+  CHECK(WaitForSingleObject(g_preview_received_event, 0) == WAIT_OBJECT_0);
+
+  CloseHandle(g_preview_received_event);
+  g_preview_received_event = nullptr;
+  g_expected_preview_source = nullptr;
+  DestroyWindow(target);
+  DestroyWindow(source);
   return true;
 }
 
@@ -1827,6 +2063,11 @@ int wmain(int argc, wchar_t **argv) {
     return 0;
   }
   if (!PreviewRowsMapToAbsoluteCandidateIndexes() ||
+      !CandidateWindowUsesExplicitInProcessOwner() ||
+      !CandidateWindowFollowsOwnerLifecycle() ||
+      !CandidateWindowReleasesRegisteredClasses() ||
+      !CandidateWindowTakesAppearanceFromPublishedStyle() ||
+      !PreviewRoutingSupportsInProcessTarget() ||
       !PreviewRoutingBindsExactOwnerAndSourceWindow() ||
       !ScrollTransitionIsBoundedAndOptional() ||
       !CandidateWindowReportsShowEvent() ||
