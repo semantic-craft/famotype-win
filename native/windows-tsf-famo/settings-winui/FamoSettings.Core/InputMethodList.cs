@@ -50,6 +50,44 @@ public static class InputMethodList
             uint dwFlags);
     }
 
+    /// <summary>只用得到 enable 位的两个方法，其余槽位按 vtable 顺序占位。</summary>
+    [ComImport]
+    [Guid("1F02B6C5-7842-4EE6-8A0B-9A24183A95CA")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface ITfInputProcessorProfiles
+    {
+        [PreserveSig] int Register(ref Guid rclsid);
+        [PreserveSig] int Unregister(ref Guid rclsid);
+        [PreserveSig] int AddLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile,
+            [MarshalAs(UnmanagedType.LPWStr)] string pchDesc, uint cchDesc,
+            [MarshalAs(UnmanagedType.LPWStr)] string pchIconFile,
+            uint cchFile, uint uIconIndex);
+        [PreserveSig] int RemoveLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile);
+        [PreserveSig] int EnumInputProcessorInfo(out IntPtr ppEnum);
+        [PreserveSig] int GetDefaultLanguageProfile(
+            ushort langid, ref Guid catid, out Guid pclsid, out Guid pguidProfile);
+        [PreserveSig] int SetDefaultLanguageProfile(
+            ushort langid, ref Guid rclsid, ref Guid guidProfiles);
+        [PreserveSig] int ActivateLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfiles);
+        [PreserveSig] int GetActiveLanguageProfile(
+            ref Guid rclsid, out ushort plangid, out Guid pguidProfile);
+        [PreserveSig] int GetLanguageProfileDescription(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile, out IntPtr pbstrProfile);
+        [PreserveSig] int GetCurrentLanguage(out ushort plangid);
+        [PreserveSig] int ChangeCurrentLanguage(ushort langid);
+        [PreserveSig] int GetLanguageList(out IntPtr ppLangId, out uint pulCount);
+        [PreserveSig] int EnumLanguageProfiles(ushort langid, out IntPtr ppEnum);
+        [PreserveSig] int EnableLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile,
+            [MarshalAs(UnmanagedType.Bool)] bool fEnable);
+        [PreserveSig] int IsEnabledLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile,
+            [MarshalAs(UnmanagedType.Bool)] out bool pfEnable);
+    }
+
     /// <summary>加入当前用户输入法列表。幂等（已在列表时系统自行去重）；
     /// 失败（input.dll 缺失/组策略锁定等）返回 false，绝不抛——不阻断 seed/deploy 主流程。
     /// 失败可见：落一行日志到 %LOCALAPPDATA%\Famo\log\（P1-B，此前 catch 静默吞错）。</summary>
@@ -451,6 +489,94 @@ public static class InputMethodList
         IEnumerable<string> valueNames) =>
         valueNames.Any(valueName => string.Equals(
             valueName, FamoTip, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>读当前用户的 profile 启用位（ITfInputProcessorProfiles）。
+    /// 读不到（非 Windows / COM 不可用）返回 false，与"未知"同治：不修。</summary>
+    public static bool TryIsFamoProfileEnabled(out bool enabled)
+    {
+        enabled = false;
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+        try
+        {
+            if (CreateProfiles() is not ITfInputProcessorProfiles profiles)
+            {
+                return false;
+            }
+            (ushort langid, Guid clsid, Guid profile) = ParseFamoTip();
+            int hr = profiles.IsEnabledLanguageProfile(
+                ref clsid, langid, ref profile, out bool value);
+            Marshal.ReleaseComObject(profiles);
+            if (hr < 0)
+            {
+                return false;
+            }
+            enabled = value;
+            return true;
+        }
+        catch
+        {
+            enabled = false;
+            return false;
+        }
+    }
+
+    /// <summary>把当前用户的 profile 启用位置真。
+    ///
+    /// 机器级注册故意不写这一位：安装器是提权运行的，EnableLanguageProfile 只
+    /// 写调用者的 HKCU，那会落到管理员的 hive 而不是真正的用户。所以这一步必须
+    /// 由非提权的每用户链路补上，否则新装的机器上 profile 已注册、TIP 也在列表
+    /// 里，却是禁用状态——语言栏能切，输入法不工作。
+    /// 幂等；失败返回 false 并落日志，绝不抛。</summary>
+    public static bool EnsureFamoProfileEnabled(bool logFailures = true)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+        try
+        {
+            if (CreateProfiles() is not ITfInputProcessorProfiles profiles)
+            {
+                if (logFailures)
+                {
+                    FamoLog.Append(
+                        "EnableLanguageProfile skipped: profiles unavailable");
+                }
+                return false;
+            }
+            (ushort langid, Guid clsid, Guid profile) = ParseFamoTip();
+            int hr = profiles.EnableLanguageProfile(
+                ref clsid, langid, ref profile, true);
+            Marshal.ReleaseComObject(profiles);
+            if (hr < 0)
+            {
+                if (logFailures)
+                {
+                    FamoLog.Append(
+                        $"EnableLanguageProfile failed: hr=0x{hr:X8}");
+                }
+                return false;
+            }
+            return TryIsFamoProfileEnabled(out bool enabled) && enabled;
+        }
+        catch (Exception ex)
+        {
+            if (logFailures)
+            {
+                FamoLog.Append($"EnableLanguageProfile threw: {ex.Message}");
+            }
+            return false;
+        }
+    }
+
+    private static object? CreateProfiles()
+    {
+        Type? type = Type.GetTypeFromCLSID(InputProcessorProfilesClsid);
+        return type is null ? null : Activator.CreateInstance(type);
+    }
 
     private static (ushort LangId, Guid Clsid, Guid Profile) ParseFamoTip()
     {

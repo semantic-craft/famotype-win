@@ -151,6 +151,27 @@ public sealed class StableBridgeArchitectureContractTests
     }
 
     [Fact]
+    public void Packaging_RefusesARuntimeThatCannotSpeakTheBridgesProtocol()
+    {
+        string build = RepoText(
+            "native/windows-tsf-famo/installer/build-installer.ps1");
+        string main = RepoText(
+            "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp");
+
+        // A Bridge stamps its own protocol version on the first Hello frame and
+        // an older Runtime rejects that frame before negotiation, so a stale
+        // native output does not degrade -- it ships a build where no host can
+        // connect at all. Packaging asks the Runtime what it speaks instead of
+        // trusting the directory it came from.
+        Assert.Contains("--protocol", main);
+        Assert.Contains("protocol_min=%u protocol_max=%u", main);
+        Assert.Contains("--protocol", build);
+        Assert.Contains("protocol_min=(\\d+) protocol_max=(\\d+)", build);
+        Assert.Contains("$runtimeProtocolMax -lt $bridgeArtifactInfo.ProtocolMax",
+                        build);
+    }
+
+    [Fact]
     public void SmokeHarness_CanRequireARebootFreeRuntimeOnlyUpgrade()
     {
         string smoke = RepoText(

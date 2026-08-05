@@ -190,6 +190,16 @@ private:
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
+  // Packaging asks the Runtime what it speaks rather than inferring it from a
+  // build directory. A Bridge stamps its own protocol version on the first
+  // Hello frame and an older Runtime rejects that frame before negotiation, so
+  // a stale pairing does not degrade -- every host fails to connect.
+  if (argc == 2 && std::wstring_view(argv[1]) == L"--protocol") {
+    std::printf("protocol_min=%u protocol_max=%u\n",
+                static_cast<unsigned>(kMinSupportedProtocolVersion),
+                static_cast<unsigned>(kProtocolVersion));
+    return 0;
+  }
   std::wstring data_root = DefaultDataRoot();
   std::wstring endpoint_suffix = kDefaultRuntimeEndpointSuffix;
   std::wstring control_endpoint_suffix;
@@ -306,8 +316,14 @@ int wmain(int argc, wchar_t **argv) {
     constexpr DWORD kTipSelfHealReadyDelayMs = 1000;
     bool ready = false;
     for (int attempt = 0; attempt < kTipSelfHealReadyAttempts; ++attempt) {
-      if (!ProductionInstallAllowed(ModuleDirectory(), true))
+      if (!ProductionInstallAllowed(ModuleDirectory(), true)) {
+        // Returning here used to be silent, which made a machine that came up
+        // with the profile registered but disabled impossible to diagnose:
+        // nothing was written anywhere.
+        AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                                "install not in an allowed state");
         return;
+      }
       if (ProductionInstallAllowed(ModuleDirectory(), false)) {
         ready = true;
         break;

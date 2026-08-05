@@ -225,6 +225,63 @@ public sealed class TipSelfHealTests
         Assert.Contains("TipSelfHeal.RunAtStartup(\"runtime\")", program);
     }
 
+    // ── 两条用户级事实：在列表里，且 profile 已启用 ──
+
+    [Fact]
+    public void SelfHeal_HealsBothListMembershipAndTheProfileEnableBit()
+    {
+        string selfHeal = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings.Core/TipSelfHeal.cs"));
+        string registration = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/text-service/src/registration.cpp"));
+
+        // Machine registration must keep leaving the user's enable bit alone:
+        // the installer is elevated, so EnableLanguageProfile there would write
+        // the administrator's HKCU rather than the user's.
+        Assert.Contains("RegisterTsfProfile(false)", registration);
+        Assert.Contains("if (enable_current_user) {", registration);
+
+        // Which makes the per-user self-heal the only thing that can set it.
+        Assert.Contains("TryIsFamoProfileEnabled", selfHeal);
+        Assert.Contains("EnsureFamoProfileEnabled", selfHeal);
+        Assert.Contains("TryIsFamoInUserList", selfHeal);
+        Assert.Contains("EnsureFamoInUserList", selfHeal);
+    }
+
+    [Fact]
+    public void Run_ReadyAndListedButDisabled_RepairsBeforeReportingHealthy()
+    {
+        // A machine that is registered and listed but disabled looks installed
+        // and does not type. The probe has to fail for it and the repair has to
+        // clear it.
+        bool enabled = false;
+        int repairs = 0;
+
+        TipSelfHealOutcome outcome = TipSelfHeal.Run(
+            readInstallState: () => "Ready",
+            isPresent: () => enabled,
+            repair: () => { repairs++; enabled = true; return true; },
+            delay: _ => { });
+
+        Assert.Equal(TipSelfHealOutcome.Repaired, outcome);
+        Assert.Equal(1, repairs);
+    }
+
+    [Fact]
+    public void SelfHeal_SkippedInstallState_IsWrittenToTheLog()
+    {
+        string selfHeal = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings.Core/TipSelfHeal.cs"));
+        string main = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
+
+        // Both ways of declining to heal were silent, so an install that left
+        // the profile disabled produced no trace anywhere.
+        Assert.Contains("TipSelfHealOutcome.SkippedInstallState", selfHeal);
+        Assert.Contains("skipped, InstallState=", selfHeal);
+        Assert.Contains("install not in an allowed state", main);
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;

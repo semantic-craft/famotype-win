@@ -180,6 +180,32 @@ $bridgeArtifactInfo = Read-BridgeArtifact $BridgeArtifact
 $bridgeAbi = $bridgeArtifactInfo.Abi
 $bridgeHash = $bridgeArtifactInfo.Hash
 
+# The Bridge stamps its own protocol version on the very first Hello frame, and
+# a Runtime rejects any frame above the version it was built with before
+# negotiation is reached. Pairing them wrong therefore does not degrade -- every
+# host in the session fails to connect, including unsandboxed ones -- and a
+# stale $NativeOutput is enough to cause it. Ask the Runtime what it speaks.
+$runtimeExe = Join-Path $NativeOutput 'FamoRuntime.exe'
+$protocolReport = & $runtimeExe --protocol 2>&1
+if ($LASTEXITCODE -ne 0) {
+  throw "FamoRuntime --protocol 失败（exit=$LASTEXITCODE）：$protocolReport`n" +
+        '该 Runtime 太旧，不认识协议自述参数；请用与 Bridge 同一次构建的产物。'
+}
+$protocolMatch = [regex]::Match(
+  [string] $protocolReport, 'protocol_min=(\d+) protocol_max=(\d+)')
+if (-not $protocolMatch.Success) {
+  throw "无法解析 FamoRuntime --protocol 输出：$protocolReport"
+}
+$runtimeProtocolMin = [int] $protocolMatch.Groups[1].Value
+$runtimeProtocolMax = [int] $protocolMatch.Groups[2].Value
+if ($runtimeProtocolMax -lt $bridgeArtifactInfo.ProtocolMax -or
+    $runtimeProtocolMin -gt $bridgeArtifactInfo.ProtocolMax) {
+  throw ("Runtime 与 Bridge 协议不匹配：Runtime 支持 " +
+    "$runtimeProtocolMin..$runtimeProtocolMax，Bridge ABI $bridgeAbi 需要 " +
+    "$($bridgeArtifactInfo.ProtocolMin)..$($bridgeArtifactInfo.ProtocolMax)。`n" +
+    "装出来的包会在每个宿主上握手失败。请重新构建 $NativeOutput。")
+}
+
 $unsigned = @($runtimeFiles | Where-Object {
   (Get-AuthenticodeSignature -LiteralPath (Join-Path $NativeOutput $_)).Status -ne 'Valid'
 })
