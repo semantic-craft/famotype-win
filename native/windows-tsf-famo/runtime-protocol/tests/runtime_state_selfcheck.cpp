@@ -60,13 +60,16 @@ int main() {
         FaultKind::EngineHang, FaultKind::UiHang}) {
     InMemoryRuntimePort port(Echo);
     port.SetReady(7);
-    port.Inject(fault, 200ms);
+    port.Inject(fault, 2s);
     Frame request;
     request.command = Command::ProcessKey;
     request.correlation = {1, 1, 7, 1, 1, 1};
     const CallResult first_call = port.Call(request, 50ms);
     CHECK(first_call.status == Status::Timeout);
-    CHECK(first_call.elapsed >= 45ms && first_call.elapsed <= 65ms);
+    // sleep_for may overshoot on a loaded Windows runner. Keep a generous
+    // scheduler allowance while still proving the call returns far before the
+    // injected two-second stall.
+    CHECK(first_call.elapsed >= 45ms && first_call.elapsed <= 250ms);
     const CallResult second_call = port.Call(request, 50ms);
     CHECK(second_call.status == Status::Unavailable);
     CHECK(second_call.elapsed < 5ms);

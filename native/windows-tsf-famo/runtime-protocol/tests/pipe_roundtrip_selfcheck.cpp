@@ -38,8 +38,8 @@ bool PipeSecurityAllowsRestrictedClients() {
   CHECK(BuildPipeSecurity(endpoint, &attributes, &descriptor, nullptr));
   LPWSTR sddl = nullptr;
   CHECK(ConvertSecurityDescriptorToStringSecurityDescriptorW(
-      descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &sddl,
-      nullptr));
+      descriptor, SDDL_REVISION_1,
+      DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION, &sddl, nullptr));
   const std::wstring security(sddl);
   LocalFree(sddl);
   LocalFree(descriptor);
@@ -48,6 +48,7 @@ bool PipeSecurityAllowsRestrictedClients() {
         std::wstring::npos);
   CHECK(security.find(L"(A;;GWGR;;;AC)") != std::wstring::npos);
   CHECK(security.find(L"(A;;GWGR;;;S-1-15-2-2)") != std::wstring::npos);
+  CHECK(security.find(L"S:(ML;;NW;;;LW)") != std::wstring::npos);
   CHECK(security.find(L";;;WD)") == std::wstring::npos);
   CHECK(security.find(L";;;AN)") == std::wstring::npos);
   return true;
