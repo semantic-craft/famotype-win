@@ -1263,11 +1263,17 @@ Add-Check 'H7' 'S0' ($notInstalled -or $isolationProblems.Count -eq 0) `
 
 $resourceProblems = @()
 if (-not $notInstalled -and -not $noActivePayload) {
-  foreach ($relative in @(
-    'FamoRuntime.exe', 'FamoRimeEngine.dll', 'FamoProfileTool.exe', 'rime.dll',
-    'data\default.yaml', 'data\weasel.yaml', 'data\opencc',
-    'settings\FamoSettings.exe', 'settings\FamoSettings.pri')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $target $relative))) { $resourceProblems += $relative }
+  if (-not $target) {
+    $resourceProblems += 'active target missing'
+  } else {
+    foreach ($relative in @(
+      'FamoRuntime.exe', 'FamoRimeEngine.dll', 'FamoProfileTool.exe', 'rime.dll',
+      'data\default.yaml', 'data\weasel.yaml', 'data\opencc',
+      'settings\FamoSettings.exe', 'settings\FamoSettings.pri')) {
+      if (-not (Test-Path -LiteralPath (Join-Path $target $relative))) {
+        $resourceProblems += $relative
+      }
+    }
   }
 }
 Add-Check 'H8' 'S1' ($notInstalled -or $noActivePayload -or

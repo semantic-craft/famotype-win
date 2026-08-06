@@ -84,7 +84,19 @@ public:
   const TS_SELECTION_ACP &selection() const { return selection_; }
   size_t replace_count() const { return replace_count_; }
   size_t lock_request_count() const { return lock_request_count_; }
+  size_t text_ext_query_count() const { return text_ext_query_count_; }
+  size_t screen_ext_query_count() const { return screen_ext_query_count_; }
+  size_t window_query_count() const { return window_query_count_; }
+  LONG last_text_ext_start() const { return last_text_ext_start_; }
+  LONG last_text_ext_end() const { return last_text_ext_end_; }
   void set_deny_locks(bool deny) { deny_locks_ = deny; }
+  void set_window_for_test(HWND window) { window_ = window; }
+  void set_selection_for_test(LONG start, LONG end, TsActiveSelEnd active_end) {
+    selection_.acpStart = start;
+    selection_.acpEnd = end;
+    selection_.style.ase = active_end;
+    selection_.style.fInterimChar = FALSE;
+  }
 
 private:
   ~FakeTextStore();
@@ -101,6 +113,12 @@ private:
   bool deny_locks_ = false;
   size_t lock_request_count_ = 0;
   size_t replace_count_ = 0;
+  size_t text_ext_query_count_ = 0;
+  size_t screen_ext_query_count_ = 0;
+  size_t window_query_count_ = 0;
+  LONG last_text_ext_start_ = 0;
+  LONG last_text_ext_end_ = 0;
+  HWND window_ = nullptr;
   std::wstring text_;
   TS_SELECTION_ACP selection_{};
 };

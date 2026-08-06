@@ -162,6 +162,63 @@ public sealed class InputMethodListTests
     }
 
     [Fact]
+    public void UserListInstall_PersistsAfterNativeReadbackLooksHealthy()
+    {
+        int nativeCalls = 0;
+        int persistenceCalls = 0;
+
+        bool result = InputMethodList.TryEnsureDurableFamoInUserList(
+            ensureNative: () =>
+            {
+                nativeCalls++;
+                return true;
+            },
+            persistWithUserLanguageList: () =>
+            {
+                persistenceCalls++;
+                return true;
+            });
+
+        Assert.True(result);
+        Assert.Equal(1, nativeCalls);
+        Assert.Equal(1, persistenceCalls);
+    }
+
+    [Fact]
+    public void UserListInstall_DurablePersistenceFailureIsNotReportedHealthy()
+    {
+        bool result = InputMethodList.TryEnsureDurableFamoInUserList(
+            ensureNative: () => true,
+            persistWithUserLanguageList: () => false);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public void UserListInstall_DurablePersistenceCanRecoverNativeFailure()
+    {
+        bool result = InputMethodList.TryEnsureDurableFamoInUserList(
+            ensureNative: () => false,
+            persistWithUserLanguageList: () => true);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void UserListInstall_UsesOfficialLanguageListWithoutAddingLanguages()
+    {
+        string source = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings.Core/InputMethodList.cs"));
+
+        Assert.Contains("EnsureFamoWithUserLanguageList", source);
+        Assert.Contains("Get-WinUserLanguageList", source);
+        Assert.Contains("Set-WinUserLanguageList", source);
+        Assert.Contains("$target.InputMethodTips.Add($tip)", source);
+        Assert.Contains("WaitForExit(30_000)", source);
+        Assert.DoesNotContain("New-WinUserLanguageList", source);
+    }
+
+    [Fact]
     public void UserListRemoval_UsesOfficialLanguageListWhenNativeDisableLeavesTip()
     {
         int disableCalls = 0;

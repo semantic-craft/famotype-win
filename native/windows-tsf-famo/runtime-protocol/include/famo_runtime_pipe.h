@@ -38,6 +38,9 @@ constexpr std::chrono::milliseconds kHardCallDeadline{50};
 // first librime context allocation. It remains strictly bounded, but does not
 // consume the tighter per-key callback budget.
 constexpr std::chrono::milliseconds kSessionOpenDeadline{1000};
+// Search integration is a host control path, not a keystroke callback. It may
+// allocate one ephemeral engine context but remains bounded for Explorer.
+constexpr std::chrono::milliseconds kSearchCandidatesDeadline{1000};
 
 enum class ServerFault {
   None,
@@ -50,6 +53,7 @@ enum class ServerFault {
   OpenSessionDelay,
   OpenSessionHang,
   OpenSessionUnavailable,
+  StaleSession,
   UiHang,
   LateReply,
   DisconnectBeforeExecute,

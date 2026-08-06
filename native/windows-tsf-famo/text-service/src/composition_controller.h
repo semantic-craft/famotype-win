@@ -27,6 +27,18 @@ public:
   HRESULT Recover(ITfContext *context, TfClientId client_id,
                   std::string_view confirmed_preedit, ITfCompositionSink *sink);
   HRESULT End(ITfContext *context, TfClientId client_id);
+  // Returns the range whose extent locates the caret, plus which edge of that
+  // extent the caret sits on. The range is widened over one character where
+  // possible because text stores cannot measure an empty one.
+  HRESULT CloneLayoutCaret(TfEditCookie cookie, ITfContext *context,
+                           ITfRange **range,
+                           TfAnchor *caret_edge = nullptr) const;
+  // Display-attribute atom published over the composition range. Hosts that
+  // build their composition from GUID_PROP_ATTRIBUTE (every Chromium and XAML
+  // text store) ignore a composition that carries no attribute property.
+  void SetDisplayAttribute(TfGuidAtom atom) noexcept {
+    display_attribute_atom_ = atom;
+  }
   bool CompositionTerminated(ITfComposition *composition);
   void ObserveUnhandledKey(WPARAM key, bool down);
   void ResetBehaviorState();
@@ -46,6 +58,7 @@ private:
   wchar_t pending_close_ = 0;
   wchar_t previous_commit_ = 0;
   ULONGLONG injected_guard_until_ = 0;
+  TfGuidAtom display_attribute_atom_ = TF_INVALID_GUIDATOM;
 };
 
 } // namespace famo::tsf

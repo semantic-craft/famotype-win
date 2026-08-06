@@ -149,6 +149,45 @@ public sealed class RuntimeBoundaryAuditContractTests
             runtime);
     }
 
+    [Fact]
+    public void DevelopmentRuntimeDoesNotRequireAStableInstallProjection()
+    {
+        string runtime = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"))
+            .ReplaceLineEndings("\n");
+
+        int startupGuard = runtime.IndexOf(
+            "#if defined(FAMO_STABLE_IDENTITY)\n  if (endpoint_suffix",
+            StringComparison.Ordinal);
+        Assert.True(startupGuard >= 0,
+            "the Stable Runtime install-state check must have an identity guard");
+        int startupCheck = runtime.IndexOf(
+            "ProductionInstallAllowed(ModuleDirectory(), true)",
+            startupGuard,
+            StringComparison.Ordinal);
+        int startupEnd = runtime.IndexOf("#endif", startupGuard,
+            StringComparison.Ordinal);
+        Assert.True(startupGuard >= 0 && startupCheck > startupGuard &&
+            startupEnd > startupCheck,
+            "only a Stable Runtime may require the machine install projection");
+
+        int singleton = runtime.IndexOf("ERROR_ALREADY_EXISTS",
+            StringComparison.Ordinal);
+        int healGuard = runtime.IndexOf(
+            "#if defined(FAMO_STABLE_IDENTITY)", singleton,
+            StringComparison.Ordinal);
+        Assert.True(healGuard > singleton,
+            "production TIP self-heal must have an identity guard");
+        int healThread = runtime.IndexOf("std::thread([data_root]",
+            singleton,
+            StringComparison.Ordinal);
+        int healEnd = runtime.IndexOf("#endif", healGuard,
+            StringComparison.Ordinal);
+        Assert.True(healGuard > singleton && healThread > healGuard &&
+            healEnd > healThread,
+            "Development Runtime must not run production TIP self-heal");
+    }
+
     private static string RepoFile(string relativePath)
     {
         string? dir = AppContext.BaseDirectory;

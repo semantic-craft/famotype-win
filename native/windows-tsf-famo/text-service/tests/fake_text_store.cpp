@@ -317,10 +317,13 @@ HRESULT FakeTextStore::GetACPFromPoint(TsViewCookie, const POINT *, DWORD,
   return S_OK;
 }
 
-HRESULT FakeTextStore::GetTextExt(TsViewCookie, LONG, LONG, RECT *rect,
-                                  BOOL *clipped) {
+HRESULT FakeTextStore::GetTextExt(TsViewCookie, LONG start, LONG end,
+                                  RECT *rect, BOOL *clipped) {
   if (!rect || !clipped)
     return E_POINTER;
+  ++text_ext_query_count_;
+  last_text_ext_start_ = start;
+  last_text_ext_end_ = end;
   *rect = {0, 0, 1, 16};
   *clipped = FALSE;
   return S_OK;
@@ -329,6 +332,7 @@ HRESULT FakeTextStore::GetTextExt(TsViewCookie, LONG, LONG, RECT *rect,
 HRESULT FakeTextStore::GetScreenExt(TsViewCookie, RECT *rect) {
   if (!rect)
     return E_POINTER;
+  ++screen_ext_query_count_;
   *rect = {0, 0, 1024, 768};
   return S_OK;
 }
@@ -336,7 +340,8 @@ HRESULT FakeTextStore::GetScreenExt(TsViewCookie, RECT *rect) {
 HRESULT FakeTextStore::GetWnd(TsViewCookie, HWND *window) {
   if (!window)
     return E_POINTER;
-  *window = nullptr;
+  ++window_query_count_;
+  *window = window_;
   return S_OK;
 }
 

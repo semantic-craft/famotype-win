@@ -5,8 +5,9 @@ using Microsoft.Win32;
 namespace Famo.Settings.Core;
 
 /// <summary>
-/// 把法墨 TIP 加入/移出【当前用户】的输入法列表（input.dll!InstallLayoutOrTip，
-/// 即 Win+Space / 语言设置里可见可切）。上游 WeaselSetup 注册后就做这一步，
+/// 把法墨 TIP 加入/移出【当前用户】的输入法列表（input.dll!InstallLayoutOrTip
+/// 引导 + Windows International 模块持久化，即 Win+Space / 语言设置里可见可切）。
+/// 上游 WeaselSetup 注册后就做这一步，
 /// 法墨改用 regsvr32（仅机器级 CLSID/profile 注册）后曾缺失——注册 ≠ 进列表。
 /// 红线：提权安装段绝不写用户配置，故本步骤只能以原始用户身份在首启链路
 /// （--seed-only）执行；卸载侧经 --remove-input-tip 反向移除。
@@ -49,6 +50,44 @@ public static class InputMethodList
             uint dwFlags);
     }
 
+    /// <summary>只用得到 enable 位的两个方法，其余槽位按 vtable 顺序占位。</summary>
+    [ComImport]
+    [Guid("1F02B6C5-7842-4EE6-8A0B-9A24183A95CA")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface ITfInputProcessorProfiles
+    {
+        [PreserveSig] int Register(ref Guid rclsid);
+        [PreserveSig] int Unregister(ref Guid rclsid);
+        [PreserveSig] int AddLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile,
+            [MarshalAs(UnmanagedType.LPWStr)] string pchDesc, uint cchDesc,
+            [MarshalAs(UnmanagedType.LPWStr)] string pchIconFile,
+            uint cchFile, uint uIconIndex);
+        [PreserveSig] int RemoveLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile);
+        [PreserveSig] int EnumInputProcessorInfo(out IntPtr ppEnum);
+        [PreserveSig] int GetDefaultLanguageProfile(
+            ushort langid, ref Guid catid, out Guid pclsid, out Guid pguidProfile);
+        [PreserveSig] int SetDefaultLanguageProfile(
+            ushort langid, ref Guid rclsid, ref Guid guidProfiles);
+        [PreserveSig] int ActivateLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfiles);
+        [PreserveSig] int GetActiveLanguageProfile(
+            ref Guid rclsid, out ushort plangid, out Guid pguidProfile);
+        [PreserveSig] int GetLanguageProfileDescription(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile, out IntPtr pbstrProfile);
+        [PreserveSig] int GetCurrentLanguage(out ushort plangid);
+        [PreserveSig] int ChangeCurrentLanguage(ushort langid);
+        [PreserveSig] int GetLanguageList(out IntPtr ppLangId, out uint pulCount);
+        [PreserveSig] int EnumLanguageProfiles(ushort langid, out IntPtr ppEnum);
+        [PreserveSig] int EnableLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile,
+            [MarshalAs(UnmanagedType.Bool)] bool fEnable);
+        [PreserveSig] int IsEnabledLanguageProfile(
+            ref Guid rclsid, ushort langid, ref Guid guidProfile,
+            [MarshalAs(UnmanagedType.Bool)] out bool pfEnable);
+    }
+
     /// <summary>加入当前用户输入法列表。幂等（已在列表时系统自行去重）；
     /// 失败（input.dll 缺失/组策略锁定等）返回 false，绝不抛——不阻断 seed/deploy 主流程。
     /// 失败可见：落一行日志到 %LOCALAPPDATA%\Famo\log\（P1-B，此前 catch 静默吞错）。</summary>
@@ -56,38 +95,54 @@ public static class InputMethodList
     {
         int lastError = 0;
         Exception? lastException = null;
-        bool result = RetryEnsureFamoInUserList(
-            install: () =>
-            {
-                try
+        string languageListError = "";
+        bool result = TryEnsureDurableFamoInUserList(
+            ensureNative: () => RetryEnsureFamoInUserList(
+                install: () =>
                 {
-                    bool installed = InstallLayoutOrTip(FamoTip, 0);
-                    if (!installed)
+                    try
                     {
-                        lastError = Marshal.GetLastPInvokeError();
+                        bool installed = InstallLayoutOrTip(FamoTip, 0);
+                        if (!installed)
+                        {
+                            lastError = Marshal.GetLastPInvokeError();
+                        }
+                        return installed;
                     }
-                    return installed;
-                }
-                catch (Exception ex)
-                {
-                    lastException = ex;
-                    return false;
-                }
-            },
-            isAlreadyPresent: () =>
-                TryIsFamoInUserList(out bool present) && present,
-            delay: Thread.Sleep,
-            maxAttempts: 20,
-            delayMilliseconds: 500);
+                    catch (Exception ex)
+                    {
+                        lastException = ex;
+                        return false;
+                    }
+                },
+                isAlreadyPresent: () =>
+                    TryIsFamoInUserList(out bool present) && present,
+                delay: Thread.Sleep,
+                maxAttempts: 20,
+                delayMilliseconds: 500),
+            persistWithUserLanguageList: () =>
+                EnsureFamoWithUserLanguageList(out languageListError));
         if (!result && logFailures)
         {
-            string detail = lastException is null
+            string nativeDetail = lastException is null
                 ? $"Win32={lastError}"
                 : lastException.Message;
             FamoLog.Append(
-                $"InstallLayoutOrTip(install) failed after retry: {detail}");
+                $"InstallLayoutOrTip(install) failed after retry: native={nativeDetail}; language-list={languageListError}");
         }
         return result;
+    }
+
+    internal static bool TryEnsureDurableFamoInUserList(
+        Func<bool> ensureNative,
+        Func<bool> persistWithUserLanguageList)
+    {
+        _ = ensureNative();
+        // InstallLayoutOrTip can expose a process-local healthy readback while
+        // Windows has not persisted the current-user language list. Converge
+        // through the official language-list API and treat its fresh readback
+        // as authoritative.
+        return persistWithUserLanguageList();
     }
 
     internal static bool RetryEnsureFamoInUserList(
@@ -219,24 +274,60 @@ public static class InputMethodList
         return !isStillPresent();
     }
 
+    private static bool EnsureFamoWithUserLanguageList(out string error)
+    {
+        const string script = """
+            $ErrorActionPreference = 'Stop'
+            $tip = '0804:{54EAD76A-B864-4A6D-9C82-148E3352BEE7}{0158C2BA-4E96-4BA8-B505-E1BBEBB3FA33}'
+            $list = Get-WinUserLanguageList
+            $target = $null
+            foreach ($language in $list) {
+              if ([string]::Equals([string]$language.LanguageTag, 'zh-Hans-CN', [StringComparison]::OrdinalIgnoreCase) -or
+                  [string]::Equals([string]$language.LanguageTag, 'zh-CN', [StringComparison]::OrdinalIgnoreCase)) {
+                $target = $language
+                break
+              }
+            }
+            if ($null -eq $target) {
+              foreach ($language in $list) {
+                foreach ($entry in $language.InputMethodTips) {
+                  if ($entry.StartsWith('0804:', [StringComparison]::OrdinalIgnoreCase)) {
+                    $target = $language
+                    break
+                  }
+                }
+                if ($null -ne $target) { break }
+              }
+            }
+            if ($null -eq $target) {
+              throw 'Simplified Chinese user language is unavailable'
+            }
+            $present = $false
+            foreach ($entry in $target.InputMethodTips) {
+              if ([string]::Equals($entry, $tip, [StringComparison]::OrdinalIgnoreCase)) {
+                $present = $true
+                break
+              }
+            }
+            if (-not $present) {
+              $target.InputMethodTips.Add($tip)
+            }
+            Set-WinUserLanguageList -LanguageList $list -Force
+            foreach ($language in Get-WinUserLanguageList) {
+              foreach ($entry in $language.InputMethodTips) {
+                if ([string]::Equals($entry, $tip, [StringComparison]::OrdinalIgnoreCase)) {
+                  exit 0
+                }
+              }
+            }
+            exit 1
+            """;
+
+        return RunUserLanguageListScript(script, out error);
+    }
+
     private static bool RemoveFamoWithUserLanguageList(out string error)
     {
-        error = "";
-        if (!OperatingSystem.IsWindows())
-        {
-            error = "Windows-only International module unavailable";
-            return false;
-        }
-
-        string powershell = Path.Combine(
-            Environment.SystemDirectory,
-            @"WindowsPowerShell\v1.0\powershell.exe");
-        if (!File.Exists(powershell))
-        {
-            error = "Windows PowerShell not found";
-            return false;
-        }
-
         const string script = """
             $ErrorActionPreference = 'Stop'
             $tip = '0804:{54EAD76A-B864-4A6D-9C82-148E3352BEE7}{0158C2BA-4E96-4BA8-B505-E1BBEBB3FA33}'
@@ -262,6 +353,27 @@ public static class InputMethodList
             }
             exit 0
             """;
+
+        return RunUserLanguageListScript(script, out error);
+    }
+
+    private static bool RunUserLanguageListScript(string script, out string error)
+    {
+        error = "";
+        if (!OperatingSystem.IsWindows())
+        {
+            error = "Windows-only International module unavailable";
+            return false;
+        }
+
+        string powershell = Path.Combine(
+            Environment.SystemDirectory,
+            @"WindowsPowerShell\v1.0\powershell.exe");
+        if (!File.Exists(powershell))
+        {
+            error = "Windows PowerShell not found";
+            return false;
+        }
 
         try
         {
@@ -377,6 +489,94 @@ public static class InputMethodList
         IEnumerable<string> valueNames) =>
         valueNames.Any(valueName => string.Equals(
             valueName, FamoTip, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>读当前用户的 profile 启用位（ITfInputProcessorProfiles）。
+    /// 读不到（非 Windows / COM 不可用）返回 false，与"未知"同治：不修。</summary>
+    public static bool TryIsFamoProfileEnabled(out bool enabled)
+    {
+        enabled = false;
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+        try
+        {
+            if (CreateProfiles() is not ITfInputProcessorProfiles profiles)
+            {
+                return false;
+            }
+            (ushort langid, Guid clsid, Guid profile) = ParseFamoTip();
+            int hr = profiles.IsEnabledLanguageProfile(
+                ref clsid, langid, ref profile, out bool value);
+            Marshal.ReleaseComObject(profiles);
+            if (hr < 0)
+            {
+                return false;
+            }
+            enabled = value;
+            return true;
+        }
+        catch
+        {
+            enabled = false;
+            return false;
+        }
+    }
+
+    /// <summary>把当前用户的 profile 启用位置真。
+    ///
+    /// 机器级注册故意不写这一位：安装器是提权运行的，EnableLanguageProfile 只
+    /// 写调用者的 HKCU，那会落到管理员的 hive 而不是真正的用户。所以这一步必须
+    /// 由非提权的每用户链路补上，否则新装的机器上 profile 已注册、TIP 也在列表
+    /// 里，却是禁用状态——语言栏能切，输入法不工作。
+    /// 幂等；失败返回 false 并落日志，绝不抛。</summary>
+    public static bool EnsureFamoProfileEnabled(bool logFailures = true)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+        try
+        {
+            if (CreateProfiles() is not ITfInputProcessorProfiles profiles)
+            {
+                if (logFailures)
+                {
+                    FamoLog.Append(
+                        "EnableLanguageProfile skipped: profiles unavailable");
+                }
+                return false;
+            }
+            (ushort langid, Guid clsid, Guid profile) = ParseFamoTip();
+            int hr = profiles.EnableLanguageProfile(
+                ref clsid, langid, ref profile, true);
+            Marshal.ReleaseComObject(profiles);
+            if (hr < 0)
+            {
+                if (logFailures)
+                {
+                    FamoLog.Append(
+                        $"EnableLanguageProfile failed: hr=0x{hr:X8}");
+                }
+                return false;
+            }
+            return TryIsFamoProfileEnabled(out bool enabled) && enabled;
+        }
+        catch (Exception ex)
+        {
+            if (logFailures)
+            {
+                FamoLog.Append($"EnableLanguageProfile threw: {ex.Message}");
+            }
+            return false;
+        }
+    }
+
+    private static object? CreateProfiles()
+    {
+        Type? type = Type.GetTypeFromCLSID(InputProcessorProfilesClsid);
+        return type is null ? null : Activator.CreateInstance(type);
+    }
 
     private static (ushort LangId, Guid Clsid, Guid Profile) ParseFamoTip()
     {

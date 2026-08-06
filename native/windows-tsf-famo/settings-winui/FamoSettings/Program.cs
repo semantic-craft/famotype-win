@@ -66,6 +66,11 @@ public static class Program
         {
             return InputMethodList.EnsureFamoInUserList() ? 0 : 1;
         }
+        if (HasFlag(args, "--tip-self-heal"))
+        {
+            return TipSelfHeal.RunAtStartup("runtime") ==
+                TipSelfHealOutcome.Failed ? 1 : 0;
+        }
         if (HasFlag(args, "--demo-appearance"))
         {
             return RunDemoAppearance();

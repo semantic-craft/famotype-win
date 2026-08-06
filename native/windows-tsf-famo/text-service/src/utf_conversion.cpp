@@ -46,6 +46,25 @@ bool Utf8ToUtf16(std::string_view input, std::wstring *output) {
                              size) == size;
 }
 
+bool Utf16ToUtf8(std::wstring_view input, std::string *output) {
+  if (!output ||
+      input.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+    return false;
+  output->clear();
+  if (input.empty())
+    return true;
+  const int size = WideCharToMultiByte(
+      CP_UTF8, WC_ERR_INVALID_CHARS, input.data(),
+      static_cast<int>(input.size()), nullptr, 0, nullptr, nullptr);
+  if (size <= 0)
+    return false;
+  output->resize(static_cast<size_t>(size));
+  return WideCharToMultiByte(
+             CP_UTF8, WC_ERR_INVALID_CHARS, input.data(),
+             static_cast<int>(input.size()), output->data(), size, nullptr,
+             nullptr) == size;
+}
+
 bool Utf8PreeditToUtf16(std::string_view input, uint32_t selection_start,
                         uint32_t selection_end, uint32_t cursor,
                         Utf16Preedit *output) {

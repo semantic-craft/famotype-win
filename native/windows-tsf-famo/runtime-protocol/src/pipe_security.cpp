@@ -1,5 +1,6 @@
 #include "famo_pipe_security.h"
 
+#include <aclapi.h>
 #include <sddl.h>
 
 #include <cwctype>
@@ -52,10 +53,21 @@ bool SamePath(std::wstring_view left, std::wstring_view right) {
   return _wcsicmp(left_full.c_str(), right_full.c_str()) == 0;
 }
 
+// peer_unreadable is set only when the peer process cannot be inspected at
+// all. A refusal with an answer in hand -- wrong session, wrong image -- stays
+// a hard failure so it can never be mistaken for a sandbox restriction.
 bool VerifyProcess(DWORD pid, const PipeEndpoint &endpoint,
-                   std::wstring_view expected_path, std::string *error) {
+                   std::wstring_view expected_path, std::string *error,
+                   bool *peer_unreadable = nullptr) {
   DWORD session_id = 0;
   if (!ProcessIdToSessionId(pid, &session_id)) {
+    // An AppContainer host cannot query another process's session, and this is
+    // the first thing asked, so it denies the whole peer check before the
+    // image comparison is ever reached. The endpoint name the client opened
+    // already encodes its own user SID and session, so the caller's
+    // owner-based proof carries the guarantee this branch would have given.
+    if (GetLastError() == ERROR_ACCESS_DENIED && peer_unreadable)
+      *peer_unreadable = true;
     WinError("ProcessIdToSessionId", error);
     return false;
   }
@@ -71,6 +83,8 @@ bool VerifyProcess(DWORD pid, const PipeEndpoint &endpoint,
   UniqueHandle process(
       OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
   if (!process) {
+    if (GetLastError() == ERROR_ACCESS_DENIED && peer_unreadable)
+      *peer_unreadable = true;
     WinError("OpenProcess(peer)", error);
     return false;
   }
@@ -96,13 +110,50 @@ uint64_t FileTimeValue(const FILETIME &value) {
   return encoded.QuadPart;
 }
 
+// Proves the pipe object itself belongs to the expected user. The owner is
+// readable from the handle already held, so it needs no access to the peer
+// process. An AppContainer cannot create a pipe under this name, so a lesser
+// privileged squatter is still refused, and a pipe owned by any other user is
+// rejected outright.
+bool VerifyPipeOwner(HANDLE pipe, const PipeEndpoint &endpoint,
+                     std::string *error) {
+  PSID owner = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  const DWORD status =
+      GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION,
+                      &owner, nullptr, nullptr, nullptr, &descriptor);
+  if (status != ERROR_SUCCESS) {
+    SetLastError(status);
+    WinError("GetSecurityInfo(pipe owner)", error);
+    return false;
+  }
+  LPWSTR owner_text = nullptr;
+  const bool converted =
+      owner != nullptr && ConvertSidToStringSidW(owner, &owner_text) != FALSE;
+  const bool matches =
+      converted && endpoint.user_sid == std::wstring_view(owner_text);
+  if (owner_text)
+    LocalFree(owner_text);
+  if (descriptor)
+    LocalFree(descriptor);
+  if (!matches) {
+    if (error)
+      *error = "pipe owner is not the expected user";
+    SetLastError(ERROR_ACCESS_DENIED);
+  }
+  return matches;
+}
+
 bool ReadProcessIdentity(DWORD pid, PipeClientIdentity *identity,
-                         std::string *error) {
+                         std::string *error,
+                         bool *peer_unreadable = nullptr) {
   if (!identity)
     return true;
   UniqueHandle process(
       OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
   if (!process) {
+    if (GetLastError() == ERROR_ACCESS_DENIED && peer_unreadable)
+      *peer_unreadable = true;
     WinError("OpenProcess(client identity)", error);
     return false;
   }
@@ -183,8 +234,14 @@ bool BuildPipeSecurity(const PipeEndpoint &endpoint,
       *error = "invalid security descriptor arguments";
     return false;
   }
+  // AppContainer clients still carry the desktop user's SID, but Windows
+  // performs a second access check against their restricted SID set. Keep the
+  // existing per-user boundary and grant only pipe read/write to both modern
+  // application-package classes; without these ACEs, hosts such as SearchHost
+  // load the TIP but cannot open the out-of-process Runtime channel.
   const std::wstring sddl =
-      L"D:P(A;;GA;;;SY)(A;;GA;;;" + endpoint.user_sid + L")";
+      L"D:P(A;;GA;;;SY)(A;;GA;;;" + endpoint.user_sid +
+      L")(A;;GRGW;;;AC)(A;;GRGW;;;S-1-15-2-2)";
   if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
           sddl.c_str(), SDDL_REVISION_1, descriptor, nullptr)) {
     WinError("ConvertStringSecurityDescriptor", error);
@@ -204,8 +261,29 @@ bool VerifyPipeServer(HANDLE pipe, const PipeEndpoint &endpoint,
     WinError("GetNamedPipeServerProcessId", error);
     return false;
   }
-  return VerifyProcess(pid, endpoint, expected_path, error) &&
-         ReadProcessIdentity(pid, identity, error);
+  bool peer_unreadable = false;
+  if (VerifyProcess(pid, endpoint, expected_path, error, &peer_unreadable) &&
+      ReadProcessIdentity(pid, identity, error, &peer_unreadable)) {
+    return true;
+  }
+  // A host that runs in an AppContainer -- the Windows search surface and the
+  // shell input hosts do -- cannot open a medium integrity process, so the
+  // server's image path and creation time are unreadable from there and the
+  // checks above fail with ERROR_ACCESS_DENIED. Refusing the connection would
+  // leave those hosts with no engine at all: every key would pass through
+  // untranslated. Prove the peer a different way instead of dropping the
+  // requirement.
+  if (!peer_unreadable)
+    return false;
+  if (!VerifyPipeOwner(pipe, endpoint, error))
+    return false;
+  // The peer is the expected user's, but this host could not read the process
+  // identity that authenticates a cross-process candidate click. Leave it
+  // empty: an empty identity is falsy, so every capability that depends on it
+  // refuses rather than trusting an unauthenticated peer.
+  if (identity)
+    *identity = {};
+  return true;
 }
 
 bool VerifyPipeClient(HANDLE pipe, const PipeEndpoint &endpoint,

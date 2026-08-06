@@ -148,7 +148,11 @@ int RunChecks() {
   auto *element = new famo::tsf::CandidateUiElement(manager, nullptr);
   BOOL allowed = TRUE;
   CHECK(SUCCEEDED(element->Update(Snapshot(), &allowed)));
-  CHECK(element->begun() && !allowed && manager->begins == 1);
+  // UI-less hosts do not inspect contents during BeginUIElement. When they
+  // return FALSE to own presentation, the first UpdateUIElement is what tells
+  // them the candidate data is ready.
+  CHECK(element->begun() && !allowed && manager->begins == 1 &&
+        manager->updates == 1);
 
   DWORD flags = 0;
   UINT count = 0;
@@ -164,9 +168,19 @@ int RunChecks() {
 
   UINT page_count = 0;
   UINT pages[1]{};
+  // The documented discovery call uses a null buffer and size zero. Hosts
+  // treat S_OK as the contract success before allocating the page array.
+  CHECK(element->GetPageIndex(nullptr, 0, &page_count) == S_OK);
+  CHECK(page_count == 1);
   CHECK(SUCCEEDED(element->GetPageIndex(pages, 1, &page_count)));
   CHECK(page_count == 1 && pages[0] == 0);
-  CHECK(SUCCEEDED(element->Update(Snapshot())) && manager->updates == 1);
+  UINT split_pages[2]{0, 2};
+  CHECK(SUCCEEDED(element->SetPageIndex(split_pages, 2)));
+  UINT undersized = 99;
+  CHECK(element->GetPageIndex(&undersized, 1, &page_count) == E_INVALIDARG);
+  CHECK(page_count == 2 && undersized == 99);
+  CHECK(SUCCEEDED(element->SetPageIndex(pages, 1)));
+  CHECK(SUCCEEDED(element->Update(Snapshot())) && manager->updates == 2);
   famo::runtime::Composition empty;
   CHECK(SUCCEEDED(element->Update(empty)) && manager->ends == 1);
   CHECK(!element->begun());

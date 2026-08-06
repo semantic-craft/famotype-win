@@ -22,6 +22,8 @@ static_assert(noexcept(FamoSkinDefault()));
 static_assert(noexcept(FamoUtf8ByteToWchar(nullptr, 0, 0)));
 static_assert(noexcept(FamoComputeAnchor(
     nullptr, nullptr, {}, nullptr, nullptr, nullptr)));
+static_assert(noexcept(FamoComputeWindowAnchor(
+    nullptr, nullptr, {}, 0, nullptr, nullptr, nullptr)));
 static_assert(noexcept(FamoCandidateUiLayout(
     nullptr, nullptr, nullptr, nullptr)));
 static_assert(noexcept(FamoTextResourcesCreate(nullptr, 0)));
@@ -328,6 +330,63 @@ int RunFlip() {
   return 0;
 }
 
+int RunShadowWindowBounds() {
+  FamoSkin skin = FamoSkinDefault();
+  const FamoRect work = R(0, 0, 1920, 1080);
+  FamoCandidate candidate;
+  const Cand source[1] = {{"1", kNiHao, nullptr}};
+  FillCands(&candidate, source, 1);
+  FamoCompositionView view = MakeView(&candidate, 1, 0, 0, 1);
+
+  const FamoRect edge_carets[] = {
+      R(1918, 300, 1920, 320),
+      R(500, 1058, 502, 1078),
+  };
+  for (const FamoRect caret : edge_carets) {
+    FamoLayoutInput input = MakeInput(caret, work);
+    FamoLayoutResult output{};
+    CHECK(FamoCandidateUiLayout(&view, &skin, &input, &output) ==
+          FAMO_UI_OK);
+    CHECK(output.shadow_margin > 0);
+    const FamoRect window =
+        R(output.origin_x - output.shadow_margin,
+          output.origin_y - output.shadow_margin,
+          output.origin_x + output.content_size.cx + output.shadow_margin,
+          output.origin_y + output.content_size.cy + output.shadow_margin);
+    CHECK(Inside(window, work));
+  }
+
+  const FamoRect constrained_work = R(0, 0, 96, 64);
+  FamoLayoutInput constrained_input =
+      MakeInput(R(90, 40, 92, 60), constrained_work);
+  FamoLayoutResult constrained{};
+  CHECK(FamoCandidateUiLayout(&view, &skin, &constrained_input, &constrained) ==
+        FAMO_UI_OK);
+  const FamoRect constrained_window =
+      R(constrained.origin_x - constrained.shadow_margin,
+        constrained.origin_y - constrained.shadow_margin,
+        constrained.origin_x + constrained.content_size.cx +
+            constrained.shadow_margin,
+        constrained.origin_y + constrained.content_size.cy +
+            constrained.shadow_margin);
+  CHECK(Inside(constrained_window, constrained_work));
+  const FamoRect constrained_content =
+      R(0, 0, constrained.content_size.cx, constrained.content_size.cy);
+  const FamoRect constrained_regions[] = {
+      constrained.preedit,     constrained.aux,       constrained.highlight,
+      constrained.status_icon, constrained.prev_page, constrained.next_page,
+  };
+  for (const FamoRect region : constrained_regions)
+    CHECK(Inside(region, constrained_content));
+  CHECK(constrained.candidate_count == 1);
+  const FamoCandidateRects &laid = constrained.candidates[0];
+  CHECK(Inside(laid.bounds, constrained_content));
+  CHECK(Inside(laid.label, constrained_content));
+  CHECK(Inside(laid.text, constrained_content));
+  CHECK(Inside(laid.comment, constrained_content));
+  return 0;
+}
+
 int RunOffsetConversion() {
   // Pure helper: UTF-8 byte offset → UTF-16 wchar offset.
   // "你好": bytes 0,3,6 → wchars 0,1,2
@@ -599,6 +658,7 @@ int main() {
   if (RunFamily(FAMO_LAYOUT_HORIZONTAL)) return 1;
   if (RunFamily(FAMO_LAYOUT_VERTICAL_TEXT)) return 1;
   if (RunFlip()) return 1;
+  if (RunShadowWindowBounds()) return 1;
   if (RunOffsetConversion()) return 1;
   if (RunPreeditAndPreview()) return 1;
   if (RunLegacyCandidateAbi()) return 1;
