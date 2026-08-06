@@ -266,6 +266,7 @@ int wmain(int argc, wchar_t **argv) {
                ? 0
                : 10 + static_cast<int>(result.error);
   }
+#if defined(FAMO_STABLE_IDENTITY)
   if (endpoint_suffix == kDefaultRuntimeEndpointSuffix &&
       !ProductionInstallAllowed(ModuleDirectory(), true)) {
     AppendStartupDiagnostic(data_root, "install-state", 3,
@@ -273,6 +274,7 @@ int wmain(int argc, wchar_t **argv) {
     std::fprintf(stderr, "runtime install state is not active\n");
     return 3;
   }
+#endif
   const bool root_ready = CreateDirectoryW(data_root.c_str(), nullptr) != FALSE ||
                           GetLastError() == ERROR_ALREADY_EXISTS;
   // The primary accept pool must be able to service every logical client slot;
@@ -302,6 +304,7 @@ int wmain(int argc, wchar_t **argv) {
     return 0;
   }
 
+#if defined(FAMO_STABLE_IDENTITY)
   // #41: bounded TIP self-heal. A clean install starts this runtime while its
   // projection is still Activating, so a one-shot Ready check can permanently
   // miss the transition. Wait only while this exact target remains Activating;
@@ -358,6 +361,7 @@ int wmain(int argc, wchar_t **argv) {
                               "settled exit=" +
                                   std::to_string(settled_result));
   }).detach();
+#endif
 
   CandidateWindow candidate_window;
   if (!candidate_window.Start()) {

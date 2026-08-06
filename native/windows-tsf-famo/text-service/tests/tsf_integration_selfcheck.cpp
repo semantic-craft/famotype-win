@@ -52,6 +52,32 @@ private:
   std::string name_;
 };
 
+class ScopedNeutralLetterKeyboardState {
+public:
+  ScopedNeutralLetterKeyboardState() {
+    captured_ = GetKeyboardState(original_) != FALSE;
+    if (!captured_)
+      return;
+    BYTE neutral[256]{};
+    CopyMemory(neutral, original_, sizeof(neutral));
+    neutral[VK_SHIFT] = 0;
+    neutral[VK_LSHIFT] = 0;
+    neutral[VK_RSHIFT] = 0;
+    neutral[VK_CAPITAL] &= static_cast<BYTE>(~1u);
+    applied_ = SetKeyboardState(neutral) != FALSE;
+  }
+  ~ScopedNeutralLetterKeyboardState() {
+    if (applied_)
+      SetKeyboardState(original_);
+  }
+  explicit operator bool() const { return captured_ && applied_; }
+
+private:
+  BYTE original_[256]{};
+  bool captured_ = false;
+  bool applied_ = false;
+};
+
 class ScopedDpiAwareness {
 public:
   explicit ScopedDpiAwareness(DPI_AWARENESS_CONTEXT awareness)
@@ -1294,6 +1320,8 @@ bool InlinePreeditPreservesUtf16Selection(TextServiceModule *module,
 
 bool PhysicalSelectionKeysAreInterpretedByEngine(
     TextServiceModule *module, const wchar_t *runtime_path) {
+  ScopedNeutralLetterKeyboardState keyboard;
+  CHECK(keyboard);
   ScopedEnvironment select_keys("FAMO_TEST_SELECT_KEYS", "j0123456789");
   RuntimeProcess runtime;
   CHECK(runtime.Start(runtime_path));
