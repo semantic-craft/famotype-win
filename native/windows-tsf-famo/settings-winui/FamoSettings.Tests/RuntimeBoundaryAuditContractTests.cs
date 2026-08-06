@@ -155,6 +155,9 @@ public sealed class RuntimeBoundaryAuditContractTests
         string runtime = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"))
             .ReplaceLineEndings("\n");
+        string tsf = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/text-service/src/text_service.cpp"))
+            .ReplaceLineEndings("\n");
 
         int startupGuard = runtime.IndexOf(
             "#if defined(FAMO_STABLE_IDENTITY)\n  if (endpoint_suffix",
@@ -186,6 +189,28 @@ public sealed class RuntimeBoundaryAuditContractTests
         Assert.True(healGuard > singleton && healThread > healGuard &&
             healEnd > healThread,
             "Development Runtime must not run production TIP self-heal");
+
+        int bridgeGuard = tsf.IndexOf(
+            "#if defined(FAMO_STABLE_IDENTITY)\n"
+            + "  if (runtime_executable_name_ == L\"FamoRuntime.exe\")",
+            StringComparison.Ordinal);
+        Assert.True(bridgeGuard >= 0,
+            "production Runtime resolution must have an identity guard");
+        int productionProjection = tsf.IndexOf(
+            "ResolveProductionRuntime(&expected)", bridgeGuard,
+            StringComparison.Ordinal);
+        int developmentBranch = tsf.IndexOf("#else", productionProjection,
+            StringComparison.Ordinal);
+        int adjacentRuntime = tsf.IndexOf(
+            "expected = ModuleDirectory() + L\"\\\\\" + runtime_executable_name_",
+            developmentBranch, StringComparison.Ordinal);
+        int bridgeEnd = tsf.IndexOf("#endif", developmentBranch,
+            StringComparison.Ordinal);
+        Assert.True(productionProjection > bridgeGuard &&
+            developmentBranch > productionProjection &&
+            adjacentRuntime > developmentBranch && bridgeEnd > adjacentRuntime,
+            "Development Bridge must accept only its adjacent Runtime instead of "
+            + "resolving the Stable install projection");
     }
 
     private static string RepoFile(string relativePath)
