@@ -18,9 +18,28 @@ using famo::runtime::Correlation;
 using famo::tsf::ContextPhase;
 using famo::tsf::ContextState;
 using famo::tsf::HostKey;
+using famo::tsf::NormalizeLayoutCaret;
 using famo::tsf::RequestKind;
 
 namespace {
+
+bool LayoutGeometryIsNormalizedAtTheHostSeam() {
+  using famo::runtime::UiRect;
+  const UiRect view{1658, 1938, 2727, 2004};
+  const auto valid =
+      NormalizeLayoutCaret({1658, 1939, 1659, 1967}, view, false);
+  CHECK(valid && valid->left == 1658 && valid->right == 1659 &&
+        valid->top == 1939 && valid->bottom == 1967);
+
+  const auto clipped =
+      NormalizeLayoutCaret({1657, 1939, 1659, 1967}, view, false);
+  CHECK(clipped && clipped->left == view.left && clipped->right == 1659);
+  CHECK(!NormalizeLayoutCaret({1656, 1939, 1657, 1967}, view, true));
+  CHECK(!NormalizeLayoutCaret({2913, 1889, 3890, 2131}, view, false));
+  CHECK(!NormalizeLayoutCaret({0, 0, 0, 0}, view, false));
+  CHECK(!NormalizeLayoutCaret({1, 1, 1, 2}, {0, 0, 0, 0}, false));
+  return true;
+}
 
 Correlation Identity(uint64_t session) {
   return {10, 20, 30, session, 40 + session, 0};
@@ -201,6 +220,14 @@ bool UtfConversionIsStrict() {
   CHECK(output == L"\u4f60\u597d");
   CHECK(!famo::tsf::Utf8ToUtf16("\xff", &output));
 
+  std::string utf8;
+  CHECK(famo::tsf::Utf16ToUtf8(L"nihao", &utf8) && utf8 == "nihao");
+  CHECK(famo::tsf::Utf16ToUtf8(L"\u4f60\u597d", &utf8) &&
+        utf8 == "\xe4\xbd\xa0\xe5\xa5\xbd");
+  const std::wstring unpaired_surrogate(
+      1, static_cast<wchar_t>(0xd800));
+  CHECK(!famo::tsf::Utf16ToUtf8(unpaired_surrogate, &utf8));
+
   famo::tsf::Utf16Preedit preedit;
   CHECK(famo::tsf::Utf8PreeditToUtf16("abcd", 0, 0, 2, &preedit));
   CHECK(preedit.selection_start == 0 && preedit.selection_end == 0 &&
@@ -222,7 +249,8 @@ bool UtfConversionIsStrict() {
 } // namespace
 
 int main() {
-  if (!PureTestAndExactlyOnce() || !DigitCanStartSchemaInput() ||
+  if (!LayoutGeometryIsNormalizedAtTheHostSeam() ||
+      !PureTestAndExactlyOnce() || !DigitCanStartSchemaInput() ||
       !SecurityUiStateCanPassPendingComposition() ||
       !CandidateAndCorrelation() ||
       !FailureLatchesRecovery() || !ContextsAndGenerationAreIndependent() ||

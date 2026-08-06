@@ -32,6 +32,13 @@ struct RecoveryPlan {
   std::optional<std::string> commit_preedit;
 };
 
+// TSF geometry is converted to physical screen coordinates before crossing
+// into Runtime. This seam rejects stale/off-view rectangles and clamps the
+// small edge discrepancies produced by clipped host layouts.
+std::optional<runtime::UiRect>
+NormalizeLayoutCaret(runtime::UiRect caret,
+                     const runtime::UiRect &view_bounds, bool clipped);
+
 class ContextState {
 public:
   void Open(const runtime::Correlation &session_identity);

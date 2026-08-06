@@ -103,6 +103,7 @@ if(TARGET FamoRimeEngine)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../famo-candidate-ui
                    ${CMAKE_CURRENT_BINARY_DIR}/famo-candidate-ui)
   add_library(famo_candidate_window STATIC
+    src/candidate_automation.cpp
     src/candidate_window.cpp
     src/candidate_skin.cpp
     src/status_ui.cpp
@@ -114,7 +115,7 @@ if(TARGET FamoRimeEngine)
   endif()
   target_link_libraries(famo_candidate_window PUBLIC
     famo_runtime_core famo_candidate_ui
-    d2d1 dwrite gdiplus gdi32 user32 ole32 shell32)
+    d2d1 dwrite gdiplus gdi32 user32 ole32 shell32 uiautomationcore)
 
   add_executable(FamoRuntime src/runtime_main.cpp)
   target_link_libraries(FamoRuntime PRIVATE famo_candidate_window)

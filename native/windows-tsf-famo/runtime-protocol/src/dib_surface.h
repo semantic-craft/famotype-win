@@ -91,7 +91,9 @@ inline bool SubmitLayered(HWND window, const DibSurface &surface, int x,
   ReleaseDC(nullptr, screen);
   if (!updated)
     return false;
-  return SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+  const HWND insert_after = GetWindow(window, GW_OWNER) ? HWND_TOP
+                                                        : HWND_TOPMOST;
+  return SetWindowPos(window, insert_after, 0, 0, 0, 0,
                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
                           SWP_SHOWWINDOW) != FALSE;
 }

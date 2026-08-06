@@ -12,7 +12,18 @@ namespace {
 
 bool KnownCommand(uint16_t value) {
   return value >= static_cast<uint16_t>(Command::Hello) &&
-         value <= static_cast<uint16_t>(Command::AbandonSession);
+         value <= static_cast<uint16_t>(Command::GetStyleOverlay);
+}
+
+bool CommandSupported(Command command, uint16_t wire_version) {
+  switch (command) {
+  case Command::SearchCandidates:
+    return wire_version >= 4;
+  case Command::GetStyleOverlay:
+    return wire_version >= 5;
+  default:
+    return true;
+  }
 }
 
 bool KnownStatus(uint32_t value) {
@@ -129,6 +140,7 @@ bool EncodeFrame(const Frame &frame, std::vector<uint8_t> *bytes,
                  std::string *error) noexcept {
   return ProtocolBoundary(error, [&] {
   if (!bytes || !KnownCommand(static_cast<uint16_t>(frame.command)) ||
+      !CommandSupported(frame.command, frame.wire_version) ||
       !KnownStatus(static_cast<uint32_t>(frame.status)) ||
       (frame.flags & ~(kFlagResponse | kFlagAcknowledgePrevious)) != 0 ||
       frame.wire_version < kMinSupportedProtocolVersion ||
@@ -193,7 +205,9 @@ bool DecodeFrame(std::span<const uint8_t> bytes, Frame *frame,
       *error = "truncated fixed header";
     return false;
   }
-  if (!KnownCommand(command) || !KnownStatus(status) ||
+  if (!KnownCommand(command) ||
+      !CommandSupported(static_cast<Command>(command), version) ||
+      !KnownStatus(status) ||
       (flags & ~(kFlagResponse | kFlagAcknowledgePrevious)) != 0 ||
       reserved != 0) {
     if (error)
@@ -376,6 +390,155 @@ bool DecodeOpenSession(std::span<const uint8_t> payload, std::string *schema,
     return false;
   *schema = std::move(decoded);
   return true;
+  });
+}
+
+bool EncodeSearchQuery(std::string_view query,
+                       std::vector<uint8_t> *payload,
+                       std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!payload || query.empty() || query.size() > kMaxSearchQueryBytes ||
+        !IsValidUtf8(query)) {
+      if (error)
+        *error = "invalid search query";
+      return false;
+    }
+    Writer writer;
+    if (!writer.String(query, error))
+      return false;
+    *payload = writer.Take();
+    return true;
+  });
+}
+
+bool DecodeSearchQuery(std::span<const uint8_t> payload, std::string *query,
+                       std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!query) {
+      if (error)
+        *error = "search query target is required";
+      return false;
+    }
+    Reader reader(payload);
+    std::string decoded;
+    if (!reader.String(decoded, error) || !Finish(reader, error) ||
+        decoded.empty() || decoded.size() > kMaxSearchQueryBytes) {
+      if (error && error->empty())
+        *error = "invalid search query";
+      return false;
+    }
+    *query = std::move(decoded);
+    return true;
+  });
+}
+
+bool EncodeStyleOverlay(std::string_view text, bool exists,
+                        std::vector<uint8_t> *payload,
+                        std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!payload || text.size() > kMaxStringBytes ||
+        (!exists && !text.empty()) || !IsValidUtf8(text)) {
+      if (error)
+        *error = "invalid style overlay";
+      return false;
+    }
+    Writer writer;
+    writer.U8(exists ? 1 : 0);
+    if (!writer.String(text, error))
+      return false;
+    *payload = writer.Take();
+    return true;
+  });
+}
+
+bool DecodeStyleOverlay(std::span<const uint8_t> payload, std::string *text,
+                        bool *exists, std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!text || !exists) {
+      if (error)
+        *error = "style overlay targets are required";
+      return false;
+    }
+    Reader reader(payload);
+    uint8_t present = 0;
+    std::string decoded;
+    if (!reader.U8(&present) || present > 1 ||
+        !reader.String(decoded, error) || !Finish(reader, error) ||
+        decoded.size() > kMaxStringBytes ||
+        (present == 0 && !decoded.empty())) {
+      if (error && error->empty())
+        *error = "invalid style overlay";
+      return false;
+    }
+    *exists = present == 1;
+    *text = std::move(decoded);
+    return true;
+  });
+}
+
+bool EncodeSearchCandidates(std::span<const std::string> candidates,
+                            std::vector<uint8_t> *payload,
+                            std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!payload || candidates.size() > kMaxSearchCandidateCount) {
+      if (error)
+        *error = "invalid search candidate count";
+      return false;
+    }
+    size_t encoded_size = sizeof(uint32_t);
+    for (const std::string &candidate : candidates) {
+      if (candidate.empty() || candidate.size() > kMaxStringBytes ||
+          !IsValidUtf8(candidate) || encoded_size > kMaxFramePayloadSize ||
+          candidate.size() + sizeof(uint32_t) >
+              kMaxFramePayloadSize - encoded_size) {
+        if (error)
+          *error = "invalid search candidate";
+        return false;
+      }
+      encoded_size += sizeof(uint32_t) + candidate.size();
+    }
+    Writer writer;
+    writer.U32(static_cast<uint32_t>(candidates.size()));
+    for (const std::string &candidate : candidates) {
+      if (!writer.String(candidate, error))
+        return false;
+    }
+    *payload = writer.Take();
+    return true;
+  });
+}
+
+bool DecodeSearchCandidates(std::span<const uint8_t> payload,
+                            std::vector<std::string> *candidates,
+                            std::string *error) noexcept {
+  return ProtocolBoundary(error, [&] {
+    if (!candidates) {
+      if (error)
+        *error = "search candidate target is required";
+      return false;
+    }
+    Reader reader(payload);
+    uint32_t count = 0;
+    if (!reader.U32(&count) || count > kMaxSearchCandidateCount) {
+      if (error)
+        *error = "invalid search candidate count";
+      return false;
+    }
+    std::vector<std::string> decoded;
+    decoded.reserve(count);
+    for (uint32_t index = 0; index < count; ++index) {
+      std::string candidate;
+      if (!reader.String(candidate, error) || candidate.empty()) {
+        if (error && error->empty())
+          *error = "invalid search candidate";
+        return false;
+      }
+      decoded.push_back(std::move(candidate));
+    }
+    if (!Finish(reader, error))
+      return false;
+    *candidates = std::move(decoded);
+    return true;
   });
 }
 

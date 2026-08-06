@@ -132,6 +132,21 @@ extern "C" BOOL STDAPICALLTYPE FamoGetPreviewSelectionStateForTest(
   });
 }
 
+extern "C" BOOL STDAPICALLTYPE
+FamoGetUiStateForTest(ITfTextInputProcessorEx *object, ITfContext *context,
+                      famo::runtime::UiState *state) {
+  if (state)
+    *state = {};
+  if (!object || !context || !state)
+    return FALSE;
+  return famo::tsf::BoundaryOr<BOOL>(FALSE, [&] {
+    return static_cast<famo::tsf::TextService *>(object)->UiStateForTest(
+               context, state)
+               ? TRUE
+               : FALSE;
+  });
+}
+
 extern "C" uint32_t STDAPICALLTYPE
 FamoGetTerminalCleanupConnectAttemptsForTest() {
   return famo::tsf::TerminalCleanupConnectAttemptsForTest();

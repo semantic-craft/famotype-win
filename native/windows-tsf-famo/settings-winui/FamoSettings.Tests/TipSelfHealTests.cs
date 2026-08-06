@@ -166,30 +166,120 @@ public sealed class TipSelfHealTests
             "self-heal must come after the --demo-appearance headless early return");
     }
 
-    // ── Runtime 接线：单例之后、Ready-only 门（allow_activating=false）、
-    //    探针在前修复在后、后台线程不阻塞启动 ──
+    // ── Runtime 接线：安装期可在 Activating 启动，但必须有界等到 Ready，
+    //    立即委托一次后还要跨过安装结束时的 Windows 输入源重整窗口再复查；
+    //    两次都复用共享 helper，不能复制第三套探针/修复循环 ──
 
     [Fact]
-    public void RuntimeStartup_GatesSelfHealReadyOnlyOffStartupThread()
+    public void RuntimeStartup_RechecksAfterReadySettles()
     {
         string main = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
+        string program = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings/Program.cs"));
 
-        // 启动门是 allow_activating=true（232 行既有语义）；自愈门必须显式收紧为 false。
-        Assert.Contains("ProductionInstallAllowed(ModuleDirectory(), false)", main);
-        int probe = main.IndexOf("--is-input-tip", StringComparison.Ordinal);
-        int repair = main.IndexOf("--add-input-tip", StringComparison.Ordinal);
-        Assert.True(probe >= 0 && repair > probe,
-            "runtime self-heal must probe before repairing");
-        // 只有拿到单例的主 runtime 自愈，且在后台线程上。
         int singleton = main.IndexOf("ERROR_ALREADY_EXISTS", StringComparison.Ordinal);
-        int heal = main.IndexOf("ProductionInstallAllowed(ModuleDirectory(), false)",
+        int activating = main.IndexOf(
+            "ProductionInstallAllowed(ModuleDirectory(), true)",
+            singleton,
             StringComparison.Ordinal);
-        Assert.True(singleton >= 0 && heal > singleton,
-            "self-heal must run only in the runtime that owns the singleton");
+        Assert.True(singleton >= 0 && activating > singleton,
+            "the singleton runtime must recognize only its own Activating projection while it waits");
+        int ready = main.IndexOf(
+            "ProductionInstallAllowed(ModuleDirectory(), false)",
+            activating,
+            StringComparison.Ordinal);
+        Assert.True(ready > activating,
+            "the runtime must not delegate until the projection reaches Ready");
+        int delegated = main.IndexOf("--tip-self-heal", ready,
+            StringComparison.Ordinal);
+        Assert.True(
+            ready < delegated,
+            "the singleton runtime must wait through its own Activating projection, then delegate only after Ready");
+        int settledReady = main.IndexOf(
+            "ProductionInstallAllowed(ModuleDirectory(), false)",
+            delegated,
+            StringComparison.Ordinal);
+        int redelegated = main.IndexOf(
+            "--tip-self-heal",
+            delegated + 1,
+            StringComparison.Ordinal);
+        Assert.True(settledReady > delegated && redelegated > settledReady,
+            "the runtime must remain Ready through a bounded post-install settling window, then delegate a second time");
+        Assert.Contains("kTipSelfHealReadyAttempts", main);
+        Assert.Contains("kTipSelfHealPostReadyAttempts", main);
+        Assert.Contains("kTipSelfHealPostReadyDelayMs", main);
         Assert.Contains(".detach()", main);
-        // 结果走既有启动诊断日志（无用户文本）。
         Assert.Contains("tip-selfheal", main);
+        Assert.DoesNotContain("--is-input-tip", main);
+        Assert.DoesNotContain("--add-input-tip", main);
+
+        int dispatch = program.IndexOf(
+            "HasFlag(args, \"--tip-self-heal\")",
+            StringComparison.Ordinal);
+        int xaml = program.IndexOf(
+            "WinRT.ComWrappersSupport.InitializeComWrappers",
+            StringComparison.Ordinal);
+        Assert.True(dispatch >= 0 && dispatch < xaml,
+            "runtime self-heal must stay in the headless path");
+        Assert.Contains("TipSelfHeal.RunAtStartup(\"runtime\")", program);
+    }
+
+    // ── 两条用户级事实：在列表里，且 profile 已启用 ──
+
+    [Fact]
+    public void SelfHeal_HealsBothListMembershipAndTheProfileEnableBit()
+    {
+        string selfHeal = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings.Core/TipSelfHeal.cs"));
+        string registration = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/text-service/src/registration.cpp"));
+
+        // Machine registration must keep leaving the user's enable bit alone:
+        // the installer is elevated, so EnableLanguageProfile there would write
+        // the administrator's HKCU rather than the user's.
+        Assert.Contains("RegisterTsfProfile(false)", registration);
+        Assert.Contains("if (enable_current_user) {", registration);
+
+        // Which makes the per-user self-heal the only thing that can set it.
+        Assert.Contains("TryIsFamoProfileEnabled", selfHeal);
+        Assert.Contains("EnsureFamoProfileEnabled", selfHeal);
+        Assert.Contains("TryIsFamoInUserList", selfHeal);
+        Assert.Contains("EnsureFamoInUserList", selfHeal);
+    }
+
+    [Fact]
+    public void Run_ReadyAndListedButDisabled_RepairsBeforeReportingHealthy()
+    {
+        // A machine that is registered and listed but disabled looks installed
+        // and does not type. The probe has to fail for it and the repair has to
+        // clear it.
+        bool enabled = false;
+        int repairs = 0;
+
+        TipSelfHealOutcome outcome = TipSelfHeal.Run(
+            readInstallState: () => "Ready",
+            isPresent: () => enabled,
+            repair: () => { repairs++; enabled = true; return true; },
+            delay: _ => { });
+
+        Assert.Equal(TipSelfHealOutcome.Repaired, outcome);
+        Assert.Equal(1, repairs);
+    }
+
+    [Fact]
+    public void SelfHeal_SkippedInstallState_IsWrittenToTheLog()
+    {
+        string selfHeal = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/settings-winui/FamoSettings.Core/TipSelfHeal.cs"));
+        string main = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp"));
+
+        // Both ways of declining to heal were silent, so an install that left
+        // the profile disabled produced no trace anywhere.
+        Assert.Contains("TipSelfHealOutcome.SkippedInstallState", selfHeal);
+        Assert.Contains("skipped, InstallState=", selfHeal);
+        Assert.Contains("install not in an allowed state", main);
     }
 
     private static string RepoFile(string relativePath)

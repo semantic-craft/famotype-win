@@ -32,15 +32,39 @@ public static class TipSelfHeal
     {
         try
         {
+            // Two per-user facts, not one. Machine registration deliberately
+            // leaves the profile's enable bit alone because the installer runs
+            // elevated and EnableLanguageProfile would write the administrator's
+            // HKCU instead of the real user's. A machine that is registered and
+            // listed but disabled looks installed and does not type, so both
+            // have to be healed here.
             TipSelfHealOutcome outcome = Run(
                 readInstallState: ReadInstallState,
                 isPresent: () =>
-                    InputMethodList.TryIsFamoInUserList(out bool present) && present,
-                repair: () => InputMethodList.EnsureFamoInUserList(),
+                    InputMethodList.TryIsFamoInUserList(out bool present) &&
+                    present &&
+                    InputMethodList.TryIsFamoProfileEnabled(out bool enabled) &&
+                    enabled,
+                repair: () =>
+                {
+                    bool listed = InputMethodList.EnsureFamoInUserList();
+                    bool enabled = InputMethodList.EnsureFamoProfileEnabled();
+                    return listed || enabled;
+                },
                 delay: Thread.Sleep);
             if (outcome is TipSelfHealOutcome.Repaired or TipSelfHealOutcome.Failed)
             {
                 FamoLog.Append($"tip self-heal ({source}): {outcome}");
+            }
+            else if (outcome is TipSelfHealOutcome.SkippedInstallState)
+            {
+                // A skip and a healthy run were both silent, so an install that
+                // left the profile disabled produced no trace at all. The state
+                // that caused the skip is the whole diagnosis, and this costs
+                // one line per runtime start.
+                FamoLog.Append(
+                    $"tip self-heal ({source}): skipped, InstallState=" +
+                    (ReadInstallState() ?? "<absent>"));
             }
             return outcome;
         }

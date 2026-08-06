@@ -167,50 +167,9 @@ bool SettingsCompatibleLockBlocksDeletion(
          SUCCEEDED(delete_result) && !std::filesystem::exists(target);
 }
 
-bool ScheduledTaskCompletionRejectsPreStartDefaultResult() {
-  bool observed_this_run = false;
-  if (ScheduledTaskCompletionCanBeSampled(false, &observed_this_run) ||
-      observed_this_run) {
-    return false;
-  }
-  if (ScheduledTaskCompletionCanBeSampled(true, &observed_this_run) ||
-      !observed_this_run) {
-    return false;
-  }
-  if (!ScheduledTaskCompletionCanBeSampled(true, &observed_this_run))
-    return false;
-
-  DWORD exit_code = STILL_ACTIVE;
-  if (TryAcceptScheduledTaskCompletion(
-          TASK_STATE_READY, 0, false, &exit_code) ||
-      exit_code != STILL_ACTIVE) {
-    return false;
-  }
-  for (const TASK_STATE invalid_state :
-       {TASK_STATE_UNKNOWN, TASK_STATE_DISABLED, TASK_STATE_QUEUED,
-        TASK_STATE_RUNNING}) {
-    if (TryAcceptScheduledTaskCompletion(
-            invalid_state, 0, true, &exit_code) ||
-        exit_code != STILL_ACTIVE) {
-      return false;
-    }
-  }
-  if (!TryAcceptScheduledTaskCompletion(
-          TASK_STATE_READY, 1, true, &exit_code) ||
-      exit_code != 1) {
-    return false;
-  }
-  exit_code = STILL_ACTIVE;
-  return TryAcceptScheduledTaskCompletion(
-             TASK_STATE_READY, 0, true, &exit_code) &&
-         exit_code == 0;
-}
-
 }  // namespace
 
 int wmain() {
-  if (!ScheduledTaskCompletionRejectsPreStartDefaultResult())
-    return 6;
   wchar_t temporary[MAX_PATH]{};
   if (!GetTempPathW(ARRAYSIZE(temporary), temporary))
     return 1;

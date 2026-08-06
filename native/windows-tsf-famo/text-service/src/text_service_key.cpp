@@ -9,6 +9,7 @@ namespace famo::tsf {
 
 namespace {
 
+
 constexpr uint32_t kRimeBackSpace = 0xff08;
 constexpr uint32_t kRimeTab = 0xff09;
 constexpr uint32_t kRimeReturn = 0xff0d;
@@ -224,8 +225,12 @@ HRESULT TextService::ApplyRuntimeComposition(
 
 std::string_view TextService::HostInlinePreedit(
     const runtime::Composition &composition) noexcept {
-  if ((composition.state_flags & runtime::kHostInlinePreedit) == 0)
-    return {};
+  // The host composition is not a display preference: it is the only thing a
+  // conforming text store can measure. Hosts answer ITfContextView::GetTextExt
+  // from laid-out text, so a TIP that writes nothing leaves them with an empty
+  // range and no caret geometry, and the candidate window can never be placed.
+  // The composition is therefore always maintained; kHostInlinePreedit no
+  // longer suppresses it.
   if ((composition.state_flags & runtime::kHostCandidatePreview) != 0 &&
       !composition.commit_preview.empty()) {
     return composition.commit_preview;
@@ -269,19 +274,26 @@ bool TextService::HandlePreviewSelection(
   if (!OnActivationThread() || !source_window || !IsWindow(source_window) ||
       selection.reserved != 0)
     return false;
+  DWORD source_process_id = 0;
+  if (GetWindowThreadProcessId(source_window, &source_process_id) == 0)
+    return false;
+  const bool in_process_source = source_process_id == GetCurrentProcessId();
   const runtime::PipeClientIdentity runtime_identity =
       runtime_port_.server_identity();
   ScopedKernelHandle runtime_process(
-      runtime::AcquirePipeClientIdentityLease(runtime_identity));
-  DWORD source_process_id = 0;
-  if (!runtime_process ||
-      GetWindowThreadProcessId(source_window, &source_process_id) == 0 ||
-      source_process_id != runtime_identity.process_id) {
+      in_process_source
+          ? nullptr
+          : runtime::AcquirePipeClientIdentityLease(runtime_identity));
+  if (!in_process_source &&
+      (!runtime_process || source_process_id != runtime_identity.process_id)) {
     return false;
   }
   ContextEntry *entry = nullptr;
   for (auto &owned : contexts_) {
     if (!owned->close_requested && owned->ui_state.focused &&
+        (!in_process_source ||
+         (owned->candidate_owner &&
+          GetWindow(source_window, GW_OWNER) == owned->candidate_owner)) &&
         SameSession(owned->state.session_identity(), selection.correlation) &&
         owned->selection_capability_sequence ==
             selection.composition_sequence &&
@@ -304,11 +316,27 @@ bool TextService::HandlePreviewSelection(
   (void)RenewSelectionCapability(entry, 0);
 
   runtime::Frame request;
-  request.command = runtime::Command::SelectCandidateAbsolute;
   request.correlation = *correlation;
-  if (!runtime::EncodeAbsoluteCandidateSelection(
-          selection.absolute_index, selection.composition_sequence,
-          &request.payload)) {
+  const runtime::Composition &displayed = entry->state.displayed();
+  const uint64_t page_start =
+      static_cast<uint64_t>(displayed.page_index) * displayed.page_size;
+  const uint64_t page_end = page_start + displayed.candidates.size();
+  const bool current_page =
+      displayed.page_size != 0 && selection.absolute_index >= page_start &&
+      selection.absolute_index < page_end;
+  bool encoded = false;
+  if (in_process_source && current_page) {
+    request.command = runtime::Command::SelectCandidate;
+    encoded = runtime::EncodeCandidateIndex(
+        static_cast<uint32_t>(selection.absolute_index - page_start),
+        &request.payload);
+  } else {
+    request.command = runtime::Command::SelectCandidateAbsolute;
+    encoded = runtime::EncodeAbsoluteCandidateSelection(
+        selection.absolute_index, selection.composition_sequence,
+        &request.payload);
+  }
+  if (!encoded) {
     entry->state.CompleteUnhandled();
     return false;
   }
@@ -427,8 +455,9 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
   ApplyDeliveryResult();
   ApplySessionResult();
   entry = FindContext(context);
-  if (!entry)
+  if (!entry) {
     return S_OK;
+  }
   ReconcileKeyboardSecurity(entry, KeyboardDisabled(context));
   if (entry->keyboard_security != KeyboardSecurityState::Enabled) {
     if (entry->keyboard_security == KeyboardSecurityState::Closing)
@@ -480,6 +509,10 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
   if (attempt.state == DeliveryAttemptState::Rejected) {
     entry->state.CompleteUnhandled();
     entry->composition.ObserveUnhandledKey(key, down);
+    // Deploy can retire this logical session while an editor remains focused,
+    // so no later TSF focus callback is guaranteed to reopen it.
+    if (attempt.status == runtime::Status::StaleRequest)
+      RecoverConnection();
     return S_OK;
   }
   if (attempt.state == DeliveryAttemptState::PrepareUnknown) {
@@ -596,8 +629,11 @@ void TextService::UpdateCandidates(
     entry->ui_state.show_allowed = false;
     return;
   }
+  if (entry->layout_sink_cookie == TF_INVALID_COOKIE)
+    RefreshLayout(entry, nullptr);
   BOOL show_allowed = FALSE;
-  if (FAILED(entry->candidates->Update(composition, &show_allowed))) {
+  const HRESULT updated = entry->candidates->Update(composition, &show_allowed);
+  if (FAILED(updated)) {
     entry->candidates->End();
     show_allowed = FALSE;
   }

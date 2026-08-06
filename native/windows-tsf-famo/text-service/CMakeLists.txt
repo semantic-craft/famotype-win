@@ -8,7 +8,7 @@ endif()
 set(FAMO_IDENTITY "Development" CACHE STRING
     "Compile-time identity set: Development or Stable")
 set_property(CACHE FAMO_IDENTITY PROPERTY STRINGS Development Stable)
-set(FAMO_BRIDGE_ABI "4" CACHE STRING
+set(FAMO_BRIDGE_ABI "13" CACHE STRING
     "Stable in-process TSF Bridge ABI; bump only for a Bridge release")
 if(NOT FAMO_BRIDGE_ABI MATCHES "^[1-9][0-9]*$")
   message(FATAL_ERROR "FAMO_BRIDGE_ABI must be a positive integer")
@@ -61,9 +61,11 @@ configure_file(
 add_library(FamoTextService SHARED
   src/candidate_ui_element.cpp
   src/composition_controller.cpp
+  src/display_attribute.cpp
   src/dll_module.cpp
   src/module_state.cpp
   src/registration.cpp
+  src/search_candidate_list.cpp
   src/text_service.cpp
   src/text_service_key.cpp
   src/text_service_ui.cpp
@@ -75,7 +77,8 @@ target_compile_definitions(FamoTextService PRIVATE
   WIN32_LEAN_AND_MEAN
   FAMO_BRIDGE_ABI_VERSION=${FAMO_BRIDGE_ABI})
 target_link_libraries(FamoTextService PRIVATE
-  famo_tsf_host_model famo_runtime_core ole32 oleaut32 advapi32 bcrypt)
+  famo_tsf_host_model famo_runtime_core famo_candidate_window
+  ole32 oleaut32 advapi32 bcrypt)
 set_target_properties(FamoTextService PROPERTIES PREFIX "")
 add_dependencies(FamoTextService FamoTestRuntime FamoTestEngine)
 add_custom_command(TARGET FamoTextService POST_BUILD
@@ -104,7 +107,7 @@ target_include_directories(${FAMO_PROFILE_TOOL} PRIVATE
   src ${CMAKE_CURRENT_SOURCE_DIR}/../runtime-protocol/include)
 target_compile_definitions(${FAMO_PROFILE_TOOL} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(${FAMO_PROFILE_TOOL} PRIVATE
-  ole32 oleaut32 advapi32 Rstrtmgr shell32 taskschd ntdll)
+  ole32 advapi32 Rstrtmgr shell32 ntdll userenv)
 add_dependencies(${FAMO_PROFILE_TOOL} FamoTextService)
 add_custom_command(TARGET ${FAMO_PROFILE_TOOL} POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different

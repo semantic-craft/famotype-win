@@ -32,6 +32,13 @@ struct RuntimeSnapshot {
   // published. It stays outside UiState because it is local process metadata,
   // not part of the v2 TSF-to-Runtime wire snapshot.
   uintptr_t source_window = 0;
+  // Same-process message-only target used by the in-process TSF presenter.
+  // The standalone Runtime presenter leaves this null and authenticates the
+  // owning TSF process through selection_owner instead.
+  HWND selection_target = nullptr;
+  // The in-process presenter must never fall back to an unowned foreground
+  // popup when ITfContextView::GetWnd cannot provide an owner.
+  bool require_in_process_owner = false;
   // Exact authenticated TSF process that owns the message-only selection
   // target. CandidateWindow never routes a capability to a same-name window
   // owned by another process.
@@ -244,6 +251,11 @@ private:
                        const PipeClientIdentity *owner = nullptr);
   Frame DispatchSessionCommand(const Frame &request, const SessionKey &key,
                                Session &session);
+  Frame DispatchSearchCandidatesLocked(const Frame &request);
+  Frame DispatchStyleOverlayLocked(const Frame &request);
+  static std::vector<std::string>
+  FilterSearchCandidates(std::span<const Candidate> candidates,
+                         std::string_view query);
   Frame RecoverSessionCommand(const Frame &request, const SessionKey &key,
                               Session &session);
   Frame CompleteSessionCommand(const Frame &request, Session &session,

@@ -190,6 +190,16 @@ private:
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
+  // Packaging asks the Runtime what it speaks rather than inferring it from a
+  // build directory. A Bridge stamps its own protocol version on the first
+  // Hello frame and an older Runtime rejects that frame before negotiation, so
+  // a stale pairing does not degrade -- every host fails to connect.
+  if (argc == 2 && std::wstring_view(argv[1]) == L"--protocol") {
+    std::printf("protocol_min=%u protocol_max=%u\n",
+                static_cast<unsigned>(kMinSupportedProtocolVersion),
+                static_cast<unsigned>(kProtocolVersion));
+    return 0;
+  }
   std::wstring data_root = DefaultDataRoot();
   std::wstring endpoint_suffix = kDefaultRuntimeEndpointSuffix;
   std::wstring control_endpoint_suffix;
@@ -256,6 +266,7 @@ int wmain(int argc, wchar_t **argv) {
                ? 0
                : 10 + static_cast<int>(result.error);
   }
+#if defined(FAMO_STABLE_IDENTITY)
   if (endpoint_suffix == kDefaultRuntimeEndpointSuffix &&
       !ProductionInstallAllowed(ModuleDirectory(), true)) {
     AppendStartupDiagnostic(data_root, "install-state", 3,
@@ -263,6 +274,7 @@ int wmain(int argc, wchar_t **argv) {
     std::fprintf(stderr, "runtime install state is not active\n");
     return 3;
   }
+#endif
   const bool root_ready = CreateDirectoryW(data_root.c_str(), nullptr) != FALSE ||
                           GetLastError() == ERROR_ALREADY_EXISTS;
   // The primary accept pool must be able to service every logical client slot;
@@ -292,29 +304,64 @@ int wmain(int argc, wchar_t **argv) {
     return 0;
   }
 
-  // #41: bounded TIP self-heal. The installer's Ready path only proves the TIP
-  // was in the user's input list at install time; a later system or user
-  // language-list change can remove it, leaving the candidate UI unreachable.
-  // Ready-only gate -- stricter than the startup gate above, which also admits
-  // Activating -- then probe before repair via the settings companion's
-  // headless verbs (the installer's exact probe/add implementation, no third
-  // copy). Detached thread: startup and typing never block on repair.
+#if defined(FAMO_STABLE_IDENTITY)
+  // #41: bounded TIP self-heal. A clean install starts this runtime while its
+  // projection is still Activating, so a one-shot Ready check can permanently
+  // miss the transition. Wait only while this exact target remains Activating;
+  // PendingReboot, RolledBack, uninstall, or a different target stop the task.
+  // Once Ready, delegate the full probe/add/two-stable-readback loop to the
+  // settings companion instead of copying a third implementation. Windows can
+  // still rebuild the user input-source list as Setup exits, so repeat the
+  // delegated check after a bounded Ready-only settling window. Detached
+  // thread: startup and typing never block on either check.
   std::thread([data_root] {
-    if (!ProductionInstallAllowed(ModuleDirectory(), false))
-      return; // PendingReboot/RolledBack/uninstalled expect the TIP absent
+    constexpr int kTipSelfHealReadyAttempts = 60;
+    constexpr DWORD kTipSelfHealReadyDelayMs = 1000;
+    bool ready = false;
+    for (int attempt = 0; attempt < kTipSelfHealReadyAttempts; ++attempt) {
+      if (!ProductionInstallAllowed(ModuleDirectory(), true)) {
+        // Returning here used to be silent, which made a machine that came up
+        // with the profile registered but disabled impossible to diagnose:
+        // nothing was written anywhere.
+        AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                                "install not in an allowed state");
+        return;
+      }
+      if (ProductionInstallAllowed(ModuleDirectory(), false)) {
+        ready = true;
+        break;
+      }
+      Sleep(kTipSelfHealReadyDelayMs);
+    }
+    if (!ready) {
+      AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                              "ready transition timed out");
+      return;
+    }
     const std::wstring settings =
         ModuleDirectory() + L"\\settings\\FamoSettings.exe";
-    const int probe = RunSettingsHeadless(settings, L"--is-input-tip");
-    if (probe == 0)
-      return; // healthy: zero writes, no log churn on every logon
-    const int repair = RunSettingsHeadless(settings, L"--add-input-tip");
-    const int readback = RunSettingsHeadless(settings, L"--is-input-tip");
-    AppendStartupDiagnostic(data_root, "tip-selfheal",
-                            readback == 0 ? 0 : 3,
-                            "probe=" + std::to_string(probe) +
-                                " repair=" + std::to_string(repair) +
-                                " readback=" + std::to_string(readback));
+    const int result = RunSettingsHeadless(settings, L"--tip-self-heal");
+    if (result != 0)
+      AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                              "initial exit=" + std::to_string(result));
+    if (result < 0)
+      return; // do not overlap a companion that may have hit our wait bound
+
+    constexpr int kTipSelfHealPostReadyAttempts = 10;
+    constexpr DWORD kTipSelfHealPostReadyDelayMs = 1000;
+    for (int attempt = 0; attempt < kTipSelfHealPostReadyAttempts; ++attempt) {
+      Sleep(kTipSelfHealPostReadyDelayMs);
+      if (!ProductionInstallAllowed(ModuleDirectory(), false))
+        return;
+    }
+    const int settled_result =
+        RunSettingsHeadless(settings, L"--tip-self-heal");
+    if (settled_result != 0)
+      AppendStartupDiagnostic(data_root, "tip-selfheal", 3,
+                              "settled exit=" +
+                                  std::to_string(settled_result));
   }).detach();
+#endif
 
   CandidateWindow candidate_window;
   if (!candidate_window.Start()) {

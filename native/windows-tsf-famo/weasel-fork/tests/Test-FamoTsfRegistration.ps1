@@ -15,6 +15,9 @@ $brandKey = 'HKLM:\' + [string]$identity.registry.brandKey
 $machineComKey = "HKLM:\Software\Classes\CLSID\$clsid\InProcServer32"
 $userComKey = "HKCU:\Software\Classes\CLSID\$clsid\InProcServer32"
 $tipKey = "HKLM:\Software\Microsoft\CTF\TIP\$clsid"
+$inputModeCategory = '{CCF05DD7-4A87-11D7-A6E2-00065B84435C}'
+$inputModeCategoryKey =
+  Join-Path $tipKey "Category\Category\$inputModeCategory\$clsid"
 $probeMode = 'ReadOnly'
 $userWeaselDataPolicy = 'NoWrite:%AppData%\Rime'
 $results = New-Object System.Collections.Generic.List[object]
@@ -185,6 +188,22 @@ Add-Audit 'TSF-PROFILE' 'profile registration' ($notInstalled -or $profileExit -
   'FamoProfileTool verifies registry, Simplified Chinese profile, expected enabled state, and keyboard category.' `
   $(if ($isPending) { 'registry=absent profile=absent category=absent' } else { 'registry=present profile=present enabled=yes category=present' }) `
   $(if ($notInstalled) { 'absent with clean uninstall' } else { "command=$profileCommand; exit=$profileExit; $profileOutput" })
+
+$inputModeCategoryPresent = Test-Path -LiteralPath $inputModeCategoryKey
+$inputModeCategoryOk = if ($notInstalled -or $isPending) {
+  -not $inputModeCategoryPresent
+} else {
+  $inputModeCategoryPresent
+}
+Add-Audit 'TSF-INPUT-MODE' 'input mode compartment capability' `
+  $inputModeCategoryOk `
+  'Windows shell integration requires the TIP to register its standard input mode compartment capability.' `
+  $(if ($notInstalled -or $isPending) {
+      "$inputModeCategory absent"
+    } else {
+      "$inputModeCategory registered for $clsid"
+    }) `
+  "path=$inputModeCategoryKey; present=$inputModeCategoryPresent"
 
 $profileActive = $false
 if ($profileTool -and (Test-Path -LiteralPath $profileTool)) {
