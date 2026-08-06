@@ -1023,6 +1023,7 @@ bool TextService::ConnectRuntimePort(
   }
   std::wstring expected;
   std::chrono::milliseconds deadline{500};
+#if defined(FAMO_STABLE_IDENTITY)
   if (runtime_executable_name_ == L"FamoRuntime.exe") {
     if (!runtime::ResolveProductionRuntime(&expected)) {
       return false;
@@ -1044,6 +1045,10 @@ bool TextService::ConnectRuntimePort(
   } else {
     expected = ModuleDirectory() + L"\\" + runtime_executable_name_;
   }
+#else
+  expected = ModuleDirectory() + L"\\" + runtime_executable_name_;
+#endif
+
   if (retry_terminal_debt) {
     RetryTerminalAbandonDebts(
         runtime_endpoint_suffix_, runtime_executable_name_, endpoint, expected,
