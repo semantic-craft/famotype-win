@@ -92,10 +92,10 @@ public sealed class UpdateIntegrationContractTests
         string sbom = File.ReadAllText(RepoFile(
             "native/windows-tsf-famo/installer/SBOM.spdx.json"));
 
-        Assert.Contains("[string] $AppVersion = '1.5.32'", build);
-        Assert.Contains("[string] $AppVersion = '1.5.32'", appcast);
-        Assert.Contains("#define AppVersion  \"1.5.32\"", installer);
-        Assert.Contains("\"versionInfo\": \"1.5.32\"", sbom);
+        Assert.Contains("[string] $AppVersion = '1.5.33'", build);
+        Assert.Contains("[string] $AppVersion = '1.5.33'", appcast);
+        Assert.Contains("#define AppVersion  \"1.5.33\"", installer);
+        Assert.Contains("\"versionInfo\": \"1.5.33\"", sbom);
     }
 
     private static string RepoFile(string relativePath)
