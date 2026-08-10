@@ -9,6 +9,7 @@
 - 每次安装或 repair 都提取到新的不可变目标：`{app}\versions\<version>-<manifest-prefix>-<transaction-id>`。
 - `payload-manifest.txt` 固定 Runtime 版本、协议、架构、Stable identity、文件数、大小和 SHA-256；Bridge artifact 另以 `bridge-manifest.txt` 固定 ABI、协议窗口和 DLL SHA-256。安装器在激活前分别验证。
 - Bridge 注册路径为 `{app}\bridge\v<bridge-abi>\FamoTextService.dll`。产品版本可连续升级而 Bridge ABI 与签名字节保持不变。
+- Famo 自有原生载荷统一静态链接 MSVC runtime；源码构建、Bridge 冻结和最终打包都会拒绝导入 `MSVCP140*.dll` 或 `VCRUNTIME140*.dll` 的二进制，干净 Windows 安装不依赖开发工具或 VC++ Redistributable 预装状态。
 - 稳定身份使用产品 GUID 和 `runtime-v2/control-v2` endpoint；开发构建使用独立 GUID 和 `dev-runtime-v2/dev-control-v2` endpoint，不得混入稳定安装包。
 
 ## 事务顺序
@@ -69,7 +70,7 @@ Windows EdDSA 私钥只放在发布机的密钥存储中，不入仓库。脚本
 ```powershell
 $env:FAMO_UPDATE_PRIVATE_KEY = '<仓库外私钥路径>'
 .\make-appcast-selftest.ps1
-.\make-appcast.ps1 -AppVersion 1.5.29
+.\make-appcast.ps1 -AppVersion 1.5.31
 ```
 
 若从 WSL 调用 Windows PowerShell，须用 Windows `cmd.exe` 作为宿主，避免 WSL

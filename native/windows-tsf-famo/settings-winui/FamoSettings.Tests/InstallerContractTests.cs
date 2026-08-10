@@ -1289,11 +1289,11 @@ public sealed class InstallerContractTests
             iss[install..Position(iss, "function CommitSeedReceiptAfterReady", install)];
         int prepare = Position(installBody, "--prepare-seed-transaction");
         int apply = Position(installBody, "--apply-seed-transaction", prepare);
-        int start = Position(installBody, "StartRuntimeAsOriginalUser", apply);
-        int deploy = Position(installBody, "--control deploy", start);
+        int deploy = Position(installBody, "--install-deploy", apply);
+        int start = Position(installBody, "StartRuntimeAsOriginalUser", deploy);
         Assert.Contains("'desktop-run-for ' + OriginalUserSid", iss);
         Assert.DoesNotContain("ExecAsOriginalUser", iss);
-        Assert.True(prepare < apply && apply < start && start < deploy);
+        Assert.True(prepare < apply && apply < deploy && deploy < start);
         Assert.Contains("is-active", iss);
         Assert.DoesNotContain("new profile activation failed", iss);
         int shutdown = Position(iss, "StopRuntimeAsOriginalUser(PreviousServer)");
@@ -1301,10 +1301,29 @@ public sealed class InstallerContractTests
         Assert.True(shutdown < switchRegistration);
         Assert.DoesNotContain("'/quit'", iss);
         Assert.Contains("else if Parameters = '/q' then Operation := 'quit'", iss);
-        Assert.Contains("runtime deploy attempt ", installBody);
+        Assert.Contains("runtime install deploy attempt ", installBody);
         Assert.Contains("StartRuntimeAsOriginalUser;", installBody[start..]);
+        Assert.DoesNotContain("--control deploy", installBody);
         Assert.DoesNotContain("--control status", iss);
         Assert.DoesNotContain("FamoDeploy.exe", iss, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void InstallerDeploy_RunsInOneOriginalUserProcessWithoutControlPipe()
+    {
+        string runtime = RepoText(
+            "native/windows-tsf-famo/runtime-protocol/src/runtime_main.cpp");
+        string broker = RepoText(
+            "native/windows-tsf-famo/text-service/tools/dev_profile_main.cpp");
+
+        Assert.Contains("int RunInstallDeploy", runtime);
+        Assert.Contains("class InstallDeploySink", runtime);
+        Assert.Contains("service.SetSnapshotSink(&sink)", runtime);
+        Assert.Contains("service.ExecuteControl(Command::ControlDeploy)", runtime);
+        Assert.Contains("install deploy cannot be combined with control mode", runtime);
+        Assert.Contains("ProductionInstallSelfHealAllowed", runtime);
+        Assert.Contains("operation == L\"install-deploy\"", broker);
+        Assert.Contains("*arguments = L\"--install-deploy\"", broker);
     }
 
     [Fact]

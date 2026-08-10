@@ -908,6 +908,10 @@ bool ResolveDesktopOperation(std::wstring_view kind,
       *arguments = L"--control deploy";
       return true;
     }
+    if (operation == L"install-deploy") {
+      *arguments = L"--install-deploy";
+      return true;
+    }
     if (operation == L"reload-options") {
       *arguments = L"--control reload-options";
       return true;

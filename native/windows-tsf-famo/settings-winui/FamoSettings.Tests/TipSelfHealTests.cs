@@ -166,7 +166,7 @@ public sealed class TipSelfHealTests
             "self-heal must come after the --demo-appearance headless early return");
     }
 
-    // ── Runtime 接线：安装期可在 Activating 启动，但必须有界等到 Ready，
+    // ── Runtime 接线：安装期可跨过 Activating/VerifyIntent，但必须有界等到 Ready，
     //    立即委托一次后还要跨过安装结束时的 Windows 输入源重整窗口再复查；
     //    两次都复用共享 helper，不能复制第三套探针/修复循环 ──
 
@@ -180,11 +180,11 @@ public sealed class TipSelfHealTests
 
         int singleton = main.IndexOf("ERROR_ALREADY_EXISTS", StringComparison.Ordinal);
         int activating = main.IndexOf(
-            "ProductionInstallAllowed(ModuleDirectory(), true)",
+            "ProductionInstallSelfHealAllowed(ModuleDirectory())",
             singleton,
             StringComparison.Ordinal);
         Assert.True(singleton >= 0 && activating > singleton,
-            "the singleton runtime must recognize only its own Activating projection while it waits");
+            "the singleton runtime must recognize only its own activation and verification window while it waits");
         int ready = main.IndexOf(
             "ProductionInstallAllowed(ModuleDirectory(), false)",
             activating,
@@ -195,7 +195,7 @@ public sealed class TipSelfHealTests
             StringComparison.Ordinal);
         Assert.True(
             ready < delegated,
-            "the singleton runtime must wait through its own Activating projection, then delegate only after Ready");
+            "the singleton runtime must wait through its own install window, then delegate only after Ready");
         int settledReady = main.IndexOf(
             "ProductionInstallAllowed(ModuleDirectory(), false)",
             delegated,

@@ -23,6 +23,18 @@ int main() {
   CHECK(!InstallTargetAllowed(L"Activating", L"C:\\Famo\\v2", L"C:\\Famo\\v2"));
   CHECK(!InstallTargetAllowed(L"PendingReboot", L"C:\\Famo\\v2", L"C:\\Famo\\v2",
                               true));
+  CHECK(InstallTargetSelfHealAllowed(L"Activating", L"C:\\Famo\\v2",
+                                     L"C:\\Famo\\v2"));
+  CHECK(InstallTargetSelfHealAllowed(L"VerifyIntent", L"C:\\Famo\\v2",
+                                     L"C:\\Famo\\v2"));
+  CHECK(InstallTargetSelfHealAllowed(L"Ready", L"C:\\Famo\\v2",
+                                     L"C:\\Famo\\v2"));
+  CHECK(!InstallTargetSelfHealAllowed(L"RollbackIntent", L"C:\\Famo\\v2",
+                                      L"C:\\Famo\\v2"));
+  CHECK(!InstallTargetSelfHealAllowed(L"PendingReboot", L"C:\\Famo\\v2",
+                                      L"C:\\Famo\\v2"));
+  CHECK(!InstallTargetSelfHealAllowed(L"VerifyIntent", L"C:\\Famo\\v1",
+                                      L"C:\\Famo\\v2"));
   CHECK(!InstallTargetAllowed(L"Ready", L"C:\\Famo\\v1", L"C:\\Famo\\v2"));
   CHECK(ActiveRuntimeProjectionAllowed(
       L"Ready", L"C:\\Program Files\\Famo\\versions\\v2\\",
