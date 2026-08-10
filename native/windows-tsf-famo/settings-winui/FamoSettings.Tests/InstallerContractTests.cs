@@ -702,12 +702,22 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
-    public void Installer_RetainsOnlyVerifiedActiveAndPreviousVersionObjects()
+    public void Installer_RetiresTheRollbackPredecessorAndKeepsOnlyTheActiveVersion()
     {
         string iss = InstallerText("famo-setup.iss");
+        int retire = Position(iss, "procedure RetireReadyRollbackPredecessor");
         int cleanup = Position(iss, "procedure CleanupObsoleteVersions");
+        string retireBody = iss[retire..cleanup];
         string cleanupBody = iss[cleanup..Position(iss, "procedure VerifyActiveInstall", cleanup)];
 
+        Assert.Contains("JournalPhase <> PhaseReady", retireBody);
+        Assert.Contains("ValidateCurrentPayloadForExecution", retireBody);
+        Assert.Contains("RegDeleteValue(HKLM64, BrandKey, 'PreviousTarget')", retireBody);
+        Assert.Contains("PreviousTarget := ''", retireBody);
+        Assert.Contains("PriorPreviousTarget := ''", retireBody);
+        Assert.Contains("PreviousTransactionId := ''", retireBody);
+        Assert.Contains("PreviousCompatibilityTransactionId := ''", retireBody);
+        Assert.Contains("TransitionTransactionPhase(PhaseReady)", retireBody);
         Assert.Contains("TryGetFinalObjectInfo", cleanupBody);
         Assert.Contains("FinalObjectsSame", cleanupBody);
         Assert.Contains("ValidateVersionDirectoryForCleanup", cleanupBody);
@@ -724,9 +734,41 @@ public sealed class InstallerContractTests
             int at = Position(iss, terminalFlow);
             string body = iss[at..];
             int ready = Position(body, "TransitionTransactionPhase(PhaseReady)");
-            int prune = Position(body, "CleanupObsoleteVersions", ready);
-            Assert.True(ready < prune);
+            int retireAfterReady = Position(body, "RetireReadyRollbackPredecessor", ready);
+            int prune = Position(body, "CleanupObsoleteVersions", retireAfterReady);
+            Assert.True(ready < retireAfterReady && retireAfterReady < prune);
         }
+    }
+
+    [Fact]
+    public void Installer_SchedulesOnlyVerifiedLockedVersionResidueForRestartDeletion()
+    {
+        string iss = InstallerText("famo-setup.iss");
+        int scheduleTree = Position(
+            iss, "procedure ScheduleValidatedCleanupTreeForRestart");
+        int scheduleVersion = Position(
+            iss, "function ScheduleVersionCleanupForRestart", scheduleTree);
+        int retire = Position(
+            iss, "procedure RetireReadyRollbackPredecessor", scheduleVersion);
+        string scheduleTreeBody = iss[scheduleTree..scheduleVersion];
+        string scheduleVersionBody = iss[scheduleVersion..retire];
+        int cleanup = Position(iss, "procedure CleanupObsoleteVersions", retire);
+        string cleanupBody = iss[cleanup..Position(
+            iss, "procedure VerifyActiveInstall", cleanup)];
+        int needRestart = Position(iss, "function NeedRestart: Boolean");
+        string needRestartBody = iss[needRestart..Position(
+            iss, "procedure DeinitializeSetup", needRestart)];
+
+        Assert.Contains("FileAttributeReparsePoint", scheduleTreeBody);
+        Assert.Contains("TryGetFinalObjectInfo", scheduleTreeBody);
+        Assert.Contains("PathStartsWith", scheduleTreeBody);
+        Assert.Contains("RestartReplace(Path, '')", scheduleTreeBody);
+        Assert.Contains("FinalObjectsSame", scheduleVersionBody);
+        Assert.Contains("ValidateCleanupTree", scheduleVersionBody);
+        Assert.Contains("RestartReplace(VersionTarget, '')", scheduleVersionBody);
+        Assert.Contains("CleanupRestartPending := True", scheduleVersionBody);
+        Assert.Contains("ScheduleVersionCleanupForRestart", cleanupBody);
+        Assert.Contains("PendingTerminal or CleanupRestartPending", needRestartBody);
     }
 
     [Fact]
@@ -1115,7 +1157,10 @@ public sealed class InstallerContractTests
         Assert.Contains(@"versions\{#AppVersion}-{#ManifestPrefix}-", iss);
         Assert.Contains("TransactionId := NewIdentityNonce", iss);
         Assert.Contains("function ValidTransactionId", iss);
-        Assert.DoesNotContain("restartreplace", iss[..Position(iss, "function InitializeUninstall")], StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(
+            "restartreplace",
+            iss[..Position(iss, "procedure ScheduleValidatedCleanupTreeForRestart")],
+            StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(@"DestDir: ""{app}""", EffectiveInnoContent(iss), StringComparison.OrdinalIgnoreCase);
     }
 
@@ -1538,7 +1583,7 @@ public sealed class InstallerContractTests
 
         Assert.Contains("SetupLogging=yes", iss);
         Assert.Contains("FinishedRestartLabel=", iss);
-        Assert.Contains("必须重新启动电脑才能完成切换并显示新输入法", iss);
+        Assert.Contains("必须重新启动电脑才能完成切换或清理", iss);
         Assert.Contains("' /SILENT /SP- /NORESTART'", argumentsBody);
         Assert.DoesNotContain("/VERYSILENT", argumentsBody);
         Assert.DoesNotContain("/SUPPRESSMSGBOXES", argumentsBody);

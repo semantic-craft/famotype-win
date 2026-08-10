@@ -60,8 +60,8 @@ UninstallDisplayIcon={code:GetActiveSettings}
 Name: "zh"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-FinishedRestartLabel=法墨的新版本文件已经安装，但旧输入法模块仍被 Windows 占用。必须重新启动电脑才能完成切换并显示新输入法。是否现在重启？
-FinishedRestartMessage=法墨的新版本文件已经安装，但旧输入法模块仍被 Windows 占用。必须重新启动电脑才能完成切换并显示新输入法。%n%n是否现在重启？
+FinishedRestartLabel=法墨的新版本已经安装，但旧版本文件仍被 Windows 占用。必须重新启动电脑才能完成切换或清理。是否现在重启？
+FinishedRestartMessage=法墨的新版本已经安装，但旧版本文件仍被 Windows 占用。必须重新启动电脑才能完成切换或清理。%n%n是否现在重启？
 
 [Files]
 ; Every repair extracts a complete payload to a fresh immutable transaction target.
@@ -253,6 +253,7 @@ var
   ResumeMode: Boolean;
   RollbackMode: Boolean;
   PendingTerminal: Boolean;
+  CleanupRestartPending: Boolean;
   TransactionPrepared: Boolean;
   RegistrationSwitched: Boolean;
   InstallReady: Boolean;
@@ -3648,6 +3649,7 @@ begin
       (Next = PhaseUserStateApplied)) or
     ((Current = PhaseUserStateApplied) and (Next = PhaseVerifyIntent)) or
     ((Current = PhaseVerifyIntent) and (Next = PhaseReady)) or
+    ((Current = PhaseReady) and (Next = PhaseReady)) or
     ((Next = PhaseRollbackIntent) and
       (Current <> '') and (Current <> PhaseReady) and
       (Current <> PhaseRolledBack)) or
@@ -5596,6 +5598,115 @@ begin
   end;
 end;
 
+procedure ScheduleValidatedCleanupTreeForRestart(const Directory,
+  FinalRoot: String);
+var
+  FindRec: TFindRec;
+  Path, FinalPath, ObjectId: String;
+begin
+  if FindFirst(AddBackslash(Directory) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Path := AddBackslash(Directory) + FindRec.Name;
+          if ((FindRec.Attributes and FileAttributeReparsePoint) <> 0) or
+             not TryGetFinalObjectInfo(Path, FinalPath, ObjectId) or
+             not PathStartsWith(FinalPath, AddBackslash(FinalRoot), True) then
+            RaiseException(
+              'version cleanup residue changed before restart scheduling');
+          if (FindRec.Attributes and FileAttributeDirectory) <> 0 then
+            ScheduleValidatedCleanupTreeForRestart(Path, FinalRoot);
+          RestartReplace(Path, '');
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function ScheduleVersionCleanupForRestart(const VersionTarget,
+  ExpectedFinalPath, ExpectedObjectId: String): Boolean;
+var
+  CurrentFinalPath, CurrentObjectId: String;
+begin
+  Result := False;
+  if not DirExists(VersionTarget) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  if not TryGetFinalObjectInfo(VersionTarget, CurrentFinalPath,
+       CurrentObjectId) or
+     not FinalObjectsSame(CurrentFinalPath, CurrentObjectId,
+       ExpectedFinalPath, ExpectedObjectId) or
+     not ValidateCleanupTree(VersionTarget, CurrentFinalPath) then
+    Exit;
+  CleanupRestartPending := True;
+  try
+    ScheduleValidatedCleanupTreeForRestart(
+      VersionTarget, CurrentFinalPath);
+    RestartReplace(VersionTarget, '');
+    Result := True;
+  except
+    Log('cannot schedule verified version cleanup for restart: ' +
+      GetExceptionMessage);
+  end;
+end;
+
+procedure RetireReadyRollbackPredecessor;
+var
+  RetiredTarget: String;
+begin
+  if (JournalPhase <> PhaseReady) or (PreviousTarget = '') then Exit;
+  if TransactionDebtPresent(
+       'UserCleanupDebt', DebtKindSeedCommit) or
+     TransactionDebtPresent(
+       'RecoveryCleanupDebt', DebtKindRecoveryArtifacts) or
+     (JournalResumeInstaller <> '') or (JournalTaskName <> '') then
+    Exit;
+  if not ValidateCurrentPayloadForExecution then
+    RaiseException(
+      'current payload identity mismatch before rollback retirement');
+
+  RetiredTarget := PreviousTarget;
+  RegDeleteValue(HKLM64, BrandKey, 'PreviousTarget');
+  RegDeleteValue(HKLM64, BrandKey, 'PreviousDefault');
+  FlushMachineRegistryKey(BrandKey);
+  if RegValueExists(HKLM64, BrandKey, 'PreviousTarget') or
+     RegValueExists(HKLM64, BrandKey, 'PreviousDefault') then
+    RaiseException('rollback predecessor projection retirement failed');
+
+  PreviousTarget := '';
+  JournalPreviousFinalTarget := '';
+  JournalPreviousObjectId := '';
+  PriorPreviousTarget := '';
+  JournalPriorPreviousFinalTarget := '';
+  JournalPriorPreviousObjectId := '';
+  PreviousManifest := '';
+  PreviousManifestHash := '';
+  PreviousDefault := '';
+  PreviousHost := '';
+  PreviousServer := '';
+  PreviousProfileTool := '';
+  PreviousVersion := '';
+  PreviousIdentity := '';
+  PreviousTransactionId := '';
+  PreviousCompatibilityTransactionId := '';
+  PreviousState := '';
+  PreviousProfileActive := False;
+  PreviousProfileEnabled := False;
+  PreviousInputTipPresent := False;
+  LoadedHostHash := '';
+  LoadedHostVersion := '';
+  LoadedHostExpectedHash := '';
+  TransitionTransactionPhase(PhaseReady);
+  Log('retired rollback predecessor for active-only retention: ' +
+    RetiredTarget);
+end;
+
 function ValidateJournalBoundPartialTargetForCleanup(
   var NormalizedTarget: String): Boolean;
 var
@@ -5720,7 +5831,8 @@ begin
                    FinalObjectsSame(CandidateFinalPath, CandidateObjectId,
                      PreviousFinalPath, PreviousObjectId)) then
           begin
-            { Retain the active target and its exact rollback predecessor. }
+            { Retain the active target and any predecessor that has not yet
+              been durably retired after Ready. }
           end
           else if not ValidateVersionDirectoryForCleanup(VersionTarget,
                     VersionsFinalPath) then
@@ -5732,8 +5844,13 @@ begin
           else if not DelTree(VersionTarget, True, True, True) then
           begin
             CleanupIncomplete := True;
-            Log('retention deferred locked version directory: ' +
-              VersionTarget);
+            if ScheduleVersionCleanupForRestart(VersionTarget,
+                 CandidateFinalPath, CandidateObjectId) then
+              Log('retention scheduled locked version directory for restart ' +
+                'deletion: ' + VersionTarget)
+            else
+              Log('retention deferred locked version directory: ' +
+                VersionTarget);
           end;
         end;
       until not FindNext(FindRec);
@@ -5864,9 +5981,10 @@ begin
     end;
   end;
   try
+    RetireReadyRollbackPredecessor;
     CleanupObsoleteVersions;
   except
-    Log('deferred version retention cleanup after ready: ' +
+    Log('deferred active-only version cleanup after ready: ' +
       GetExceptionMessage);
   end;
   ClearPendingRegistry;
@@ -6364,9 +6482,10 @@ begin
   if JournalPhase = PhaseReady then
   begin
     try
+      RetireReadyRollbackPredecessor;
       CleanupObsoleteVersions;
     except
-      Log('deferred terminal version retention cleanup: ' +
+      Log('deferred terminal active-only version cleanup: ' +
         GetExceptionMessage);
       Exit;
     end;
@@ -6434,6 +6553,7 @@ begin
   ResumeMode := False;
   RollbackMode := False;
   PendingTerminal := False;
+  CleanupRestartPending := False;
   TransactionPrepared := False;
   RegistrationSwitched := False;
   InstallReady := False;
@@ -6639,9 +6759,10 @@ begin
             end;
           end;
           try
+            RetireReadyRollbackPredecessor;
             CleanupObsoleteVersions;
           except
-            Log('deferred version retention cleanup after ready: ' +
+            Log('deferred active-only version cleanup after ready: ' +
               GetExceptionMessage);
           end;
           ClearPendingRegistry;
@@ -6673,7 +6794,7 @@ end;
 
 function NeedRestart: Boolean;
 begin
-  Result := PendingTerminal;
+  Result := PendingTerminal or CleanupRestartPending;
 end;
 
 procedure DeinitializeSetup;

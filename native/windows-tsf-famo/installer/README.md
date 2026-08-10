@@ -19,12 +19,15 @@
 3. 停止旧 runtime。若 Bridge 路径或 SHA-256 变化，才切离/反注册旧 profile 并注册新 Bridge；字节相同时完全不触碰 TSF 注册。
 4. 以原始用户身份准备 seed 事务；安装器把收据的完整 SHA-256 写入并 flush 到提权 journal 后，才按 CAS 规则应用用户文件。
 5. 启动 `FamoRuntime.exe` 并通过 `--control deploy` 部署；验证 COM/profile/manifest 回读后才写入 `InstallState=Ready`，随后提交并清除已认证的 seed 收据。
+6. 只有在 `Ready`、seed 收据提交和恢复任务清理全部成功后，才写入新的 `Ready` journal generation 注销旧版回滚锚；随后验证并删除除当前活动目标外的全部旧版本目录。
 
 任何阶段失败都按反向顺序停止新 runtime、反注册新 profile、恢复旧注册/激活/runtime，并以 CAS 回滚 seed：安装后出现的用户修改会被保留，不会被备份覆盖。所有延迟工作都使用 `famo-debt-v2|<transaction-id>|<kind>` 类型化债务；写入和删除均 flush 并精确回读，foreign、malformed 或同事务未知 kind 一律阻断。身份捕获和机器清理 helper 还会在创建目录前持久化 `famo-debt-v2|<transaction-id>|identity-helper:<nonce>` 或 `famo-debt-v2|<transaction-id>|machine-cleanup-helper:<nonce>` 的 `HelperCleanupDebt`；普通安装或卸载启动时先验证固定父目录、非 reparse 最终路径和两个允许的精确文件名，再逐个回收，不使用通配删除。普通安装启动会先恢复这些 helper 残留和终态债务，不会先创建新事务；新版安装器按三段版本号严格比较，只接管通过完整 journal 校验的更旧版 `Ready`/`RolledBack` 终态，不接管同版不同产物、未来版本或任何旧版非终态载荷。若终态目标已被部分删除，续删还必须同时匹配 journal 最终路径、NTFS 对象 ID，并验证残余树无 reparse；完成这些校验后删除仍被阻断时，交互安装和未显式使用 `/SUPPRESSMSGBOXES` 的静默安装都会提示文件通常仍被系统占用并建议重启，其他恢复失败使用通用错误提示。用户、目标和恢复工件按顺序清完后，恢复任务和保留安装器才最后删除。若精确用户暂不可用、文件发生冲突或版本目录仍被占用，journal 会保留 cleanup/rollback debt 和精确 SID 恢复任务，在后续该用户登录时重试；债务清除前不删除恢复锚。对外终态只有 `Ready`、`RolledBack`、`PendingReboot` 和 `NotInstalled`。
 
 setup 与 uninstall 从各自初始化入口的第一步起就持有同一个独立的全局事务互斥量，任何恢复或 journal 变更之前即拒绝并发进程。helper 回收会持有 `{app}`、`pending` 和精确 helper 目录的非共享删除句柄；精确文件和目录消失后，先对 `{app}` 所在卷执行 `FlushFileBuffers`，成功后才清除 `HelperCleanupDebt`。卷刷新失败会保留债务供下次恢复。
 
-常规 Runtime-only 升级复用相同的 Bridge 路径和 SHA-256，因此不探测宿主是否加载 DLL、不切离输入法、不反注册/重注册，也不会因为 TSF DLL 进入 `PendingReboot`。从旧版版本目录首次迁移到 `bridge\v1`，或以后显式提升 Bridge ABI 时，若旧 `FamoTextService.dll` 仍被宿主进程加载，才保留原有安全语义：记录旧 DLL 身份、切离注册并进入 `PendingReboot`，由精确 SID 的登录任务在重启后恢复。安装器不会强杀 Explorer 或用户应用。
+自动旧版本清理以 1.5.32 为升级基线，不为更早安装状态增加迁移或兼容分支。新版本进入 `Ready` 以前仍保留当前活动版本，保证安装失败可以原地回滚；进入 `Ready` 并完成用户数据与恢复工件提交以后，回滚锚被持久化注销，`versions` 中只保留当前活动目录。待删除目录必须先通过 manifest、SHA-256、最终路径、NTFS 对象 ID 和无 reparse 完整验证；未知或被替换的目录一律拒绝删除。若已验证的旧目录仍有文件被占用，安装器逐项登记为 Windows 重启删除并显示重启提示，不强杀设置、Explorer、浏览器或其他用户应用。
+
+常规 Runtime-only 升级复用相同的 Bridge 路径和 SHA-256，因此不探测宿主是否加载 DLL、不切离输入法、不反注册/重注册，也不会因为 TSF DLL 进入 `PendingReboot`。以后显式提升 Bridge ABI 时，若旧 `FamoTextService.dll` 仍被宿主进程加载，才保留原有安全语义：记录旧 DLL 身份、切离注册并进入 `PendingReboot`，由精确 SID 的登录任务在重启后恢复。安装器不会强杀 Explorer 或用户应用。
 
 等待重启期间可用 `Test-FamoHealth.ps1` 和 `Test-FamoTsfRegistration.ps1` 验证安全终态。恢复安装器、hash、任务名和原用户 SID 只从 `ActiveTransactionId → Transactions\<id>\ActiveGeneration → gN` journal generation 读取。若决定放弃升级，以管理员身份运行该 generation 的 `ResumeInstaller`：
 
