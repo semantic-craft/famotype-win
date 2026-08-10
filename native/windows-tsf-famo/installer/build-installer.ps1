@@ -10,7 +10,7 @@ param(
   [string] $NativeOutput = '',
   [string] $BridgeArtifact = '',
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.5.29',
+  [string] $AppVersion = '1.5.31',
   [ValidateSet('Stable')]
   [string] $Identity = 'Stable',
   [string] $Configuration = 'Release',
@@ -24,7 +24,7 @@ if (-not $NativeOutput) {
   $NativeOutput = Join-Path $NativeDir 'text-service\build-msvc-installer-stable'
 }
 if (-not $BridgeArtifact) {
-  $BridgeArtifact = Join-Path $NativeDir 'text-service\build-bridge-v13-artifact'
+  $BridgeArtifact = Join-Path $NativeDir 'text-service\build-bridge-v14-artifact'
 }
 $PayloadDir = Join-Path $NativeDir 'famo-config\payload'
 $OverlayDir = Join-Path $NativeDir 'famo-config\overlay'
@@ -45,6 +45,20 @@ function NeedSameFileHash([string] $Expected, [string] $Actual, [string] $Hint) 
   if ((Get-FileHash -LiteralPath $Expected -Algorithm SHA256).Hash -ne
       (Get-FileHash -LiteralPath $Actual -Algorithm SHA256).Hash) {
     throw "文件不同步：$Actual`n应与：$Expected`n$Hint"
+  }
+}
+
+function Assert-NoDynamicMsvcRuntime([string] $Path) {
+  $image = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
+  foreach ($dependency in @(
+      'MSVCP140.dll',
+      'MSVCP140_ATOMIC_WAIT.dll',
+      'VCRUNTIME140.dll',
+      'VCRUNTIME140_1.dll')) {
+    if ($image.IndexOf($dependency, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+      throw "原生载荷 $(Split-Path $Path -Leaf) 依赖 $dependency；" +
+        '干净 Windows 机器无法保证可加载。请使用静态 MSVC runtime 重建。'
+    }
   }
 }
 
@@ -179,6 +193,10 @@ foreach ($name in $runtimeFiles) { Need (Join-Path $NativeOutput $name) 'stable 
 $bridgeArtifactInfo = Read-BridgeArtifact $BridgeArtifact
 $bridgeAbi = $bridgeArtifactInfo.Abi
 $bridgeHash = $bridgeArtifactInfo.Hash
+foreach ($name in $runtimeFiles) {
+  Assert-NoDynamicMsvcRuntime (Join-Path $NativeOutput $name)
+}
+Assert-NoDynamicMsvcRuntime $bridgeArtifactInfo.Dll
 
 # The Bridge stamps its own protocol version on the very first Hello frame, and
 # a Runtime rejects any frame above the version it was built with before

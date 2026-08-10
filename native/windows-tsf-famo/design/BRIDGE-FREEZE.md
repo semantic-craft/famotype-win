@@ -107,6 +107,16 @@ only the Bridge can hold:
 
 ABI 13 is installed only at `bridge\v13` and never replaces earlier bytes.
 
+Bridge ABI 14 preserves ABI 13's host-owned candidate behavior and changes the
+native linkage contract: the Bridge and the rest of Famo's native payload use
+the static MSVC runtime. A TSF DLL is loaded into arbitrary host processes
+before FamoRuntime starts, so installation must not depend on a matching Visual
+C++ Redistributable already being present on the user's machine. The build
+fails if a shipping native binary imports `MSVCP140*.dll` or
+`VCRUNTIME140*.dll`.
+
+ABI 14 is installed only at `bridge\v14` and never replaces ABI 13 bytes.
+
 ## Artifact rules
 
 `installer/build-bridge-artifact.ps1` creates:
@@ -149,7 +159,7 @@ Current compatibility is:
 | Legacy Bridge, wire v2 | yes | yes | yes | yes |
 | Bridge ABI 3/4, wire through v3 | no | yes | yes | yes |
 | Bridge ABI 5/6, wire v4 | no | no | yes | yes |
-| Bridge ABI 13, wire v5 | no | no | no | yes |
+| Bridge ABI 13/14, wire v5 | no | no | no | yes |
 
 A Bridge stamps its own `kProtocolVersion` on the very first `Hello` frame, and
 a Runtime rejects any frame above the version it was compiled with before

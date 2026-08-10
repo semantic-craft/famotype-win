@@ -26,6 +26,21 @@ if (-not (Test-Path -LiteralPath $BridgeDll -PathType Leaf)) {
   throw "Bridge DLL 不存在：$BridgeDll"
 }
 
+function Assert-NoDynamicMsvcRuntime([string] $Path) {
+  $image = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
+  foreach ($dependency in @(
+      'MSVCP140.dll',
+      'MSVCP140_ATOMIC_WAIT.dll',
+      'VCRUNTIME140.dll',
+      'VCRUNTIME140_1.dll')) {
+    if ($image.IndexOf($dependency, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+      throw "Bridge 依赖 $dependency；干净 Windows 机器无法保证可加载。"
+    }
+  }
+}
+
+Assert-NoDynamicMsvcRuntime $BridgeDll
+
 $outputFull = [IO.Path]::GetFullPath($Output)
 if (Test-Path -LiteralPath $outputFull) {
   $existing = Join-Path $outputFull 'FamoTextService.dll'

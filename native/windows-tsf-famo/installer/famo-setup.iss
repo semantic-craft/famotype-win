@@ -3,7 +3,7 @@
 #define AppName       "法墨输入法"
 #define AppNameEN     "Famo"
 #ifndef AppVersion
-  #define AppVersion  "1.5.29"
+  #define AppVersion  "1.5.31"
 #endif
 #ifndef ManifestPrefix
   #define ManifestPrefix "UNSET"
@@ -15,7 +15,7 @@
   #define Identity "Stable"
 #endif
 #ifndef BridgeAbi
-  #define BridgeAbi "13"
+  #define BridgeAbi "14"
 #endif
 #ifndef BridgeHash
   #define BridgeHash "0000000000000000000000000000000000000000000000000000000000000000"
@@ -529,6 +529,7 @@ begin
     else if Parameters = '--control shutdown' then Operation := 'shutdown'
     else if Parameters = '/q' then Operation := 'quit'
     else if Parameters = '--control deploy' then Operation := 'deploy'
+    else if Parameters = '--install-deploy' then Operation := 'install-deploy'
     else if Parameters = '--control reload-options' then
       Operation := 'reload-options';
   end;
@@ -4899,34 +4900,29 @@ begin
     RaiseException('user seed transaction apply failed');
   TransitionTransactionPhase(PhaseUserStateApplied);
   WriteActiveRegistry(TransactionTarget, 'Activating');
-  StartRuntimeAsOriginalUser;
-  { First launch of freshly written binaries is slow (Defender scans them on
-    execute), so the runtime's control pipe may not be up 750ms after start.
-    One shot here killed a real 1.4.9 install; the control client is
-    idempotent, so retry briefly instead. }
+  { Deploy in one bounded original-user process before starting the resident
+    runtime. The old path started a server and then reached it through a second
+    desktop-token process and a named pipe. That transport can be unavailable
+    on otherwise supported Windows hosts, causing a false deployment failure
+    after the engine itself loaded successfully. }
   DeployOk := False;
-  for DeployAttempt := 1 to 15 do
+  for DeployAttempt := 1 to 3 do
   begin
     DeployExit := RunBoundDesktopExitCode(
       AddBackslash(TransactionTarget) + 'FamoRuntime.exe',
-      '--control deploy', True);
-    Log('runtime deploy attempt ' + IntToStr(DeployAttempt) +
+      '--install-deploy', True);
+    Log('runtime install deploy attempt ' + IntToStr(DeployAttempt) +
       ' exit=' + IntToStr(DeployExit));
     if DeployExit = 0 then
     begin
       DeployOk := True;
       Break;
     end;
-    { A just-stopped predecessor can briefly retain the per-session singleton.
-      In that case the first new process exits cleanly and no server remains.
-      Restart before retrying the control pipe instead of polling an absent
-      process forever. }
-    if DeployAttempt < 15 then
-      StartRuntimeAsOriginalUser;
-    Sleep(2000);
+    if DeployAttempt < 3 then Sleep(2000);
   end;
   if not DeployOk then
     RaiseException('runtime deploy failed');
+  StartRuntimeAsOriginalUser;
   TransitionTransactionPhase(PhaseVerifyIntent);
 end;
 

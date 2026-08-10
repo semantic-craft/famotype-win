@@ -187,6 +187,75 @@ private:
   RuntimeSnapshotSink *status_;
 };
 
+class InstallDeploySink final : public RuntimeSnapshotSink {
+public:
+  void Publish(std::shared_ptr<const RuntimeSnapshot>) noexcept override {}
+  bool PrepareStyle(std::string_view, bool,
+                    std::shared_ptr<const void> *presentation) noexcept override {
+    if (!presentation)
+      return false;
+    presentation->reset();
+    return true;
+  }
+  void ActivateStyle(
+      std::shared_ptr<const RuntimeStyleState>) noexcept override {}
+  void PrepareForRuntimeReady() noexcept override {}
+};
+
+int RunInstallDeploy(const std::wstring &data_root) {
+#if defined(FAMO_STABLE_IDENTITY)
+  if (!ProductionInstallAllowed(ModuleDirectory(), true)) {
+    AppendStartupDiagnostic(data_root, "install-deploy-state", 3,
+                            InstallProjectionSummary());
+    std::fprintf(stderr, "install deploy state is not active\n");
+    return 3;
+  }
+#endif
+  bool root_ready = CreateDirectoryW(data_root.c_str(), nullptr) != FALSE;
+  if (!root_ready) {
+    const DWORD attributes = GetFileAttributesW(data_root.c_str());
+    root_ready = attributes != INVALID_FILE_ATTRIBUTES &&
+                 (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  }
+  std::string data_root_utf8;
+  if (data_root.empty() || !root_ready || !Utf8(data_root, &data_root_utf8)) {
+    AppendStartupDiagnostic(data_root, "install-deploy-root", 2);
+    std::fprintf(stderr, "install deploy data root setup failed\n");
+    return 2;
+  }
+
+  InstallDeploySink sink;
+  RuntimeService service;
+  service.SetSnapshotSink(&sink);
+  const std::wstring engine = ModuleDirectory() + L"\\FamoRimeEngine.dll";
+  std::string error;
+  if (!service.Start(engine.c_str(), data_root_utf8.c_str(), &error)) {
+    AppendStartupDiagnostic(data_root, "install-deploy-engine", 4, error);
+    std::fprintf(stderr, "install deploy engine setup failed: %s\n",
+                 error.c_str());
+    return 4;
+  }
+  (void)service.InitializeControlState();
+  const ControlError result = service.ExecuteControl(Command::ControlDeploy);
+  const RuntimeReadiness readiness = service.readiness();
+  const uint64_t generation = service.engine_generation();
+  service.SetSnapshotSink(nullptr);
+  service.Stop();
+  if (result != ControlError::None) {
+    const unsigned code = 10 + static_cast<unsigned>(result);
+    AppendStartupDiagnostic(data_root, "install-deploy", code,
+                            "control_error=" +
+                                std::to_string(static_cast<unsigned>(result)));
+    std::fprintf(stderr, "install deploy failed: control_error=%u\n",
+                 static_cast<unsigned>(result));
+    return static_cast<int>(code);
+  }
+  std::printf("install_deploy=ok readiness=%u generation=%llu\n",
+              static_cast<unsigned>(readiness),
+              static_cast<unsigned long long>(generation));
+  return 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t **argv) {
@@ -205,6 +274,7 @@ int wmain(int argc, wchar_t **argv) {
   std::wstring control_endpoint_suffix;
   Command control_command = Command::Hello;
   bool control_mode = false;
+  bool install_deploy_mode = false;
   int workers = static_cast<int>(kRuntimeAcceptWorkerCapacity);
   for (int i = 1; i < argc; ++i) {
     const std::wstring_view argument(argv[i]);
@@ -222,6 +292,8 @@ int wmain(int argc, wchar_t **argv) {
       }
     } else if (argument == L"--control-endpoint-suffix" && i + 1 < argc) {
       control_endpoint_suffix = argv[++i];
+    } else if (argument == L"--install-deploy") {
+      install_deploy_mode = true;
     } else if (argument == L"/q") {
       control_mode = true;
       control_command = Command::ControlShutdown;
@@ -230,6 +302,12 @@ int wmain(int argc, wchar_t **argv) {
       return 2;
     }
   }
+  if (install_deploy_mode && control_mode) {
+    std::fprintf(stderr, "install deploy cannot be combined with control mode\n");
+    return 2;
+  }
+  if (install_deploy_mode)
+    return RunInstallDeploy(data_root);
   std::string data_root_utf8;
   PipeEndpoint endpoint;
   PipeEndpoint control_endpoint;
@@ -306,9 +384,9 @@ int wmain(int argc, wchar_t **argv) {
 
 #if defined(FAMO_STABLE_IDENTITY)
   // #41: bounded TIP self-heal. A clean install starts this runtime while its
-  // projection is still Activating, so a one-shot Ready check can permanently
-  // miss the transition. Wait only while this exact target remains Activating;
-  // PendingReboot, RolledBack, uninstall, or a different target stop the task.
+  // projection is still Activating, then advances through VerifyIntent before
+  // reaching Ready. Wait only while this exact target remains in that window;
+  // PendingReboot, rollback, uninstall, or a different target stop the task.
   // Once Ready, delegate the full probe/add/two-stable-readback loop to the
   // settings companion instead of copying a third implementation. Windows can
   // still rebuild the user input-source list as Setup exits, so repeat the
@@ -319,7 +397,7 @@ int wmain(int argc, wchar_t **argv) {
     constexpr DWORD kTipSelfHealReadyDelayMs = 1000;
     bool ready = false;
     for (int attempt = 0; attempt < kTipSelfHealReadyAttempts; ++attempt) {
-      if (!ProductionInstallAllowed(ModuleDirectory(), true)) {
+      if (!ProductionInstallSelfHealAllowed(ModuleDirectory())) {
         // Returning here used to be silent, which made a machine that came up
         // with the profile registered but disabled impossible to diagnose:
         // nothing was written anywhere.
