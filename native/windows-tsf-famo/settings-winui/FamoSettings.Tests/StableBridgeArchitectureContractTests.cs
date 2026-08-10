@@ -18,12 +18,12 @@ public sealed class StableBridgeArchitectureContractTests
         Assert.Contains("/DBridgeAbi=$bridgeAbi", script);
         Assert.Contains("/DBridgeHash=$bridgeHash", script);
         Assert.Contains(
-            "text-service\\build-bridge-v13-artifact",
+            "text-service\\build-bridge-v14-artifact",
             script);
 
         string installer = RepoText(
             "native/windows-tsf-famo/installer/famo-setup.iss");
-        Assert.Contains("#define BridgeAbi \"13\"", installer);
+        Assert.Contains("#define BridgeAbi \"14\"", installer);
 
         int runtimeFiles = Position(script, "$runtimeFiles = @(");
         int runtimeFilesEnd = Position(script, ")", runtimeFiles);
@@ -97,11 +97,41 @@ public sealed class StableBridgeArchitectureContractTests
             "native/windows-tsf-famo/text-service/src/FamoTextService.rc.in");
 
         Assert.Contains("FAMO_BRIDGE_ABI", cmake);
-        Assert.Contains("set(FAMO_BRIDGE_ABI \"13\"", cmake);
+        Assert.Contains("set(FAMO_BRIDGE_ABI \"14\"", cmake);
         Assert.Contains("FamoTextService.rc.in", cmake);
         Assert.Contains("FILEVERSION @FAMO_BRIDGE_ABI@", resource);
         Assert.Contains("FileMajorPart", artifactBuilder);
         Assert.Contains("$BridgeAbi", artifactBuilder);
+    }
+
+    [Fact]
+    public void NativePayload_UsesAndVerifiesTheStaticMsvcRuntime()
+    {
+        string cmake = RepoText(
+            "native/windows-tsf-famo/text-service/CMakeLists.txt");
+        string verifier = RepoText(
+            "native/windows-tsf-famo/text-service/cmake/verify-no-dynamic-msvc-runtime.cmake");
+        string artifactBuilder = RepoText(
+            "native/windows-tsf-famo/installer/build-bridge-artifact.ps1");
+        string installerBuilder = RepoText(
+            "native/windows-tsf-famo/installer/build-installer.ps1");
+
+        int runtimeSelection = Position(cmake, "CMAKE_MSVC_RUNTIME_LIBRARY");
+        int dependencies = Position(cmake, "add_subdirectory");
+        Assert.True(runtimeSelection < dependencies);
+        Assert.Contains("MultiThreaded$<$<CONFIG:Debug>:Debug>", cmake);
+        Assert.Contains("FamoTextService", cmake[runtimeSelection..]);
+        Assert.Contains("FamoRuntime", cmake[runtimeSelection..]);
+        Assert.Contains("FamoRimeEngine", cmake[runtimeSelection..]);
+        Assert.Contains("MSVCP140.DLL", verifier);
+        Assert.Contains("MSVCP140_ATOMIC_WAIT.DLL", verifier);
+        Assert.Contains("VCRUNTIME140.DLL", verifier);
+        Assert.Contains("VCRUNTIME140_1.DLL", verifier);
+        Assert.Contains("Assert-NoDynamicMsvcRuntime $BridgeDll", artifactBuilder);
+        Assert.Contains("Assert-NoDynamicMsvcRuntime $bridgeArtifactInfo.Dll",
+                        installerBuilder);
+        Assert.Contains("MSVCP140_ATOMIC_WAIT.dll", artifactBuilder);
+        Assert.Contains("MSVCP140_ATOMIC_WAIT.dll", installerBuilder);
     }
 
     [Fact]

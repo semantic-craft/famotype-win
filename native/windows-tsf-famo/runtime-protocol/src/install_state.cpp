@@ -48,6 +48,14 @@ bool InstallTargetAllowed(std::wstring_view state,
   return state_allowed && EqualDirectory(install_directory, module_directory);
 }
 
+bool InstallTargetSelfHealAllowed(std::wstring_view state,
+                                  std::wstring_view install_directory,
+                                  std::wstring_view module_directory) {
+  const bool state_allowed = state == L"Ready" || state == L"Activating" ||
+                             state == L"VerifyIntent";
+  return state_allowed && EqualDirectory(install_directory, module_directory);
+}
+
 bool ActiveRuntimeProjectionAllowed(
     std::wstring_view state, std::wstring_view install_directory,
     std::wstring_view server_executable, bool allow_activating) {
@@ -130,6 +138,28 @@ bool ProductionInstallAllowed(std::wstring_view module_directory,
   return state_result == ERROR_SUCCESS && directory_result == ERROR_SUCCESS &&
          InstallTargetAllowed(state, install_directory, module_directory,
                               allow_activating);
+}
+
+bool ProductionInstallSelfHealAllowed(std::wstring_view module_directory) {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Famo\\InputMethod", 0,
+                    KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
+    return false;
+  }
+  wchar_t state[32]{};
+  wchar_t install_directory[32768]{};
+  DWORD state_bytes = sizeof(state);
+  DWORD directory_bytes = sizeof(install_directory);
+  const LSTATUS state_result =
+      RegGetValueW(key, nullptr, L"InstallState", RRF_RT_REG_SZ, nullptr,
+                   state, &state_bytes);
+  const LSTATUS directory_result =
+      RegGetValueW(key, nullptr, L"InstallDir", RRF_RT_REG_SZ, nullptr,
+                   install_directory, &directory_bytes);
+  RegCloseKey(key);
+  return state_result == ERROR_SUCCESS && directory_result == ERROR_SUCCESS &&
+         InstallTargetSelfHealAllowed(state, install_directory,
+                                      module_directory);
 }
 
 } // namespace famo::runtime

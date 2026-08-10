@@ -8,7 +8,7 @@ endif()
 set(FAMO_IDENTITY "Development" CACHE STRING
     "Compile-time identity set: Development or Stable")
 set_property(CACHE FAMO_IDENTITY PROPERTY STRINGS Development Stable)
-set(FAMO_BRIDGE_ABI "13" CACHE STRING
+set(FAMO_BRIDGE_ABI "14" CACHE STRING
     "Stable in-process TSF Bridge ABI; bump only for a Bridge release")
 if(NOT FAMO_BRIDGE_ABI MATCHES "^[1-9][0-9]*$")
   message(FATAL_ERROR "FAMO_BRIDGE_ABI must be a positive integer")
@@ -21,6 +21,14 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(MSVC)
+  # The Bridge is loaded into arbitrary Windows processes before FamoRuntime
+  # starts.  A clean user machine cannot be assumed to have the toolchain's
+  # matching VC++ redistributable, so every native payload built by this tree
+  # uses the static CRT.
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../runtime-protocol
                  ${CMAKE_CURRENT_BINARY_DIR}/runtime-protocol)
@@ -180,3 +188,30 @@ add_test(NAME tsf_integration_selfcheck
     $<TARGET_FILE:FamoTextService>
     $<TARGET_FILE_DIR:FamoTextService>/FamoTestRuntime.exe)
 set_tests_properties(tsf_integration_selfcheck PROPERTIES TIMEOUT 40)
+
+if(MSVC)
+  get_filename_component(FAMO_MSVC_TOOL_DIRECTORY
+    "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  set(FAMO_DUMPBIN "${FAMO_MSVC_TOOL_DIRECTORY}/dumpbin.exe")
+  if(NOT EXISTS "${FAMO_DUMPBIN}")
+    message(FATAL_ERROR "dumpbin.exe not found beside the MSVC compiler")
+  endif()
+
+  function(famo_verify_portable_native_payload target)
+    if(TARGET ${target})
+      add_custom_target(${target}_portable_runtime_check ALL
+        COMMAND ${CMAKE_COMMAND}
+          "-DDUMPBIN=${FAMO_DUMPBIN}"
+          "-DBINARY=$<TARGET_FILE:${target}>"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify-no-dynamic-msvc-runtime.cmake"
+        DEPENDS ${target}
+        VERBATIM)
+    endif()
+  endfunction()
+
+  foreach(target IN ITEMS
+      FamoTextService FamoProfileTool FamoDevProfile
+      FamoRuntime FamoRimeEngine)
+    famo_verify_portable_native_payload(${target})
+  endforeach()
+endif()
