@@ -85,6 +85,20 @@ cmd.exe /d /c "set FAMO_UPDATE_PRIVATE_KEY=C:\path\to\key&& pwsh -NonInteractive
 
 把 `Famo-Setup-<version>.exe` 与 `appcast.xml` 一起上传到同一个 Windows Release；不得把
 macOS appcast、安装包或 tag 混入本仓。脚本只生成本地资产，不创建或修改 GitHub Release。
+稳定 Release 应先保持 draft，上传并核对这两个资产后再发布；prerelease 不附 appcast，
+也不会替换 stable `releases/latest`。
+
+稳定 Release 发布后，运行不需要私钥的真实资产门禁：
+
+```powershell
+.\verify-live-appcast.ps1 -ExpectedVersion 1.5.33
+```
+
+该门禁会从生产 URL 下载 appcast 和真实安装包，核对同版本不可变 URL、Windows x64、
+最低系统版本、安装参数和声明长度，再用客户端内置公钥验证 EdDSA。GitHub Actions
+每周、手动触发及每次 stable Release 发布后也执行同一门禁；prerelease 会跳过。
+每周巡检兼容 1.5.4 已发布的 `/NORESTART` 历史参数；新 stable Release 事件仍强制
+当前 `/SILENT /SP- /NOICONS`，确保需要重启时安装器能明确提示。
 
 本地自检只覆盖正式私钥与内置公钥配对、appcast 元数据、EdDSA 签名生成与验签；
 它不访问真实 GitHub appcast，也不覆盖 WinSparkle 更新窗口和下载、篡改签名拒绝、
