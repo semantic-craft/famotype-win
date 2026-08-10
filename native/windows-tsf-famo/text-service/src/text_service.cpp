@@ -1813,6 +1813,7 @@ TextService::SendDelivery(ContextEntry *entry, runtime::Frame &&request) {
 
   const auto started = std::chrono::steady_clock::now();
   const auto deadline = started + runtime::kHardCallDeadline;
+  attempt.deadline = deadline;
   const runtime::CallResult prepared =
       runtime_port_.Prepare(std::move(request), deadline);
   const bool explicit_response =
@@ -1846,6 +1847,28 @@ TextService::SendDelivery(ContextEntry *entry, runtime::Frame &&request) {
     attempt.state = DeliveryAttemptState::PreparedAmbiguous;
   }
   return attempt;
+}
+
+void TextService::AcknowledgeAppliedDelivery(
+    ContextEntry *entry, const runtime::DeliveryReference &reference,
+    std::chrono::steady_clock::time_point deadline) {
+  if (!entry)
+    return;
+  entry->applied_delivery = reference;
+  // Runtime keeps a completed delivery until the host explicitly ACKs it,
+  // while configuration controls refuse to replace live contexts with any
+  // delivery outstanding. Waiting for the next key therefore leaves an idle
+  // focused editor permanently blocking settings. Spend only the unused part
+  // of this key's existing 50 ms budget; an ambiguous ACK remains available
+  // to the established piggyback and recovery paths.
+  if (deadline <= std::chrono::steady_clock::now())
+    return;
+  const runtime::CallResult acknowledged =
+      runtime_port_.Ack(reference, deadline);
+  if (acknowledged.status == runtime::Status::Ok ||
+      acknowledged.status == runtime::Status::StaleRequest) {
+    entry->applied_delivery.reset();
+  }
 }
 
 void TextService::SessionWorkerMain() noexcept {
@@ -2573,9 +2596,10 @@ void TextService::ApplyOneDeliveryResult(
     }
     const bool cancelled = result->status == runtime::Status::Ok;
     // The recovery worker addresses the exact logical delivery identity. A
-    // StaleRequest from that authenticated runtime is authoritative evidence
-    // that an unconfirmed Prepare never became durable; it is therefore safe
-    // to pass the original key and continue the same session.
+    // StaleRequest proves the unconfirmed Prepare is not durable, so the key
+    // can pass through, but the physical disconnect may also have retired an
+    // epoch that had no other outstanding delivery. Reopen the session rather
+    // than continuing with a host identity the Runtime no longer owns.
     const bool safe_missing =
         result->status == runtime::Status::StaleRequest;
     entry->pending_delivery.reset();
@@ -2587,6 +2611,10 @@ void TextService::ApplyOneDeliveryResult(
                                                entry->pending_key_down);
       }
       entry->pending_physical_key = false;
+      if (safe_missing) {
+        RecoverConnection();
+        return;
+      }
       if (!entry->ui_state.focused && entry->applied_delivery) {
         ScheduleDeliveryWork(entry, DeliveryWorkKind::Ack,
                              *entry->applied_delivery);

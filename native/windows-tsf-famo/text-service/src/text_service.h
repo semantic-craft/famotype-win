@@ -122,6 +122,7 @@ private:
     runtime::DeliveryReference reference;
     runtime::Frame final_reply;
     std::chrono::milliseconds elapsed{0};
+    std::chrono::steady_clock::time_point deadline{};
   };
 
   struct ExactCandidateCommit {
@@ -267,6 +268,9 @@ private:
       const runtime::PreviewSelectionRequest &request);
   bool DeliverCandidateRequest(ContextEntry *entry, runtime::Frame &&request,
                                std::string exact_commit = {});
+  void AcknowledgeAppliedDelivery(
+      ContextEntry *entry, const runtime::DeliveryReference &reference,
+      std::chrono::steady_clock::time_point deadline);
   bool ResolveCandidateCommitOverride(
       ContextEntry *entry, const runtime::DeliveryReference &reference,
       const runtime::Composition &composition,

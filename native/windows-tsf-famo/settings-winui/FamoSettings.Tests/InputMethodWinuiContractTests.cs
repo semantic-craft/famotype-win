@@ -46,6 +46,64 @@ public sealed class InputMethodWinuiContractTests
     }
 
     [Fact]
+    public void AppliedHostResults_AcknowledgeWithinTheOriginalKeyDeadline()
+    {
+        string header = File.ReadAllText(RepoFile(new[]
+        {
+            "native", "windows-tsf-famo", "text-service", "src", "text_service.h",
+        }));
+        string service = File.ReadAllText(RepoFile(new[]
+        {
+            "native", "windows-tsf-famo", "text-service", "src", "text_service.cpp",
+        }));
+        string key = File.ReadAllText(RepoFile(new[]
+        {
+            "native", "windows-tsf-famo", "text-service", "src", "text_service_key.cpp",
+        }));
+
+        Assert.Contains("std::chrono::steady_clock::time_point deadline{};", header);
+        Assert.Contains("attempt.deadline = deadline;", service);
+        Assert.Equal(5, key.Split(
+            "AcknowledgeAppliedDelivery(entry, attempt.reference, attempt.deadline)",
+            StringSplitOptions.None).Length - 1);
+
+        int method = service.IndexOf("void TextService::AcknowledgeAppliedDelivery(",
+            StringComparison.Ordinal);
+        int worker = service.IndexOf("void TextService::SessionWorkerMain()", method,
+            StringComparison.Ordinal);
+        Assert.True(method >= 0 && worker > method);
+        string body = service[method..worker];
+        int retain = body.IndexOf("entry->applied_delivery = reference;",
+            StringComparison.Ordinal);
+        int deadline = body.IndexOf(
+            "if (deadline <= std::chrono::steady_clock::now())",
+            StringComparison.Ordinal);
+        int acknowledge = body.IndexOf("runtime_port_.Ack(reference, deadline)",
+            StringComparison.Ordinal);
+        int clear = body.IndexOf("entry->applied_delivery.reset();",
+            StringComparison.Ordinal);
+        Assert.True(retain >= 0 && deadline > retain && acknowledge > deadline &&
+            clear > acknowledge,
+            "the host must retain an ambiguous ACK and clear only an explicit result");
+        Assert.Contains("acknowledged.status == runtime::Status::Ok", body);
+        Assert.Contains("acknowledged.status == runtime::Status::StaleRequest", body);
+
+        int cancel = service.IndexOf(
+            "if (result->kind == DeliveryWorkKind::Cancel)", worker,
+            StringComparison.Ordinal);
+        int retry = service.IndexOf(
+            "if (result->status == runtime::Status::Unavailable", cancel + 1,
+            StringComparison.Ordinal);
+        int nextBranch = service.IndexOf(
+            "if (result->status == runtime::Status::Unavailable", retry + 1,
+            StringComparison.Ordinal);
+        Assert.True(cancel >= 0 && retry > cancel && nextBranch > retry);
+        string cancelBody = service[cancel..nextBranch];
+        Assert.Contains("if (safe_missing)", cancelBody);
+        Assert.Contains("RecoverConnection();", cancelBody);
+    }
+
+    [Fact]
     public void FeaturePatchDryRun_UsesTempCopyInsteadOfMutatingCallerWorktree()
     {
         string apply = File.ReadAllText(WeaselForkFile("apply-famo-features.ps1"));

@@ -396,7 +396,7 @@ bool TextService::DeliverCandidateRequest(ContextEntry *entry,
     // the runtime connection; the next valid key can continue in-place.
     entry->exact_candidate_commit.reset();
     entry->state.CompleteUnhandled();
-    entry->applied_delivery = attempt.reference;
+    AcknowledgeAppliedDelivery(entry, attempt.reference, attempt.deadline);
     return false;
   }
   runtime::Composition composition;
@@ -416,7 +416,7 @@ bool TextService::DeliverCandidateRequest(ContextEntry *entry,
   if (!composition.handled) {
     entry->exact_candidate_commit.reset();
     entry->state.CompleteUnhandled();
-    entry->applied_delivery = attempt.reference;
+    AcknowledgeAppliedDelivery(entry, attempt.reference, attempt.deadline);
     return false;
   }
   if (FAILED(ApplyRuntimeComposition(entry, composition, commit_override))) {
@@ -427,7 +427,7 @@ bool TextService::DeliverCandidateRequest(ContextEntry *entry,
   entry->state.ApplySucceeded(composition);
   UpdateCandidates(entry, composition);
   entry->exact_candidate_commit.reset();
-  entry->applied_delivery = attempt.reference;
+  AcknowledgeAppliedDelivery(entry, attempt.reference, attempt.deadline);
   return true;
 }
 
@@ -559,7 +559,7 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
   if (!composition.handled) {
     entry->state.CompleteUnhandled();
     entry->composition.ObserveUnhandledKey(key, down);
-    entry->applied_delivery = attempt.reference;
+    AcknowledgeAppliedDelivery(entry, attempt.reference, attempt.deadline);
     return S_OK;
   }
   const HRESULT applied = ApplyRuntimeComposition(entry, composition);
@@ -571,7 +571,7 @@ HRESULT TextService::HandleKey(ITfContext *context, WPARAM key,
   }
   entry->state.ApplySucceeded(composition);
   UpdateCandidates(entry, composition);
-  entry->applied_delivery = attempt.reference;
+  AcknowledgeAppliedDelivery(entry, attempt.reference, attempt.deadline);
   *eaten = TRUE;
   return S_OK;
 }

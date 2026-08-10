@@ -1928,7 +1928,13 @@ bool MissingRuntimeFailsOpen(TextServiceModule *module) {
 bool FaultFailsOpen(TextServiceModule *module, const wchar_t *runtime_path,
                      std::wstring_view fault) {
   RuntimeProcess runtime;
-  CHECK(runtime.Start(runtime_path, fault, 1, 2));
+  // A disconnect before Prepare reaches Runtime leaves no delivery that can
+  // pin the old logical session. The recovery ACK reconnects once to confirm
+  // StaleRequest, then the TIP opens a fresh session on a third connection.
+  const bool retires_session_before_prepare =
+      fault == L"disconnect" || fault == L"malformed";
+  const uint32_t connections = retires_session_before_prepare ? 3 : 2;
+  CHECK(runtime.Start(runtime_path, fault, 1, connections));
   const bool passed = RunTextStoreSession(
       module, [](ITfKeyEventSink *key_sink, ITfContext *context,
                  FakeTextStore *store, ITfTextInputProcessorEx *,
