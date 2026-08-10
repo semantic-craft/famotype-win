@@ -117,6 +117,17 @@ fails if a shipping native binary imports `MSVCP140*.dll` or
 
 ABI 14 is installed only at `bridge\v14` and never replaces ABI 13 bytes.
 
+Bridge ABI 15 preserves ABI 14's portable native linkage and fixes the
+host-to-Runtime delivery lifetime. Only the in-process Bridge knows when a TSF
+edit has actually reached the host document, so it now acknowledges that
+completed delivery within the original bounded key deadline instead of waiting
+for another key. If a physical disconnect retires a session before Prepare is
+durable, the Bridge reopens the session after the authenticated cancellation
+reports it stale rather than continuing with an identity Runtime no longer
+owns.
+
+ABI 15 is installed only at `bridge\v15` and never replaces ABI 14 bytes.
+
 ## Artifact rules
 
 `installer/build-bridge-artifact.ps1` creates:
@@ -159,7 +170,7 @@ Current compatibility is:
 | Legacy Bridge, wire v2 | yes | yes | yes | yes |
 | Bridge ABI 3/4, wire through v3 | no | yes | yes | yes |
 | Bridge ABI 5/6, wire v4 | no | no | yes | yes |
-| Bridge ABI 13/14, wire v5 | no | no | no | yes |
+| Bridge ABI 13/14/15, wire v5 | no | no | no | yes |
 
 A Bridge stamps its own `kProtocolVersion` on the very first `Hello` frame, and
 a Runtime rejects any frame above the version it was compiled with before

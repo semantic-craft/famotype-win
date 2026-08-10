@@ -10,7 +10,7 @@ param(
   [string] $NativeOutput = '',
   [string] $BridgeArtifact = '',
   [ValidatePattern('^\d+\.\d+\.\d+$')]
-  [string] $AppVersion = '1.5.31',
+  [string] $AppVersion = '1.5.32',
   [ValidateSet('Stable')]
   [string] $Identity = 'Stable',
   [string] $Configuration = 'Release',
@@ -24,7 +24,7 @@ if (-not $NativeOutput) {
   $NativeOutput = Join-Path $NativeDir 'text-service\build-msvc-installer-stable'
 }
 if (-not $BridgeArtifact) {
-  $BridgeArtifact = Join-Path $NativeDir 'text-service\build-bridge-v14-artifact'
+  $BridgeArtifact = Join-Path $NativeDir 'text-service\build-bridge-v15-artifact'
 }
 $PayloadDir = Join-Path $NativeDir 'famo-config\payload'
 $OverlayDir = Join-Path $NativeDir 'famo-config\overlay'
