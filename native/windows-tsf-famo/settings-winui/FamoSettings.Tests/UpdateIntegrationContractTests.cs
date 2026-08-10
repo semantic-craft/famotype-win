@@ -81,6 +81,29 @@ public sealed class UpdateIntegrationContractTests
     }
 
     [Fact]
+    public void StableUpdateFeedHasASecretFreeLiveAssetGate()
+    {
+        string verifier = File.ReadAllText(RepoFile(
+            "native/windows-tsf-famo/installer/verify-live-appcast.ps1"));
+        string workflow = File.ReadAllText(RepoFile(
+            ".github/workflows/famo-update-feed-gate.yml"));
+
+        Assert.Contains("releases/latest/download/appcast.xml", verifier);
+        Assert.Contains("sparkle:edSignature", verifier);
+        Assert.Contains("sparkle:os", verifier);
+        Assert.Contains("sparkle:installerArguments", verifier);
+        Assert.Contains("'verify'", verifier);
+        Assert.Contains("$installer.Length -ne $declaredLength", verifier);
+        Assert.DoesNotContain("FAMO_UPDATE_PRIVATE_KEY", verifier);
+        Assert.Contains("schedule:", workflow);
+        Assert.Contains("release:", workflow);
+        Assert.Contains("types: [published]", workflow);
+        Assert.Contains("ExpectedVersion = $env:EXPECTED_VERSION", workflow);
+        Assert.Contains("RequiredInstallerArguments =", workflow);
+        Assert.Contains("verify-live-appcast.ps1", workflow);
+    }
+
+    [Fact]
     public void ReleaseMetadataIsPreparedFor159()
     {
         string build = File.ReadAllText(RepoFile(
